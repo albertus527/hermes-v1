@@ -5583,7 +5583,7 @@ def cmd_cron(args):
 
 
 def cmd_backtest(args):
-    """R2.7 canonical backtest (Phase 0/1 scaffolding)."""
+    """R2.7 canonical backtest (Phase 0/1/2 scaffolding)."""
     from backtest import cli as _backtest_cli
 
     handler = getattr(args, "backtest_handler", None)
@@ -5591,7 +5591,14 @@ def cmd_backtest(args):
         return _backtest_cli.cmd_init(args)
     if handler == "fee-smoke":
         return _backtest_cli.cmd_fee_smoke(args)
-    print("usage: hermes backtest <init|fee-smoke>")
+    if handler == "populate-news-cache":
+        return _backtest_cli.cmd_populate_news_cache(args)
+    if handler == "news-cache-report":
+        return _backtest_cli.cmd_news_cache_report(args)
+    if handler == "calibrate-news":
+        return _backtest_cli.cmd_calibrate_news(args)
+    print("usage: hermes backtest <init|fee-smoke|populate-news-cache|"
+          "news-cache-report|calibrate-news>")
     return 2
 
 
