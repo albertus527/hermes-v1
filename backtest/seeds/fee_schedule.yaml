@@ -1,0 +1,37 @@
+# R2.7 §9.7 effective-dated regulatory fee schedule (SEC/TAF/CAT).
+#
+# Three historical entry states:
+#   - verified dated rate            (rate + verified: true)
+#   - verified zero                  (applicable: false + verified: true)
+#   - absence of any entry           (UNVERIFIED -> PROVISIONAL;
+#                                     TRAIN_SUBSTITUTED_ZERO in TRAIN runs only)
+#
+# IMPORTANT: only the CURRENT published rates are seeded below as verified.
+# Historical SEC/TAF/CAT rates and pass-through start dates are an external
+# research task (public SEC/FINRA/CAT fee notices) and are deliberately NOT
+# invented here; historical spans remain PROVISIONAL until verified entries
+# are added with source citations. This blocks criterion-bearing OOS over
+# unverified spans (§9.7 items 3-5) but not train-window computation.
+version: "0.1.0-seed"
+entries:
+  # Current published schedule (§9.6 formulas, KNOWN for the current
+  # schedule). Effective-from dates below are the rates' known-current
+  # values; the exact pass-through start dates are MUST CONFIRM from public
+  # notices and must be encoded as verified applicable:false spans once
+  # confirmed. Until then these entries cover only from the spec's canonical
+  # validation date forward.
+  - component: SEC
+    rate: 0.0000206            # $ per dollar of sell notional; $0.01 min per §9.6
+    effective: ["2026-08-25", null]
+    verified: true
+    source: "R2.7 §9.6 current published schedule (KNOWN current); start date provisional-pending-notice"
+  - component: TAF
+    rate: 0.000166             # $ per share sold; $0.01 min, $8.30 cap per §9.6
+    effective: ["2026-08-25", null]
+    verified: true
+    source: "R2.7 §9.6 current published schedule (KNOWN current); start date provisional-pending-notice"
+  - component: CAT
+    rate: 0.0000265            # $ per share sold; $0.01 min per §9.6
+    effective: ["2026-08-25", null]
+    verified: true
+    source: "R2.7 §9.6 current published schedule (KNOWN current); start date provisional-pending-notice"

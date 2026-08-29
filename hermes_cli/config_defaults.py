@@ -20,6 +20,34 @@ DEFAULT_CONFIG = {
         "wal_autocheckpoint": None,
         "journal_size_limit": None,
     },
+    # R2.7 canonical backtest (docs/specs/HERMES_FABLE_R2_7_CANONICAL_BACKTEST_SPECIFICATION.md).
+    # Behavioral settings only — data-provider secrets live in .env
+    # (ALPACA_API_KEY / ALPACA_API_SECRET / FINNHUB_API_KEY / FRED_API_KEY).
+    "backtest": {
+        # Directory (relative to the profile HERMES_HOME, or absolute) holding
+        # backtest SQLite databases and run artifacts.
+        "db_dir": "backtest",
+        # SQLite journal mode for backtest stores; null inherits
+        # database.journal_mode.
+        "journal_mode": None,
+        # R2.7 §14.1/§11.5: pinned OpenRouter identifier for the Phase-2 news
+        # cache-population job. MUST be set before Phase 2; the deterministic
+        # core never calls an LLM regardless.
+        "pinned_model": "",
+    },
+    # R2.7 trading strategy behavioral defaults (shared live/backtest
+    # deterministic core, trading_core/). Versioned strategy artifacts
+    # (universe.yaml, fee_schedule.yaml) live under
+    # $HERMES_HOME/backtest/artifacts/ — see backtest/artifacts.py.
+    "trading": {
+        "risk_per_trade": 0.01,
+        "stop_mult": 2.5,
+        # R2.7 §9.6 rounding/VAT branches.
+        "fee_rounding": "CEIL_CENT_PER_COMPONENT",
+        "vat_on_regulatory": False,
+        # R2.7 §9.8 dividend withholding default (treaty rate MUST CONFIRM).
+        "dividend_withholding_rate": 0.30,
+    },
     # Soft file-descriptor limit for long-running Hermes server processes.
     # Clamped to the OS hard limit; 0/false/null disables the adjustment.
     "runtime": {
@@ -3919,6 +3947,39 @@ OPTIONAL_ENV_VARS = {
         "password": True,
         "tools": ["vision_analyze"],
         "category": "provider",
+        "advanced": True,
+    },
+    # ── R2.7 backtest data-provider credentials (docs/specs/HERMES_FABLE_R2_7_* §3.1) ──
+    "ALPACA_API_KEY": {
+        "description": "Alpaca market-data API key (R2.7 backtest bars + corporate actions; Phase 0+)",
+        "prompt": "Alpaca API key ID",
+        "url": "https://app.alpaca.markets/signup",
+        "password": True,
+        "category": "tool",
+        "advanced": True,
+    },
+    "ALPACA_API_SECRET": {
+        "description": "Alpaca market-data API secret (pairs with ALPACA_API_KEY)",
+        "prompt": "Alpaca API secret key",
+        "url": "https://app.alpaca.markets/signup",
+        "password": True,
+        "category": "tool",
+        "advanced": True,
+    },
+    "FINNHUB_API_KEY": {
+        "description": "Finnhub API key (R2.7 news headlines + earnings calendar ingestion; Phase 0+)",
+        "prompt": "Finnhub API key",
+        "url": "https://finnhub.io/dashboard",
+        "password": True,
+        "category": "tool",
+        "advanced": True,
+    },
+    "FRED_API_KEY": {
+        "description": "FRED API key (R2.7 VIXCLS daily series for the §5.2 volatility state)",
+        "prompt": "FRED API key",
+        "url": "https://fred.stlouisfed.org/docs/api/api_key.html",
+        "password": True,
+        "category": "tool",
         "advanced": True,
     },
     "GOOGLE_API_KEY": {

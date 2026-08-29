@@ -442,6 +442,7 @@ import functools as _functools
 
 from hermes_cli.subcommands._shared import add_accept_hooks_flag as _add_accept_hooks_flag
 from hermes_cli.subcommands.cron import build_cron_parser
+from hermes_cli.subcommands.backtest import build_backtest_parser
 from hermes_cli.subcommands.sync import build_sync_parser
 from hermes_cli.subcommands.gateway import build_gateway_parser
 from hermes_cli.subcommands.profile import build_profile_parser
@@ -5579,6 +5580,19 @@ def cmd_cron(args):
     from hermes_cli.cron import cron_command
 
     cron_command(args)
+
+
+def cmd_backtest(args):
+    """R2.7 canonical backtest (Phase 0/1 scaffolding)."""
+    from backtest import cli as _backtest_cli
+
+    handler = getattr(args, "backtest_handler", None)
+    if handler == "init":
+        return _backtest_cli.cmd_init(args)
+    if handler == "fee-smoke":
+        return _backtest_cli.cmd_fee_smoke(args)
+    print("usage: hermes backtest <init|fee-smoke>")
+    return 2
 
 
 def cmd_sync(args):
@@ -13531,6 +13545,7 @@ def main():
     # cron command  (parser built in hermes_cli/subcommands/cron.py)
     # =========================================================================
     build_cron_parser(subparsers, cmd_cron=cmd_cron)
+    build_backtest_parser(subparsers, cmd_backtest=cmd_backtest)
     build_sync_parser(subparsers, cmd_sync=cmd_sync)
 
     # =========================================================================

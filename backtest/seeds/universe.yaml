@@ -1,0 +1,47 @@
+# R2.7 §4.1 baseline universe v1.0 (validation date 2026-08-25).
+#
+# All pluang_confirmed statuses are UNCONFIRMED until the user verifies each
+# ticker in the Pluang app. Unconfirmed tickers are excluded from live
+# recommendations and included in backtest only with the exclusion disclosed
+# (§4.1, §7.2 G3, §13.9 item 7).
+#
+# Universe rules (§4.2): leveraged/inverse products categorically excluded
+# (every entry asserts leveraged: false); history_continuous_since required
+# per entry; user confirmation increments universe_version and stamps
+# pluang_confirmed: <date>.
+universe_version: "1.0"
+validation_date: "2026-08-25"
+tickers:
+  # ETFs (G6 earnings blackout N/A)
+  - {ticker: QQQ,  class: etf, leveraged: false, history_continuous_since: "2016-01-01", pluang_confirmed: false}
+  - {ticker: VUG,  class: etf, leveraged: false, history_continuous_since: "2016-01-01", pluang_confirmed: false}
+  - {ticker: SCHG, class: etf, leveraged: false, history_continuous_since: "2016-01-01", pluang_confirmed: false}
+  - {ticker: VGT,  class: etf, leveraged: false, history_continuous_since: "2016-01-01", pluang_confirmed: false}
+  # SMH structure change predates the window (§4.1)
+  - {ticker: SMH,  class: etf, leveraged: false, history_continuous_since: "2016-01-01", pluang_confirmed: false}
+  - {ticker: IWF,  class: etf, leveraged: false, history_continuous_since: "2016-01-01", pluang_confirmed: false}
+  # Stocks
+  - {ticker: AAPL, class: stock, leveraged: false, history_continuous_since: "2016-01-01", pluang_confirmed: false}
+  - {ticker: MSFT, class: stock, leveraged: false, history_continuous_since: "2016-01-01", pluang_confirmed: false}
+  - {ticker: NVDA, class: stock, leveraged: false, history_continuous_since: "2016-01-01", pluang_confirmed: false}
+  - {ticker: GOOGL, class: stock, leveraged: false, history_continuous_since: "2016-01-01", pluang_confirmed: false}
+  - {ticker: AMZN, class: stock, leveraged: false, history_continuous_since: "2016-01-01", pluang_confirmed: false}
+  - {ticker: META, class: stock, leveraged: false, history_continuous_since: "2016-01-01", pluang_confirmed: false}
+  - {ticker: TSLA, class: stock, leveraged: false, history_continuous_since: "2016-01-01", pluang_confirmed: false}
+  - {ticker: AVGO, class: stock, leveraged: false, history_continuous_since: "2016-01-01", pluang_confirmed: false}
+  - {ticker: JPM,  class: stock, leveraged: false, history_continuous_since: "2016-01-01", pluang_confirmed: false}
+  - {ticker: V,    class: stock, leveraged: false, history_continuous_since: "2016-01-01", pluang_confirmed: false}
+  - {ticker: MA,   class: stock, leveraged: false, history_continuous_since: "2016-01-01", pluang_confirmed: false}
+  - {ticker: UNH,  class: stock, leveraged: false, history_continuous_since: "2016-01-01", pluang_confirmed: false}
+  - {ticker: HD,   class: stock, leveraged: false, history_continuous_since: "2016-01-01", pluang_confirmed: false}
+  - {ticker: PG,   class: stock, leveraged: false, history_continuous_since: "2016-01-01", pluang_confirmed: false}
+  - {ticker: COST, class: stock, leveraged: false, history_continuous_since: "2016-01-01", pluang_confirmed: false}
+  - {ticker: ORCL, class: stock, leveraged: false, history_continuous_since: "2016-01-01", pluang_confirmed: false}
+  - {ticker: NFLX, class: stock, leveraged: false, history_continuous_since: "2016-01-01", pluang_confirmed: false}
+  - {ticker: AMD,  class: stock, leveraged: false, history_continuous_since: "2016-01-01", pluang_confirmed: false}
+  - {ticker: CRM,  class: stock, leveraged: false, history_continuous_since: "2016-01-01", pluang_confirmed: false}
+  - {ticker: ADBE, class: stock, leveraged: false, history_continuous_since: "2016-01-01", pluang_confirmed: false}
+# §3.6 / §5.5 reference instruments consumed by the strategy and benchmarks
+# but not universe members for entry purposes.
+reference_instruments:
+  - {ticker: SPY, class: etf, leveraged: false, history_continuous_since: "2016-01-01"}
