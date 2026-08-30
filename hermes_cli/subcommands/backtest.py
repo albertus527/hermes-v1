@@ -62,4 +62,68 @@ def build_backtest_parser(subparsers, *, cmd_backtest: Callable) -> None:
                              help="path to the labeled-headlines JSON set")
     p_calibrate.set_defaults(backtest_handler="calibrate-news")
 
+    # -- Phase-0 data-ingestion jobs (§20 Phase 0) -------------------------
+
+    p_bars = subs.add_parser(
+        "fetch-alpaca-bars",
+        help="Alpaca historical bars (SIP feed asserted; daily or 1-min; "
+             "split=signal / raw=executable adjustment)")
+    p_bars.add_argument("--tickers", required=True,
+                        help="comma-separated ticker list")
+    p_bars.add_argument("--start", required=True, help="YYYY-MM-DD")
+    p_bars.add_argument("--end", required=True, help="YYYY-MM-DD (inclusive)")
+    p_bars.add_argument("--timeframe", default="1Min",
+                        choices=["1Min", "1Day"])
+    p_bars.add_argument("--adjustment", default="split",
+                        choices=["split", "raw"])
+    p_bars.add_argument("--run-id", default="fetch-alpaca-bars")
+    p_bars.set_defaults(backtest_handler="fetch-alpaca-bars")
+
+    p_ca = subs.add_parser(
+        "fetch-corp-actions",
+        help="Alpaca Corporate Actions (§3.6 designated provider) + verified "
+             "CORP_ACTIONS coverage-manifest attestations")
+    p_ca.add_argument("--tickers", required=True,
+                      help="comma-separated ticker list")
+    p_ca.add_argument("--start", required=True, help="YYYY-MM-DD")
+    p_ca.add_argument("--end", required=True, help="YYYY-MM-DD (inclusive)")
+    p_ca.add_argument("--corp-actions-version", default="alpaca-ca-1")
+    p_ca.add_argument("--manifest-version", default=None,
+                      help="coverage manifest version (defaults to "
+                           "corp-actions-version)")
+    p_ca.add_argument("--run-id", default="fetch-corp-actions")
+    p_ca.set_defaults(backtest_handler="fetch-corp-actions")
+
+    p_news = subs.add_parser(
+        "fetch-finnhub-news",
+        help="Finnhub raw headline inventory + verified NEWS covered-span "
+             "manifests (FP-5)")
+    p_news.add_argument("--tickers", required=True,
+                        help="comma-separated ticker list")
+    p_news.add_argument("--start", required=True, help="YYYY-MM-DD")
+    p_news.add_argument("--end", required=True, help="YYYY-MM-DD (inclusive)")
+    p_news.add_argument("--manifest-version", default="finnhub-news-1")
+    p_news.add_argument("--run-id", default="fetch-finnhub-news")
+    p_news.set_defaults(backtest_handler="fetch-finnhub-news")
+
+    p_earn = subs.add_parser(
+        "fetch-finnhub-earnings",
+        help="Finnhub earnings calendar (G6 inputs) + verified EARNINGS "
+             "covered-span manifests")
+    p_earn.add_argument("--tickers", required=True,
+                        help="comma-separated ticker list")
+    p_earn.add_argument("--start", required=True, help="YYYY-MM-DD")
+    p_earn.add_argument("--end", required=True, help="YYYY-MM-DD (inclusive)")
+    p_earn.add_argument("--manifest-version", default="finnhub-earnings-1")
+    p_earn.add_argument("--run-id", default="fetch-finnhub-earnings")
+    p_earn.set_defaults(backtest_handler="fetch-finnhub-earnings")
+
+    p_vix = subs.add_parser(
+        "fetch-fred-vix",
+        help="FRED VIXCLS daily closes (§5.2 volatility state input)")
+    p_vix.add_argument("--start", required=True, help="YYYY-MM-DD")
+    p_vix.add_argument("--end", required=True, help="YYYY-MM-DD (inclusive)")
+    p_vix.add_argument("--run-id", default="fetch-fred-vix")
+    p_vix.set_defaults(backtest_handler="fetch-fred-vix")
+
     parser.set_defaults(func=cmd_backtest)

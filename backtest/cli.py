@@ -1,15 +1,18 @@
 """`hermes backtest` command handlers (R2.7 Phase 0/1/2 verbs).
 
-Phase-0 verbs: `init`, `fee-smoke`. Phase-2 verbs: `populate-news-cache`
+Phase-0 verbs: `init`, `fee-smoke`, plus the Phase-0 data-ingestion jobs
+`fetch-alpaca-bars`, `fetch-corp-actions`, `fetch-finnhub-news`,
+`fetch-finnhub-earnings`, `fetch-fred-vix` (each fails closed when its
+credential is absent). Phase-2 verbs: `populate-news-cache`
 (the ONLY authorized live-LLM context — fails closed until the pinned
 model is configured), `news-cache-report` (completeness + P-4 integrity
-over an existing cache; pure reads), and `calibrate-news` (§11.4 framework
-runner; refuses to claim PASS). Data-fetch verbs (fetch-alpaca,
-fetch-finnhub, fetch-fred) arrive with their phases.
+over an existing cache; pure reads), and `calibrate-news` (§11.4
+framework runner; refuses to claim PASS).
 """
 
 from __future__ import annotations
 
+import datetime as _dt
 from decimal import Decimal
 from pathlib import Path
 
@@ -273,3 +276,225 @@ def cmd_calibrate_news(args) -> int:
 def _now_iso() -> str:
     import datetime as _dt
     return _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Phase-0 data-ingestion jobs (§20 Phase 0; hermetic transport injected by
+# tests; live transport fails closed on missing credentials)
+# ---------------------------------------------------------------------------
+
+def _parse_date(value: str) -> _dt.date:
+    return _dt.date.fromisoformat(value)
+
+
+def _open_ingest_store(run_id: str):
+    from backtest.db.schema import open_db
+    db_path = _backtest_db_path()
+    if not db_path.exists():
+        print(f"No backtest store at {db_path} — run `hermes backtest init` "
+              "first.")
+        return None
+    from backtest.data.ingest_core import IngestStore
+    conn = open_db(db_path)
+    conn.row_factory = None
+    return IngestStore(conn, run_id=run_id)
+
+
+def _run_credential_job(label: str, fn) -> int:
+    """Run a fetch job body; map credential absence to exit code 3 and
+    deterministic ingestion errors to exit code 4."""
+    from backtest.data.ingest_core import IngestionError
+    try:
+        return fn()
+    except IngestionError as exc:
+        name = type(exc).__name__
+        if name == "CredentialsMissing":
+            print(f"BLOCKED: {exc}")
+            print(f"  {label} requires its provider credential in "
+                  "~/.hermes/.env; execution against the live provider is "
+                  "blocked until it is configured.")
+            return 3
+        print(f"INGESTION FAILED (deterministic fail-closed): {exc}")
+        return 4
+
+
+def cmd_fetch_alpaca_bars(args) -> int:
+    """Alpaca historical bar ingestion (daily + 1-min, both adjustments,
+    SIP feed asserted at request time, §3.5)."""
+    def run() -> int:
+        from backtest.data.fetch_alpaca import fetch_bars
+        from backtest.data.ingest_core import FetchLog
+        from trading_core.types import (
+            ADJUSTMENT_RAW, ADJUSTMENT_SPLIT, TIMEFRAME_1DAY, TIMEFRAME_1MIN,
+        )
+        store = _open_ingest_store(getattr(args, "run_id", "") or
+                                   "fetch-alpaca-bars")
+        if store is None:
+            return 2
+        tickers = [t.strip() for t in
+                   (getattr(args, "tickers", "") or "").split(",") if t.strip()]
+        start = _parse_date(args.start)
+        end = _parse_date(args.end)
+        timeframe = TIMEFRAME_1MIN if getattr(args, "timeframe", "1Min") == "1Min" \
+            else TIMEFRAME_1DAY
+        adjustment = ADJUSTMENT_SPLIT if getattr(args, "adjustment", "split") == "split" \
+            else ADJUSTMENT_RAW
+        log = FetchLog()
+        total_new = 0
+        for ticker in tickers:
+            rows = fetch_bars(ticker=ticker, timeframe=timeframe,
+                              adjustment=adjustment, start=start, end=end,
+                              fetch_log=log)
+            total_new += store.upsert_bars(rows)
+            print(f"  {ticker}: {len(rows)} bars fetched "
+                  f"({adjustment}/{timeframe}), {total_new} new rows total")
+        path = _save_report(log.to_json(),
+                            f"fetch_alpaca_bars_{start}_{end}.json")
+        print(f"Fetch log: {path}")
+        return 0
+    return _run_credential_job("Alpaca bars ingestion", run)
+
+
+def cmd_fetch_corp_actions(args) -> int:
+    """Alpaca Corporate Actions ingestion (§3.6 designated provider) +
+    verified coverage-manifest attestations for the queried spans."""
+    def run() -> int:
+        from backtest.data.fetch_alpaca import (
+            corp_actions_manifest_rows, fetch_corporate_actions,
+        )
+        from backtest.data.ingest_core import FetchLog
+        store = _open_ingest_store(getattr(args, "run_id", "") or
+                                   "fetch-corp-actions")
+        if store is None:
+            return 2
+        tickers = [t.strip() for t in
+                   (getattr(args, "tickers", "") or "").split(",") if t.strip()]
+        start = _parse_date(args.start)
+        end = _parse_date(args.end)
+        version = getattr(args, "corp_actions_version", "") or "alpaca-ca-1"
+        manifest_version = getattr(args, "manifest_version", "") or version
+        log = FetchLog()
+        events_new = 0
+        manifest_new = 0
+        for ticker in tickers:
+            result = fetch_corporate_actions(
+                ticker=ticker, start=start, end=end,
+                corp_actions_version=version, fetch_log=log)
+            events_new += store.upsert_corp_actions(result.events)
+            manifest_new += store.write_manifest(corp_actions_manifest_rows(
+                result, manifest_version=manifest_version))
+            print(f"  {ticker}: {len(result.events)} events, "
+                  f"verified span {start}..{end}")
+        path = _save_report(log.to_json(),
+                            f"fetch_corp_actions_{start}_{end}.json")
+        print(f"Fetch log: {path}")
+        print(f"corp_actions rows: {events_new} new; coverage-manifest "
+              f"rows: {manifest_new} new")
+        return 0
+    return _run_credential_job("Alpaca corporate-actions ingestion", run)
+
+
+def cmd_fetch_finnhub_news(args) -> int:
+    """Finnhub raw headline inventory ingestion + verified NEWS covered-
+    span manifest attestations (FP-5)."""
+    def run() -> int:
+        from backtest.data.fetch_finnhub import (
+            fetch_news_inventory, news_manifest_rows,
+        )
+        from backtest.data.ingest_core import FetchLog
+        store = _open_ingest_store(getattr(args, "run_id", "") or
+                                   "fetch-finnhub-news")
+        if store is None:
+            return 2
+        tickers = [t.strip() for t in
+                   (getattr(args, "tickers", "") or "").split(",") if t.strip()]
+        start = _parse_date(args.start)
+        end = _parse_date(args.end)
+        manifest_version = getattr(args, "manifest_version", "") or \
+            "finnhub-news-1"
+        log = FetchLog()
+        headlines_new = 0
+        manifest_new = 0
+        for ticker in tickers:
+            rows = fetch_news_inventory(ticker=ticker, start=start, end=end,
+                                        fetch_log=log)
+            headlines_new += store.upsert_headlines(rows)
+            manifest_new += store.write_manifest(news_manifest_rows(
+                ticker=ticker, start=start, end=end,
+                manifest_version=manifest_version))
+            print(f"  {ticker}: {len(rows)} timed headlines ingested "
+                  f"(verified NEWS span {start}..{end})")
+        path = _save_report(log.to_json(),
+                            f"fetch_finnhub_news_{start}_{end}.json")
+        print(f"Fetch log: {path}")
+        print(f"news_headlines rows: {headlines_new} new; NEWS manifest "
+              f"rows: {manifest_new} new")
+        return 0
+    return _run_credential_job("Finnhub news ingestion", run)
+
+
+def cmd_fetch_finnhub_earnings(args) -> int:
+    """Finnhub earnings-calendar ingestion (G6 inputs) + verified EARNINGS
+    covered-span manifest attestations. NOTE: earnings events are stored
+    in the fetch log report; §16 persistence of the event rows themselves
+    rides on gate_results inputs_json at evaluation time."""
+    def run() -> int:
+        import json as _json
+        from backtest.data.fetch_finnhub import (
+            earnings_manifest_rows, fetch_earnings_calendar,
+        )
+        from backtest.data.ingest_core import FetchLog
+        store = _open_ingest_store(getattr(args, "run_id", "") or
+                                   "fetch-finnhub-earnings")
+        if store is None:
+            return 2
+        tickers = [t.strip() for t in
+                   (getattr(args, "tickers", "") or "").split(",") if t.strip()]
+        start = _parse_date(args.start)
+        end = _parse_date(args.end)
+        manifest_version = getattr(args, "manifest_version", "") or \
+            "finnhub-earnings-1"
+        log = FetchLog()
+        all_events: list[dict] = []
+        manifest_new = 0
+        for ticker in tickers:
+            events = fetch_earnings_calendar(ticker=ticker, start=start,
+                                             end=end, fetch_log=log)
+            all_events.extend(events)
+            manifest_new += store.write_manifest(earnings_manifest_rows(
+                ticker=ticker, start=start, end=end,
+                manifest_version=manifest_version))
+            print(f"  {ticker}: {len(events)} earnings events "
+                  f"(verified EARNINGS span {start}..{end})")
+        path = _save_report(log.to_json(),
+                            f"fetch_finnhub_earnings_{start}_{end}.json")
+        events_path = _save_report(
+            _json.dumps(all_events, sort_keys=True, indent=2),
+            f"earnings_events_{start}_{end}.json")
+        print(f"Fetch log: {path}")
+        print(f"Earnings events report: {events_path}")
+        print(f"EARNINGS manifest rows: {manifest_new} new")
+        return 0
+    return _run_credential_job("Finnhub earnings ingestion", run)
+
+
+def cmd_fetch_fred_vix(args) -> int:
+    """FRED VIXCLS daily-close ingestion (§5.2 volatility state input)."""
+    def run() -> int:
+        from backtest.data.fetch_fred import fetch_vixcls
+        from backtest.data.ingest_core import FetchLog
+        store = _open_ingest_store(getattr(args, "run_id", "") or
+                                   "fetch-fred-vix")
+        if store is None:
+            return 2
+        start = _parse_date(args.start)
+        end = _parse_date(args.end)
+        log = FetchLog()
+        rows = fetch_vixcls(start=start, end=end, fetch_log=log)
+        new = store.upsert_vix(rows)
+        path = _save_report(log.to_json(), f"fetch_fred_vix_{start}_{end}.json")
+        print(f"Fetch log: {path}")
+        print(f"vix_observations: {len(rows)} fetched, {new} new rows")
+        return 0
+    return _run_credential_job("FRED VIXCLS ingestion", run)
+

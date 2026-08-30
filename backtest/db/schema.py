@@ -11,7 +11,7 @@ import os
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 DDL = """
 CREATE TABLE IF NOT EXISTS run_history (
@@ -130,6 +130,16 @@ CREATE TABLE IF NOT EXISTS fee_calculations (
     base_amount TEXT NOT NULL, vat_amount TEXT NOT NULL,
     rounded_amount TEXT NOT NULL, rounding_branch TEXT NOT NULL,
     fee_schedule_version TEXT NOT NULL, fee_input_status TEXT NOT NULL,
+    run_id TEXT NOT NULL DEFAULT '', config_version INTEGER NOT NULL DEFAULT 0,
+    code_commit TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS vix_observations (
+    -- FRED VIXCLS daily close (§3.1, §5.2). observation_date is the
+    -- series date (already a trading-day close); value is the raw close.
+    -- '.'-encoded FRED missing values are NOT stored.
+    observation_date TEXT NOT NULL PRIMARY KEY,
+    value TEXT NOT NULL,
+    series_id TEXT NOT NULL DEFAULT 'VIXCLS',
     run_id TEXT NOT NULL DEFAULT '', config_version INTEGER NOT NULL DEFAULT 0,
     code_commit TEXT NOT NULL DEFAULT ''
 );

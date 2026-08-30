@@ -5597,8 +5597,20 @@ def cmd_backtest(args):
         return _backtest_cli.cmd_news_cache_report(args)
     if handler == "calibrate-news":
         return _backtest_cli.cmd_calibrate_news(args)
-    print("usage: hermes backtest <init|fee-smoke|populate-news-cache|"
-          "news-cache-report|calibrate-news>")
+    if handler == "fetch-alpaca-bars":
+        return _backtest_cli.cmd_fetch_alpaca_bars(args)
+    if handler == "fetch-corp-actions":
+        return _backtest_cli.cmd_fetch_corp_actions(args)
+    if handler == "fetch-finnhub-news":
+        return _backtest_cli.cmd_fetch_finnhub_news(args)
+    if handler == "fetch-finnhub-earnings":
+        return _backtest_cli.cmd_fetch_finnhub_earnings(args)
+    if handler == "fetch-fred-vix":
+        return _backtest_cli.cmd_fetch_fred_vix(args)
+    print("usage: hermes backtest <init|fee-smoke|fetch-alpaca-bars|"
+          "fetch-corp-actions|fetch-finnhub-news|fetch-finnhub-earnings|"
+          "fetch-fred-vix|populate-news-cache|news-cache-report|"
+          "calibrate-news>")
     return 2
 
 
