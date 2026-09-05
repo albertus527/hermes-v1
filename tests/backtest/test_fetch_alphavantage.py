@@ -28,6 +28,7 @@ Covers the §3.8 substitutable historical NEWS contract:
 
 import datetime as dt
 import json
+import re
 
 import pytest
 
@@ -485,10 +486,10 @@ class TestFetchWindows:
         assert len(calls) == 2
         assert calls[0]["params"]["function"] == "NEWS_SENTIMENT"
         assert calls[0]["params"]["tickers"] == "AAPL"
-        assert calls[0]["params"]["time_from"] == "20190101T000000"
-        assert calls[0]["params"]["time_to"] == "20190130T235959"
-        assert calls[1]["params"]["time_from"] == "20190131T000000"
-        assert calls[1]["params"]["time_to"] == "20190131T235959"
+        assert calls[0]["params"]["time_from"] == "20190101T0000"
+        assert calls[0]["params"]["time_to"] == "20190130T2359"
+        assert calls[1]["params"]["time_from"] == "20190131T0000"
+        assert calls[1]["params"]["time_to"] == "20190131T2359"
 
     def test_long_span_sweeps_in_30_day_windows(self, av_creds):
         calls = []
@@ -499,9 +500,38 @@ class TestFetchWindows:
         assert len(calls) == 3
         assert len(log.records) == 3
         assert [c["params"]["time_from"] for c in calls] == [
-            "20190101T000000", "20190131T000000", "20190302T000000"]
+            "20190101T0000", "20190131T0000", "20190302T0000"]
         assert [c["params"]["time_to"] for c in calls] == [
-            "20190130T235959", "20190301T235959", "20190331T235959"]
+            "20190130T2359", "20190301T2359", "20190331T2359"]
+
+    def test_request_bounds_minute_resolution_contract(self, av_creds):
+        # REQUEST time_from/time_to must match the NEWS_SENTIMENT
+        # provider contract: ^\d{8}T\d{4}$ (YYYYMMDDTHHMM, minute
+        # resolution). The response-side time_published legitimately
+        # uses HHMMSS — a different format that must never leak into
+        # the request bounds (verified by the bounded real diagnostic:
+        # HHMMSS bounds -> provider "Invalid inputs" envelope).
+        stamp_re = re.compile(r"^\d{8}T\d{4}$")
+        calls = []
+        log = FetchLog()
+        _fetch(_payload([]), start=dt.date(2019, 1, 1),
+               end=dt.date(2019, 5, 15), calls=calls, fetch_log=log)
+        assert calls
+        for c in calls:
+            for key in ("time_from", "time_to"):
+                assert stamp_re.match(c["params"][key]), \
+                    f"{key}={c['params'][key]!r} violates YYYYMMDDTHHMM"
+        # FetchRecord.params stores the same minute-resolution bounds
+        # as the actual outgoing request
+        assert len(log.records) == len(calls)
+        for rec in log.records:
+            for key in ("time_from", "time_to"):
+                assert stamp_re.match(rec.params[key]), \
+                    f"FetchRecord {key}={rec.params[key]!r} violates " \
+                    f"YYYYMMDDTHHMM"
+        for c, rec in zip(calls, log.records):
+            assert rec.params["time_from"] == c["params"]["time_from"]
+            assert rec.params["time_to"] == c["params"]["time_to"]
 
     def test_request_never_places_key_in_url_path(self, av_creds):
         calls = []

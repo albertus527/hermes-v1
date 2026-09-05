@@ -7,8 +7,10 @@ the repo under the managed root — synthetic fixtures only in tests):
 
 - Endpoint: ``GET https://www.alphavantage.co/query`` with
   ``function=NEWS_SENTIMENT``, ``tickers=<T>``, ``time_from`` /
-  ``time_to`` (``YYYYMMDDTHHMMSS`` bounds), and the credential in the
-  ``apikey`` query parameter.
+  ``time_to`` REQUEST bounds (``YYYYMMDDTHHMM`` minute resolution —
+  see ``_window_stamp``) and the credential in the ``apikey`` query
+  parameter. (The RESPONSE field ``time_published`` is
+  ``YYYYMMDDTHHMMSS`` — a different, response-side format.)
 - Top-level payload: ``{"items": …, "sentiment_score_definition": …,
   "relevance_score_definition": …, "feed": […]}``.
 - Feed item fields: ``authors, banner_image, category_within_source,
@@ -335,10 +337,14 @@ def normalize_news_payload(payload: Any, *, ticker: str,
 
 
 def _window_stamp(d: _dt.date, *, end_of_day: bool = False) -> str:
-    """Provider-format window bound: ``YYYYMMDDTHHMMSS`` at midnight or
-    23:59:59 — the same UTC-axis bounds the manifest machinery uses."""
-    t = _dt.time(23, 59, 59) if end_of_day else _dt.time(0, 0, 0)
-    return _dt.datetime.combine(d, t).strftime("%Y%m%dT%H%M%S")
+    """Provider-format REQUEST window bound: ``YYYYMMDDTHHMM`` at
+    00:00 or 23:59 — the NEWS_SENTIMENT ``time_from`` / ``time_to``
+    contract (minute resolution; see the official API documentation).
+    This is the REQUEST format only; the response-side
+    ``time_published`` field is ``YYYYMMDDTHHMMSS`` and is parsed
+    separately by ``_parse_time_published``."""
+    t = _dt.time(23, 59) if end_of_day else _dt.time(0, 0)
+    return _dt.datetime.combine(d, t).strftime("%Y%m%dT%H%M")
 
 
 def fetch_news_inventory(
