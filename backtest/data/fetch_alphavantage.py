@@ -80,6 +80,38 @@ manifests and claims NO completeness beyond what a response itself
 establishes; completeness attestation is deferred to the later
 production-ingestion checkpoint.
 
+Completeness / saturation contract (§3.8 N-1-f — the deterministic
+mechanism the production ingestion job attests coverage under):
+
+The official Alpha Vantage NEWS_SENTIMENT contract (verified against
+the live provider documentation) states: "By default, limit=50 and the
+API will return up to 50 matching results. You can also set limit=1000
+to output up to 1000 results." — the provider returns ALL matching
+results for the requested window up to the requested limit, and there
+is NO continuation token. The 2026-08-29 capability probe confirmed
+the credential honors explicit limits above the default 50 (a
+``limit=1000`` request returned 288 articles, i.e. fewer than
+requested — all matches returned).
+
+Therefore every window request carries an EXPLICIT
+``limit=NEWS_WINDOW_LIMIT`` (1000, the provider maximum), and:
+
+    len(feed) < 1000  → the window is COMPLETE under the provider
+                        contract (all matching results returned);
+    len(feed) >= 1000 → the window is SATURATED — completeness is NOT
+                        established (results may have been truncated
+                        at the provider maximum) and the sweep fails
+                        closed with :class:`WindowSaturatedError`.
+
+A saturated window is NEVER silently attested as verified coverage,
+and never treated as a successful zero/partial result (§3.8 N-1-f:
+provider response-size limits must not silently create verified
+coverage). A 30-day window holding 1000+ associated articles is far
+outside the observed provider density (26/288 items per month/year
+for AAPL), so saturation indicates a provider-contract change rather
+than genuine news volume; either way the span stays unverified and a
+rerun with smaller windows can re-establish completeness.
+
 No secrets are persisted: ALPHAVANTAGE_API_KEY is read via
 ``hermes_cli.config.get_env_value`` (the optional-skills
 ``ALPHA_VANTAGE_KEY`` variable is deliberately NOT read) and used only
@@ -108,8 +140,17 @@ ALPHAVANTAGE_BASE = "https://www.alphavantage.co/query"
 
 # Bounded date-window fetching (§3.8 N-1-f): sweep in windows rather
 # than one unbounded multi-year request. The window size is an adapter
-# implementation detail and claims nothing about provider completeness.
+# implementation detail; completeness is established per-window by the
+# saturation rule below, not by the window size.
 NEWS_WINDOW_DAYS = 30
+
+# Explicit per-window result limit (the provider-documented maximum).
+# The official contract: "You can also set limit=1000 to output up to
+# 1000 results" — all matching results up to the limit are returned in
+# one response, with no continuation token. A feed of exactly this
+# length is SATURATED (completeness unestablished) — see the module
+# docstring.
+NEWS_WINDOW_LIMIT = 1000
 
 # Provider informational/error envelope keys — a 200 body carrying one
 # of these is a provider notice, never a successful empty feed.
@@ -122,6 +163,14 @@ _TIME_PUBLISHED_RE = re.compile(r"^\d{8}T\d{6}$")
 class CredentialsMissing(IngestionError):
     """ALPHAVANTAGE_API_KEY is not configured (§20 Phase 0 credential
     prerequisite). Fail-closed: the job refuses to run."""
+
+
+class WindowSaturatedError(IngestionError):
+    """A window response returned at least NEWS_WINDOW_LIMIT items —
+    the provider may have truncated at its documented maximum, so
+    completeness for that window is NOT established (§3.8 N-1-f). The
+    sweep fails closed; the affected ticker/span stays unverified and
+    MUST NOT receive a verified coverage manifest row."""
 
 
 def _redact_apikey(text: Any) -> str:
@@ -305,9 +354,19 @@ def fetch_news_inventory(
 
     Returns canonical rows for ``IngestStore.upsert_headlines`` with
     FP-4-normalized text, the existing source-independent
-    ``headline_hash``, and aware-UTC ISO-8601 ``published_at``. This
-    checkpoint writes NO coverage manifests — a completed sweep here
-    does not by itself attest verified NEWS coverage (§3.8 N-1-e/f).
+    ``headline_hash``, and aware-UTC ISO-8601 ``published_at``.
+
+    Completeness contract (§3.8 N-1-f): every window request carries an
+    explicit ``limit=NEWS_WINDOW_LIMIT`` (the provider-documented
+    maximum, no continuation token), so a window returning FEWER items
+    than the limit is demonstrably complete under the provider
+    contract. A window returning at least the limit is SATURATED —
+    completeness is unestablished — and the sweep fails closed with
+    :class:`WindowSaturatedError` (never silently attested as verified
+    coverage). Envelopes, malformed payloads, and transport failures
+    fail closed exactly as before. A completed sweep of demonstrably
+    complete windows (including all-zero-news windows) is the state the
+    caller may attest as verified NEWS coverage.
 
     The ``apikey`` credential is redacted from any transport error text
     before it propagates (the key rides in the query parameters).
@@ -328,11 +387,20 @@ def fetch_news_inventory(
                         "tickers": ticker,
                         "time_from": _window_stamp(window_start),
                         "time_to": _window_stamp(window_end,
-                                                 end_of_day=True)},
+                                                 end_of_day=True),
+                        "limit": str(NEWS_WINDOW_LIMIT)},
                 http_get=http_get)
         except IngestionError as exc:
             raise IngestionError(_redact_apikey(exc)) from exc
         feed = _parse_feed(payload)
+        if len(feed) >= NEWS_WINDOW_LIMIT:
+            raise WindowSaturatedError(
+                f"Alpha Vantage NEWS_SENTIMENT window {window_start}.."
+                f"{window_end} for {ticker} returned {len(feed)} items "
+                f"(>= limit {NEWS_WINDOW_LIMIT}) — the response may be "
+                f"truncated at the provider maximum, so completeness is "
+                f"NOT established; refusing to attest the window "
+                f"(R2.8.1 §3.8 N-1-f)")
         rows.extend(_rows_from_feed(
             feed, ticker=ticker, fetched_at=fetched_at))
         # FetchRecord params deliberately exclude the credential.
@@ -341,7 +409,37 @@ def fetch_news_inventory(
             params={"tickers": ticker,
                     "time_from": _window_stamp(window_start),
                     "time_to": _window_stamp(window_end,
-                                             end_of_day=True)},
+                                             end_of_day=True),
+                    "limit": str(NEWS_WINDOW_LIMIT)},
             fetched_at=fetched_at, items=len(feed)))
         window_start = window_end + _dt.timedelta(days=1)
     return rows
+
+
+def _date_to_utc_midnight(d: _dt.date) -> str:
+    return _dt.datetime(d.year, d.month, d.day,
+                        tzinfo=_dt.timezone.utc).isoformat()
+
+
+def _date_to_utc_end_of_day(d: _dt.date) -> str:
+    return _dt.datetime(d.year, d.month, d.day, 23, 59, 59,
+                        tzinfo=_dt.timezone.utc).isoformat()
+
+
+def news_manifest_rows(*, ticker: str, start: _dt.date, end: _dt.date,
+                       manifest_version: str) -> list[dict]:
+    """Verified NEWS covered-span attestation for a completed sweep of
+    demonstrably complete windows (§3.8 / §11.6). A zero-headline span
+    is still a verified covered span (§11.6 verified-zero semantics,
+    unchanged). Span bounds are midnight-UTC / 23:59:59-UTC timestamps
+    of the inclusive date range — the same form the Finnhub NEWS rows
+    and ``HeadlineInventory.covered`` use; no new manifest_version
+    semantics, no provider-ID field (§3.8 N-1-e)."""
+    return [{
+        "source_kind": "NEWS",
+        "ticker": ticker,
+        "span_start": _date_to_utc_midnight(start),
+        "span_end": _date_to_utc_end_of_day(end),
+        "verified": True,
+        "manifest_version": manifest_version,
+    }]

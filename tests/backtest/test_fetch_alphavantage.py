@@ -510,6 +510,123 @@ class TestFetchWindows:
         assert calls[0]["url"] == \
             "https://www.alphavantage.co/query"
 
+    def test_request_carries_explicit_provider_max_limit(self, av_creds):
+        # Completeness contract: every window request carries an
+        # explicit provider-documented maximum limit, so a sub-limit
+        # feed is demonstrably complete and a limit-length feed is
+        # saturation (§3.8 N-1-f).
+        calls = []
+        _fetch(_payload([]), calls=calls)
+        assert calls[0]["params"]["limit"] == "1000"
+        assert fetch_alphavantage.NEWS_WINDOW_LIMIT == 1000
+
+
+# ---------------------------------------------------------------------------
+# saturation / completeness (§3.8 N-1-f)
+# ---------------------------------------------------------------------------
+
+class TestSaturation:
+    @staticmethod
+    def _saturating_feed(n):
+        return _payload([
+            _feed_item(title=f"Synthetic headline number {i}",
+                       time_published=f"201901{i % 28 + 1:02d}T120000")
+            for i in range(n)])
+
+    def test_feed_below_limit_is_complete(self, av_creds):
+        # 999 items < limit 1000: complete under the provider contract.
+        rows = _fetch(self._saturating_feed(999))
+        assert len(rows) == 999
+
+    def test_feed_at_limit_is_saturated(self, av_creds):
+        # Exactly the limit: completeness NOT established — fail closed.
+        with pytest.raises(fetch_alphavantage.WindowSaturatedError,
+                           match="completeness"):
+            _fetch(self._saturating_feed(1000))
+
+    def test_feed_above_limit_is_saturated(self, av_creds):
+        with pytest.raises(fetch_alphavantage.WindowSaturatedError):
+            _fetch(self._saturating_feed(1001))
+
+    def test_saturation_is_an_ingestion_error(self, av_creds):
+        # The CLI's exit-code-4 path keys on IngestionError.
+        assert issubclass(fetch_alphavantage.WindowSaturatedError,
+                          IngestionError)
+
+    def test_saturation_fails_before_rows_returned(self, av_creds):
+        # A saturated window never yields partial rows to the caller.
+        with pytest.raises(fetch_alphavantage.WindowSaturatedError):
+            fetch_alphavantage.fetch_news_inventory(
+                ticker="AAPL", start=dt.date(2019, 1, 1),
+                end=dt.date(2019, 1, 31),
+                http_get=fake_transport(
+                    {"alphavantage.co": [(200, self._saturating_feed(1000))]}))
+
+    def test_saturation_on_later_window_fails_whole_sweep(self, av_creds):
+        # Window 1 complete, window 2 saturated: the sweep fails closed
+        # — the caller never sees a partial row list to attest.
+        pages = [(200, _payload([_feed_item()])),
+                 (200, self._saturating_feed(1000))]
+        with pytest.raises(fetch_alphavantage.WindowSaturatedError):
+            fetch_alphavantage.fetch_news_inventory(
+                ticker="AAPL", start=dt.date(2019, 1, 1),
+                end=dt.date(2019, 3, 31),
+                http_get=fake_transport({"alphavantage.co": pages}))
+
+    def test_no_saturation_log_record_for_failed_window(self, av_creds):
+        # The saturated window is not logged as a successful fetch.
+        log = FetchLog()
+        with pytest.raises(fetch_alphavantage.WindowSaturatedError):
+            fetch_alphavantage.fetch_news_inventory(
+                ticker="AAPL", start=dt.date(2019, 1, 1),
+                end=dt.date(2019, 1, 31), fetch_log=log,
+                http_get=fake_transport(
+                    {"alphavantage.co": [(200,
+                                          self._saturating_feed(1000))]}))
+        assert log.records == []
+
+
+# ---------------------------------------------------------------------------
+# manifest rows (§3.8 / §11.6)
+# ---------------------------------------------------------------------------
+
+class TestManifestRows:
+    def test_manifest_row_shape(self):
+        rows = fetch_alphavantage.news_manifest_rows(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 1, 31), manifest_version="alphavantage-news-1")
+        assert rows == [{
+            "source_kind": "NEWS",
+            "ticker": "AAPL",
+            "span_start": "2019-01-01T00:00:00+00:00",
+            "span_end": "2019-01-31T23:59:59+00:00",
+            "verified": True,
+            "manifest_version": "alphavantage-news-1",
+        }]
+
+    def test_manifest_rows_feed_write_manifest(self, store):
+        rows = fetch_alphavantage.news_manifest_rows(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 1, 31), manifest_version="alphavantage-news-1")
+        assert store.write_manifest(rows) == 1
+        # idempotent
+        assert store.write_manifest(rows) == 0
+
+    def test_span_bounds_match_finnhub_news_convention(self):
+        # Same timestamp-bound form as fetch_finnhub.news_manifest_rows —
+        # midnight-UTC start, 23:59:59-UTC end of the inclusive range.
+        from backtest.data.fetch_finnhub import news_manifest_rows as fh
+        av = fetch_alphavantage.news_manifest_rows(
+            ticker="AAPL", start=dt.date(2020, 2, 29),
+            end=dt.date(2020, 3, 31),
+            manifest_version="alphavantage-news-1")[0]
+        finnhub = fh(ticker="AAPL", start=dt.date(2020, 2, 29),
+                     end=dt.date(2020, 3, 31),
+                     manifest_version="finnhub-news-1")[0]
+        assert av["span_start"] == finnhub["span_start"]
+        assert av["span_end"] == finnhub["span_end"]
+        assert av["source_kind"] == finnhub["source_kind"]
+
     def test_associated_and_unassociated_items_in_one_feed(
             self, av_creds):
         feed = [

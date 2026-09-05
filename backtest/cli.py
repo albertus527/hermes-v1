@@ -551,6 +551,54 @@ def cmd_fetch_eodhd_earnings(args) -> int:
     return _run_credential_job("EODHD earnings ingestion", run)
 
 
+def cmd_fetch_alphavantage_news(args) -> int:
+    """Alpha Vantage historical NEWS_SENTIMENT ingestion (§3.8
+    substitutable historical news source) + verified NEWS covered-span
+    manifest attestations, following the Finnhub news pattern: the
+    canonical rows go through the EXISTING IngestStore.upsert_headlines
+    path into news_headlines (no second NEWS persistence path). Only
+    successfully completed sweeps of demonstrably complete windows
+    attest coverage — every window request carries an explicit
+    provider-maximum ``limit``, and a window returning >= that limit is
+    SATURATED (completeness unestablished) and fails closed with no
+    verified manifest row (§3.8 N-1-f). A successful zero-headline
+    sweep is the verified-zero state (§11.6, unchanged)."""
+    def run() -> int:
+        from backtest.data.fetch_alphavantage import (
+            fetch_news_inventory, news_manifest_rows,
+        )
+        from backtest.data.ingest_core import FetchLog
+        store = _open_ingest_store(getattr(args, "run_id", "") or
+                                   "fetch-alphavantage-news")
+        if store is None:
+            return 2
+        tickers = [t.strip() for t in
+                   (getattr(args, "tickers", "") or "").split(",") if t.strip()]
+        start = _parse_date(args.start)
+        end = _parse_date(args.end)
+        manifest_version = getattr(args, "manifest_version", "") or \
+            "alphavantage-news-1"
+        log = FetchLog()
+        headlines_new = 0
+        manifest_new = 0
+        for ticker in tickers:
+            rows = fetch_news_inventory(ticker=ticker, start=start, end=end,
+                                        fetch_log=log)
+            headlines_new += store.upsert_headlines(rows)
+            manifest_new += store.write_manifest(news_manifest_rows(
+                ticker=ticker, start=start, end=end,
+                manifest_version=manifest_version))
+            print(f"  {ticker}: {len(rows)} headlines ingested "
+                  f"(verified NEWS span {start}..{end})")
+        path = _save_report(log.to_json(),
+                            f"fetch_alphavantage_news_{start}_{end}.json")
+        print(f"Fetch log: {path}")
+        print(f"news_headlines rows: {headlines_new} new; NEWS manifest "
+              f"rows: {manifest_new} new")
+        return 0
+    return _run_credential_job("Alpha Vantage news ingestion", run)
+
+
 def cmd_fetch_fred_vix(args) -> int:
     """FRED VIXCLS daily-close ingestion (§5.2 volatility state input)."""
     def run() -> int:

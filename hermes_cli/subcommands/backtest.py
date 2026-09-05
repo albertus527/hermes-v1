@@ -132,6 +132,21 @@ def build_backtest_parser(subparsers, *, cmd_backtest: Callable) -> None:
     p_eodhd_earn.add_argument("--run-id", default="fetch-eodhd-earnings")
     p_eodhd_earn.set_defaults(backtest_handler="fetch-eodhd-earnings")
 
+    p_av_news = subs.add_parser(
+        "fetch-alphavantage-news",
+        help="Alpha Vantage historical NEWS_SENTIMENT (§3.8 substitutable "
+             "historical news source) + verified NEWS covered-span "
+             "manifests")
+    p_av_news.add_argument("--tickers", required=True,
+                           help="comma-separated ticker list")
+    p_av_news.add_argument("--start", required=True, help="YYYY-MM-DD")
+    p_av_news.add_argument("--end", required=True,
+                           help="YYYY-MM-DD (inclusive)")
+    p_av_news.add_argument("--manifest-version",
+                           default="alphavantage-news-1")
+    p_av_news.add_argument("--run-id", default="fetch-alphavantage-news")
+    p_av_news.set_defaults(backtest_handler="fetch-alphavantage-news")
+
     p_vix = subs.add_parser(
         "fetch-fred-vix",
         help="FRED VIXCLS daily closes (§5.2 volatility state input)")

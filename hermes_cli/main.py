@@ -5607,12 +5607,14 @@ def cmd_backtest(args):
         return _backtest_cli.cmd_fetch_finnhub_earnings(args)
     if handler == "fetch-eodhd-earnings":
         return _backtest_cli.cmd_fetch_eodhd_earnings(args)
+    if handler == "fetch-alphavantage-news":
+        return _backtest_cli.cmd_fetch_alphavantage_news(args)
     if handler == "fetch-fred-vix":
         return _backtest_cli.cmd_fetch_fred_vix(args)
     print("usage: hermes backtest <init|fee-smoke|fetch-alpaca-bars|"
           "fetch-corp-actions|fetch-finnhub-news|fetch-finnhub-earnings|"
-          "fetch-eodhd-earnings|fetch-fred-vix|populate-news-cache|"
-          "news-cache-report|calibrate-news>")
+          "fetch-eodhd-earnings|fetch-alphavantage-news|fetch-fred-vix|"
+          "populate-news-cache|news-cache-report|calibrate-news>")
     return 2
 
 

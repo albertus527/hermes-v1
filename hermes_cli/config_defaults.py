@@ -3982,6 +3982,14 @@ OPTIONAL_ENV_VARS = {
         "category": "tool",
         "advanced": True,
     },
+    "ALPHAVANTAGE_API_KEY": {
+        "description": "Alpha Vantage API key (R2.8.1 §3.8 substitutable historical NEWS source; Phase 0+)",
+        "prompt": "Alpha Vantage API key",
+        "url": "https://www.alphavantage.co/support/#api-key",
+        "password": True,
+        "category": "tool",
+        "advanced": True,
+    },
     "FRED_API_KEY": {
         "description": "FRED API key (R2.7 VIXCLS daily series for the §5.2 volatility state)",
         "prompt": "FRED API key",
