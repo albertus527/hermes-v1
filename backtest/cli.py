@@ -45,6 +45,27 @@ def _save_report(text: str, name: str) -> Path:
     return path
 
 
+def _eodhd_data_root() -> Path:
+    """Provider-managed EODHD retention root (§3.7): raw payloads,
+    normalized artifacts, probes, and fetch logs stay under
+    ~/.hermes/data/r28/eodhd/ — the external retention mechanism owns
+    this tree, so nothing under it is ever committed to the repo."""
+    return _hermes_home() / "data" / "r28" / "eodhd"
+
+
+def _save_eodhd_artifact(text: str, name: str) -> Path:
+    """Atomically persist a retained EODHD artifact under the
+    provider-managed root (NOT _save_report — that writes outside the
+    provider retention root, and the EODHD data contract keeps every
+    derived artifact inside it)."""
+    from utils import atomic_write_text
+    normalized = _eodhd_data_root() / "normalized"
+    normalized.mkdir(parents=True, exist_ok=True)
+    path = normalized / name
+    atomic_write_text(path, text)
+    return path
+
+
 def cmd_init(args) -> int:
     from backtest.artifacts import ensure_artifacts
     from backtest.db.schema import open_db
@@ -476,6 +497,58 @@ def cmd_fetch_finnhub_earnings(args) -> int:
         print(f"EARNINGS manifest rows: {manifest_new} new")
         return 0
     return _run_credential_job("Finnhub earnings ingestion", run)
+
+
+def cmd_fetch_eodhd_earnings(args) -> int:
+    """EODHD historical earnings-calendar ingestion (§3.7 substitutable
+    earnings source, G6 inputs) + verified EARNINGS covered-span
+    manifest attestations, following the Finnhub earnings pattern:
+    the canonical {ticker, event_date, timing} rows ride a retained
+    JSON event artifact under the provider-managed root; §16 has no
+    earnings-events table and none is added. Only successfully
+    completed sweeps attest coverage (a successful zero-row sweep is
+    the verified-zero state, §3.7/§11.6)."""
+    def run() -> int:
+        import json as _json
+        from backtest.data.fetch_eodhd import (
+            earnings_manifest_rows, fetch_earnings_calendar,
+        )
+        from backtest.data.ingest_core import FetchLog
+        store = _open_ingest_store(getattr(args, "run_id", "") or
+                                   "fetch-eodhd-earnings")
+        if store is None:
+            return 2
+        tickers = [t.strip() for t in
+                   (getattr(args, "tickers", "") or "").split(",") if t.strip()]
+        start = _parse_date(args.start)
+        end = _parse_date(args.end)
+        manifest_version = getattr(args, "manifest_version", "") or \
+            "eodhd-earnings-1"
+        log = FetchLog()
+        all_events: list[dict] = []
+        manifest_new = 0
+        for ticker in tickers:
+            events = fetch_earnings_calendar(ticker=ticker, start=start,
+                                             end=end, fetch_log=log)
+            all_events.extend(events)
+            manifest_new += store.write_manifest(earnings_manifest_rows(
+                ticker=ticker, start=start, end=end,
+                manifest_version=manifest_version))
+            print(f"  {ticker}: {len(events)} earnings events "
+                  f"(verified EARNINGS span {start}..{end})")
+        # Retained artifacts stay inside the provider retention root —
+        # _save_report would write outside it (external retention
+        # mechanism owns this tree).
+        log_path = _save_eodhd_artifact(
+            log.to_json(), f"fetch_eodhd_earnings_{start}_{end}.json")
+        events_path = _save_eodhd_artifact(
+            _json.dumps(all_events, sort_keys=True, indent=2),
+            f"earnings_events_{start}_{end}.json")
+        print(f"Fetch log: {log_path}")
+        print(f"Earnings events artifact: {events_path}")
+        print(f"EARNINGS manifest rows: {manifest_new} new")
+        return 0
+    return _run_credential_job("EODHD earnings ingestion", run)
 
 
 def cmd_fetch_fred_vix(args) -> int:

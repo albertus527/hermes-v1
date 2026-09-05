@@ -3974,6 +3974,14 @@ OPTIONAL_ENV_VARS = {
         "category": "tool",
         "advanced": True,
     },
+    "EODHD_API_KEY": {
+        "description": "EODHD API key (R2.8 §3.7 substitutable historical earnings source; Phase 0+)",
+        "prompt": "EODHD API key",
+        "url": "https://eodhd.com/register",
+        "password": True,
+        "category": "tool",
+        "advanced": True,
+    },
     "FRED_API_KEY": {
         "description": "FRED API key (R2.7 VIXCLS daily series for the §5.2 volatility state)",
         "prompt": "FRED API key",

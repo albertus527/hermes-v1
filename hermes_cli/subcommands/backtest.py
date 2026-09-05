@@ -118,6 +118,20 @@ def build_backtest_parser(subparsers, *, cmd_backtest: Callable) -> None:
     p_earn.add_argument("--run-id", default="fetch-finnhub-earnings")
     p_earn.set_defaults(backtest_handler="fetch-finnhub-earnings")
 
+    p_eodhd_earn = subs.add_parser(
+        "fetch-eodhd-earnings",
+        help="EODHD historical earnings calendar (§3.7 substitutable G6 "
+             "inputs) + verified EARNINGS covered-span manifests")
+    p_eodhd_earn.add_argument("--tickers", required=True,
+                              help="comma-separated ticker list")
+    p_eodhd_earn.add_argument("--start", required=True, help="YYYY-MM-DD")
+    p_eodhd_earn.add_argument("--end", required=True,
+                              help="YYYY-MM-DD (inclusive)")
+    p_eodhd_earn.add_argument("--manifest-version",
+                              default="eodhd-earnings-1")
+    p_eodhd_earn.add_argument("--run-id", default="fetch-eodhd-earnings")
+    p_eodhd_earn.set_defaults(backtest_handler="fetch-eodhd-earnings")
+
     p_vix = subs.add_parser(
         "fetch-fred-vix",
         help="FRED VIXCLS daily closes (§5.2 volatility state input)")
