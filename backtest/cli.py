@@ -581,9 +581,17 @@ def cmd_fetch_alphavantage_news(args) -> int:
         log = FetchLog()
         headlines_new = 0
         manifest_new = 0
+        # Durable resume checkpoints live in the provider-managed root
+        # (implementation state only — never canonical coverage
+        # evidence); the checkpoint dir is overridable via
+        # --checkpoint-dir (tests pass a temp dir).
+        from backtest.data.fetch_alphavantage import _checkpoint_dir
+        checkpoint_dir = (getattr(args, "checkpoint_dir", "") or
+                          str(_checkpoint_dir()))
         for ticker in tickers:
             rows = fetch_news_inventory(ticker=ticker, start=start, end=end,
-                                        fetch_log=log)
+                                        fetch_log=log,
+                                        checkpoint_dir=checkpoint_dir)
             headlines_new += store.upsert_headlines(rows)
             manifest_new += store.write_manifest(news_manifest_rows(
                 ticker=ticker, start=start, end=end,

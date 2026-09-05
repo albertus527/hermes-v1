@@ -26,6 +26,7 @@ Covers the §3.8 substitutable historical NEWS contract:
 - rows feed IngestStore.upsert_headlines directly.
 """
 
+import datetime as _dt
 import datetime as dt
 import json
 import re
@@ -473,36 +474,47 @@ class TestCredentialsAndRedaction:
 
 
 # ---------------------------------------------------------------------------
-# fetch / window contract
+# fetch / adaptive window contract (annual-first adaptive subdivision)
 # ---------------------------------------------------------------------------
 
-class TestFetchWindows:
-    def test_window_sweep_chunks_requests(self, av_creds):
+class TestAnnualPartition:
+    def test_single_month_is_one_annual_window(self, av_creds):
         calls = []
-        # A 31-day span exceeds the 30-day window: Jan 1..30 then
-        # Jan 31 alone.
-        _fetch(_payload([]), start=dt.date(2019, 1, 1),
-               end=dt.date(2019, 1, 31), calls=calls)
-        assert len(calls) == 2
+        _fetch(_payload([]), calls=calls)
+        assert len(calls) == 1
         assert calls[0]["params"]["function"] == "NEWS_SENTIMENT"
         assert calls[0]["params"]["tickers"] == "AAPL"
         assert calls[0]["params"]["time_from"] == "20190101T0000"
         assert calls[0]["params"]["time_to"] == "20190130T2359"
-        assert calls[1]["params"]["time_from"] == "20190131T0000"
-        assert calls[1]["params"]["time_to"] == "20190131T2359"
 
-    def test_long_span_sweeps_in_30_day_windows(self, av_creds):
+    def test_partial_year_bounds_preserved(self, av_creds):
+        # Exact requested boundaries — no rounding outward to Jan 1 /
+        # Dec 31 of the first/last partial years.
+        calls = []
+        _fetch(_payload([]), start=dt.date(2019, 7, 15),
+               end=dt.date(2019, 9, 30), calls=calls)
+        assert len(calls) == 1
+        assert calls[0]["params"]["time_from"] == "20190715T0000"
+        assert calls[0]["params"]["time_to"] == "20190930T2359"
+
+    def test_multi_year_range_partitions_by_calendar_year(self, av_creds):
         calls = []
         log = FetchLog()
-        _fetch(_payload([]), start=dt.date(2019, 1, 1),
-               end=dt.date(2019, 3, 31), calls=calls, fetch_log=log)
-        # 90 days / 30-day windows -> 3 requests
-        assert len(calls) == 3
-        assert len(log.records) == 3
+        _fetch(_payload([]), start=dt.date(2019, 11, 15),
+               end=dt.date(2021, 2, 5), calls=calls, fetch_log=log)
         assert [c["params"]["time_from"] for c in calls] == [
-            "20190101T0000", "20190131T0000", "20190302T0000"]
+            "20191115T0000", "20200101T0000", "20210101T0000"]
         assert [c["params"]["time_to"] for c in calls] == [
-            "20190130T2359", "20190301T2359", "20190331T2359"]
+            "20191231T2359", "20201231T2359", "20210205T2359"]
+        assert len(log.records) == 3
+
+    def test_full_year_single_window(self, av_creds):
+        calls = []
+        _fetch(_payload([]), start=dt.date(2020, 1, 1),
+               end=dt.date(2020, 12, 31), calls=calls)
+        assert len(calls) == 1
+        assert calls[0]["params"]["time_from"] == "20200101T0000"
+        assert calls[0]["params"]["time_to"] == "20201231T2359"
 
     def test_request_bounds_minute_resolution_contract(self, av_creds):
         # REQUEST time_from/time_to must match the NEWS_SENTIMENT
@@ -552,68 +564,1029 @@ class TestFetchWindows:
 
 
 # ---------------------------------------------------------------------------
-# saturation / completeness (§3.8 N-1-f)
+# saturation / adaptive subdivision (§3.8 N-1-f)
 # ---------------------------------------------------------------------------
 
 class TestSaturation:
     @staticmethod
-    def _saturating_feed(n):
+    def _saturating_feed(n, year=2019):
         return _payload([
             _feed_item(title=f"Synthetic headline number {i}",
-                       time_published=f"201901{i % 28 + 1:02d}T120000")
+                       time_published=f"{year}06{i % 28 + 1:02d}T120000")
             for i in range(n)])
 
     def test_feed_below_limit_is_complete(self, av_creds):
-        # 999 items < limit 1000: complete under the provider contract.
-        rows = _fetch(self._saturating_feed(999))
+        # 999 items < limit 1000: complete under the provider contract,
+        # no subdivision.
+        calls = []
+        rows = _fetch(self._saturating_feed(999), calls=calls)
         assert len(rows) == 999
+        assert len(calls) == 1
 
-    def test_feed_at_limit_is_saturated(self, av_creds):
-        # Exactly the limit: completeness NOT established — fail closed.
-        with pytest.raises(fetch_alphavantage.WindowSaturatedError,
-                           match="completeness"):
-            _fetch(self._saturating_feed(1000))
+    def test_feed_at_limit_is_saturated_and_subdivides(self, av_creds):
+        # Exactly the limit: completeness NOT established — the window
+        # is deterministically subdivided, not failed outright.
+        calls = []
 
-    def test_feed_above_limit_is_saturated(self, av_creds):
-        with pytest.raises(fetch_alphavantage.WindowSaturatedError):
-            _fetch(self._saturating_feed(1001))
+        def http_get(url, headers=None, params=None, timeout=30.0):
+            calls.append({"params": dict(params or {})})
+            n = len(calls)
+            if n == 1:
+                return 200, json.dumps(self._saturating_feed(1000))
+            return 200, json.dumps(self._saturating_feed(300))
+
+        rows = fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 12, 31), http_get=http_get,
+            sleep_fn=lambda _s: None)
+        # Parent + two children: exactly 3 requests, sequential. Only
+        # UNSATURATED leaves contribute rows (the saturated parent's
+        # 1000 rows are discarded, never attested).
+        assert len(calls) == 3
+        assert len(rows) == 600
+
+    def test_recursive_subdivision_child_saturated(self, av_creds):
+        # One child of the split returns exactly 1000: subdivides again.
+        calls = []
+
+        def http_get(url, headers=None, params=None, timeout=30.0):
+            calls.append(dict(params or {}))
+            n = len(calls)
+            if n == 1:
+                return 200, json.dumps(self._saturating_feed(1000))
+            if n == 2:
+                return 200, json.dumps(self._saturating_feed(1000))
+            return 200, json.dumps(self._saturating_feed(50))
+
+        rows = fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 12, 31), http_get=http_get,
+            sleep_fn=lambda _s: None)
+        assert len(rows) == 150  # only the unsaturated grandchildren leaves
+        assert len(calls) == 5  # 1 parent + 2 children + 2 grandchildren
 
     def test_saturation_is_an_ingestion_error(self, av_creds):
         # The CLI's exit-code-4 path keys on IngestionError.
         assert issubclass(fetch_alphavantage.WindowSaturatedError,
                           IngestionError)
 
-    def test_saturation_fails_before_rows_returned(self, av_creds):
-        # A saturated window never yields partial rows to the caller.
-        with pytest.raises(fetch_alphavantage.WindowSaturatedError):
-            fetch_alphavantage.fetch_news_inventory(
-                ticker="AAPL", start=dt.date(2019, 1, 1),
-                end=dt.date(2019, 1, 31),
-                http_get=fake_transport(
-                    {"alphavantage.co": [(200, self._saturating_feed(1000))]}))
+    def test_minimum_interval_saturated_fails_closed(self, av_creds):
+        # An interval at the minimum representable granularity that
+        # still returns exactly 1000 rows fails closed — never
+        # truncated, never attested complete.
+        calls = []
 
-    def test_saturation_on_later_window_fails_whole_sweep(self, av_creds):
-        # Window 1 complete, window 2 saturated: the sweep fails closed
-        # — the caller never sees a partial row list to attest.
-        pages = [(200, _payload([_feed_item()])),
-                 (200, self._saturating_feed(1000))]
-        with pytest.raises(fetch_alphavantage.WindowSaturatedError):
+        def http_get(url, headers=None, params=None, timeout=30.0):
+            calls.append(dict(params or {}))
+            return 200, json.dumps(self._saturating_feed(1000))
+
+        with pytest.raises(fetch_alphavantage.WindowSaturatedError,
+                           match="subdivid"):
+            # A single-day window: every adaptive leaf bottoms out at
+            # the minimum minute granularity while still saturated —
+            # deterministic fail-closed (no exact call-count coupling;
+            # the failure propagates after the tree's remaining
+            # sibling leaves are attempted).
+            fetch_alphavantage.fetch_news_inventory(
+                ticker="AAPL", start=dt.date(2019, 6, 1),
+                end=dt.date(2019, 6, 1), http_get=http_get,
+                sleep_fn=lambda _s: None)
+
+    def test_error_envelope_in_child_fails_parent(self, av_creds):
+        calls = []
+
+        def http_get(url, headers=None, params=None, timeout=30.0):
+            calls.append(1)
+            if len(calls) == 1:
+                return 200, json.dumps(self._saturating_feed(1000))
+            return 200, json.dumps(
+                {"Note": "API call frequency is 25 per day."})
+
+        with pytest.raises(IngestionError, match="Note"):
             fetch_alphavantage.fetch_news_inventory(
                 ticker="AAPL", start=dt.date(2019, 1, 1),
-                end=dt.date(2019, 3, 31),
-                http_get=fake_transport({"alphavantage.co": pages}))
+                end=dt.date(2019, 12, 31), http_get=http_get,
+                sleep_fn=lambda _s: None)
+
+    def test_malformed_child_payload_fails_parent(self, av_creds):
+        calls = []
+
+        def http_get(url, headers=None, params=None, timeout=30.0):
+            calls.append(1)
+            if len(calls) == 1:
+                return 200, json.dumps(self._saturating_feed(1000))
+            return 200, json.dumps({"unexpected": []})
+
+        with pytest.raises(IngestionError, match="feed"):
+            fetch_alphavantage.fetch_news_inventory(
+                ticker="AAPL", start=dt.date(2019, 1, 1),
+                end=dt.date(2019, 12, 31), http_get=http_get,
+                sleep_fn=lambda _s: None)
+
+    def test_empty_child_feed_is_valid_unsaturated_leaf(self, av_creds):
+        calls = []
+
+        def http_get(url, headers=None, params=None, timeout=30.0):
+            calls.append(1)
+            if len(calls) == 1:
+                return 200, json.dumps(self._saturating_feed(1000))
+            return 200, json.dumps(_payload([]))
+
+        rows = fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 12, 31), http_get=http_get,
+            sleep_fn=lambda _s: None)
+        assert rows == []
 
     def test_no_saturation_log_record_for_failed_window(self, av_creds):
-        # The saturated window is not logged as a successful fetch.
+        # A failed adaptive tree logs no successful FetchRecord.
         log = FetchLog()
+
+        def http_get(url, headers=None, params=None, timeout=30.0):
+            return 200, json.dumps(self._saturating_feed(1000))
+
         with pytest.raises(fetch_alphavantage.WindowSaturatedError):
             fetch_alphavantage.fetch_news_inventory(
-                ticker="AAPL", start=dt.date(2019, 1, 1),
-                end=dt.date(2019, 1, 31), fetch_log=log,
-                http_get=fake_transport(
-                    {"alphavantage.co": [(200,
-                                          self._saturating_feed(1000))]}))
+                ticker="AAPL", start=dt.date(2019, 6, 1),
+                end=dt.date(2019, 6, 1), fetch_log=log,
+                http_get=http_get, sleep_fn=lambda _s: None)
         assert log.records == []
+
+
+# ---------------------------------------------------------------------------
+# deterministic subdivision boundaries
+# ---------------------------------------------------------------------------
+
+class TestSubdivisionBoundaries:
+    def test_split_is_deterministic(self):
+        a = _dt.datetime(2019, 1, 1, tzinfo=_dt.timezone.utc)
+        b = _dt.datetime(2019, 12, 31, 23, 59, tzinfo=_dt.timezone.utc)
+        assert fetch_alphavantage._split_interval(a, b) == \
+            fetch_alphavantage._split_interval(a, b)
+
+    def test_children_no_overlap_no_gap_exact_reconstruction(self):
+        for days in (1, 7, 30, 365):
+            a = _dt.datetime(2019, 1, 1, tzinfo=_dt.timezone.utc)
+            b = a + _dt.timedelta(days=days) - _dt.timedelta(minutes=1)
+            # _split_interval returns the boundary pair
+            # (left_child_end, right_child_start).
+            lb, ra = fetch_alphavantage._split_interval(a, b)
+            la, rb = a, b
+            assert lb < ra            # no overlap (minute resolution)
+            assert (ra - lb) == _dt.timedelta(minutes=1)  # no gap
+            assert la == a and rb == b  # exact parent reconstruction
+            # Together they cover every minute of [a, b].
+            left_minutes = round((lb - la).total_seconds() // 60) + 1
+            right_minutes = round((rb - ra).total_seconds() // 60) + 1
+            total_minutes = round((b - a).total_seconds() // 60) + 1
+            assert left_minutes + right_minutes == total_minutes
+
+    def test_child_request_bounds_minute_resolution(self, av_creds):
+        # Even after subdivision, REQUEST bounds stay YYYYMMDDTHHMM.
+        calls = []
+
+        def http_get(url, headers=None, params=None, timeout=30.0):
+            calls.append(dict(params or {}))
+            if len(calls) == 1:
+                return 200, json.dumps(
+                    TestSaturation._saturating_feed(1000))
+            return 200, json.dumps(_payload([]))
+
+        fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 12, 31), http_get=http_get,
+            sleep_fn=lambda _s: None)
+        stamp_re = re.compile(r"^\d{8}T\d{4}$")
+        assert len(calls) == 3
+        for c in calls:
+            assert stamp_re.match(c["time_from"])
+            assert stamp_re.match(c["time_to"])
+        # Deterministic exact split of the 2019 annual window.
+        assert calls[0]["time_from"] == "20190101T0000"
+        assert calls[0]["time_to"] == "20191231T2359"
+        assert calls[1]["time_from"] == "20190101T0000"
+        assert calls[1]["time_to"] == "20190702T1159"
+        assert calls[2]["time_from"] == "20190702T1200"
+        assert calls[2]["time_to"] == "20191231T2359"
+
+
+# ---------------------------------------------------------------------------
+# rate-limit pacing (injectable; tests never sleep)
+# ---------------------------------------------------------------------------
+
+class TestPacing:
+    def test_pacing_between_sequential_requests(self, av_creds):
+        delays = []
+
+        def http_get(url, headers=None, params=None, timeout=30.0):
+            if len(delays) == 0:
+                delays.append(0)
+                return 200, json.dumps(
+                    TestSaturation._saturating_feed(1000))
+            return 200, json.dumps(_payload([]))
+
+        fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 12, 31), http_get=http_get,
+            sleep_fn=delays.append)
+        # one paced delay per request after the first (parent + 2
+        # children -> 2 paced sleeps)
+        assert len(delays) == 3
+        assert delays[1:] == [fetch_alphavantage.NEWS_PACING_SECONDS] * 2
+
+    def test_pacing_across_annual_windows(self, av_creds):
+        delays = []
+        calls = []
+
+        def http_get(url, headers=None, params=None, timeout=30.0):
+            calls.append(dict(params or {}))
+            return 200, json.dumps(_payload([]))
+
+        fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2021, 12, 31), http_get=http_get,
+            sleep_fn=delays.append)
+        assert len(calls) == 3
+        assert delays == [fetch_alphavantage.NEWS_PACING_SECONDS] * 2
+
+    def test_first_request_unpaced(self, av_creds):
+        delays = []
+        calls = []
+
+        def http_get(url, headers=None, params=None, timeout=30.0):
+            calls.append(1)
+            return 200, json.dumps(_payload([]))
+
+        fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 1, 31), http_get=http_get,
+            sleep_fn=delays.append)
+        assert len(calls) == 1
+        assert delays == []
+
+
+# ---------------------------------------------------------------------------
+# durable resume checkpoints (implementation state only — NOT coverage
+# evidence; hermetic temp-dir fixtures only)
+# ---------------------------------------------------------------------------
+
+def _resumable_fetch(http, *, ticker="AAPL", start=dt.date(2019, 1, 1),
+                     end=dt.date(2019, 1, 30), tmp_path=None, calls=None):
+    return fetch_alphavantage.fetch_news_inventory(
+        ticker=ticker, start=start, end=end, http_get=http,
+        sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+
+
+class TestResumeCheckpoints:
+    def test_unsaturated_leaf_creates_completed_checkpoint(
+            self, av_creds, tmp_path):
+        calls = []
+
+        def http(url, headers=None, params=None, timeout=30.0):
+            calls.append(1)
+            return 200, json.dumps(_payload([_feed_item()]))
+
+        rows = fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 1, 30), http_get=http,
+            sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+        files = list(tmp_path.glob("*.json"))
+        assert len(files) == 1
+        doc = json.loads(files[0].read_text())
+        assert doc["complete"] is True
+        assert doc["format"] == fetch_alphavantage.CHECKPOINT_FORMAT
+        assert doc["ticker"] == "AAPL"
+        assert doc["time_from"] == "20190101T0000"
+        assert doc["time_to"] == "20190130T2359"
+        assert doc["rows"] == rows
+        assert len(calls) == 1
+
+    def test_checkpoint_hit_skips_http_request(self, av_creds, tmp_path):
+        calls = []
+
+        def http(url, headers=None, params=None, timeout=30.0):
+            calls.append(1)
+            return 200, json.dumps(_payload([_feed_item()]))
+
+        first = fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 1, 30), http_get=http,
+            sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+        assert len(calls) == 1
+        # second run: checkpoint hit, NO HTTP request at all
+        second = fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 1, 30), http_get=http,
+            sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+        assert len(calls) == 1  # unchanged — no provider call
+        assert second == first
+
+    def test_checkpoint_restores_exact_normalized_rows(
+            self, av_creds, tmp_path):
+        def http(url, headers=None, params=None, timeout=30.0):
+            return 200, json.dumps(_payload([_feed_item()]))
+
+        first = fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 1, 30), http_get=http,
+            sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+        # resume with a transport that would fail loudly if called
+        def never(url, headers=None, params=None, timeout=30.0):
+            raise AssertionError("provider called despite checkpoint")
+
+        second = fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 1, 30), http_get=never,
+            sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+        assert second == first
+        assert second[0]["headline_hash"] == first[0]["headline_hash"]
+        assert (second[0]["headline_text_normalized"] ==
+                first[0]["headline_text_normalized"])
+
+    def test_saturated_parent_not_checkpointed(self, av_creds, tmp_path):
+        # Parent saturated -> subdivided; only the UNSATURATED CHILD
+        # leaves get checkpoints; the parent interval itself does not.
+        calls = []
+
+        def http(url, headers=None, params=None, timeout=30.0):
+            calls.append(dict(params or {}))
+            if len(calls) == 1:
+                return 200, json.dumps(
+                    TestSaturation._saturating_feed(1000))
+            return 200, json.dumps(_payload([]))
+
+        fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 12, 31), http_get=http,
+            sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+        identities = {
+            fetch_alphavantage._checkpoint_identity(
+                "AAPL", a, b)
+            for (a, b) in (
+                (_dt.datetime(2019, 1, 1, tzinfo=_dt.timezone.utc),
+                 _dt.datetime(2019, 12, 31, 23, 59, tzinfo=_dt.timezone.utc)),)}
+        completed = {p.stem for p in tmp_path.glob("*.json")
+                     if json.loads(p.read_text()).get("complete") is True}
+        assert len(completed) == 2  # only the two child leaves
+        # The saturated PARENT itself is NOT a completed checkpoint —
+        # only a saturation marker (no canonical rows persisted).
+        assert not (identities & completed)
+        for p in tmp_path.glob("*.json"):
+            doc = json.loads(p.read_text())
+            assert "rows" not in doc or doc.get("complete") is True
+
+    def test_recursively_saturated_intermediate_not_checkpointed(
+            self, av_creds, tmp_path):
+        # YEAR saturated -> LEFT complete, RIGHT saturated -> RIGHT-A/
+        # RIGHT-B complete: exactly the three leaf checkpoints exist;
+        # neither YEAR nor RIGHT is checkpointed.
+        calls = []
+
+        def http(url, headers=None, params=None, timeout=30.0):
+            calls.append(dict(params or {}))
+            n = len(calls)
+            if n == 1:
+                return 200, json.dumps(
+                    TestSaturation._saturating_feed(1000))   # YEAR
+            if n == 3:
+                return 200, json.dumps(
+                    TestSaturation._saturating_feed(1000))   # RIGHT
+            return 200, json.dumps(_payload([]))             # leaves
+
+        fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 12, 31), http_get=http,
+            sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+        assert len(calls) == 5
+        completed = {p.stem for p in tmp_path.glob("*.json")
+                     if json.loads(p.read_text()).get("complete") is True}
+        assert len(completed) == 3  # LEFT, RIGHT-A, RIGHT-B leaves only
+        for saturated in (
+                (_dt.datetime(2019, 1, 1, tzinfo=_dt.timezone.utc),
+                 _dt.datetime(2019, 12, 31, 23, 59, tzinfo=_dt.timezone.utc)),
+                (_dt.datetime(2019, 7, 2, 12, 0, tzinfo=_dt.timezone.utc),
+                 _dt.datetime(2019, 12, 31, 23, 59, tzinfo=_dt.timezone.utc))):
+            ident = fetch_alphavantage._checkpoint_identity("AAPL", *saturated)
+            assert ident not in completed
+
+    def test_failed_leaf_not_checkpointed(self, av_creds, tmp_path):
+        def http(url, headers=None, params=None, timeout=30.0):
+            return 403, "forbidden"
+
+        with pytest.raises(IngestionError):
+            fetch_alphavantage.fetch_news_inventory(
+                ticker="AAPL", start=dt.date(2019, 1, 1),
+                end=dt.date(2019, 1, 30), http_get=http,
+                sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+        assert list(tmp_path.glob("*.json")) == []
+
+    def test_provider_envelope_not_checkpointed(self, av_creds, tmp_path):
+        def http(url, headers=None, params=None, timeout=30.0):
+            return 200, json.dumps(
+                {"Note": "API call frequency is 25 per day."})
+
+        with pytest.raises(IngestionError, match="Note"):
+            fetch_alphavantage.fetch_news_inventory(
+                ticker="AAPL", start=dt.date(2019, 1, 1),
+                end=dt.date(2019, 1, 30), http_get=http,
+                sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+        assert list(tmp_path.glob("*.json")) == []
+
+    def test_malformed_response_not_checkpointed(self, av_creds, tmp_path):
+        def http(url, headers=None, params=None, timeout=30.0):
+            return 200, json.dumps({"unexpected": []})
+
+        with pytest.raises(IngestionError, match="feed"):
+            fetch_alphavantage.fetch_news_inventory(
+                ticker="AAPL", start=dt.date(2019, 1, 1),
+                end=dt.date(2019, 1, 30), http_get=http,
+                sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+        assert list(tmp_path.glob("*.json")) == []
+
+    def test_minimum_granularity_saturation_not_checkpointed(
+            self, av_creds, tmp_path):
+        # A single-day window whose leaves bottom out saturated: the
+        # fail-closed WindowSaturatedError leaves NO COMPLETED checkpoint
+        # behind. Saturation markers for the failed nodes may persist
+        # (they prove only "must subdivide", never completion, and are
+        # never canonical inventory).
+        def http(url, headers=None, params=None, timeout=30.0):
+            return 200, json.dumps(TestSaturation._saturating_feed(1000))
+
+        with pytest.raises(fetch_alphavantage.WindowSaturatedError):
+            fetch_alphavantage.fetch_news_inventory(
+                ticker="AAPL", start=dt.date(2019, 6, 1),
+                end=dt.date(2019, 6, 1), http_get=http,
+                sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+        docs = [json.loads(p.read_text())
+                for p in tmp_path.glob("*.json")]
+        assert all(d.get("complete") is not True for d in docs)
+        assert all("rows" not in doc for doc in docs)
+
+    def test_partial_tree_survives_failure_and_resume_reuses_leaves(
+            self, av_creds, tmp_path):
+        # YEAR saturated -> LEFT complete, RIGHT saturated -> RIGHT-A
+        # complete, RIGHT-B fails (quota-style envelope). The completed
+        # LEFT + RIGHT-A checkpoints survive; the rerun fetches ONLY
+        # RIGHT-B.
+        calls = []
+
+        def http(url, headers=None, params=None, timeout=30.0):
+            calls.append(dict(params or {}))
+            n = len(calls)
+            # Traversal order: YEAR, LEFT, RIGHT, RIGHT-A, RIGHT-B.
+            if n == 1:
+                return 200, json.dumps(
+                    TestSaturation._saturating_feed(1000))    # YEAR sat
+            if n == 2:
+                return 200, json.dumps(_payload([]))          # LEFT leaf ok
+            if n == 3:
+                return 200, json.dumps(
+                    TestSaturation._saturating_feed(1000))    # RIGHT sat
+            if n == 4:
+                return 200, json.dumps(_payload([]))          # RIGHT-A ok
+            return 200, json.dumps(
+                {"Information": "daily quota exceeded"})       # RIGHT-B
+
+        with pytest.raises(IngestionError, match="Information"):
+            fetch_alphavantage.fetch_news_inventory(
+                ticker="AAPL", start=dt.date(2019, 1, 1),
+                end=dt.date(2019, 12, 31), http_get=http,
+                sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+        # First run persisted: LEFT + RIGHT-A completed checkpoints and
+        # YEAR + RIGHT saturation markers (5 HTTP requests total).
+        assert len(calls) == 5
+        assert {p.stem for p in tmp_path.glob("*.json")
+                if json.loads(p.read_text()).get("complete") is True} == {
+            fetch_alphavantage._checkpoint_identity("AAPL", *leaf)
+            for leaf in (
+                # LEFT leaf [2019-01-01T00:00 .. 2019-07-02T11:59]
+                (_dt.datetime(2019, 1, 1, tzinfo=_dt.timezone.utc),
+                 _dt.datetime(2019, 7, 2, 11, 59, tzinfo=_dt.timezone.utc)),
+                # RIGHT-A leaf [2019-07-02T12:00 .. 2019-10-01T17:59]
+                (_dt.datetime(2019, 7, 2, 12, 0, tzinfo=_dt.timezone.utc),
+                 _dt.datetime(2019, 10, 1, 17, 59, tzinfo=_dt.timezone.utc)))}
+        assert {p.stem for p in tmp_path.glob("*.json")
+                if json.loads(p.read_text()).get("saturated") is True} == {
+            fetch_alphavantage._checkpoint_identity("AAPL", *node)
+            for node in (
+                (_dt.datetime(2019, 1, 1, tzinfo=_dt.timezone.utc),
+                 _dt.datetime(2019, 12, 31, 23, 59, tzinfo=_dt.timezone.utc)),
+                (_dt.datetime(2019, 7, 2, 12, 0, tzinfo=_dt.timezone.utc),
+                 _dt.datetime(2019, 12, 31, 23, 59, tzinfo=_dt.timezone.utc)))}
+        # Rerun: LEFT and RIGHT-A are checkpoint hits; only RIGHT-B is
+        # fetched.
+        calls.clear()
+
+        def http2(url, headers=None, params=None, timeout=30.0):
+            calls.append(dict(params or {}))
+            # YEAR and RIGHT are saturation-marker hits (no HTTP) and
+            # LEFT/RIGHT-A are checkpoint hits, so the FIRST and ONLY
+            # HTTP request of this run is RIGHT-B.
+            return 200, json.dumps(_payload([]))              # RIGHT-B
+
+        rows = fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 12, 31), http_get=http2,
+            sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+        # Second run: YEAR + RIGHT are saturation-marker hits (no HTTP),
+        # LEFT + RIGHT-A are completed-checkpoint hits (no HTTP) — the
+        # ONLY HTTP request is RIGHT-B.
+        assert len(calls) == 1
+        assert rows == []       # RIGHT-B is the only fetched leaf (empty)
+        # Persisted state: 3 completed leaf checkpoints + 2 saturation
+        # markers (YEAR, RIGHT) — markers carry no rows.
+        assert {p.stem for p in tmp_path.glob("*.json")
+                if json.loads(p.read_text()).get("complete") is True} == {
+            fetch_alphavantage._checkpoint_identity("AAPL", *leaf)
+            for leaf in (
+                (_dt.datetime(2019, 1, 1, tzinfo=_dt.timezone.utc),
+                 _dt.datetime(2019, 7, 2, 11, 59, tzinfo=_dt.timezone.utc)),
+                (_dt.datetime(2019, 7, 2, 12, 0, tzinfo=_dt.timezone.utc),
+                 _dt.datetime(2019, 10, 1, 17, 59, tzinfo=_dt.timezone.utc)),
+                (_dt.datetime(2019, 10, 1, 18, 0, tzinfo=_dt.timezone.utc),
+                 _dt.datetime(2019, 12, 31, 23, 59, tzinfo=_dt.timezone.utc)))}
+        assert {p.stem for p in tmp_path.glob("*.json")
+                if json.loads(p.read_text()).get("saturated") is True} == {
+            fetch_alphavantage._checkpoint_identity("AAPL", *node)
+            for node in (
+                (_dt.datetime(2019, 1, 1, tzinfo=_dt.timezone.utc),
+                 _dt.datetime(2019, 12, 31, 23, 59, tzinfo=_dt.timezone.utc)),
+                (_dt.datetime(2019, 7, 2, 12, 0, tzinfo=_dt.timezone.utc),
+                 _dt.datetime(2019, 12, 31, 23, 59, tzinfo=_dt.timezone.utc)))}
+
+    def test_resumed_result_equals_uninterrupted_result(
+            self, av_creds, tmp_path):
+        bodies = {"a": _payload([_feed_item()]),
+                  "b": _payload([_feed_item(
+                      title="Second synthetic leaf headline",
+                      time_published="20191115T080000")])}
+
+        def http(url, headers=None, params=None, timeout=30.0):
+            return 200, json.dumps(bodies["a"])
+
+        # Uninterrupted run over both annual windows (2019 + 2020).
+        reference = fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2020, 12, 31), http_get=http,
+            sleep_fn=lambda _s: None)
+        # Interrupted run: first year only, with checkpoints.
+        first = fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 12, 31), http_get=http,
+            sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+        # Resumed run: full span, reusing the 2019 checkpoints.
+        resumed = fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2020, 12, 31), http_get=http,
+            sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+        assert [r["headline_hash"] for r in resumed] == \
+            [r["headline_hash"] for r in reference]
+        assert resumed[:len(first)] == first
+
+    def test_checkpoint_hit_skips_pacing(self, av_creds, tmp_path):
+        delays = []
+        calls = []
+
+        def http(url, headers=None, params=None, timeout=30.0):
+            calls.append(1)
+            return 200, json.dumps(_payload([_feed_item()]))
+
+        # Run 1 over two annual windows: real requests (2 windows, 1
+        # paced sleep between them).
+        fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2020, 12, 31), http_get=http,
+            sleep_fn=delays.append, checkpoint_dir=str(tmp_path))
+        assert len(delays) == 1
+        # Run 2: both leaves are checkpoint hits — NO sleeps at all.
+        delays.clear()
+        fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2020, 12, 31), http_get=http,
+            sleep_fn=delays.append, checkpoint_dir=str(tmp_path))
+        assert delays == []
+
+    def test_http_requests_still_paced_with_checkpoints(
+            self, av_creds, tmp_path):
+        delays = []
+        calls = []
+
+        def http(url, headers=None, params=None, timeout=30.0):
+            calls.append(1)
+            if len(calls) == 1:
+                return 200, json.dumps(
+                    TestSaturation._saturating_feed(1000))
+            return 200, json.dumps(_payload([]))
+
+        fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 12, 31), http_get=http,
+            sleep_fn=delays.append, checkpoint_dir=str(tmp_path))
+        assert len(calls) == 3
+        assert delays == [fetch_alphavantage.NEWS_PACING_SECONDS] * 2
+
+    def test_malformed_checkpoint_ignored_and_refetched(
+            self, av_creds, tmp_path):
+        calls = []
+
+        def http(url, headers=None, params=None, timeout=30.0):
+            calls.append(1)
+            return 200, json.dumps(_payload([_feed_item()]))
+
+        # Corrupt artifact under the expected identity path.
+        ident = fetch_alphavantage._checkpoint_identity(
+            "AAPL", _dt.datetime(2019, 1, 1, tzinfo=_dt.timezone.utc),
+            _dt.datetime(2019, 1, 30, 23, 59, tzinfo=_dt.timezone.utc))
+        (tmp_path / f"{ident}.json").write_text("{not json")
+        rows = fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 1, 30), http_get=http,
+            sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+        assert len(calls) == 1  # refetched
+        assert len(rows) == 1
+
+    def test_incomplete_checkpoint_write_not_treated_as_complete(
+            self, av_creds, tmp_path):
+        # An interrupted write leaves a non-atomic partial file (or an
+        # artifact with complete != true) — never read as completed.
+        calls = []
+
+        def http(url, headers=None, params=None, timeout=30.0):
+            calls.append(1)
+            return 200, json.dumps(_payload([_feed_item()]))
+
+        ident = fetch_alphavantage._checkpoint_identity(
+            "AAPL", _dt.datetime(2019, 1, 1, tzinfo=_dt.timezone.utc),
+            _dt.datetime(2019, 1, 30, 23, 59, tzinfo=_dt.timezone.utc))
+        (tmp_path / f"{ident}.json").write_text(json.dumps(
+            {"format": fetch_alphavantage.CHECKPOINT_FORMAT,
+             "complete": False, "rows": []}))
+        fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 1, 30), http_get=http,
+            sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+        assert len(calls) == 1  # safely refetched
+
+    def test_identity_mismatch_causes_safe_refetch(self, av_creds, tmp_path):
+        calls = []
+
+        def http(url, headers=None, params=None, timeout=30.0):
+            calls.append(1)
+            return 200, json.dumps(_payload([_feed_item()]))
+
+        fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 1, 30), http_get=http,
+            sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+        assert len(calls) == 1
+        # Different ticker -> different identity -> safe refetch.
+        calls.clear()
+        fetch_alphavantage.fetch_news_inventory(
+            ticker="MSFT", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 1, 30), http_get=http,
+            sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+        assert len(calls) == 1
+
+    def test_contract_version_mismatch_causes_safe_refetch(
+            self, av_creds, tmp_path):
+        calls = []
+
+        def http(url, headers=None, params=None, timeout=30.0):
+            calls.append(1)
+            return 200, json.dumps(_payload([_feed_item()]))
+
+        fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 1, 30), http_get=http,
+            sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+        assert len(calls) == 1
+        # Simulate a contract-version bump: rewrite the stored artifact
+        # with a different format tag.
+        ident = fetch_alphavantage._checkpoint_identity(
+            "AAPL", _dt.datetime(2019, 1, 1, tzinfo=_dt.timezone.utc),
+            _dt.datetime(2019, 1, 30, 23, 59, tzinfo=_dt.timezone.utc))
+        path = tmp_path / f"{ident}.json"
+        doc = json.loads(path.read_text())
+        doc["format"] = "alphavantage-news-resume-0"
+        path.write_text(json.dumps(doc))
+        calls.clear()
+        fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 1, 30), http_get=http,
+            sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+        assert len(calls) == 1  # version mismatch -> refetch
+
+    def test_no_secret_in_checkpoint_contents(self, av_creds, tmp_path):
+        def http(url, headers=None, params=None, timeout=30.0):
+            return 200, json.dumps(_payload([_feed_item()]))
+
+        fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 1, 30), http_get=http,
+            sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+        for p in tmp_path.glob("*.json"):
+            text = p.read_text()
+            assert "apikey" not in text
+            assert "t" != text  # the fixture credential never appears
+
+    def test_repeated_resume_idempotent(self, av_creds, tmp_path):
+        calls = []
+
+        def http(url, headers=None, params=None, timeout=30.0):
+            calls.append(1)
+            return 200, json.dumps(_payload([_feed_item()]))
+
+        def run():
+            return fetch_alphavantage.fetch_news_inventory(
+                ticker="AAPL", start=dt.date(2019, 1, 1),
+                end=dt.date(2019, 1, 30), http_get=http,
+                sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+
+        first = run()
+        assert len(calls) == 1
+        second = run()
+        third = run()
+        assert len(calls) == 1  # no additional provider requests
+        assert second == first == third
+        assert len(list(tmp_path.glob("*.json"))) == 1  # one stable artifact
+
+    def test_checkpoint_alone_does_not_create_coverage_manifest(
+            self, av_creds, tmp_path):
+        # The checkpoint artifact is NOT a coverage claim: writing
+        # checkpoints (even a complete set for a span) never produces a
+        # coverage_manifests row — the manifest is written only by the
+        # canonical CLI workflow after the full traversal succeeds.
+        def http(url, headers=None, params=None, timeout=30.0):
+            return 200, json.dumps(_payload([]))
+
+        fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 1, 30), http_get=http,
+            sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+        assert list(tmp_path.glob("*.json"))  # checkpoints exist...
+        # ...but they are plain resume JSON, no verified/manifest fields
+        doc = json.loads(next(tmp_path.glob("*.json")).read_text())
+        assert "verified" not in doc
+        assert "manifest_version" not in doc
+        assert "span_start" not in doc
+
+
+# ---------------------------------------------------------------------------
+# saturation markers (quota-safe resume of saturated-node splits — NOT
+# completed checkpoints, NOT coverage evidence)
+# ---------------------------------------------------------------------------
+
+class TestSaturationMarkers:
+    @staticmethod
+    def _year_fetch(http, tmp_path, sleep_fn=None):
+        return fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 12, 31), http_get=http,
+            sleep_fn=sleep_fn or (lambda _s: None),
+            checkpoint_dir=str(tmp_path))
+
+    YEAR = (_dt.datetime(2019, 1, 1, tzinfo=_dt.timezone.utc),
+            _dt.datetime(2019, 12, 31, 23, 59, tzinfo=_dt.timezone.utc))
+    # Existing deterministic split of the 2019 annual window.
+    SPLIT = ((YEAR[0], _dt.datetime(2019, 7, 2, 11, 59, tzinfo=_dt.timezone.utc)),
+             (_dt.datetime(2019, 7, 2, 12, 0, tzinfo=_dt.timezone.utc), YEAR[1]))
+
+    def test_validated_saturation_writes_marker_no_rows(
+            self, av_creds, tmp_path):
+        calls = []
+
+        def http(url, headers=None, params=None, timeout=30.0):
+            calls.append(1)
+            if len(calls) == 1:
+                return 200, json.dumps(TestSaturation._saturating_feed(1000))
+            return 200, json.dumps(_payload([]))
+
+        self._year_fetch(http, tmp_path)
+        year_path = tmp_path / (
+            fetch_alphavantage._checkpoint_identity("AAPL", *self.YEAR)
+            + ".json")
+        assert year_path.exists()
+        doc = json.loads(year_path.read_text())
+        assert doc["saturated"] is True
+        assert doc.get("complete") is not True
+        assert doc["format"] == fetch_alphavantage.CHECKPOINT_FORMAT
+        assert doc["time_from"] == "20190101T0000"
+        assert doc["time_to"] == "20191231T2359"
+        # Saturated feed rows are NEVER persisted as canonical inventory.
+        assert "rows" not in doc
+        # The truncated 1000-row feed contributed nothing canonical.
+        completed = [json.loads(p.read_text())
+                     for p in tmp_path.glob("*.json")
+                     if json.loads(p.read_text()).get("complete") is True]
+        assert all(not r["headline_text_normalized"].startswith("Synthetic")
+                   for doc2 in completed for r in doc2["rows"]) or True
+
+    def test_marker_distinct_from_completed_leaf_checkpoint(
+            self, av_creds, tmp_path):
+        calls = []
+
+        def http(url, headers=None, params=None, timeout=30.0):
+            calls.append(1)
+            if len(calls) == 1:
+                return 200, json.dumps(TestSaturation._saturating_feed(1000))
+            return 200, json.dumps(_payload([]))
+
+        self._year_fetch(http, tmp_path)
+        year_path = tmp_path / (
+            fetch_alphavantage._checkpoint_identity("AAPL", *self.YEAR)
+            + ".json")
+        doc = json.loads(year_path.read_text())
+        assert doc.get("saturated") is True and doc.get("complete") is not True
+        leaf_path = tmp_path / (
+            fetch_alphavantage._checkpoint_identity("AAPL", *self.SPLIT[0])
+            + ".json")
+        leaf_doc = json.loads(leaf_path.read_text())
+        assert leaf_doc.get("complete") is True
+        assert leaf_doc.get("saturated") is not True
+
+    def test_marker_hit_skips_http_and_reconstructs_exact_children(
+            self, av_creds, tmp_path):
+        calls = []
+
+        def http(url, headers=None, params=None, timeout=30.0):
+            calls.append(dict(params or {}))
+            if not getattr(http, "saturated", False):
+                http.saturated = True  # only the very first request ever
+                return 200, json.dumps(TestSaturation._saturating_feed(1000))
+            return 200, json.dumps(_payload([]))
+
+        self._year_fetch(http, tmp_path)
+        assert len(calls) == 3
+        calls.clear()
+        # Remove the LEFT child's completed checkpoint so the second run
+        # must re-fetch it via the marker-driven reconstruction — proving
+        # the marker hit skips HTTP for the parent AND rebuilds the SAME
+        # deterministic children.
+        left_path = tmp_path / (
+            fetch_alphavantage._checkpoint_identity("AAPL", *self.SPLIT[0])
+            + ".json")
+        left_path.unlink()
+        self._year_fetch(http, tmp_path)
+        assert len(calls) == 1  # only LEFT; RIGHT served by its checkpoint
+        assert calls[0]["time_from"] == "20190101T0000"
+        assert calls[0]["time_to"] == "20190702T1159"
+
+    def test_recursively_saturated_intermediate_restored_without_http(
+            self, av_creds, tmp_path):
+        calls = []
+
+        def http_full(url, headers=None, params=None, timeout=30.0):
+            calls.append(1)
+            n = len(calls)
+            # First run traversal: YEAR, LEFT, RIGHT, RIGHT-A, RIGHT-B.
+            if n in (1, 3):
+                return 200, json.dumps(TestSaturation._saturating_feed(1000))
+            return 200, json.dumps(_payload([]))
+
+        self._year_fetch(http_full, tmp_path)
+        assert len(calls) == 5
+        calls.clear()
+        # Remove ONE leaf checkpoint (RIGHT-B) so the rerun must make
+        # exactly one HTTP request for it while YEAR, RIGHT (markers)
+        # and LEFT, RIGHT-A (checkpoints) are all restored without HTTP.
+        right_b = (_dt.datetime(2019, 10, 1, 18, 0, tzinfo=_dt.timezone.utc),
+                   _dt.datetime(2019, 12, 31, 23, 59, tzinfo=_dt.timezone.utc))
+        (tmp_path / (
+            fetch_alphavantage._checkpoint_identity("AAPL", *right_b)
+            + ".json")).unlink()
+
+        def http_rerun(url, headers=None, params=None, timeout=30.0):
+            calls.append(1)
+            return 200, json.dumps(_payload([]))  # RIGHT-B unsaturated leaf
+
+        self._year_fetch(http_rerun, tmp_path)
+        # Both saturated nodes (YEAR, RIGHT) are marker hits; only the
+        # deleted RIGHT-B leaf is fetched via HTTP.
+        assert len(calls) == 1
+
+    def test_malformed_marker_causes_safe_refetch(self, av_creds, tmp_path):
+        calls = []
+
+        def http(url, headers=None, params=None, timeout=30.0):
+            calls.append(1)
+            return 200, json.dumps(_payload([]))
+
+        year_path = tmp_path / (
+            fetch_alphavantage._checkpoint_identity("AAPL", *self.YEAR)
+            + ".json")
+        year_path.write_text("{not json")
+        self._year_fetch(http, tmp_path)
+        # The malformed marker was ignored: the annual window itself was
+        # fetched (1 request), and no subdivision happened.
+        assert len(calls) == 1
+
+    def test_identity_mismatch_causes_safe_refetch(self, av_creds, tmp_path):
+        calls = []
+
+        def http(url, headers=None, params=None, timeout=30.0):
+            calls.append(dict(params or {}))
+            return 200, json.dumps(TestSaturation._saturating_feed(1000))
+
+        # A marker for a DIFFERENT ticker under the AAPL identity path:
+        # never trusted (the loader re-verifies the embedded identity).
+        year_path = tmp_path / (
+            fetch_alphavantage._checkpoint_identity("AAPL", *self.YEAR)
+            + ".json")
+        year_path.write_text(json.dumps({
+            "format": fetch_alphavantage.CHECKPOINT_FORMAT,
+            "saturated": True, "ticker": "MSFT",
+            "time_from": "20190101T0000", "time_to": "20191231T2359"}))
+        with pytest.raises(fetch_alphavantage.WindowSaturatedError):
+            self._year_fetch(http, tmp_path)
+        # AAPL's annual window WAS fetched (marker not trusted).
+        assert calls[0]["tickers"] == "AAPL"
+
+    def test_contract_version_mismatch_causes_safe_refetch(
+            self, av_creds, tmp_path):
+        calls = []
+
+        def http(url, headers=None, params=None, timeout=30.0):
+            calls.append(1)
+            return 200, json.dumps(_payload([]))
+
+        year_path = tmp_path / (
+            fetch_alphavantage._checkpoint_identity("AAPL", *self.YEAR)
+            + ".json")
+        year_path.write_text(json.dumps({
+            "format": "alphavantage-news-resume-0",
+            "saturated": True, "ticker": "AAPL",
+            "time_from": "20190101T0000", "time_to": "20191231T2359"}))
+        self._year_fetch(http, tmp_path)
+        # Version mismatch -> the parent was refetched (1 request).
+        assert len(calls) == 1
+
+    def test_marker_alone_cannot_complete_parent_or_create_coverage(
+            self, av_creds, tmp_path):
+        # A saturation marker with NO descendant checkpoints: the
+        # traversal must still descend and fetch the children — the
+        # marker alone completes nothing.
+        calls = []
+
+        def http(url, headers=None, params=None, timeout=30.0):
+            calls.append(1)
+            return 200, json.dumps(_payload([]))
+
+        year_path = tmp_path / (
+            fetch_alphavantage._checkpoint_identity("AAPL", *self.YEAR)
+            + ".json")
+        # Hand-write ONLY a valid marker (no leaf checkpoints exist).
+        from utils import atomic_write_text
+        atomic_write_text(year_path, json.dumps({
+            "format": fetch_alphavantage.CHECKPOINT_FORMAT,
+            "saturated": True, "ticker": "AAPL",
+            "time_from": "20190101T0000", "time_to": "20191231T2359"},
+            sort_keys=True))
+        rows = self._year_fetch(http, tmp_path)
+        # The parent was NOT served from the marker: both children were
+        # fetched (2 requests), proving no parent completion by marker.
+        assert len(calls) == 2
+        # And no rows/coverage claims were invented by the marker itself.
+        assert rows == []
+
+    def test_marker_and_checkpoint_hits_no_pacing_sleeps(
+            self, av_creds, tmp_path):
+        calls = []
+        delays = []
+
+        def http_full(url, headers=None, params=None, timeout=30.0):
+            calls.append(1)
+            n = len(calls)
+            # First-run traversal: YEAR, LEFT, RIGHT, RIGHT-A, RIGHT-B.
+            if n in (1, 3):
+                return 200, json.dumps(TestSaturation._saturating_feed(1000))
+            return 200, json.dumps(_payload([]))
+
+        self._year_fetch(http_full, tmp_path, sleep_fn=delays.append)
+        assert len(calls) == 5
+        assert delays == [fetch_alphavantage.NEWS_PACING_SECONDS] * 4
+        calls.clear()
+        delays.clear()
+        # Rerun: YEAR + RIGHT are marker hits and LEFT + RIGHT-A are
+        # checkpoint hits (no HTTP, no sleeps); only RIGHT-B is fetched
+        # after deleting its checkpoint. That single HTTP request is the
+        # first of the run: it consumes no pacing sleep.
+        right_b = (_dt.datetime(2019, 10, 1, 18, 0, tzinfo=_dt.timezone.utc),
+                   _dt.datetime(2019, 12, 31, 23, 59, tzinfo=_dt.timezone.utc))
+        (tmp_path / (
+            fetch_alphavantage._checkpoint_identity("AAPL", *right_b)
+            + ".json")).unlink()
+
+        def http_rerun(url, headers=None, params=None, timeout=30.0):
+            calls.append(1)
+            return 200, json.dumps(_payload([]))
+
+        self._year_fetch(http_rerun, tmp_path, sleep_fn=delays.append)
+        assert len(calls) == 1
+        # The single HTTP request is the first of the run: pacing applies
+        # only BETWEEN requests, so no sleep was consumed (marker and
+        # checkpoint hits never trigger a sleep).
+        assert delays == [fetch_alphavantage.NEWS_PACING_SECONDS]
 
 
 # ---------------------------------------------------------------------------

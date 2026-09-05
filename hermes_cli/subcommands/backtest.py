@@ -145,6 +145,11 @@ def build_backtest_parser(subparsers, *, cmd_backtest: Callable) -> None:
     p_av_news.add_argument("--manifest-version",
                            default="alphavantage-news-1")
     p_av_news.add_argument("--run-id", default="fetch-alphavantage-news")
+    p_av_news.add_argument(
+        "--checkpoint-dir", default="",
+        help="durable resume-checkpoint directory (default: provider-"
+             "managed root under $HERMES_HOME/data/r28/alphavantage/"
+             "resume; implementation state only, never coverage evidence)")
     p_av_news.set_defaults(backtest_handler="fetch-alphavantage-news")
 
     p_vix = subs.add_parser(

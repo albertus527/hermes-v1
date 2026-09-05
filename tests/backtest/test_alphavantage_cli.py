@@ -227,6 +227,9 @@ class TestParser:
         assert args.tickers == "AAPL"
         assert args.start == START
         assert args.end == END
+        # durable resume checkpoints default to the provider-managed
+        # root (implementation state only, never coverage evidence)
+        assert args.checkpoint_dir == ""
 
     def test_required_ticker_start_end_enforced(self):
         with pytest.raises(SystemExit):
@@ -432,15 +435,17 @@ class TestCoverageManifest:
 
     def test_verified_coverage_only_after_complete_sweep(
             self, av_creds, store_db, inject_transport):
-        # A multi-window span: EVERY window must succeed and be
-        # established complete before the span is attested. Here the
-        # first window succeeds and the second fails — no coverage.
+        # A multi-annual-window span: EVERY annual window must succeed
+        # and be established complete before the span is attested.
+        # Here the first window succeeds and the second fails — no
+        # coverage. (The 2018-12-01..2019-02-28 range is two annual
+        # windows: 2018 partial + 2019 partial.)
         pages = [(200, good_body()),
                  (403, {"e": "forbidden"})]
         inject_transport(fake_transport({"alphavantage.co": pages}))
         rc = run_job(["backtest", "fetch-alphavantage-news",
                       "--tickers", "AAPL",
-                      "--start", "2019-01-01", "--end", "2019-03-31"])
+                      "--start", "2018-12-01", "--end", "2019-02-28"])
         assert rc == 4
         assert manifest_rows(store_db) == []
 
@@ -455,6 +460,40 @@ class TestCoverageManifest:
         rows = manifest_rows(store_db)
         assert len(rows) == 1 and rows[0][4] == 1  # verified zero span
         assert headline_rows(store_db) == []        # nothing invented
+
+    def test_checkpoints_written_and_resume_skips_http(
+            self, av_creds, store_db, inject_transport, tmp_path):
+        # Full CLI path with an explicit --checkpoint-dir: run 1 writes
+        # the leaf checkpoint; run 2 is fully served from it (no HTTP).
+        calls = []
+        ckpt = store_db.parent / "av-resume-test"
+
+        def http(url, headers=None, params=None, timeout=30.0):
+            calls.append(1)
+            return 200, json.dumps(_payload([
+                _feed_item(), _feed_item(title="Second synthetic headline",
+                                         time_published="20190115T090000")]))
+
+        inject_transport(http)
+        rc = run_job(["backtest", "fetch-alphavantage-news",
+                      "--tickers", "AAPL",
+                      "--start", START, "--end", END,
+                      "--checkpoint-dir", str(ckpt)])
+        assert rc == 0
+        assert len(calls) == 1
+        assert len(list(ckpt.glob("*.json"))) == 1
+        n_manifests_after_run1 = len(manifest_rows(store_db))
+        # Resume run: checkpoint hit, no HTTP request, no duplicate rows,
+        # no additional coverage claims.
+        inject_transport(http)
+        rc = run_job(["backtest", "fetch-alphavantage-news",
+                      "--tickers", "AAPL",
+                      "--start", START, "--end", END,
+                      "--checkpoint-dir", str(ckpt)])
+        assert rc == 0
+        assert len(calls) == 1  # no provider request on resume
+        assert len(headline_rows(store_db, "AAPL")) == 2
+        assert len(manifest_rows(store_db)) == n_manifests_after_run1
 
 
 # ---------------------------------------------------------------------------
@@ -570,14 +609,15 @@ class TestFailClosedCoverage:
         its own verified span) does persist before a later ticker
         fails — that ticker's span was completely swept, so §11.6 is
         not weakened. Verified here end-to-end."""
-        # Window 1 (Jan 1..30) succeeds, window 2 (Jan 31..Feb 28)
-        # fails: NO rows persist for AAPL and NO coverage is written.
+        # Window 1 (2018 partial year) succeeds, window 2 (2019 partial
+        # year) fails: NO rows persist for AAPL and NO coverage is
+        # written.
         pages = [(200, good_body()),
                  (403, {"e": "forbidden"})]
         inject_transport(fake_transport({"alphavantage.co": pages}))
         rc = run_job(["backtest", "fetch-alphavantage-news",
                       "--tickers", "AAPL",
-                      "--start", "2019-01-01", "--end", "2019-02-28"])
+                      "--start", "2018-12-01", "--end", "2019-02-28"])
         assert rc == 4
         assert headline_rows(store_db) == []
         assert manifest_rows(store_db) == []
@@ -588,7 +628,7 @@ class TestFailClosedCoverage:
                                  (200, good_body())]}))
         rc = run_job(["backtest", "fetch-alphavantage-news",
                       "--tickers", "AAPL",
-                      "--start", "2019-01-01", "--end", "2019-02-28"])
+                      "--start", "2018-12-01", "--end", "2019-02-28"])
         assert rc == 0
         rows = headline_rows(store_db, "AAPL")
         assert len(rows) == 2
@@ -598,18 +638,19 @@ class TestFailClosedCoverage:
 
     def test_multi_ticker_mid_job_failure_no_coverage_for_failed_ticker(
             self, av_creds, store_db, inject_transport):
-        # AAPL's full sweep (both Jan windows) succeeds; MSFT's sweep
-        # fails: the failed ticker gets NO rows and NO verified
-        # coverage, while the completed ticker keeps its verified span
-        # (its span was completely swept — per-ticker attestation,
-        # same repo precedent as the Finnhub/EODHD jobs).
+        # AAPL's full sweep (both its annual windows) succeeds; MSFT's
+        # sweep fails on its first window: the failed ticker gets NO
+        # rows and NO verified coverage, while the completed ticker
+        # keeps its verified span (its span was completely swept —
+        # per-ticker attestation, same repo precedent as the
+        # Finnhub/EODHD jobs).
         pages = [(200, good_body("AAPL")),
                  (200, good_body("AAPL")),
                  (403, {"e": "forbidden"})]
         inject_transport(fake_transport({"alphavantage.co": pages}))
         rc = run_job(["backtest", "fetch-alphavantage-news",
                       "--tickers", "AAPL,MSFT",
-                      "--start", START, "--end", END])
+                      "--start", "2018-12-01", "--end", "2019-02-28"])
         assert rc == 4
         assert headline_rows(store_db, "MSFT") == []
         rows = manifest_rows(store_db)
