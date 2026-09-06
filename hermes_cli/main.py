@@ -5599,6 +5599,8 @@ def cmd_backtest(args):
         return _backtest_cli.cmd_calibrate_news(args)
     if handler == "generate-calibration-worksheet":
         return _backtest_cli.cmd_generate_calibration_worksheet(args)
+    if handler == "benchmark-news-classifier":
+        return _backtest_cli.cmd_benchmark_news_classifier(args)
     if handler == "fetch-alpaca-bars":
         return _backtest_cli.cmd_fetch_alpaca_bars(args)
     if handler == "fetch-corp-actions":

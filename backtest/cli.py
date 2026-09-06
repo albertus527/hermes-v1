@@ -377,6 +377,51 @@ def _now_iso() -> str:
     return _dt.datetime.now(_dt.timezone.utc).isoformat()
 
 
+def cmd_benchmark_news_classifier(args) -> int:
+    """R2.8.1 Phase-2 — offline classifier benchmark harness.
+
+    Fully offline: NO LLM call, NO provider/API credentials, NO network,
+    NO classification-cache or news/coverage writes, NO worksheet
+    mutation. The human-labeled worksheet is the sole source of truth;
+    candidate prediction files are scored offline. All agreement figures
+    are DESCRIPTIVE METRICS; the only normative quantity implemented is
+    the spec-defined §11.4 ≥200-headline minimum. Final classifier
+    selection is never automatic — HUMAN ADJUDICATION REQUIRED."""
+    from backtest.news.classifier_benchmark import (
+        BenchmarkInputError,
+        load_candidate_files,
+        load_labeled_worksheet,
+        run_benchmark,
+        write_report,
+    )
+    try:
+        labeled = load_labeled_worksheet(args.labeled_worksheet)
+        candidates = load_candidate_files(args.candidates)
+        report = run_benchmark(labeled, candidates)
+    except (OSError, ValueError, BenchmarkInputError) as exc:
+        print(f"BLOCKED: benchmark input invalid: {exc}")
+        return 3
+    import datetime as _dt
+    report.generated_at = _now_iso()   # provenance only; never digested
+    write_report(report, Path(args.output_report))
+    print(f"Benchmark report written: {args.output_report}")
+    print(f"  labeled headlines: {report.labeled_count}")
+    print(f"  candidates:        {len(report.candidates)}")
+    for c in report.candidates:
+        print(f"    {c['candidate_id']}: exact match "
+              f"{c['exact_label_match']}/{c['labeled_count']} "
+              f"({c['exact_match_rate']:.3f}); per-field "
+              + ", ".join(f"{k}={v:.3f}" for k, v in
+                          sorted(c['per_field_accuracy'].items())))
+    print(f"  §11.4 minimum met: {report.meets_minimum}")
+    print(f"  normative status:  {report.normative_status}")
+    if not report.meets_minimum:
+        print("  WARNING: labeled set is below the §11.4 minimum; "
+              "metrics are descriptive only and NOT EVALUABLE for the "
+              "Phase-2 exit gate.")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Phase-0 data-ingestion jobs (§20 Phase 0; hermetic transport injected by
 # tests; live transport fails closed on missing credentials)

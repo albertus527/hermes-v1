@@ -92,6 +92,23 @@ def build_backtest_parser(subparsers, *, cmd_backtest: Callable) -> None:
                              help="output worksheet CSV path")
     p_worksheet.set_defaults(backtest_handler="generate-calibration-worksheet")
 
+    p_bench = subs.add_parser(
+        "benchmark-news-classifier",
+        help="R2.8.1 Phase-2: offline classifier benchmark harness — "
+             "scores offline candidate prediction files against a fully "
+             "human-labeled calibration worksheet. NO LLM, NO network, "
+             "NO cache/cache-population; descriptive metrics only; "
+             "final selection is HUMAN ADJUDICATION REQUIRED")
+    p_bench.add_argument("--labeled-worksheet", required=True,
+                         help="path to the human-labeled calibration "
+                              "worksheet CSV (immutable input)")
+    p_bench.add_argument("--candidates", required=True, action="append",
+                         help="offline candidate-prediction JSONL file "
+                              "(repeatable; one candidate per file)")
+    p_bench.add_argument("--output-report", required=True,
+                         help="output machine-readable report JSON path")
+    p_bench.set_defaults(backtest_handler="benchmark-news-classifier")
+
     # -- Phase-0 data-ingestion jobs (§20 Phase 0) -------------------------
 
     p_bars = subs.add_parser(
