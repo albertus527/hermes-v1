@@ -515,6 +515,218 @@ class TestIntraResponseDuplicateCanonicalization:
 
 
 # ---------------------------------------------------------------------------
+# 6b: cross-interval FINAL INVENTORY canonicalization
+# ---------------------------------------------------------------------------
+
+def _window_http(responses_by_time_from):
+    """http_get fake keyed by the request's ``time_from`` param so each
+    annual window can be served a distinct canned feed."""
+    calls = []
+
+    def http(url, headers=None, params=None, timeout=30.0):
+        calls.append(1)
+        tf = (params or {}).get("time_from")
+        body = responses_by_time_from[tf]
+        return 200, json.dumps(body)
+
+    http.calls = calls
+    return http
+
+
+class TestCrossIntervalInventoryCanonicalization:
+    """FINAL INVENTORY canonicalization across completed intervals.
+
+    Per-leaf canonicalization collapses duplicates within ONE interval
+    only. The SAME canonical identity (headline_hash, source, ticker)
+    may occur in MULTIPLE completed intervals (annual or adaptive
+    children; live fetch or replayed checkpoint) with the same
+    normalized text and different published_at. Before the aggregate
+    inventory reaches atomic DB publication, the SAME deterministic
+    primitive (_canonicalize_rows) is applied to the FULL aggregated
+    inventory: same text + differing timestamps → MAX(published_at)
+    (PIT-conservative), exact duplicates collapse, differing text
+    fails closed. The result is independent of interval/input order.
+    """
+
+    # Real-world repro: the MarketWatch identity that failed the AAPL
+    # 2020–2025 production run — same headline text republished by the
+    # provider under two different annual windows with different
+    # timestamps.
+    TITLE = "Apple Inc. stock falls Tuesday, underperforms market"
+    SOURCE = "MarketWatch"
+
+    def _two_year_fetch(self, *, ts_2021, ts_2022, checkpoint_dir=None,
+                        http=None):
+        responses = {
+            "20210101T0000": _payload([_feed_item(
+                time_published=ts_2021, title=self.TITLE,
+                source=self.SOURCE)]),
+            "20220101T0000": _payload([_feed_item(
+                time_published=ts_2022, title=self.TITLE,
+                source=self.SOURCE)]),
+        }
+        http = http or _window_http(responses)
+        rows, drops = fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2021, 1, 1),
+            end=dt.date(2022, 12, 31), http_get=http,
+            sleep_fn=lambda _s: None, checkpoint_dir=checkpoint_dir)
+        return rows, drops, http
+
+    def test_cross_interval_duplicate_collapses_to_max(self, av_creds):
+        rows, drops, _http = self._two_year_fetch(
+            ts_2021="20210518T163100", ts_2022="20220531T163100")
+        assert len(rows) == 1
+        assert rows[0]["published_at"] == "2022-05-31T16:31:00+00:00"
+        assert rows[0]["source"] == self.SOURCE
+        assert rows[0]["ticker"] == "AAPL"
+        assert rows[0]["headline_text_normalized"] == \
+            normalize_headline_text(self.TITLE)
+        # Final collapse changes NO drop accounting: each leaf's
+        # canonical exclusion count is replayed/summed verbatim.
+        assert drops == 0
+
+    def test_reverse_interval_order_same_result(self, av_creds):
+        # Swapping WHICH interval carries the early vs late occurrence
+        # must not change the outcome — the retained row is the global
+        # MAX(published_at), not the first- or last-fetched one.
+        rows_reversed, _drops, _http = self._two_year_fetch(
+            ts_2021="20220531T163100", ts_2022="20210518T163100")
+        assert len(rows_reversed) == 1
+        assert rows_reversed[0]["published_at"] == "2022-05-31T16:31:00+00:00"
+
+    def test_exact_duplicate_across_intervals_collapses(self, av_creds):
+        rows, _drops, _http = self._two_year_fetch(
+            ts_2021="20220531T163100", ts_2022="20220531T163100")
+        assert len(rows) == 1
+        assert rows[0]["published_at"] == "2022-05-31T16:31:00+00:00"
+
+    def test_three_occurrences_retain_global_max(self, av_creds):
+        responses = {
+            "20200101T0000": _payload([_feed_item(
+                time_published="20200301T090000", title=self.TITLE,
+                source=self.SOURCE)]),
+            "20210101T0000": _payload([_feed_item(
+                time_published="20210518T163100", title=self.TITLE,
+                source=self.SOURCE)]),
+            "20220101T0000": _payload([_feed_item(
+                time_published="20220531T163100", title=self.TITLE,
+                source=self.SOURCE)]),
+        }
+        http = _window_http(responses)
+        rows, _drops = fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2020, 1, 1),
+            end=dt.date(2022, 12, 31), http_get=http,
+            sleep_fn=lambda _s: None)
+        assert len(rows) == 1
+        assert rows[0]["published_at"] == "2022-05-31T16:31:00+00:00"
+
+    def test_live_then_full_checkpoint_replay_same_result(
+            self, av_creds, tmp_path):
+        # Live fetch persists per-leaf checkpoints; a replay from those
+        # checkpoints (zero HTTP) yields the SAME final canonical
+        # inventory — cross-interval collapse is deterministic across
+        # live and replayed sources.
+        first, _drops, _http = self._two_year_fetch(
+            ts_2021="20210518T163100", ts_2022="20220531T163100",
+            checkpoint_dir=str(tmp_path))
+        replay_responses = {
+            "20210101T0000": _payload([]),
+            "20220101T0000": _payload([]),
+        }
+        http_replay = _window_http(replay_responses)
+        second, _drops, _ = self._two_year_fetch(
+            ts_2021="20210518T163100", ts_2022="20220531T163100",
+            checkpoint_dir=str(tmp_path), http=http_replay)
+        assert len(http_replay.calls) == 0        # zero HTTP on replay
+        assert second == first
+        assert len(second) == 1
+        assert second[0]["published_at"] == "2022-05-31T16:31:00+00:00"
+
+    def test_cross_interval_collapse_does_not_rewrite_checkpoints(
+            self, av_creds, tmp_path):
+        # Checkpoints remain per-leaf resumability artifacts: the final
+        # cross-interval collapse happens AFTER checkpoint persistence
+        # and never rewrites the stored leaf rows.
+        self._two_year_fetch(
+            ts_2021="20210518T163100", ts_2022="20220531T163100",
+            checkpoint_dir=str(tmp_path))
+        files = sorted(tmp_path.glob("*.json"))
+        assert len(files) == 2                   # one leaf checkpoint/year
+        stored_ts = set()
+        for f in files:
+            doc = json.loads(f.read_text())
+            assert doc["complete"] is True
+            stored_ts.update(r["published_at"] for r in doc["rows"])
+        # Each checkpoint still stores ITS OWN interval's timestamp —
+        # the 2021 leaf was NOT rewritten to the collapsed MAX value.
+        assert stored_ts == {"2021-05-18T16:31:00+00:00",
+                             "2022-05-31T16:31:00+00:00"}
+
+    def test_differing_text_across_intervals_fails_closed(
+            self, av_creds):
+        # ARTIFICIAL HASH-COLLISION CONSTRUCTION (primitive-level, like
+        # test_conflicting_normalized_text_fails_closed): the fetch path
+        # cannot produce same-identity/different-text rows from real
+        # feed items (same title → same hash AND same normalized text),
+        # so the fail-closed branch is exercised directly on the SAME
+        # primitive that final inventory canonicalization reuses.
+        row_a = {
+            "headline_hash": canonical_headline_hash(self.TITLE),
+            "source": self.SOURCE,
+            "ticker": "AAPL",
+            "published_at": "2021-05-18T16:31:00+00:00",
+            "headline_text_normalized": normalize_headline_text(
+                self.TITLE),
+            "fetched_at": "2021-05-18T16:31:00+00:00",
+        }
+        row_b = {
+            "headline_hash": canonical_headline_hash(self.TITLE),
+            "source": self.SOURCE,
+            "ticker": "AAPL",
+            "published_at": "2022-05-31T16:31:00+00:00",
+            "headline_text_normalized": "A DIFFERENT normalized text",
+            "fetched_at": "2022-05-31T16:31:00+00:00",
+        }
+        with pytest.raises(IngestionError,
+                           match="differing headline_text_normalized"):
+            fetch_alphavantage._canonicalize_rows([row_a, row_b])
+        # And deterministically in the reverse order.
+        with pytest.raises(IngestionError,
+                           match="differing headline_text_normalized"):
+            fetch_alphavantage._canonicalize_rows([row_b, row_a])
+
+    def test_per_leaf_behavior_unchanged(self, av_creds):
+        # REGRESSION GUARD: a single-year fetch still canonicalizes
+        # intra-interval duplicates exactly as before (MAX rule), and
+        # distinct identities within one interval are all retained.
+        item_dup_early = _feed_item(
+            time_published="20210518T163100", title=self.TITLE,
+            source=self.SOURCE)
+        item_dup_late = _feed_item(
+            time_published="20210518T170000", title=self.TITLE,
+            source=self.SOURCE)
+        item_other = _feed_item(
+            time_published="20210601T100000",
+            title="A completely different synthetic headline",
+            source="Other Wire")
+        responses = {
+            "20210101T0000": _payload(
+                [item_dup_early, item_dup_late, item_other]),
+        }
+        http = _window_http(responses)
+        rows, _drops = fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2021, 1, 1),
+            end=dt.date(2021, 12, 31), http_get=http,
+            sleep_fn=lambda _s: None)
+        assert len(rows) == 2
+        by_text = {r["headline_text_normalized"]: r for r in rows}
+        assert by_text[normalize_headline_text(self.TITLE)][
+            "published_at"] == "2021-05-18T17:00:00+00:00"
+        assert normalize_headline_text(
+            "A completely different synthetic headline") in by_text
+
+
+# ---------------------------------------------------------------------------
 # 7-8: ticker association
 # ---------------------------------------------------------------------------
 
@@ -914,9 +1126,14 @@ class TestAnnualPartition:
 
 class TestSaturation:
     @staticmethod
-    def _saturating_feed(n, year=2019):
+    def _saturating_feed(n, year=2019, salt=""):
+        # ``salt`` makes each window's feed carry DISTINCT titles: two
+        # sibling leaves served byte-identical feeds would now collapse
+        # as cross-interval exact duplicates (Policy A rule 1) — these
+        # tests assert SUBDIVISION row counts, so each leaf must
+        # contribute distinct identities.
         return _payload([
-            _feed_item(title=f"Synthetic headline number {i}",
+            _feed_item(title=f"Synthetic headline {salt} number {i}",
                        time_published=f"{year}06{i % 28 + 1:02d}T120000")
             for i in range(n)])
 
@@ -937,8 +1154,10 @@ class TestSaturation:
             calls.append({"params": dict(params or {})})
             n = len(calls)
             if n == 1:
-                return 200, json.dumps(self._saturating_feed(1000))
-            return 200, json.dumps(self._saturating_feed(300))
+                return 200, json.dumps(
+                    self._saturating_feed(1000, salt="parent"))
+            return 200, json.dumps(
+                self._saturating_feed(300, salt=f"child{n}"))
 
         rows, _drops = fetch_alphavantage.fetch_news_inventory(
             ticker="AAPL", start=dt.date(2019, 1, 1),
@@ -958,10 +1177,13 @@ class TestSaturation:
             calls.append(dict(params or {}))
             n = len(calls)
             if n == 1:
-                return 200, json.dumps(self._saturating_feed(1000))
+                return 200, json.dumps(
+                    self._saturating_feed(1000, salt="parent"))
             if n == 2:
-                return 200, json.dumps(self._saturating_feed(1000))
-            return 200, json.dumps(self._saturating_feed(50))
+                return 200, json.dumps(
+                    self._saturating_feed(1000, salt="child2"))
+            return 200, json.dumps(
+                self._saturating_feed(50, salt=f"leaf{n}"))
 
         rows, _drops = fetch_alphavantage.fetch_news_inventory(
             ticker="AAPL", start=dt.date(2019, 1, 1),

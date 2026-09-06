@@ -874,7 +874,23 @@ def fetch_news_inventory(
         rows_i, drops_i = fetch_interval(a, b, first=(i == 0))
         all_rows.extend(rows_i)
         total_drops += drops_i
-    return all_rows, total_drops
+    # FINAL INVENTORY CANONICALIZATION (cross-interval): per-leaf
+    # canonicalization (``_rows_from_feed`` / checkpoint replay) collapses
+    # duplicates within ONE interval only; the SAME identity may appear in
+    # MULTIPLE completed intervals (annual or adaptive children, live fetch
+    # or replayed checkpoint) with the same normalized text but different
+    # published_at. Reusing the same deterministic primitive here collapses
+    # cross-interval duplicates BEFORE DB publication: exact duplicates and
+    # same-text/different-timestamp duplicates resolve to the single
+    # MAX(published_at) row (PIT-conservative); differing normalized text
+    # for one identity fails closed (IngestionError). Order-independent:
+    # grouping is by identity set and retention is max-by-timestamp, so the
+    # result cannot depend on interval/input order. This does NOT alter
+    # drop accounting (total_drops counts canonical leaf exclusions only)
+    # and does NOT rewrite checkpoints. Cross-run reconciliation against
+    # ALREADY-PERSISTED DB rows is deliberately out of scope — IngestStore
+    # strict conflict semantics are unchanged.
+    return _canonicalize_rows(all_rows), total_drops
 
 
 def _date_to_utc_midnight(d: _dt.date) -> str:

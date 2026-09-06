@@ -629,6 +629,84 @@ class TestAtomicPublication:
             "SELECT verified FROM coverage_manifests").fetchone()[0] == 1
 
 
+class TestPersistedRowStrictBoundary:
+    """Policy B — ALREADY-PERSISTED DB data is OUT OF SCOPE for the
+    cross-interval MAX(published_at) canonicalization. An incoming
+    canonical row that conflicts with an ALREADY-COMMITTED news_headlines
+    row (same identity, same text, DIFFERENT published_at) must still
+    FAIL CLOSED under the strict IngestStore semantics: no UPDATE, no
+    merge, no MAX-against-DB, and atomic rollback leaves no partial
+    manifest or headline rows."""
+
+    def test_persisted_timestamp_conflict_fails_closed_not_updated(
+            self, store):
+        # Persisted row carries timestamp OLD; incoming carries NEW.
+        store._conn.execute(
+            "INSERT INTO news_headlines (headline_hash, source, ticker, "
+            "published_at, headline_text_normalized, fetched_at) "
+            "VALUES (?, 'MarketWatch', 'AAPL', "
+            "'2021-05-18T16:31:00+00:00', ?, 'old')",
+            ("a" * 64,
+             "apple inc. stock falls tuesday, underperforms market"))
+        store._conn.commit()
+        incoming = {
+            "headline_hash": "a" * 64,
+            "source": "MarketWatch",
+            "ticker": "AAPL",
+            "published_at": "2022-05-31T16:31:00+00:00",   # NEW > OLD
+            "headline_text_normalized":
+                "apple inc. stock falls tuesday, underperforms market",
+            "fetched_at": "2026-09-06T00:00:00+00:00",
+        }
+        with pytest.raises(IngestionError,
+                           match="exists with differing values"):
+            store.publish_alphavantage_news(
+                headlines=[incoming], manifest=[_manifest_row()])
+        # The persisted row is NOT rewritten to MAX(published_at).
+        row = store._conn.execute(
+            "SELECT published_at, fetched_at FROM news_headlines"
+        ).fetchone()
+        assert row[0] == "2021-05-18T16:31:00+00:00"
+        assert row[1] == "old"
+
+    def test_persisted_timestamp_conflict_failure_is_atomic(self, store):
+        # Same conflict, but with other NEW rows in the same unit to
+        # prove the whole unit rolls back: no partial manifest, no
+        # partial headline rows.
+        store._conn.execute(
+            "INSERT INTO news_headlines (headline_hash, source, ticker, "
+            "published_at, headline_text_normalized, fetched_at) "
+            "VALUES (?, 'MarketWatch', 'AAPL', "
+            "'2021-05-18T16:31:00+00:00', ?, 'old')",
+            ("a" * 64,
+             "apple inc. stock falls tuesday, underperforms market"))
+        store._conn.commit()
+        conflicting = {
+            "headline_hash": "a" * 64,
+            "source": "MarketWatch",
+            "ticker": "AAPL",
+            "published_at": "2022-05-31T16:31:00+00:00",
+            "headline_text_normalized":
+                "apple inc. stock falls tuesday, underperforms market",
+            "fetched_at": "2026-09-06T00:00:00+00:00",
+        }
+        fresh = _headlines_row("b" * 64)
+        with pytest.raises(IngestionError):
+            store.publish_alphavantage_news(
+                headlines=[fresh, conflicting],
+                manifest=[_manifest_row()])
+        # Atomic: the fresh row inserted BEFORE the conflict is rolled
+        # back, and NO manifest row was written.
+        assert store._conn.execute(
+            "SELECT COUNT(*) FROM news_headlines").fetchone()[0] == 1
+        assert store._conn.execute(
+            "SELECT COUNT(*) FROM coverage_manifests").fetchone()[0] == 0
+        # The surviving row is the pre-existing one, unchanged.
+        assert store._conn.execute(
+            "SELECT published_at, fetched_at FROM news_headlines"
+        ).fetchone() == ("2021-05-18T16:31:00+00:00", "old")
+
+
 # ---------------------------------------------------------------------------
 # FetchRecord / FetchLog plumbing sanity (dataclass contract)
 # ---------------------------------------------------------------------------
