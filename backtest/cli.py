@@ -422,6 +422,114 @@ def cmd_benchmark_news_classifier(args) -> int:
     return 0
 
 
+def cmd_populate_news_classification_cache_offline(args) -> int:
+    """R2.8.1 Phase-2 — OFFLINE classification-cache population.
+
+    Fully offline: NO LLM call, NO network, NO provider/API credentials,
+    NO classification, NO benchmarking. Validates an offline
+    classification-result artifact against the canonical news_headlines
+    inventory and the run-pinned verified NEWS coverage manifests, then —
+    in --final mode only — atomically publishes validated rows into the
+    EXISTING news_classifications cache. PREVIEW mode (default) writes
+    NOTHING. Success never implies Phase-2 completion (calibration +
+    human adjudication remain outstanding).
+    """
+    from backtest.news.cache import HeadlineInventory, open_news_cache
+    from backtest.news.cache_populate_offline import (
+        ArtifactFormatError,
+        CoverageGuardError,
+        OfflinePopulationReport,
+        PopulationProvenanceError,
+        populate_cache_from_offline_artifact,
+    )
+
+    db_path = _backtest_db_path()
+    if not db_path.exists():
+        print(f"No backtest store at {db_path} — run `hermes backtest init` "
+              "and the Phase-0 news ingest first.")
+        return 2
+    mode = "FINAL" if getattr(args, "final", False) else "PREVIEW"
+    # Explicit scope inputs — the artifact NEVER defines or narrows the
+    # population scope. Both PREVIEW and FINAL require them (deterministic
+    # completeness validation is impossible otherwise).
+    requested_tickers = list(getattr(args, "tickers", []) or [])
+    requested_start = getattr(args, "start", "") or ""
+    requested_end = getattr(args, "end", "") or ""
+    cache = open_news_cache(db_path)
+    try:
+        inventory = HeadlineInventory(cache._conn)
+        import json as _json
+        try:
+            report = populate_cache_from_offline_artifact(
+                args.artifact,
+                cache=cache,
+                inventory=inventory,
+                expected_model_version=args.expected_model_version,
+                manifest_versions=list(args.manifest_version),
+                requested_tickers=requested_tickers,
+                requested_start=requested_start,
+                requested_end=requested_end,
+                llm_config_version=getattr(args, "llm_config_version", "")
+                or "",
+                final=bool(mode == "FINAL"),
+                run_id=getattr(args, "run_id", "") or
+                "offline-news-cache-population",
+                classified_at_wallclock=_now_iso(),
+            )
+        except PopulationProvenanceError as exc:
+            print(f"BLOCKED: classifier-pin guard: {exc}")
+            return 3
+        except ArtifactFormatError as exc:
+            print(f"BLOCKED: artifact invalid: {exc}")
+            return 4
+        except CoverageGuardError as exc:
+            print(f"BLOCKED: FINAL population refused — {exc}")
+            return 5
+        except (OSError, ValueError) as exc:
+            print(f"BLOCKED: population failed: {exc}")
+            return 4
+        from pathlib import Path as _Path
+        out = _Path(args.output_report)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        report.generated_at = _now_iso()  # provenance ONLY; never digested
+        from utils import atomic_write_text
+        atomic_write_text(out, report.to_json())
+        print(f"Offline population report ({mode}) written: {out}")
+        print(f"  expected classifier:   {report.expected_model_version}")
+        print(f"  requested tickers:     "
+              f"{','.join(report.requested_tickers)}")
+        print(f"  requested window:      {report.requested_start} .. "
+              f"{report.requested_end}")
+        print(f"  expected identities:   "
+              f"{report.expected_identity_count}")
+        print(f"  artifact identities:   "
+              f"{report.artifact_identity_count}")
+        print(f"  missing identities:    "
+              f"{report.missing_identity_count}")
+        print(f"  extra identities:      {report.extra_identity_count}")
+        print(f"  validated identities:  "
+              f"{report.validated_identity_count}")
+        print(f"  input rows:            {report.input_row_count}")
+        print(f"  validated rows:        {report.validated_row_count}")
+        print(f"  inserted rows:         {report.inserted_row_count}")
+        print(f"  idempotent existing:   "
+              f"{report.idempotent_existing_row_count}")
+        print(f"  errors:                {len(report.errors)}")
+        print(f"  input digest:          {report.input_digest}")
+        print(f"  classifier-pin digest: "
+              f"{report.classifier_pin_digest}")
+        print(f"  complete:              {report.complete}")
+        if mode == "PREVIEW":
+            print("  WARNING: PREVIEW mode — ZERO cache rows written.")
+        else:
+            print("  NOTE: cache population does NOT complete Phase 2; "
+                  "human calibration and classifier adjudication remain "
+                  "outstanding.")
+        return 0 if report.complete else 1
+    finally:
+        cache._conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Phase-0 data-ingestion jobs (§20 Phase 0; hermetic transport injected by
 # tests; live transport fails closed on missing credentials)

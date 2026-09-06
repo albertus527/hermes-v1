@@ -5601,6 +5601,8 @@ def cmd_backtest(args):
         return _backtest_cli.cmd_generate_calibration_worksheet(args)
     if handler == "benchmark-news-classifier":
         return _backtest_cli.cmd_benchmark_news_classifier(args)
+    if handler == "populate-news-classification-cache-offline":
+        return _backtest_cli.cmd_populate_news_classification_cache_offline(args)
     if handler == "fetch-alpaca-bars":
         return _backtest_cli.cmd_fetch_alpaca_bars(args)
     if handler == "fetch-corp-actions":
@@ -5619,7 +5621,8 @@ def cmd_backtest(args):
           "fetch-corp-actions|fetch-finnhub-news|fetch-finnhub-earnings|"
           "fetch-eodhd-earnings|fetch-alphavantage-news|fetch-fred-vix|"
           "populate-news-cache|news-cache-report|calibrate-news|"
-          "generate-calibration-worksheet>")
+          "generate-calibration-worksheet|"
+          "populate-news-classification-cache-offline>")
     return 2
 
 

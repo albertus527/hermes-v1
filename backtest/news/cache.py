@@ -208,27 +208,17 @@ class NewsClassificationCache:
 
     # -- writes (population time only) ------------------------------------
 
-    def insert(self, classification: Classification, *, payload: dict,
-               classified_at_wallclock: str | None = None,
-               run_id: str = "", config_version: int = 0,
-               code_commit: str = "",
-               activation_start: str | None = None,
-               activation_end: str | None = None) -> bool:
-        """Insert one cache entry. Idempotent when the identical payload is
-        re-materialized for the same cache key AND ticker; raises
-        :class:`CacheKeyConflictError` on a differing payload for an
-        existing (cache key, ticker) row (§11.5 historical caches are never
-        overwritten) and :class:`NewsCacheIntegrityFailure` on a P-4
-        effect-field conflict across sources for the same
-        (headline_hash, ticker).
-
-        The same headline text from the same source MAY legitimately be
-        classified for two different tickers (P-4 groups by
-        (headline_hash, ticker)); those are distinct rows.
-
-        Returns True when a row was written, False when it was already
-        present (idempotent no-op).
-        """
+    def _insert_no_commit(self, classification: Classification, *, payload: dict,
+                          classified_at_wallclock: str | None = None,
+                          run_id: str = "", config_version: int = 0,
+                          code_commit: str = "",
+                          activation_start: str | None = None,
+                          activation_end: str | None = None) -> bool:
+        """Commit-free variant of :meth:`insert` — identical checks and
+        identical SQL, but transaction ownership stays with the CALLER
+        (the atomic multi-row population unit opens/owns its SAVEPOINT;
+        a commit() inside would destroy the savepoint and silently
+        publish outer work)."""
         existing = self._conn.execute(
             "SELECT json_payload FROM news_classifications WHERE "
             "headline_hash=? AND source=? AND schema_version=? AND "
@@ -268,8 +258,38 @@ class NewsClassificationCache:
                 run_id, config_version, code_commit,
             ),
         )
-        self._conn.commit()
         return True
+
+    def insert(self, classification: Classification, *, payload: dict,
+               classified_at_wallclock: str | None = None,
+               run_id: str = "", config_version: int = 0,
+               code_commit: str = "",
+               activation_start: str | None = None,
+               activation_end: str | None = None) -> bool:
+        """Insert one cache entry. Idempotent when the identical payload is
+        re-materialized for the same cache key AND ticker; raises
+        :class:`CacheKeyConflictError` on a differing payload for an
+        existing (cache key, ticker) row (§11.5 historical caches are never
+        overwritten) and :class:`NewsCacheIntegrityFailure` on a P-4
+        effect-field conflict across sources for the same
+        (headline_hash, ticker).
+
+        The same headline text from the same source MAY legitimately be
+        classified for two different tickers (P-4 groups by
+        (headline_hash, ticker)); those are distinct rows.
+
+        Returns True when a row was written, False when it was already
+        present (idempotent no-op).
+        """
+        result = self._insert_no_commit(
+            classification, payload=payload,
+            classified_at_wallclock=classified_at_wallclock,
+            run_id=run_id, config_version=config_version,
+            code_commit=code_commit,
+            activation_start=activation_start,
+            activation_end=activation_end)
+        self._conn.commit()
+        return result
 
     def assert_p4(self, classification: Classification) -> None:
         """P-4 (§11.5/§16 rule 9): every existing row sharing
@@ -387,6 +407,17 @@ class HeadlineInventory:
             (ticker,),
         ).fetchall()
         return [(r[0], r[1], _parse_published_at(r[2])) for r in rows]
+
+    def timed_headlines_all(self) -> list[tuple]:
+        """Every TIMED headline row across all tickers:
+        (headline_hash, source, ticker, published_at_iso,
+        headline_text_normalized) — the canonical inventory the offline
+        population job validates results against."""
+        rows = self._conn.execute(
+            "SELECT headline_hash, source, ticker, published_at, "
+            "headline_text_normalized FROM news_headlines "
+            "WHERE published_at IS NOT NULL").fetchall()
+        return [(r[0], r[1], r[2], r[3], r[4]) for r in rows]
 
     def covered(self, ticker: str, *, manifest_version: str,
                 at: _dt.datetime) -> bool:

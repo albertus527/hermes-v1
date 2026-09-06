@@ -109,6 +109,53 @@ def build_backtest_parser(subparsers, *, cmd_backtest: Callable) -> None:
                          help="output machine-readable report JSON path")
     p_bench.set_defaults(backtest_handler="benchmark-news-classifier")
 
+    p_offline = subs.add_parser(
+        "populate-news-classification-cache-offline",
+        help="R2.8.1 Phase-2: validate + publish an OFFLINE "
+             "classification-result artifact into the existing "
+             "classification cache. NO LLM, NO network, NO credentials. "
+             "PREVIEW (validate-only) by default; --final requires "
+             "verified NEWS coverage of every result and the explicit "
+             "classifier pin")
+    p_offline.add_argument("--artifact", required=True,
+                           help="path to the offline classification-result "
+                                "artifact JSON")
+    p_offline.add_argument("--expected-model-version", required=True,
+                           help="the EXACT pinned classifier identifier "
+                                "'openrouter/<provider>/<model>@<version>' "
+                                "(§11.5) every result must match")
+    p_offline.add_argument("--llm-config-version", default="",
+                           help="llm_config_version provenance label the "
+                                "artifact must match (§11.5)")
+    p_offline.add_argument("--manifest-version", required=True,
+                           action="append",
+                           help="run-pinned NEWS coverage manifest_version "
+                                "(§11.6); repeatable")
+    p_offline.add_argument("--tickers", required=True, nargs="+",
+                           help="EXPLICIT requested population tickers — "
+                                "the declared scope; NEVER inferred from "
+                                "the artifact (both PREVIEW and FINAL)")
+    p_offline.add_argument("--start", required=True,
+                           help="requested population window START "
+                                "(inclusive; date-only bounds follow the "
+                                "ingestion/manifest convention: midnight "
+                                "UTC start, 23:59:59 UTC end)")
+    p_offline.add_argument("--end", required=True,
+                           help="requested population window END "
+                                "(inclusive; see --start convention)")
+    p_offline.add_argument("--final", action="store_true",
+                           help="FINAL write mode — atomically publish "
+                                "validated rows into the cache (fails "
+                                "closed without verified coverage)")
+    p_offline.add_argument("--run-id",
+                           default="offline-news-cache-population",
+                           help="run_id stamped on published cache rows")
+    p_offline.add_argument("--output-report", required=True,
+                           help="output machine-readable population/audit "
+                                "report JSON path")
+    p_offline.set_defaults(
+        backtest_handler="populate-news-classification-cache-offline")
+
     # -- Phase-0 data-ingestion jobs (§20 Phase 0) -------------------------
 
     p_bars = subs.add_parser(
