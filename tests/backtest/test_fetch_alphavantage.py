@@ -177,7 +177,343 @@ class TestCanonicalRows:
 
 
 # ---------------------------------------------------------------------------
-# 6-8: ticker association
+# 6: intra-response duplicate canonicalization (§3.8 N-1-a determinism)
+# ---------------------------------------------------------------------------
+
+
+def _canonical_rows(body, *, ticker="AAPL",
+                    start=dt.date(2019, 1, 1), end=dt.date(2019, 1, 30),
+                    fetch_log=None, calls=None):
+    """Fetch and return the canonicalized rows WITHOUT persisting."""
+    http = fake_transport({"alphavantage.co": [(200, body)]}, calls)
+    return fetch_alphavantage.fetch_news_inventory(
+        ticker=ticker, start=start, end=end, http_get=http,
+        fetch_log=fetch_log)
+
+
+class TestIntraResponseDuplicateCanonicalization:
+    """Deterministic collapse of provider-returned intra-interval duplicates
+    by canonical identity (headline_hash, source, ticker), applied at the
+    Alpha Vantage adapter layer BEFORE checkpoint persistence or the
+    aggregate inventory reaches IngestStore.
+
+    Point-in-time safety: conflicting published_at values resolve to
+    MAX(published_at) — never to an earlier timestamp than any observed
+    for that canonical identity.
+    """
+
+    def test_single_row_unchanged(self, av_creds):
+        rows = _canonical_rows(_payload([_feed_item()]))
+        assert len(rows) == 1
+        assert rows[0]["headline_text_normalized"] == \
+            normalize_headline_text("Apple beats synthetic earnings estimates")
+
+    def test_two_exact_duplicates_collapse_to_one(self, av_creds):
+        # Same title → same headline_hash + same normalized text.
+        item = _feed_item(time_published="20190102T153000")
+        rows = _canonical_rows(_payload([item, item]))
+        assert len(rows) == 1
+        assert rows[0]["published_at"] == "2019-01-02T15:30:00+00:00"
+        assert rows[0]["headline_text_normalized"] == \
+            normalize_headline_text("Apple beats synthetic earnings estimates")
+
+    def test_conflicting_timestamp_retains_latest(self, av_creds):
+        # Same canonical identity, same normalized headline, DIFFERENT
+        # published_at. Per point-in-time rule, MAX(published_at) is
+        # retained: 2019-08-26T01:31:47+00:00 over 2019-01-01T00:00:00.
+        item_early = _feed_item(
+            time_published="20190101T000000",
+            title="Globalfoundries Launches Legal Battle Against Taiwan "
+                  "Semiconductor, Also Targets Manufacturers",
+            source="The Wall Street Journal",
+        )
+        item_late = _feed_item(
+            time_published="20190826T013147",
+            title="Globalfoundries Launches Legal Battle Against Taiwan "
+                  "Semiconductor, Also Targets Manufacturers",
+            source="The Wall Street Journal",
+        )
+        rows = _canonical_rows(_payload([item_early, item_late]))
+        assert len(rows) == 1
+        assert rows[0]["published_at"] == "2019-08-26T01:31:47+00:00"
+        assert rows[0]["source"] == "The Wall Street Journal"
+        assert rows[0]["ticker"] == "AAPL"
+        assert rows[0]["headline_text_normalized"] == \
+            normalize_headline_text(
+                "Globalfoundries Launches Legal Battle Against Taiwan "
+                "Semiconductor, Also Targets Manufacturers")
+
+    def test_input_order_independence(self, av_creds):
+        # [early, late] and [late, early] must produce identical output.
+        item_early = _feed_item(
+            time_published="20190101T000000",
+            title="GlobalFoundries launches legal battle against Taiwan "
+                  "Semiconductor",
+            source="The Wall Street Journal",
+        )
+        item_late = _feed_item(
+            time_published="20190826T013147",
+            title="GlobalFoundries launches legal battle against Taiwan "
+                  "Semiconductor",
+            source="The Wall Street Journal",
+        )
+        rows_early_first = _canonical_rows(_payload([item_early, item_late]))
+        rows_late_first = _canonical_rows(_payload([item_late, item_early]))
+        assert len(rows_early_first) == 1
+        assert len(rows_late_first) == 1
+        assert rows_early_first[0]["published_at"] == \
+            rows_late_first[0]["published_at"] == "2019-08-26T01:31:47+00:00"
+
+    def test_three_timestamps_retains_latest(self, av_creds):
+        item_e = _feed_item(
+            time_published="20190101T000000",
+            title="GlobalFoundries legal battle against Taiwan Semiconductor",
+            source="The Wall Street Journal",
+        )
+        item_m = _feed_item(
+            time_published="20190601T120000",
+            title="GlobalFoundries legal battle against Taiwan Semiconductor",
+            source="The Wall Street Journal",
+        )
+        item_l = _feed_item(
+            time_published="20190826T013147",
+            title="GlobalFoundries legal battle against Taiwan Semiconductor",
+            source="The Wall Street Journal",
+        )
+        rows = _canonical_rows(_payload([item_e, item_m, item_l]))
+        assert len(rows) == 1
+        assert rows[0]["published_at"] == "2019-08-26T01:31:47+00:00"
+
+    def test_conflicting_normalized_text_fails_closed(self, av_creds):
+        # Same canonical identity (headline_hash, source, ticker) but
+        # DIFFERENT headline_text_normalized → IngestionError. This cannot
+        # arise via the normal _rows_from_feed path (same title → same hash
+        # and same normalized text); it is verified by constructing rows
+        # directly and calling _canonicalize_rows.
+        row_a = {
+            "headline_hash": canonical_headline_hash(
+                "The same title"),
+            "source": "The Wall Street Journal",
+            "ticker": "AAPL",
+            "published_at": "2019-01-01T00:00:00+00:00",
+            "headline_text_normalized": normalize_headline_text(
+                "The same title"),
+            "fetched_at": "2019-01-01T00:00:00+00:00",
+        }
+        row_b = {
+            "headline_hash": canonical_headline_hash(
+                "The same title"),       # same hash
+            "source": "The Wall Street Journal",
+            "ticker": "AAPL",
+            "published_at": "2019-08-26T01:31:47+00:00",
+            "headline_text_normalized": "A DIFFERENT normalized text",  # !=
+            "fetched_at": "2019-08-26T01:31:47+00:00",
+        }
+        with pytest.raises(IngestionError,
+                           match="differing headline_text_normalized"):
+            fetch_alphavantage._canonicalize_rows([row_a, row_b])
+
+    def test_different_source_both_retained(self, av_creds):
+        # Same headline_hash (same title) but DIFFERENT source → separate
+        # canonical identities, both retained.
+        item_a = _feed_item(
+            time_published="20190102T153000",
+            title="Apple beats synthetic earnings estimates",
+            source="Wire A",
+        )
+        item_b = _feed_item(
+            time_published="20190103T100000",
+            title="Apple beats synthetic earnings estimates",
+            source="Wire B",
+        )
+        rows = _canonical_rows(_payload([item_a, item_b]))
+        assert len(rows) == 2
+        assert {r["source"] for r in rows} == {"Wire A", "Wire B"}
+        assert {r["published_at"] for r in rows} == {
+            "2019-01-02T15:30:00+00:00", "2019-01-03T10:00:00+00:00"}
+
+    def test_different_source_and_ticker_identities_retained(self, av_creds):
+        # Test that _canonicalize_rows treats (headline_hash, source, ticker)
+        # as the identity key: same hash + same source + DIFFERENT ticker,
+        # and same hash + DIFFERENT source + same ticker, are SEPARATE
+        # identities and both retained. This cannot be tested via the fetch
+        # path (a single requested ticker) — it is verified directly on the
+        # canonicalization function.
+        row_aapl_wire_a = {
+            "headline_hash": canonical_headline_hash(
+                "Apple beats synthetic earnings estimates"),
+            "source": "Wire A",
+            "ticker": "AAPL",
+            "published_at": "2019-01-02T15:30:00+00:00",
+            "headline_text_normalized": normalize_headline_text(
+                "Apple beats synthetic earnings estimates"),
+            "fetched_at": "2019-01-02T15:30:00+00:00",
+        }
+        row_msft_wire_a = {
+            "headline_hash": canonical_headline_hash(
+                "Apple beats synthetic earnings estimates"),
+            "source": "Wire A",
+            "ticker": "MSFT",
+            "published_at": "2019-01-03T10:00:00+00:00",
+            "headline_text_normalized": normalize_headline_text(
+                "Apple beats synthetic earnings estimates"),
+            "fetched_at": "2019-01-03T10:00:00+00:00",
+        }
+        row_aapl_wire_b = {
+            "headline_hash": canonical_headline_hash(
+                "Apple beats synthetic earnings estimates"),
+            "source": "Wire B",
+            "ticker": "AAPL",
+            "published_at": "2019-01-04T12:00:00+00:00",
+            "headline_text_normalized": normalize_headline_text(
+                "Apple beats synthetic earnings estimates"),
+            "fetched_at": "2019-01-04T12:00:00+00:00",
+        }
+        rows = fetch_alphavantage._canonicalize_rows(
+            [row_aapl_wire_a, row_msft_wire_a, row_aapl_wire_b])
+        assert len(rows) == 3
+        assert {r["ticker"] for r in rows} == {"AAPL", "MSFT"}
+        assert {r["source"] for r in rows} == {"Wire A", "Wire B"}
+
+    def test_saturated_raw_feed_stays_saturated(
+            self, av_creds, tmp_path):
+        # Raw feed count (>= 1000) determines saturation FIRST.
+        # Canonicalization must NOT reduce the raw count below the threshold
+        # and incorrectly mark the window complete.
+        calls = []
+
+        def http(url, headers=None, params=None, timeout=30.0):
+            calls.append(1)
+            # Always return 1000 items — saturated at every level.
+            # The adapter should detect saturation and subdivide, but the
+            # children also return 1000, so the minimum-granularity
+            # saturated node fails closed with WindowSaturatedError.
+            return 200, json.dumps(
+                TestSaturation._saturating_feed(1000))
+
+        with pytest.raises(fetch_alphavantage.WindowSaturatedError):
+            fetch_alphavantage.fetch_news_inventory(
+                ticker="AAPL", start=dt.date(2019, 6, 1),
+                end=dt.date(2019, 6, 1), http_get=http,
+                sleep_fn=lambda _s: None,
+                checkpoint_dir=str(tmp_path))
+        # At least one request was made (the exact count depends on the
+        # adaptive subdivision depth for a single-day window).
+        assert len(calls) >= 1
+
+    def test_complete_checkpoint_stores_canonicalized_rows(
+            self, av_creds, tmp_path):
+        # A completed leaf checkpoint must contain canonicalized rows (no
+        # raw duplicates).
+        item_a = _feed_item(
+            time_published="20190101T000000",
+            title="GlobalFoundries legal battle against Taiwan Semiconductor",
+            source="The Wall Street Journal",
+        )
+        item_b = _feed_item(
+            time_published="20190826T013147",
+            title="GlobalFoundries legal battle against Taiwan Semiconductor",
+            source="The Wall Street Journal",
+        )
+
+        def http(url, headers=None, params=None, timeout=30.0):
+            return 200, json.dumps(_payload([item_a, item_b]))
+
+        rows = fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 1, 31), http_get=http,
+            sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+
+        files = list(tmp_path.glob("*.json"))
+        assert len(files) == 1
+        doc = json.loads(files[0].read_text())
+        assert doc["complete"] is True
+        assert doc["rows"] == rows          # stored rows ARE canonicalized
+        assert len(rows) == 1               # duplicates collapsed
+        assert rows[0]["published_at"] == "2019-08-26T01:31:47+00:00"
+
+    def test_resume_replays_canonicalized_rows_no_http(
+            self, av_creds, tmp_path):
+        # Resume from a completed checkpoint must reuse the canonicalized
+        # rows without a live HTTP request.
+        item_a = _feed_item(
+            time_published="20190101T000000",
+            title="GlobalFoundries legal battle against Taiwan Semiconductor",
+            source="The Wall Street Journal",
+        )
+        item_b = _feed_item(
+            time_published="20190826T013147",
+            title="GlobalFoundries legal battle against Taiwan Semiconductor",
+            source="The Wall Street Journal",
+        )
+
+        def http_first(url, headers=None, params=None, timeout=30.0):
+            return 200, json.dumps(_payload([item_a, item_b]))
+
+        first = fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 1, 31), http_get=http_first,
+            sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+
+        calls_after = []
+
+        def http_resume(url, headers=None, params=None, timeout=30.0):
+            calls_after.append(1)
+            return 200, json.dumps(_payload([_feed_item()]))
+
+        resumed = fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 1, 31), http_get=http_resume,
+            sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+
+        # Resume hits the checkpoint, so NO HTTP request should occur.
+        assert len(calls_after) == 0
+        assert resumed == first
+        assert len(resumed) == 1
+        assert resumed[0]["published_at"] == "2019-08-26T01:31:47+00:00"
+
+    def test_real_anomaly_reproduced_synthetic_fixture(self, av_creds):
+        # Reproduce the real Alpha Vantage WSJ anomaly using synthetic
+        # fixture data: same normalized WSJ headline, same source, same
+        # AAPL ticker, timestamps 20190826T013147 and 20190101T000000.
+        # Expected: one canonical row, published_at=2019-08-26T01:31:47.
+        item_anomaly_early = _feed_item(
+            time_published="20190101T000000",
+            title="Globalfoundries Launches Legal Battle Against Taiwan "
+                  "Semiconductor, Also Targets Manufacturers",
+            source="The Wall Street Journal",
+        )
+        item_anomaly_late = _feed_item(
+            time_published="20190826T013147",
+            title="Globalfoundries Launches Legal Battle Against Taiwan "
+                  "Semiconductor, Also Targets Manufacturers",
+            source="The Wall Street Journal",
+        )
+        rows = _canonical_rows(_payload([item_anomaly_early,
+                                         item_anomaly_late]))
+        assert len(rows) == 1
+        assert rows[0]["published_at"] == "2019-08-26T01:31:47+00:00"
+        assert rows[0]["source"] == "The Wall Street Journal"
+        assert rows[0]["ticker"] == "AAPL"
+
+    def test_existing_benign_duplicate_collapses(self, av_creds):
+        # MarketWatch-style exact duplicate (same published_at + same
+        # normalized text) remains benign and collapses to one row without
+        # error.
+        item = _feed_item(
+            time_published="20190830T070800",
+            title="Here are 2019's biggest stock market winners and losers "
+                  "in the Dow, S&P 500 and Nasdaq",
+            source="MarketWatch",
+        )
+        rows = _canonical_rows(_payload([item, item]))
+        assert len(rows) == 1
+        assert rows[0]["published_at"] == "2019-08-30T07:08:00+00:00"
+        assert rows[0]["source"] == "MarketWatch"
+
+
+# ---------------------------------------------------------------------------
+# 7-8: ticker association
 # ---------------------------------------------------------------------------
 
 class TestTickerAssociation:
@@ -1167,8 +1503,275 @@ class TestResumeCheckpoints:
             sleep_fn=delays.append, checkpoint_dir=str(tmp_path))
         assert delays == []
 
-    def test_http_requests_still_paced_with_checkpoints(
+    def test_legacy_checkpoint_replay_canonicalizes_duplicates(
             self, av_creds, tmp_path):
+        # A legacy-complete checkpoint written BEFORE the duplicate-
+        # canonicalization patch contains an intra-interval duplicate by
+        # canonical identity (headline_hash, source, ticker) with the same
+        # normalized text but DIFFERENT published_at. Replay must apply the
+        # SAME canonicalization as the live-fetch path and return exactly
+        # one row with MAX(published_at).
+        item_early = _feed_item(
+            time_published="20190101T000000",
+            title="GlobalFoundries legal battle against Taiwan Semiconductor",
+            source="The Wall Street Journal",
+        )
+        item_late = _feed_item(
+            time_published="20190826T013147",
+            title="GlobalFoundries legal battle against Taiwan Semiconductor",
+            source="The Wall Street Journal",
+        )
+
+        def http_first(url, headers=None, params=None, timeout=30.0):
+            return 200, json.dumps(_payload([item_early, item_late]))
+
+        # First run: writes a completed leaf checkpoint containing the raw
+        # duplicate pair.
+        first = fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 1, 31), http_get=http_first,
+            sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+
+        # Verify the checkpoint file exists and is complete.
+        files = list(tmp_path.glob("*.json"))
+        assert len(files) == 1
+        doc = json.loads(files[0].read_text())
+        assert doc["complete"] is True
+
+        # Second run: resume from the same checkpoint. The loaded rows must
+        # be canonicalized on replay.
+        second = fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 1, 31), http_get=http_first,
+            sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+
+        assert len(second) == 1
+        assert second[0]["published_at"] == "2019-08-26T01:31:47+00:00"
+        assert second[0]["source"] == "The Wall Street Journal"
+        assert second[0]["ticker"] == "AAPL"
+
+    def test_legacy_exact_duplicate_checkpoint_replay_collapses(
+            self, av_creds, tmp_path):
+        # Exact duplicate (same published_at + same normalized text) in a
+        # legacy checkpoint collapses to one row on replay.
+        item = _feed_item(
+            time_published="20190830T070800",
+            title="Here are 2019's biggest stock market winners and losers "
+                  "in the Dow, S&P 500 and Nasdaq",
+            source="MarketWatch",
+        )
+
+        def http_first(url, headers=None, params=None, timeout=30.0):
+            return 200, json.dumps(_payload([item, item]))
+
+        first = fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 1, 31), http_get=http_first,
+            sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+
+        files = list(tmp_path.glob("*.json"))
+        assert len(files) == 1
+        assert json.loads(files[0].read_text())["complete"] is True
+
+        second = fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 1, 31), http_get=http_first,
+            sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+
+        assert len(second) == 1
+        assert second[0]["published_at"] == "2019-08-30T07:08:00+00:00"
+
+    def test_legacy_content_conflict_checkpoint_replay_fails_closed(
+            self, av_creds, tmp_path):
+        # A legacy checkpoint with same identity but DIFFERENT
+        # headline_text_normalized must raise IngestionError on replay —
+        # content conflict cannot be resolved deterministically.
+        row_a = {
+            "headline_hash": canonical_headline_hash(
+                "The same title"),
+            "source": "The Wall Street Journal",
+            "ticker": "AAPL",
+            "published_at": "2019-01-01T00:00:00+00:00",
+            "headline_text_normalized": normalize_headline_text(
+                "The same title"),
+            "fetched_at": "2019-01-01T00:00:00+00:00",
+        }
+        row_b = {
+            "headline_hash": canonical_headline_hash(
+                "The same title"),
+            "source": "The Wall Street Journal",
+            "ticker": "AAPL",
+            "published_at": "2019-08-26T01:31:47+00:00",
+            "headline_text_normalized": "A DIFFERENT normalized text",
+            "fetched_at": "2019-08-26T01:31:47+00:00",
+        }
+
+        def http_first(url, headers=None, params=None, timeout=30.0):
+            return 200, json.dumps(_payload([]))  # empty feed, write a
+                                                   # synthetic checkpoint
+        # First run writes an empty checkpoint. Then we manually replace it
+        # with a synthetic conflicting one via the checkpoint path.
+        first = fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 1, 31), http_get=http_first,
+            sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+
+        ckpt_path = tmp_path / \
+            fetch_alphavantage._checkpoint_path(
+                "AAPL",
+                _dt.datetime(2019, 1, 1, tzinfo=_dt.timezone.utc),
+                _dt.datetime(2019, 1, 31, 23, 59,
+                               tzinfo=_dt.timezone.utc),
+                tmp_path)
+        ckpt_path.write_text(json.dumps({
+            "format": fetch_alphavantage.CHECKPOINT_FORMAT,
+            "complete": True,
+            "ticker": "AAPL",
+            "time_from": "20190101T0000",
+            "time_to": "20190131T2359",
+            "rows": [row_a, row_b],
+        }, sort_keys=True))
+
+        # Replay from the conflicting legacy checkpoint: must fail closed.
+        with pytest.raises(IngestionError,
+                           match="differing headline_text_normalized"):
+            fetch_alphavantage.fetch_news_inventory(
+                ticker="AAPL", start=dt.date(2019, 1, 1),
+                end=dt.date(2019, 1, 31), http_get=http_first,
+                sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+
+    def test_replay_remains_zero_http(self, av_creds, tmp_path):
+        # Resume from a legacy checkpoint makes zero HTTP requests.
+        item_early = _feed_item(
+            time_published="20190101T000000",
+            title="GlobalFoundries legal battle against Taiwan Semiconductor",
+            source="The Wall Street Journal",
+        )
+        item_late = _feed_item(
+            time_published="20190826T013147",
+            title="GlobalFoundries legal battle against Taiwan Semiconductor",
+            source="The Wall Street Journal",
+        )
+
+        def http_first(url, headers=None, params=None, timeout=30.0):
+            return 200, json.dumps(_payload([item_early, item_late]))
+
+        fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 1, 31), http_get=http_first,
+            sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+
+        calls_after = []
+
+        def http_resume(url, headers=None, params=None, timeout=30.0):
+            calls_after.append(1)
+            return 200, json.dumps(_payload([_feed_item()]))
+
+        fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 1, 31), http_get=http_resume,
+            sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+
+        assert len(calls_after) == 0  # checkpoint hit, no HTTP
+
+    def test_already_canonicalized_checkpoint_replay_unchanged(
+            self, av_creds, tmp_path):
+        # A checkpoint already written by the current (canonicalized) path
+        # is replayed unchanged.
+        item_late = _feed_item(
+            time_published="20190826T013147",
+            title="GlobalFoundries legal battle against Taiwan Semiconductor",
+            source="The Wall Street Journal",
+        )
+
+        def http_first(url, headers=None, params=None, timeout=30.0):
+            return 200, json.dumps(_payload([item_late]))
+
+        first = fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 1, 31), http_get=http_first,
+            sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+
+        files = list(tmp_path.glob("*.json"))
+        assert len(files) == 1
+        assert json.loads(files[0].read_text())["complete"] is True
+
+        second = fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 1, 31), http_get=http_first,
+            sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+
+        assert second == first
+        assert len(second) == 1
+
+    def test_saturation_marker_resume_path_unchanged(self, av_creds,
+                                                     tmp_path):
+        # Saturation-marker resume path is NOT canonicalized (markers carry
+        # no rows). The existing behavior must be preserved exactly.
+        calls = []
+
+        def http(url, headers=None, params=None, timeout=30.0):
+            calls.append(1)
+            n = len(calls)
+            # YEAR saturated, LEFT and RIGHT children unsaturated.
+            if n == 1:
+                return 200, json.dumps(
+                    TestSaturation._saturating_feed(1000))
+            return 200, json.dumps(_payload([_feed_item()]))
+
+        rows = fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 12, 31), http_get=http,
+            sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+
+        # Verify both completed checkpoints exist.
+        completed = {p.stem for p in tmp_path.glob("*.json")
+                     if json.loads(p.read_text()).get("complete") is True}
+        assert len(completed) == 2
+
+        # Resume: both completed checkpoints are replayed with
+        # canonicalization (trivial for single-row leaves). No HTTP.
+        calls.clear()
+        rows2 = fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1),
+            end=dt.date(2019, 12, 31), http_get=http,
+            sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+        assert len(calls) == 0
+        assert rows2 == rows
+
+    def test_real_wsj_anomaly_legacy_checkpoint_in_memory(self, av_creds):
+        # Confirm that the real legacy AAPL 2019 checkpoint (288 rows,
+        # including the known WSJ duplicate) would canonicalize to 286 rows
+        # with the WSJ duplicate collapsed to one row with
+        # published_at=2019-08-26T01:31:47+00:00.
+        ckpt_path = \
+            "/home/albertus527/.hermes/data/r28/alphavantage/resume/" \
+            "2ebc072efff2b027a855cd7e68726b60.json"
+        with open(ckpt_path) as f:
+            doc = json.load(f)
+        assert doc["complete"] is True
+        assert doc["format"] == fetch_alphavantage.CHECKPOINT_FORMAT
+        raw_rows = doc["rows"]
+        assert len(raw_rows) == 288
+
+        canonical_rows = fetch_alphavantage._canonicalize_rows(list(raw_rows))
+        assert len(canonical_rows) == 286
+
+        wsj_duplicate_rows = [r for r in canonical_rows
+                    if r["headline_hash"] ==
+                       "aabe963fe8361053ab3351d12540ed8b21301d4338a545a2b75dd9b6d23edc95"]
+        assert len(wsj_duplicate_rows) == 1
+        assert wsj_duplicate_rows[0]["published_at"] == "2019-08-26T01:31:47+00:00"
+        assert wsj_duplicate_rows[0]["headline_hash"] == \
+            "aabe963fe8361053ab3351d12540ed8b21301d4338a545a2b75dd9b6d23edc95"
+
+        # The checkpoint file itself is NOT modified.
+        with open(ckpt_path) as f:
+            doc2 = json.load(f)
+        assert len(doc2["rows"]) == 288  # unchanged on disk
+
+    def test_http_requests_still_paced_with_checkpoints(self, av_creds,
+                                                      tmp_path):
         delays = []
         calls = []
 

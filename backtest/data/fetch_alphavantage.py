@@ -414,6 +414,63 @@ def _establishes_association(item: dict, ticker: str) -> bool:
     return False
 
 
+def _canonicalize_rows(rows: list[dict]) -> list[dict]:
+    """Deterministically canonicalize a batch of rows from ONE Alpha Vantage
+    fetched interval by collapsing intra-interval duplicates by canonical
+    identity (headline_hash, source, ticker).
+
+    Point-in-time safety rule: when multiple occurrences of the same canonical
+    identity carry different published_at values but the same
+    headline_text_normalized, the row with MAX(published_at) is retained — a
+    deterministic conservative rule that never introduces a headline earlier
+    than any timestamp observed for that canonical identity. This is an
+    anti-lookahead canonicalization, not a "correct timestamp" selection.
+
+    Content conflicts (same identity, same source/ticker, but differing
+    headline_text_normalized) fail closed — they are never silently resolved.
+
+    Single-occurrence identities and exact-duplicate identities (same
+    published_at AND same headline_text_normalized) are preserved/collapsed
+    unchanged.
+
+    Different (headline_hash, source, ticker) tuples are separate identities
+    and never merged.
+
+    This function operates on rows ALREADY constructed from the provider feed;
+    it does not re-parse the feed, does not consult provider sentiment/relevance
+    fields, and does not distinguish tickers or sources.
+    """
+    # Group by canonical identity: (headline_hash, source, ticker)
+    groups: dict[tuple[str, str, str], list[dict]] = {}
+    for r in rows:
+        key = (r["headline_hash"], r["source"], r["ticker"])
+        groups.setdefault(key, []).append(r)
+
+    out: list[dict] = []
+    for key, group in groups.items():
+        if len(group) == 1:
+            out.append(group[0])
+            continue
+
+        # Multiple occurrences for the same identity.
+        texts = {r["headline_text_normalized"] for r in group}
+        if len(texts) > 1:
+            raise IngestionError(
+                f"Alpha Vantage intra-interval duplicate for identity "
+                f"{key} has differing headline_text_normalized values "
+                f"{texts!r} — content conflict cannot be resolved "
+                f"deterministically (R2.8.1 §3.8 N-1-a)"
+            )
+
+        # Same normalized text. Collapse to the row with MAX(published_at).
+        # Timestamps are aware ISO-8601 UTC strings; lexicographic order
+        # matches chronological order for this format.
+        canonical = max(group, key=lambda r: r["published_at"])
+        out.append(canonical)
+
+    return out
+
+
 def _rows_from_feed(feed: list, *, ticker: str,
                     fetched_at: str | None = None) -> list[dict]:
     """Normalize validated feed items into canonical ``news_headlines``
@@ -421,6 +478,22 @@ def _rows_from_feed(feed: list, *, ticker: str,
     closed; well-formed items not associated with the requested ticker
     are skipped (never a row for a ticker the article does not
     establish). No provider sentiment/relevance field is carried over.
+
+    After row construction, intra-interval duplicates by canonical identity
+    (headline_hash, source, ticker) are deterministically canonicalized:
+
+    - Exact duplicates (same published_at + same headline_text_normalized)
+      collapse to one row.
+    - Same identity + same normalized text + different published_at:
+      the row with MAX(published_at) is retained (point-in-time safety;
+      never introduces an earlier timestamp than any observed for that
+      identity).
+    - Same identity + different headline_text_normalized: IngestionError
+      (content conflict, fail closed).
+
+    This canonicalization is Alpha-Vantage-adapter-local and is applied
+    AFTER row construction but BEFORE the rows reach checkpoint persistence
+    or the aggregate inventory.
     """
     fetched_at = fetched_at or _now_utc_iso()
     rows: list[dict] = []
@@ -458,7 +531,7 @@ def _rows_from_feed(feed: list, *, ticker: str,
             "headline_text_normalized": normalized,
             "fetched_at": fetched_at,
         })
-    return rows
+    return _canonicalize_rows(rows)
 
 
 def normalize_news_payload(payload: Any, *, ticker: str,
@@ -671,20 +744,26 @@ def fetch_news_inventory(
                        first: bool) -> list[dict]:
         ckpt_path = (_checkpoint_path(ticker, a, b, ckpt_dir)
                      if ckpt_dir is not None else None)
-        # 1) Completed-leaf HIT: restore the validated, normalized rows
-        #    without touching the provider (and without pacing — a
-        #    checkpoint read is not an HTTP request).
-        if ckpt_path is not None:
-            cached = _load_checkpoint(ckpt_path, ticker=ticker, a=a, b=b)
-            if cached is not None:
-                return list(cached)
-        # 2) Saturation-marker HIT: not an HTTP request — deterministically
+        # 1) Saturation-marker HIT: not an HTTP request — deterministically
         #    reconstruct the same two children and continue traversal.
         if ckpt_path is not None and _load_saturation_marker(
                 ckpt_path, ticker=ticker, a=a, b=b):
             left, right = _split_interval(a, b)
             return (fetch_interval(a, left, False) +
                     fetch_interval(right, b, False))
+        # 2) Completed-leaf HIT: restore the validated, normalized rows
+        #    without touching the provider (and without pacing — a
+        #    checkpoint read is not an HTTP request).
+        if ckpt_path is not None:
+            cached = _load_checkpoint(ckpt_path, ticker=ticker, a=a, b=b)
+            if cached is not None:
+                # Replay canonicalization: a legacy checkpoint written before
+                # the intra-response duplicate canonicalization patch may
+                # contain conflicting duplicate identities (same
+                # headline_hash/source/ticker with different published_at).
+                # Apply the SAME adapter-local canonicalization as the live
+                # fetch path so resume semantics are consistent.
+                return _canonicalize_rows(list(cached))
         # 3) MISS: the normal sequential paced request path.
         if not first:
             sleeper(NEWS_PACING_SECONDS)
