@@ -49,6 +49,14 @@ class IngestionError(Exception):
     """
 
 
+DROP_INVALID_FP4_EMPTY = "DROP_INVALID_FP4_EMPTY"
+"""Stable reason identifier for an otherwise well-formed provider item whose
+FP-4-normalized headline text is empty (punctuation-only / non-substantive
+titles). The item produces no canonical news_headlines row and no
+headline_hash/classification; it does NOT by itself fail the enclosing
+provider sweep. See P-NEWS-EMPTY."""
+
+
 @dataclass(frozen=True)
 class FetchRecord:
     """Provenance for one logical provider request (or paginated sweep).
@@ -65,25 +73,58 @@ class FetchRecord:
     response_window: dict[str, Any] = field(default_factory=dict)
     items: int = 0
     pages: int = 0
+    drops: int = 0
 
 
 class FetchLog:
     """Accumulates FetchRecords for a job run (explicit provider/date
-    metadata, persisted with the coverage manifest)."""
+    metadata, persisted with the coverage manifest).
+
+    Drop accounting (P-NEWS-EMPTY observability): ``total_drops``
+    describes the deterministic canonical exclusions represented by the
+    inventory used by THIS run — both live HTTP exclusions
+    (``FetchRecord.drops``) and exclusions restored from completed-leaf
+    checkpoints on replay (``replay_drops``). A checkpoint replay emits
+    NO new FetchRecord (one record per HTTP request is the invariant)
+    but its stored exclusion count is folded into the run's totals via
+    :meth:`add_replay_drops`, so exclusion evidence survives resume.
+    """
 
     def __init__(self) -> None:
         self.records: list[FetchRecord] = []
+        self.replay_drops: int = 0
 
     def add(self, record: FetchRecord) -> None:
         self.records.append(record)
 
+    def add_replay_drops(self, drops: int) -> None:
+        """Fold a replayed checkpoint's stored exclusion count into this
+        run's drop accounting (never recounted, zero HTTP)."""
+        self.replay_drops += int(drops)
+
     def to_json(self) -> str:
-        return json.dumps(
-            [r.__dict__ for r in self.records], sort_keys=True, indent=2)
+        docs = [r.__dict__ for r in self.records]
+        if self.replay_drops:
+            docs.append({
+                "provider": "alphavantage",
+                "endpoint": "CHECKPOINT_REPLAY",
+                "params": {},
+                "fetched_at": "",
+                "response_window": {},
+                "items": 0,
+                "pages": 0,
+                "drops": self.replay_drops,
+                "replay": True,
+            })
+        return json.dumps(docs, sort_keys=True, indent=2)
 
     @property
     def total_items(self) -> int:
         return sum(r.items for r in self.records)
+
+    @property
+    def total_drops(self) -> int:
+        return sum(r.drops for r in self.records) + self.replay_drops
 
 
 def _default_http_get(url: str, *, headers: dict[str, str] | None = None,
@@ -299,6 +340,120 @@ class IngestStore:
                  self.config_version, self.code_commit))
             new += 1
         self._conn.commit()
+        return new
+
+    # -- Alpha Vantage news publication (§3.8 atomic unit) ------------------
+
+    def publish_alphavantage_news(
+        self,
+        *,
+        headlines: list[dict],
+        manifest: list[dict],
+    ) -> tuple[int, int]:
+        """Atomically persist ONE Alpha Vantage publication unit:
+        canonical ``news_headlines`` rows + corresponding
+        ``coverage_manifests`` rows.
+
+        Required invariant (P-NEWS-ATOMIC): either BOTH become durable or
+        NEITHER does. If headline upsert raises, no manifest is written. If
+        manifest write raises, headline changes for this publication unit are
+        rolled back.
+
+        Returns ``(headlines_new, manifest_new)`` — the number of NEW rows
+        in each table (idempotent: identical re-ingest returns 0, 0).
+
+        Existing already-committed rows from OTHER publication units are
+        never modified. Checkpoints are filesystem artifacts and are NOT part
+        of this transaction (they remain resume state only).
+
+        Transaction design: this method owns the savepoint lifecycle. The
+        existing ``upsert_headlines`` / ``write_manifest`` each call
+        ``self._conn.commit()`` internally and cannot be used directly
+        (an internal commit would make headline changes durable before the
+        manifest phase, breaking atomicity). Instead the savepoint-scoped
+        ``_upsert_headlines_atomic`` / ``_write_manifest_atomic`` variants
+        perform the same idempotent insert-or-conflict logic but NEVER
+        commit — only this method commits, and only after BOTH phases
+        succeed. On ANY exception from either phase the savepoint is rolled
+        back, unwinding only this publication unit's changes while leaving
+        pre-existing committed rows untouched.
+        """
+        self._conn.execute("SAVEPOINT av_news_unit")
+        try:
+            headlines_new = self._upsert_headlines_atomic(headlines)
+            manifest_new = self._write_manifest_atomic(manifest)
+        except Exception:
+            # Roll back everything done in THIS publication unit. Pre-
+            # existing committed rows are untouched (a savepoint rollback
+            # only undoes changes made since the SAVEPOINT was opened).
+            # ROLLBACK TO rolls back to the savepoint but does NOT destroy
+            # it; RELEASE destroys it (a no-op commit since we just rolled
+            # back, leaving a clean savepoint-free connection state).
+            self._conn.execute("ROLLBACK TO SAVEPOINT av_news_unit")
+            self._conn.execute("RELEASE SAVEPOINT av_news_unit")
+            raise
+        self._conn.execute("RELEASE SAVEPOINT av_news_unit")
+        self._conn.commit()
+        return (headlines_new, manifest_new)
+
+    def _upsert_headlines_atomic(self, rows: list[dict]) -> int:
+        """Savepoint-scoped variant of ``upsert_headlines`` — same
+        idempotent insert-or-conflict logic, but does NOT call
+        ``self._conn.commit()``. The caller (``publish_alphavantage_news``)
+        owns the savepoint lifecycle and the final commit."""
+        new = 0
+        for r in rows:
+            key = (r["headline_hash"], r["source"], r["ticker"])
+            existing = self._conn.execute(
+                "SELECT published_at, headline_text_normalized FROM "
+                "news_headlines WHERE headline_hash=? AND source=? AND "
+                "ticker=?", key).fetchone()
+            values = (r.get("published_at"), r["headline_text_normalized"])
+            if existing is not None:
+                if tuple(existing) != values:
+                    raise IngestionError(
+                        f"news_headlines row {key} exists with differing "
+                        f"values")
+                continue
+            self._conn.execute(
+                "INSERT INTO news_headlines (headline_hash, source, ticker, "
+                "published_at, headline_text_normalized, fetched_at, run_id,"
+                " config_version, code_commit) VALUES (?,?,?,?,?,?,?,?,?)",
+                (r["headline_hash"], r["source"], r["ticker"],
+                 values[0], values[1], r["fetched_at"], self.run_id,
+                 self.config_version, self.code_commit))
+            new += 1
+        return new
+
+    def _write_manifest_atomic(self, rows: list[dict]) -> int:
+        """Savepoint-scoped variant of ``write_manifest`` — same append-
+        or-conflict logic, but does NOT call ``self._conn.commit()``. The
+        caller (``publish_alphavantage_news``) owns the savepoint
+        lifecycle and the final commit."""
+        new = 0
+        for r in rows:
+            key = (r["source_kind"], r["ticker"], r["span_start"],
+                   r["span_end"], r["manifest_version"])
+            existing = self._conn.execute(
+                "SELECT verified FROM coverage_manifests WHERE "
+                "source_kind=? AND ticker=? AND span_start=? AND span_end=?"
+                " AND manifest_version=?", key).fetchone()
+            if existing is not None:
+                if bool(existing[0]) != bool(r["verified"]):
+                    raise IngestionError(
+                        f"coverage_manifests row {key} exists with "
+                        f"verified={bool(existing[0])}, refusing rewrite to "
+                        f"{bool(r['verified'])}")
+                continue
+            self._conn.execute(
+                "INSERT INTO coverage_manifests (source_kind, ticker, "
+                "span_start, span_end, verified, manifest_version, run_id, "
+                "config_version, code_commit) VALUES (?,?,?,?,?,?,?,?,?)",
+                (r["source_kind"], r["ticker"], r["span_start"],
+                 r["span_end"], 1 if r["verified"] else 0,
+                 r["manifest_version"], self.run_id,
+                 self.config_version, self.code_commit))
+            new += 1
         return new
 
     # -- vix_observations (§3.1/§5.2 FRED VIXCLS) ---------------------------

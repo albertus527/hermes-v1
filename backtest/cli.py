@@ -589,13 +589,16 @@ def cmd_fetch_alphavantage_news(args) -> int:
         checkpoint_dir = (getattr(args, "checkpoint_dir", "") or
                           str(_checkpoint_dir()))
         for ticker in tickers:
-            rows = fetch_news_inventory(ticker=ticker, start=start, end=end,
-                                        fetch_log=log,
-                                        checkpoint_dir=checkpoint_dir)
-            headlines_new += store.upsert_headlines(rows)
-            manifest_new += store.write_manifest(news_manifest_rows(
+            rows, _drops = fetch_news_inventory(ticker=ticker, start=start, end=end,
+                                                fetch_log=log,
+                                                checkpoint_dir=checkpoint_dir)
+            manifest = news_manifest_rows(
                 ticker=ticker, start=start, end=end,
-                manifest_version=manifest_version))
+                manifest_version=manifest_version)
+            h_new, m_new = store.publish_alphavantage_news(
+                headlines=rows, manifest=manifest)
+            headlines_new += h_new
+            manifest_new += m_new
             print(f"  {ticker}: {len(rows)} headlines ingested "
                   f"(verified NEWS span {start}..{end})")
         path = _save_report(log.to_json(),

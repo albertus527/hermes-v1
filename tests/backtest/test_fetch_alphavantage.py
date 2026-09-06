@@ -121,9 +121,10 @@ def _fetch(body, *, ticker="AAPL",
            start=dt.date(2019, 1, 1), end=dt.date(2019, 1, 30),
            fetch_log=None, calls=None):
     http = fake_transport({"alphavantage.co": [(200, body)]}, calls)
-    return fetch_alphavantage.fetch_news_inventory(
+    rows, _drops = fetch_alphavantage.fetch_news_inventory(
         ticker=ticker, start=start, end=end, http_get=http,
         fetch_log=fetch_log)
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -186,9 +187,10 @@ def _canonical_rows(body, *, ticker="AAPL",
                     fetch_log=None, calls=None):
     """Fetch and return the canonicalized rows WITHOUT persisting."""
     http = fake_transport({"alphavantage.co": [(200, body)]}, calls)
-    return fetch_alphavantage.fetch_news_inventory(
+    rows, _drops = fetch_alphavantage.fetch_news_inventory(
         ticker=ticker, start=start, end=end, http_get=http,
         fetch_log=fetch_log)
+    return rows
 
 
 class TestIntraResponseDuplicateCanonicalization:
@@ -419,7 +421,7 @@ class TestIntraResponseDuplicateCanonicalization:
         def http(url, headers=None, params=None, timeout=30.0):
             return 200, json.dumps(_payload([item_a, item_b]))
 
-        rows = fetch_alphavantage.fetch_news_inventory(
+        rows, _drops = fetch_alphavantage.fetch_news_inventory(
             ticker="AAPL", start=dt.date(2019, 1, 1),
             end=dt.date(2019, 1, 31), http_get=http,
             sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
@@ -450,7 +452,7 @@ class TestIntraResponseDuplicateCanonicalization:
         def http_first(url, headers=None, params=None, timeout=30.0):
             return 200, json.dumps(_payload([item_a, item_b]))
 
-        first = fetch_alphavantage.fetch_news_inventory(
+        first, _drops = fetch_alphavantage.fetch_news_inventory(
             ticker="AAPL", start=dt.date(2019, 1, 1),
             end=dt.date(2019, 1, 31), http_get=http_first,
             sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
@@ -461,7 +463,7 @@ class TestIntraResponseDuplicateCanonicalization:
             calls_after.append(1)
             return 200, json.dumps(_payload([_feed_item()]))
 
-        resumed = fetch_alphavantage.fetch_news_inventory(
+        resumed, _drops = fetch_alphavantage.fetch_news_inventory(
             ticker="AAPL", start=dt.date(2019, 1, 1),
             end=dt.date(2019, 1, 31), http_get=http_resume,
             sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
@@ -637,11 +639,18 @@ class TestPayloadValidation:
         with pytest.raises(IngestionError, match="source"):
             _fetch(_payload([_feed_item(source=source)]))
 
-    def test_punctuation_only_title_rejected(self, av_creds):
-        # Normalizes to empty FP-4 text — a canonical headline cannot
-        # be empty, so this fails closed rather than fabricating.
-        with pytest.raises(IngestionError, match="FP-4"):
-            _fetch(_payload([_feed_item(title="?!...")]))
+    def test_punctuation_only_title_dropped(self, av_creds, tmp_path):
+        # P-NEWS-EMPTY: structurally valid title whose FP-4 normalization
+        # is empty (punctuation-only) is DROPPED — no canonical row, no
+        # error, observable deterministic drop count.
+        http = fake_transport({"alphavantage.co": [
+            (200, _payload([_feed_item(title="?!...")]))]})
+        rows, drops = fetch_alphavantage.fetch_news_inventory(
+            ticker="AAPL", start=dt.date(2019, 1, 1), end=dt.date(2019, 1, 30),
+            http_get=http, sleep_fn=lambda _s: None,
+            checkpoint_dir=str(tmp_path))
+        assert rows == []
+        assert drops == 1
 
 
 # ---------------------------------------------------------------------------
@@ -931,7 +940,7 @@ class TestSaturation:
                 return 200, json.dumps(self._saturating_feed(1000))
             return 200, json.dumps(self._saturating_feed(300))
 
-        rows = fetch_alphavantage.fetch_news_inventory(
+        rows, _drops = fetch_alphavantage.fetch_news_inventory(
             ticker="AAPL", start=dt.date(2019, 1, 1),
             end=dt.date(2019, 12, 31), http_get=http_get,
             sleep_fn=lambda _s: None)
@@ -954,7 +963,7 @@ class TestSaturation:
                 return 200, json.dumps(self._saturating_feed(1000))
             return 200, json.dumps(self._saturating_feed(50))
 
-        rows = fetch_alphavantage.fetch_news_inventory(
+        rows, _drops = fetch_alphavantage.fetch_news_inventory(
             ticker="AAPL", start=dt.date(2019, 1, 1),
             end=dt.date(2019, 12, 31), http_get=http_get,
             sleep_fn=lambda _s: None)
@@ -1028,7 +1037,7 @@ class TestSaturation:
                 return 200, json.dumps(self._saturating_feed(1000))
             return 200, json.dumps(_payload([]))
 
-        rows = fetch_alphavantage.fetch_news_inventory(
+        rows, _drops = fetch_alphavantage.fetch_news_inventory(
             ticker="AAPL", start=dt.date(2019, 1, 1),
             end=dt.date(2019, 12, 31), http_get=http_get,
             sleep_fn=lambda _s: None)
@@ -1168,9 +1177,10 @@ class TestPacing:
 
 def _resumable_fetch(http, *, ticker="AAPL", start=dt.date(2019, 1, 1),
                      end=dt.date(2019, 1, 30), tmp_path=None, calls=None):
-    return fetch_alphavantage.fetch_news_inventory(
+    rows, _drops = fetch_alphavantage.fetch_news_inventory(
         ticker=ticker, start=start, end=end, http_get=http,
         sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+    return rows
 
 
 class TestResumeCheckpoints:
@@ -1182,7 +1192,7 @@ class TestResumeCheckpoints:
             calls.append(1)
             return 200, json.dumps(_payload([_feed_item()]))
 
-        rows = fetch_alphavantage.fetch_news_inventory(
+        rows, _drops = fetch_alphavantage.fetch_news_inventory(
             ticker="AAPL", start=dt.date(2019, 1, 1),
             end=dt.date(2019, 1, 30), http_get=http,
             sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
@@ -1204,13 +1214,13 @@ class TestResumeCheckpoints:
             calls.append(1)
             return 200, json.dumps(_payload([_feed_item()]))
 
-        first = fetch_alphavantage.fetch_news_inventory(
+        first, _drops = fetch_alphavantage.fetch_news_inventory(
             ticker="AAPL", start=dt.date(2019, 1, 1),
             end=dt.date(2019, 1, 30), http_get=http,
             sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
         assert len(calls) == 1
         # second run: checkpoint hit, NO HTTP request at all
-        second = fetch_alphavantage.fetch_news_inventory(
+        second, _drops = fetch_alphavantage.fetch_news_inventory(
             ticker="AAPL", start=dt.date(2019, 1, 1),
             end=dt.date(2019, 1, 30), http_get=http,
             sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
@@ -1222,7 +1232,7 @@ class TestResumeCheckpoints:
         def http(url, headers=None, params=None, timeout=30.0):
             return 200, json.dumps(_payload([_feed_item()]))
 
-        first = fetch_alphavantage.fetch_news_inventory(
+        first, _drops = fetch_alphavantage.fetch_news_inventory(
             ticker="AAPL", start=dt.date(2019, 1, 1),
             end=dt.date(2019, 1, 30), http_get=http,
             sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
@@ -1230,7 +1240,7 @@ class TestResumeCheckpoints:
         def never(url, headers=None, params=None, timeout=30.0):
             raise AssertionError("provider called despite checkpoint")
 
-        second = fetch_alphavantage.fetch_news_inventory(
+        second, _drops = fetch_alphavantage.fetch_news_inventory(
             ticker="AAPL", start=dt.date(2019, 1, 1),
             end=dt.date(2019, 1, 30), http_get=never,
             sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
@@ -1421,7 +1431,7 @@ class TestResumeCheckpoints:
             # HTTP request of this run is RIGHT-B.
             return 200, json.dumps(_payload([]))              # RIGHT-B
 
-        rows = fetch_alphavantage.fetch_news_inventory(
+        rows, _drops = fetch_alphavantage.fetch_news_inventory(
             ticker="AAPL", start=dt.date(2019, 1, 1),
             end=dt.date(2019, 12, 31), http_get=http2,
             sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
@@ -1462,17 +1472,17 @@ class TestResumeCheckpoints:
             return 200, json.dumps(bodies["a"])
 
         # Uninterrupted run over both annual windows (2019 + 2020).
-        reference = fetch_alphavantage.fetch_news_inventory(
+        reference, _drops = fetch_alphavantage.fetch_news_inventory(
             ticker="AAPL", start=dt.date(2019, 1, 1),
             end=dt.date(2020, 12, 31), http_get=http,
             sleep_fn=lambda _s: None)
         # Interrupted run: first year only, with checkpoints.
-        first = fetch_alphavantage.fetch_news_inventory(
+        first, _drops = fetch_alphavantage.fetch_news_inventory(
             ticker="AAPL", start=dt.date(2019, 1, 1),
             end=dt.date(2019, 12, 31), http_get=http,
             sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
         # Resumed run: full span, reusing the 2019 checkpoints.
-        resumed = fetch_alphavantage.fetch_news_inventory(
+        resumed, _drops = fetch_alphavantage.fetch_news_inventory(
             ticker="AAPL", start=dt.date(2019, 1, 1),
             end=dt.date(2020, 12, 31), http_get=http,
             sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
@@ -1527,7 +1537,7 @@ class TestResumeCheckpoints:
 
         # First run: writes a completed leaf checkpoint containing the raw
         # duplicate pair.
-        first = fetch_alphavantage.fetch_news_inventory(
+        first, _drops = fetch_alphavantage.fetch_news_inventory(
             ticker="AAPL", start=dt.date(2019, 1, 1),
             end=dt.date(2019, 1, 31), http_get=http_first,
             sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
@@ -1540,7 +1550,7 @@ class TestResumeCheckpoints:
 
         # Second run: resume from the same checkpoint. The loaded rows must
         # be canonicalized on replay.
-        second = fetch_alphavantage.fetch_news_inventory(
+        second, _drops = fetch_alphavantage.fetch_news_inventory(
             ticker="AAPL", start=dt.date(2019, 1, 1),
             end=dt.date(2019, 1, 31), http_get=http_first,
             sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
@@ -1564,7 +1574,7 @@ class TestResumeCheckpoints:
         def http_first(url, headers=None, params=None, timeout=30.0):
             return 200, json.dumps(_payload([item, item]))
 
-        first = fetch_alphavantage.fetch_news_inventory(
+        first, _drops = fetch_alphavantage.fetch_news_inventory(
             ticker="AAPL", start=dt.date(2019, 1, 1),
             end=dt.date(2019, 1, 31), http_get=http_first,
             sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
@@ -1573,7 +1583,7 @@ class TestResumeCheckpoints:
         assert len(files) == 1
         assert json.loads(files[0].read_text())["complete"] is True
 
-        second = fetch_alphavantage.fetch_news_inventory(
+        second, _drops = fetch_alphavantage.fetch_news_inventory(
             ticker="AAPL", start=dt.date(2019, 1, 1),
             end=dt.date(2019, 1, 31), http_get=http_first,
             sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
@@ -1611,7 +1621,7 @@ class TestResumeCheckpoints:
                                                    # synthetic checkpoint
         # First run writes an empty checkpoint. Then we manually replace it
         # with a synthetic conflicting one via the checkpoint path.
-        first = fetch_alphavantage.fetch_news_inventory(
+        first, _drops = fetch_alphavantage.fetch_news_inventory(
             ticker="AAPL", start=dt.date(2019, 1, 1),
             end=dt.date(2019, 1, 31), http_get=http_first,
             sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
@@ -1687,7 +1697,7 @@ class TestResumeCheckpoints:
         def http_first(url, headers=None, params=None, timeout=30.0):
             return 200, json.dumps(_payload([item_late]))
 
-        first = fetch_alphavantage.fetch_news_inventory(
+        first, _drops = fetch_alphavantage.fetch_news_inventory(
             ticker="AAPL", start=dt.date(2019, 1, 1),
             end=dt.date(2019, 1, 31), http_get=http_first,
             sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
@@ -1696,7 +1706,7 @@ class TestResumeCheckpoints:
         assert len(files) == 1
         assert json.loads(files[0].read_text())["complete"] is True
 
-        second = fetch_alphavantage.fetch_news_inventory(
+        second, _drops = fetch_alphavantage.fetch_news_inventory(
             ticker="AAPL", start=dt.date(2019, 1, 1),
             end=dt.date(2019, 1, 31), http_get=http_first,
             sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
@@ -1719,7 +1729,7 @@ class TestResumeCheckpoints:
                     TestSaturation._saturating_feed(1000))
             return 200, json.dumps(_payload([_feed_item()]))
 
-        rows = fetch_alphavantage.fetch_news_inventory(
+        rows, _drops = fetch_alphavantage.fetch_news_inventory(
             ticker="AAPL", start=dt.date(2019, 1, 1),
             end=dt.date(2019, 12, 31), http_get=http,
             sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
@@ -1732,7 +1742,7 @@ class TestResumeCheckpoints:
         # Resume: both completed checkpoints are replayed with
         # canonicalization (trivial for single-row leaves). No HTTP.
         calls.clear()
-        rows2 = fetch_alphavantage.fetch_news_inventory(
+        rows2, _drops = fetch_alphavantage.fetch_news_inventory(
             ticker="AAPL", start=dt.date(2019, 1, 1),
             end=dt.date(2019, 12, 31), http_get=http,
             sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
@@ -1802,7 +1812,7 @@ class TestResumeCheckpoints:
             "AAPL", _dt.datetime(2019, 1, 1, tzinfo=_dt.timezone.utc),
             _dt.datetime(2019, 1, 30, 23, 59, tzinfo=_dt.timezone.utc))
         (tmp_path / f"{ident}.json").write_text("{not json")
-        rows = fetch_alphavantage.fetch_news_inventory(
+        rows, _drops = fetch_alphavantage.fetch_news_inventory(
             ticker="AAPL", start=dt.date(2019, 1, 1),
             end=dt.date(2019, 1, 30), http_get=http,
             sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
@@ -1901,10 +1911,11 @@ class TestResumeCheckpoints:
             return 200, json.dumps(_payload([_feed_item()]))
 
         def run():
-            return fetch_alphavantage.fetch_news_inventory(
+            rows, _drops = fetch_alphavantage.fetch_news_inventory(
                 ticker="AAPL", start=dt.date(2019, 1, 1),
                 end=dt.date(2019, 1, 30), http_get=http,
                 sleep_fn=lambda _s: None, checkpoint_dir=str(tmp_path))
+            return rows
 
         first = run()
         assert len(calls) == 1
@@ -1943,11 +1954,12 @@ class TestResumeCheckpoints:
 class TestSaturationMarkers:
     @staticmethod
     def _year_fetch(http, tmp_path, sleep_fn=None):
-        return fetch_alphavantage.fetch_news_inventory(
+        rows, _drops = fetch_alphavantage.fetch_news_inventory(
             ticker="AAPL", start=dt.date(2019, 1, 1),
             end=dt.date(2019, 12, 31), http_get=http,
             sleep_fn=sleep_fn or (lambda _s: None),
             checkpoint_dir=str(tmp_path))
+        return rows
 
     YEAR = (_dt.datetime(2019, 1, 1, tzinfo=_dt.timezone.utc),
             _dt.datetime(2019, 12, 31, 23, 59, tzinfo=_dt.timezone.utc))
@@ -2268,7 +2280,7 @@ class TestHermetic:
         assert not hasattr(m, "httpx")
 
     def test_normalize_is_pure_no_transport(self):
-        rows = fetch_alphavantage.normalize_news_payload(
+        rows, _drops = fetch_alphavantage.normalize_news_payload(
             _payload([_feed_item()]), ticker="AAPL",
             fetched_at="2019-02-01T00:00:00+00:00")
         assert len(rows) == 1
@@ -2276,4 +2288,4 @@ class TestHermetic:
 
     def test_normalize_empty_feed_pure(self):
         assert fetch_alphavantage.normalize_news_payload(
-            _payload([]), ticker="AAPL") == []
+            _payload([]), ticker="AAPL") == ([], 0)

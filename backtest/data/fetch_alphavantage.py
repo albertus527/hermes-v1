@@ -146,6 +146,7 @@ from trading_core.news_effects import headline_hash as compute_headline_hash
 from trading_core.news_effects import normalize_headline_text
 
 from backtest.data.ingest_core import (
+    DROP_INVALID_FP4_EMPTY,
     FetchLog,
     FetchRecord,
     IngestionError,
@@ -212,11 +213,21 @@ def _checkpoint_path(ticker: str, a: _dt.datetime, b: _dt.datetime,
 
 
 def _save_checkpoint(path: "Path", *, ticker: str, a: _dt.datetime,
-                     b: _dt.datetime, rows: list[dict]) -> None:
+                     b: _dt.datetime, rows: list[dict],
+                     drops: int = 0) -> None:
     """Atomically persist a COMPLETED (unsaturated, validated, fully
     normalized) leaf checkpoint. ``complete: true`` is written only in
     the same atomic rename as the rows, so a crash mid-write can never
-    produce a readable completed checkpoint."""
+    produce a readable completed checkpoint.
+
+    ``drops`` records the deterministic canonical-exclusion count for
+    DROP_INVALID_FP4_EMPTY observed while normalizing this leaf's raw
+    provider feed (P-NEWS-EMPTY observability). Only the COUNT is
+    persisted — never the dropped raw provider item, whose canonical
+    content does not exist (no row, no hash). The count must survive
+    checkpoint/resume: a later run that replays this leaf re-reports
+    the exclusions represented by the inventory it consumed.
+    """
     from utils import atomic_write_text
     doc = {
         "format": CHECKPOINT_FORMAT,
@@ -225,17 +236,25 @@ def _save_checkpoint(path: "Path", *, ticker: str, a: _dt.datetime,
         "time_from": _instant_stamp(a),
         "time_to": _instant_stamp(b),
         "rows": rows,
+        "drops": {"DROP_INVALID_FP4_EMPTY": int(drops)},
     }
     atomic_write_text(path, json.dumps(doc, sort_keys=True))
 
 
 def _load_checkpoint(path: "Path", *, ticker: str, a: _dt.datetime,
-                     b: _dt.datetime) -> list[dict] | None:
-    """Return the stored canonical rows iff the artifact is a COMPLETE,
-    structurally valid checkpoint for EXACTLY this (contract version,
-    ticker, interval). Anything else — missing, malformed JSON,
-    incomplete, identity mismatch, non-object rows — is ignored
-    (fail-safe refetch), never treated as a completed leaf."""
+                     b: _dt.datetime) -> tuple[list[dict], int] | None:
+    """Return ``(stored canonical rows, DROP_INVALID_FP4_EMPTY count)``
+    iff the artifact is a COMPLETE, structurally valid checkpoint for
+    EXACTLY this (contract version, ticker, interval). Anything else —
+    missing, malformed JSON, incomplete, identity mismatch, non-object
+    rows — is ignored (fail-safe refetch), never treated as a completed
+    leaf.
+
+    Legacy checkpoints written before drop-metadata persistence carry no
+    ``drops`` field; they remain fully readable and replay with a drop
+    count of 0 (the exclusion evidence of a legacy leaf is unknowable
+    without re-querying the provider, which replay must never do).
+    """
     try:
         doc = json.loads(path.read_text())
     except (OSError, ValueError):
@@ -253,7 +272,14 @@ def _load_checkpoint(path: "Path", *, ticker: str, a: _dt.datetime,
         return None
     if not all(isinstance(r, dict) for r in rows):
         return None
-    return rows
+    drops_doc = doc.get("drops")
+    fp4_drops = 0
+    if isinstance(drops_doc, dict):
+        value = drops_doc.get(DROP_INVALID_FP4_EMPTY)
+        if isinstance(value, int) and not isinstance(value, bool) \
+                and value >= 0:
+            fp4_drops = value
+    return rows, fp4_drops
 
 
 def _save_saturation_marker(path: "Path", *, ticker: str,
@@ -472,7 +498,7 @@ def _canonicalize_rows(rows: list[dict]) -> list[dict]:
 
 
 def _rows_from_feed(feed: list, *, ticker: str,
-                    fetched_at: str | None = None) -> list[dict]:
+                    fetched_at: str | None = None) -> tuple[list[dict], int]:
     """Normalize validated feed items into canonical ``news_headlines``
     rows for the requested ticker. Structurally malformed items fail
     closed; well-formed items not associated with the requested ticker
@@ -491,12 +517,19 @@ def _rows_from_feed(feed: list, *, ticker: str,
     - Same identity + different headline_text_normalized: IngestionError
       (content conflict, fail closed).
 
+    P-NEWS-EMPTY (DROP_INVALID_FP4_EMPTY): a structurally valid item whose
+    ``normalize_headline_text(title)`` returns empty is DROPPED — it
+    produces no canonical row, no IngestionError, no invented text from
+    summary/url/etc. The drop is counted deterministically and observable
+    via the enclosing FetchRecord.
+
     This canonicalization is Alpha-Vantage-adapter-local and is applied
     AFTER row construction but BEFORE the rows reach checkpoint persistence
     or the aggregate inventory.
     """
     fetched_at = fetched_at or _now_utc_iso()
     rows: list[dict] = []
+    drops = 0
     for item in feed:
         if not isinstance(item, dict):
             raise IngestionError(
@@ -518,10 +551,11 @@ def _rows_from_feed(feed: list, *, ticker: str,
             continue  # not associated with the requested ticker
         normalized = normalize_headline_text(title)
         if not normalized:
-            raise IngestionError(
-                f"Alpha Vantage feed item title {title!r} normalizes to "
-                f"empty FP-4 text — the canonical headline cannot be "
-                f"empty")
+            # P-NEWS-EMPTY: provider supplied a structurally valid,
+            # non-empty, non-whitespace title, but FP-4 normalization
+            # yields empty text (e.g. punctuation-only). DROP_INVALID_FP4_EMPTY.
+            drops += 1
+            continue
         rows.append({
             "headline_hash": compute_headline_hash(title),
             "source": source.strip(),
@@ -531,11 +565,12 @@ def _rows_from_feed(feed: list, *, ticker: str,
             "headline_text_normalized": normalized,
             "fetched_at": fetched_at,
         })
-    return _canonicalize_rows(rows)
+    return _canonicalize_rows(rows), drops
 
 
 def normalize_news_payload(payload: Any, *, ticker: str,
-                           fetched_at: str | None = None) -> list[dict]:
+                           fetched_at: str | None = None
+                           ) -> tuple[list[dict], int]:
     """Normalize one NEWS_SENTIMENT payload into canonical
     ``news_headlines`` rows for ``ticker`` (shape ready for
     ``IngestStore.upsert_headlines``).
@@ -545,6 +580,11 @@ def normalize_news_payload(payload: Any, *, ticker: str,
     :class:`IngestionError`. A structurally valid ``"feed": []`` stays
     zero rows — no headlines are invented. Articles that do not
     establish association with ``ticker`` produce no row.
+
+    Returns ``(rows, drops)`` where ``drops`` is the count of provider
+    items dropped because FP-4 normalized text was empty
+    (DROP_INVALID_FP4_EMPTY). The invalid items are NOT persisted and do
+    NOT by themselves fail the enclosing sweep.
     """
     return _rows_from_feed(
         _parse_feed(payload), ticker=ticker, fetched_at=fetched_at)
@@ -650,7 +690,7 @@ def fetch_news_inventory(
     fetch_log: FetchLog | None = None,
     sleep_fn: Callable[[float], None] | None = None,
     checkpoint_dir: str | None = None,
-) -> list[dict]:
+) -> tuple[list[dict], int]:
     """Sweep Alpha Vantage NEWS_SENTIMENT for one ticker over
     [start, end] using ANNUAL-FIRST ADAPTIVE SUBDIVISION
     (implementation behavior only; the canonical specification
@@ -741,7 +781,7 @@ def fetch_news_inventory(
         return _parse_feed(payload)
 
     def fetch_interval(a: _dt.datetime, b: _dt.datetime,
-                       first: bool) -> list[dict]:
+                       first: bool) -> tuple[list[dict], int]:
         ckpt_path = (_checkpoint_path(ticker, a, b, ckpt_dir)
                      if ckpt_dir is not None else None)
         # 1) Saturation-marker HIT: not an HTTP request — deterministically
@@ -749,8 +789,9 @@ def fetch_news_inventory(
         if ckpt_path is not None and _load_saturation_marker(
                 ckpt_path, ticker=ticker, a=a, b=b):
             left, right = _split_interval(a, b)
-            return (fetch_interval(a, left, False) +
-                    fetch_interval(right, b, False))
+            rows_l, drops_l = fetch_interval(a, left, False)
+            rows_r, drops_r = fetch_interval(right, b, False)
+            return rows_l + rows_r, drops_l + drops_r
         # 2) Completed-leaf HIT: restore the validated, normalized rows
         #    without touching the provider (and without pacing — a
         #    checkpoint read is not an HTTP request).
@@ -763,25 +804,45 @@ def fetch_news_inventory(
                 # headline_hash/source/ticker with different published_at).
                 # Apply the SAME adapter-local canonicalization as the live
                 # fetch path so resume semantics are consistent.
-                return _canonicalize_rows(list(cached))
+                # CHECKPOINT REPLAY SEMANTICS (drop accounting): the stored
+                # DROP_INVALID_FP4_EMPTY count is the deterministic count of
+                # provider items EXCLUDED from the canonical rows this leaf
+                # contributed. Replaying the checkpoint re-reports that count
+                # — drop counts describe canonical exclusions represented by
+                # the inventory consumed by this run, not merely exclusions
+                # observed during HTTP calls made by this process — so the
+                # exclusion evidence survives a resume even when the original
+                # run died before persisting its fetch report. The count was
+                # recorded once during the live fetch and is replayed
+                # verbatim (never recounted — the provider is not re-queried;
+                # legacy pre-drop-metadata checkpoints replay with 0).
+                cached_rows, cached_drops = cached
+                rows = _canonicalize_rows(list(cached_rows))
+                # Fold the restored exclusion count into this run's drop
+                # accounting (a replay emits no FetchRecord — one record
+                # per HTTP request is the run invariant).
+                if cached_drops and fetch_log is not None:
+                    fetch_log.add_replay_drops(cached_drops)
+                return rows, cached_drops
         # 3) MISS: the normal sequential paced request path.
         if not first:
             sleeper(NEWS_PACING_SECONDS)
         feed = request_window(a, b)
+        # 4) SATURATED parent: not complete, rows discarded (never stored as
+        #    canonical inventory). Persist the saturation marker BEFORE
+        #    recursing so a later quota-interrupted run can skip this
+        #    node entirely, then deterministically subdivide (recursion
+        #    depth is bounded; below the minimum minute granularity the
+        #    split itself raises WindowSaturatedError — fail closed,
+        #    nothing persisted as complete for this node).
         if len(feed) >= NEWS_WINDOW_LIMIT:
-            # SATURATED: not complete, rows discarded (never stored as
-            # canonical inventory). Persist the saturation marker BEFORE
-            # recursing so a later quota-interrupted run can skip this
-            # node entirely, then deterministically subdivide (recursion
-            # depth is bounded; below the minimum minute granularity the
-            # split itself raises WindowSaturatedError — fail closed,
-            # nothing persisted as complete for this node).
             if ckpt_path is not None:
                 _save_saturation_marker(ckpt_path, ticker=ticker, a=a, b=b)
             left, right = _split_interval(a, b)
-            return (fetch_interval(a, left, False) +
-                    fetch_interval(right, b, False))
-        window_rows = _rows_from_feed(
+            rows_l, drops_l = fetch_interval(a, left, False)
+            rows_r, drops_r = fetch_interval(right, b, False)
+            return rows_l + rows_r, drops_l + drops_r
+        window_rows, window_drops = _rows_from_feed(
             feed, ticker=ticker, fetched_at=fetched_at)
         # UNSATURATED leaf completed: request succeeded, payload
         # validated, association/normalization done, rows in hand —
@@ -791,22 +852,29 @@ def fetch_news_inventory(
             ckpt_dir_path.mkdir(parents=True, exist_ok=True)
             _save_checkpoint(
                 _checkpoint_path(ticker, a, b, ckpt_dir_path),
-                ticker=ticker, a=a, b=b, rows=window_rows)
+                ticker=ticker, a=a, b=b, rows=window_rows,
+                drops=window_drops)
         # FetchRecord params deliberately exclude the credential.
+        # Saturation is determined from the RAW provider feed count
+        # (len(feed)) BEFORE invalid-row dropping/canonicalization, so
+        # FP-4-empty drops never change the saturated/unsaturated verdict.
         log.add(FetchRecord(
             provider="alphavantage", endpoint="NEWS_SENTIMENT",
             params={"tickers": ticker,
                     "time_from": _instant_stamp(a),
                     "time_to": _instant_stamp(b),
                     "limit": str(NEWS_WINDOW_LIMIT)},
-            fetched_at=fetched_at, items=len(feed)))
-        return window_rows
+            fetched_at=fetched_at, items=len(feed), drops=window_drops))
+        return window_rows, window_drops
 
     all_rows: list[dict] = []
+    total_drops = 0
     for i, window in enumerate(_annual_windows(start, end)):
         a, b = _window_to_datetimes(window)
-        all_rows.extend(fetch_interval(a, b, first=(i == 0)))
-    return all_rows
+        rows_i, drops_i = fetch_interval(a, b, first=(i == 0))
+        all_rows.extend(rows_i)
+        total_drops += drops_i
+    return all_rows, total_drops
 
 
 def _date_to_utc_midnight(d: _dt.date) -> str:
