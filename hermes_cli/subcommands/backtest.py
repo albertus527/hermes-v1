@@ -62,6 +62,36 @@ def build_backtest_parser(subparsers, *, cmd_backtest: Callable) -> None:
                              help="path to the labeled-headlines JSON set")
     p_calibrate.set_defaults(backtest_handler="calibrate-news")
 
+    p_worksheet = subs.add_parser(
+        "generate-calibration-worksheet",
+        help="R2.8.1: deterministic calibration-sample selection + "
+             "human-label worksheet (pure local reads; NO fetch, NO LLM). "
+             "PREVIEW by default; --final requires verified NEWS coverage "
+             "of the full window")
+    p_worksheet.add_argument("--tickers", required=True,
+                             help="comma-separated tickers")
+    p_worksheet.add_argument("--start", required=True,
+                             help="YYYY-MM-DD or ISO timestamp (inclusive)")
+    p_worksheet.add_argument("--end", required=True,
+                             help="YYYY-MM-DD or ISO timestamp (inclusive)")
+    p_worksheet.add_argument("--size", type=int, required=True,
+                             help="exact requested sample size")
+    p_worksheet.add_argument("--seed", required=True,
+                             help="deterministic selection seed")
+    p_worksheet.add_argument("--strata", default="ticker,year",
+                             help="comma-separated strata fields among "
+                                  "ticker,year,source")
+    p_worksheet.add_argument("--manifest-version", default="",
+                             help="run-pinned NEWS coverage manifest_version "
+                                  "(required for --final)")
+    p_worksheet.add_argument("--final", action="store_true",
+                             help="produce a FINAL / COVERAGE-VERIFIED "
+                                  "worksheet (fails closed without verified "
+                                  "full-window coverage)")
+    p_worksheet.add_argument("--output-csv", required=True,
+                             help="output worksheet CSV path")
+    p_worksheet.set_defaults(backtest_handler="generate-calibration-worksheet")
+
     # -- Phase-0 data-ingestion jobs (§20 Phase 0) -------------------------
 
     p_bars = subs.add_parser(

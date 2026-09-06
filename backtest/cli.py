@@ -294,6 +294,84 @@ def cmd_calibrate_news(args) -> int:
     return 0
 
 
+def cmd_generate_calibration_worksheet(args) -> int:
+    """R2.8.1 Phase-2 — deterministic calibration-sample selection +
+    human-label worksheet. Pure local reads over persisted canonical
+    news_headlines; NO fetch, NO LLM, NO classification.
+
+    Default mode is PREVIEW (unmistakably NON-FINAL, allowed against a
+    partial corpus). FINAL requires --final, which enforces the existing
+    coverage-manifest semantics (verified NEWS covered spans attesting
+    the full requested window per ticker) and refuses otherwise.
+    """
+    from backtest.news.calibration_sampler import (
+        CalibrationSamplingError,
+        CoverageIncompleteError,
+        SampleConfig,
+        select_sample,
+        verify_corpus_coverage,
+        write_worksheet,
+    )
+    db_path = _backtest_db_path()
+    if not db_path.exists():
+        print(f"No backtest store at {db_path} — run `hermes backtest init` "
+              "first.")
+        return 2
+    tickers = tuple(t.strip().upper() for t in args.tickers.split(",")
+                    if t.strip())
+    try:
+        config = SampleConfig(
+            tickers=tickers,
+            start=args.start,
+            end=args.end,
+            size=args.size,
+            seed=args.seed,
+            strata=tuple(s.strip() for s in args.strata.split(",") if s.strip()),
+            manifest_version=getattr(args, "manifest_version", "") or "",
+        )
+    except CalibrationSamplingError as exc:
+        print(f"BLOCKED: invalid sampler configuration: {exc}")
+        return 3
+    import sqlite3 as _sq
+    conn = _sq.connect(str(db_path))
+    conn.row_factory = None
+    try:
+        try:
+            sample, metadata = select_sample(conn, config)
+        except CalibrationSamplingError as exc:
+            print(f"BLOCKED: sampling contract not satisfiable: {exc}")
+            return 4
+        mode = "FINAL" if getattr(args, "final", False) else "PREVIEW"
+        coverage_evidence = None
+        if mode == "FINAL":
+            try:
+                coverage_evidence = verify_corpus_coverage(conn, config)
+            except CoverageIncompleteError as exc:
+                print(f"BLOCKED: FINAL generation refused — {exc}")
+                print("  A PREVIEW worksheet can still be produced "
+                      "(non-final, incomplete corpus).")
+                return 5
+        metadata["corpus_coverage_evidence"] = coverage_evidence
+        out_csv = Path(args.output_csv)
+        out_meta = Path(args.output_csv).with_suffix(".meta.json")
+        write_worksheet(
+            sample, metadata, out_csv, out_meta, mode=mode,
+            generated_at=_now_iso(),
+        )
+        label = ("FINAL / COVERAGE-VERIFIED" if mode == "FINAL"
+                 else "PREVIEW / NON-FINAL")
+        print(f"Calibration worksheet ({label}) written: {out_csv}")
+        print(f"Metadata written: {out_meta}")
+        print(f"  rows: {len(sample)}  digest: {metadata['sample_digest']}")
+        if mode == "PREVIEW":
+            print("  WARNING: PREVIEW output is NON-FINAL and may come from "
+                  "an incomplete corpus; it must never be treated as the "
+                  "final R2.8.1 calibration dataset.")
+        return 0
+    finally:
+        conn.close()
+
+
 def _now_iso() -> str:
     import datetime as _dt
     return _dt.datetime.now(_dt.timezone.utc).isoformat()

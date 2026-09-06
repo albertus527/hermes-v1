@@ -5597,6 +5597,8 @@ def cmd_backtest(args):
         return _backtest_cli.cmd_news_cache_report(args)
     if handler == "calibrate-news":
         return _backtest_cli.cmd_calibrate_news(args)
+    if handler == "generate-calibration-worksheet":
+        return _backtest_cli.cmd_generate_calibration_worksheet(args)
     if handler == "fetch-alpaca-bars":
         return _backtest_cli.cmd_fetch_alpaca_bars(args)
     if handler == "fetch-corp-actions":
@@ -5614,7 +5616,8 @@ def cmd_backtest(args):
     print("usage: hermes backtest <init|fee-smoke|fetch-alpaca-bars|"
           "fetch-corp-actions|fetch-finnhub-news|fetch-finnhub-earnings|"
           "fetch-eodhd-earnings|fetch-alphavantage-news|fetch-fred-vix|"
-          "populate-news-cache|news-cache-report|calibrate-news>")
+          "populate-news-cache|news-cache-report|calibrate-news|"
+          "generate-calibration-worksheet>")
     return 2
 
 
