@@ -1031,6 +1031,55 @@ class TestVerifiedSpanSkip:
         assert manifest_rows(store_db) == manifests_before
         assert "already verified" in capsys.readouterr().out
 
+    def test_skip_path_executes_without_nameerror(
+            self, av_creds, store_db, inject_transport, capsys):
+        # Regression: production hit
+        # NameError: name '_date_to_utc_end_of_day' is not defined when the
+        # verified-span skip ran. The date-bound helpers must resolve from
+        # the consolidated import in cmd_fetch_alphavantage_news — the skip
+        # path must execute end-to-end without NameError (any second
+        # un-imported reference would fail right here).
+        _insert_verified_manifest(store_db, "AAPL",
+                                  "2019-01-01T00:00:00+00:00",
+                                  "2025-12-31T23:59:59+00:00")
+        inject_transport(fake_transport(
+            {"alphavantage.co": [(403, "{}")]}))
+        rc = run_job(["backtest", "fetch-alphavantage-news",
+                      "--tickers", "AAPL",
+                      "--start", "2019-01-01", "--end", "2025-12-31"])
+        assert rc == 0
+        assert "already verified" in capsys.readouterr().out
+
+    def test_date_bound_helpers_match_existing_utc_convention(self):
+        # The skip must use the EXISTING canonical date-bound convention —
+        # inclusive YYYY-MM-DD end → 23:59:59 UTC, start → midnight UTC —
+        # identical to the Finnhub/EODHD NEWS bound convention and to the
+        # bounds news_manifest_rows writes (test_requested_span_bounds).
+        from backtest.data.fetch_alphavantage import (
+            _date_to_utc_midnight, _date_to_utc_end_of_day)
+        assert _date_to_utc_midnight(dt.date(2019, 1, 1)) == \
+            "2019-01-01T00:00:00+00:00"
+        assert _date_to_utc_end_of_day(dt.date(2025, 12, 31)) == \
+            "2025-12-31T23:59:59+00:00"
+
+    def test_skip_uses_canonical_bounds_for_full_span_resolution(
+            self, av_creds, store_db, inject_transport, capsys):
+        # End-to-end bound resolution: a verified manifest row seeded at
+        # the EXACT canonical bounds produced from start=2019-01-01 /
+        # end=2025-12-31 must skip — proving the skip resolves
+        # midnight-UTC start and inclusive 23:59:59-UTC end via the
+        # canonical helpers (not some ad-hoc bound convention).
+        _insert_verified_manifest(store_db, "AAPL",
+                                  "2019-01-01T00:00:00+00:00",
+                                  "2025-12-31T23:59:59+00:00")
+        inject_transport(fake_transport(
+            {"alphavantage.co": [(403, "{}")]}))
+        rc = run_job(["backtest", "fetch-alphavantage-news",
+                      "--tickers", "AAPL",
+                      "--start", "2019-01-01", "--end", "2025-12-31"])
+        assert rc == 0
+        assert "already verified" in capsys.readouterr().out
+
 
 # ---------------------------------------------------------------------------
 # Finnhub news job remains unchanged

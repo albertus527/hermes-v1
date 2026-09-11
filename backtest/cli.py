@@ -797,7 +797,7 @@ def cmd_fetch_alphavantage_news(args) -> int:
     def run() -> int:
         from backtest.data.fetch_alphavantage import (
             fetch_news_inventory, news_manifest_rows,
-        )
+            _date_to_utc_midnight, _date_to_utc_end_of_day)
         from backtest.data.ingest_core import FetchLog
         store = _open_ingest_store(getattr(args, "run_id", "") or
                                    "fetch-alphavantage-news")
@@ -819,8 +819,6 @@ def cmd_fetch_alphavantage_news(args) -> int:
         from backtest.data.fetch_alphavantage import _checkpoint_dir
         checkpoint_dir = (getattr(args, "checkpoint_dir", "") or
                           str(_checkpoint_dir()))
-        from backtest.data.fetch_alphavantage import (
-            _date_to_utc_midnight, _date_to_utc_end_of_day)
         # VERIFIED-SPAN SKIP (§3.8 publication unit = coverage evidence):
         # a ticker whose requested span is ALREADY attested by a verified
         # coverage_manifests row under the requested manifest version is
