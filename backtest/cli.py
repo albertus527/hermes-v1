@@ -819,7 +819,27 @@ def cmd_fetch_alphavantage_news(args) -> int:
         from backtest.data.fetch_alphavantage import _checkpoint_dir
         checkpoint_dir = (getattr(args, "checkpoint_dir", "") or
                           str(_checkpoint_dir()))
+        from backtest.data.fetch_alphavantage import (
+            _date_to_utc_midnight, _date_to_utc_end_of_day)
+        # VERIFIED-SPAN SKIP (§3.8 publication unit = coverage evidence):
+        # a ticker whose requested span is ALREADY attested by a verified
+        # coverage_manifests row under the requested manifest version is
+        # skipped BEFORE any fetch or resume work — zero provider
+        # requests, zero checkpoint replay, zero republication. Skip is
+        # granted by the MANIFEST ROW ONLY — never by checkpoint
+        # existence, never by news_headlines row presence, never by
+        # narrower/partial coverage (the row must cover the full
+        # requested bounds).
+        from backtest.av_progress import has_verified_news_cover
         for ticker in tickers:
+            if has_verified_news_cover(
+                    store._conn, ticker=ticker,
+                    span_start=_date_to_utc_midnight(start),
+                    span_end=_date_to_utc_end_of_day(end),
+                    manifest_version=manifest_version):
+                print(f"  {ticker}: already verified for requested NEWS "
+                      "span, skipped")
+                continue
             rows, _drops = fetch_news_inventory(ticker=ticker, start=start, end=end,
                                                 fetch_log=log,
                                                 checkpoint_dir=checkpoint_dir)

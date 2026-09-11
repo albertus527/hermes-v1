@@ -804,6 +804,235 @@ class TestIsolation:
 
 
 # ---------------------------------------------------------------------------
+# verified-span skip (PART A): manifest-only skip, zero provider requests
+# ---------------------------------------------------------------------------
+
+def _insert_verified_manifest(db_path, ticker, span_start, span_end,
+                              manifest_version="alphavantage-news-1",
+                              verified=1):
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO coverage_manifests (source_kind, ticker, "
+            "span_start, span_end, verified, manifest_version, run_id, "
+            "config_version, code_commit) "
+            "VALUES ('NEWS', ?, ?, ?, ?, ?, 'seed', 'v', 'c')",
+            (ticker, span_start, span_end, verified, manifest_version))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+SPAN_START = "2019-01-01T00:00:00+00:00"
+SPAN_END = "2019-01-31T23:59:59+00:00"
+
+
+class TestVerifiedSpanSkip:
+    def test_verified_ticker_skipped_zero_provider_requests(
+            self, av_creds, store_db, inject_transport, capsys):
+        _insert_verified_manifest(store_db, "AAPL", SPAN_START, SPAN_END)
+        calls = []
+
+        def http(*a, **kw):
+            calls.append(1)
+            return 403, "{}"
+
+        inject_transport(http)
+        rc = run_job(["backtest", "fetch-alphavantage-news",
+                      "--tickers", "AAPL",
+                      "--start", START, "--end", END])
+        assert rc == 0
+        assert calls == []            # ZERO provider requests
+        out = capsys.readouterr().out
+        assert "AAPL: already verified for requested NEWS span, skipped" in out
+
+    def test_narrower_verified_span_does_not_skip(
+            self, av_creds, store_db, inject_transport, capsys):
+        # Verified coverage of only a SUBSPAN must not skip the wider
+        # requested span — the row must cover the full bounds.
+        _insert_verified_manifest(store_db, "AAPL",
+                                  "2019-01-01T00:00:00+00:00",
+                                  "2019-01-15T23:59:59+00:00")
+        inject_transport(fake_transport(
+            {"alphavantage.co": [(200, good_body())]}))
+        rc = run_job(["backtest", "fetch-alphavantage-news",
+                      "--tickers", "AAPL",
+                      "--start", START, "--end", END])
+        assert rc == 0
+        assert "already verified" not in capsys.readouterr().out
+        assert len(manifest_rows(store_db)) == 2  # narrow seed + full span
+
+    def test_wider_verified_span_does_skip(
+            self, av_creds, store_db, inject_transport, capsys):
+        # A superset row legitimately covers the requested span.
+        _insert_verified_manifest(store_db, "AAPL",
+                                  "2018-12-01T00:00:00+00:00",
+                                  "2019-02-28T23:59:59+00:00")
+        inject_transport(fake_transport(
+            {"alphavantage.co": [(200, good_body())]}))
+        rc = run_job(["backtest", "fetch-alphavantage-news",
+                      "--tickers", "AAPL",
+                      "--start", START, "--end", END])
+        assert rc == 0
+        assert "already verified" in capsys.readouterr().out
+
+    def test_wrong_manifest_version_does_not_skip(
+            self, av_creds, store_db, inject_transport, capsys):
+        _insert_verified_manifest(store_db, "AAPL", SPAN_START, SPAN_END,
+                                  manifest_version="alphavantage-news-2")
+        inject_transport(fake_transport(
+            {"alphavantage.co": [(200, good_body())]}))
+        rc = run_job(["backtest", "fetch-alphavantage-news",
+                      "--tickers", "AAPL",
+                      "--start", START, "--end", END])
+        assert rc == 0
+        assert "already verified" not in capsys.readouterr().out
+
+    def test_unverified_manifest_does_not_skip(
+            self, av_creds, store_db, inject_transport, capsys):
+        # A covering row that is NOT verified grants no skip. Seeded
+        # under a distinct manifest version because the strict
+        # write_manifest semantics (unchanged) refuse rewriting an
+        # identical key from verified=False to True — which is itself
+        # the fail-closed guarantee that unverified attestation never
+        # silently becomes verified.
+        _insert_verified_manifest(store_db, "AAPL", SPAN_START, SPAN_END,
+                                  manifest_version="alphavantage-news-0",
+                                  verified=0)
+        inject_transport(fake_transport(
+            {"alphavantage.co": [(200, good_body())]}))
+        rc = run_job(["backtest", "fetch-alphavantage-news",
+                      "--tickers", "AAPL",
+                      "--start", START, "--end", END,
+                      "--manifest-version", "alphavantage-news-1"])
+        assert rc == 0
+        assert "already verified" not in capsys.readouterr().out
+
+    def test_non_news_source_kind_does_not_skip(
+            self, av_creds, store_db, inject_transport, capsys):
+        conn = sqlite3.connect(store_db)
+        try:
+            conn.execute(
+                "INSERT INTO coverage_manifests (source_kind, ticker, "
+                "span_start, span_end, verified, manifest_version, run_id, "
+                "config_version, code_commit) "
+                "VALUES ('EARNINGS', 'AAPL', ?, ?, 1, "
+                "'alphavantage-news-1', 'seed', 'v', 'c')",
+                (SPAN_START, SPAN_END))
+            conn.commit()
+        finally:
+            conn.close()
+        inject_transport(fake_transport(
+            {"alphavantage.co": [(200, good_body())]}))
+        rc = run_job(["backtest", "fetch-alphavantage-news",
+                      "--tickers", "AAPL",
+                      "--start", START, "--end", END])
+        assert rc == 0
+        assert "already verified" not in capsys.readouterr().out
+
+    def test_checkpoint_only_state_does_not_skip(
+            self, av_creds, store_db, inject_transport, tmp_path, capsys):
+        # Checkpoints exist but NO verified manifest row: must NOT skip.
+        ckpt = tmp_path / "av-resume-skip-test"
+        ckpt.mkdir()
+        # Seed a syntactically valid completed-leaf checkpoint over the
+        # full requested window (checkpoint content is validated by the
+        # loader; here it only needs to EXIST to prove checkpoints are
+        # never sufficient for the skip).
+        from backtest.data.fetch_alphavantage import (
+            _checkpoint_path, _save_checkpoint, _window_to_datetimes,
+        )
+        a = dt.datetime(2019, 1, 1, 0, 0, tzinfo=dt.timezone.utc)
+        b = dt.datetime(2019, 1, 31, 23, 59, tzinfo=dt.timezone.utc)
+        _save_checkpoint(_checkpoint_path("AAPL", a, b, ckpt),
+                         ticker="AAPL", a=a, b=b, rows=[], drops=0)
+        inject_transport(fake_transport(
+            {"alphavantage.co": [(200, good_body())]}))
+        rc = run_job(["backtest", "fetch-alphavantage-news",
+                      "--tickers", "AAPL",
+                      "--start", START, "--end", END,
+                      "--checkpoint-dir", str(ckpt)])
+        assert rc == 0
+        assert "already verified" not in capsys.readouterr().out
+        assert len(manifest_rows(store_db)) == 1
+
+    def test_headlines_without_verified_manifest_do_not_skip(
+            self, av_creds, store_db, inject_transport, capsys):
+        # news_headlines presence (from another publication unit) is
+        # NEVER coverage evidence — the manifest row is the only gate.
+        conn = sqlite3.connect(store_db)
+        try:
+            conn.execute(
+                "INSERT INTO news_headlines (headline_hash, source, ticker,"
+                " published_at, headline_text_normalized, fetched_at,"
+                " run_id, config_version, code_commit)"
+                " VALUES ('h1', 'S', 'AAPL', '2019-01-02T15:30:00+00:00',"
+                " 'text', '2026-01-01T00:00:00+00:00', 'seed', 'v', 'c')")
+            conn.commit()
+        finally:
+            conn.close()
+        inject_transport(fake_transport(
+            {"alphavantage.co": [(200, good_body())]}))
+        rc = run_job(["backtest", "fetch-alphavantage-news",
+                      "--tickers", "AAPL",
+                      "--start", START, "--end", END])
+        assert rc == 0
+        assert "already verified" not in capsys.readouterr().out
+
+    def test_multi_ticker_skips_completed_and_processes_next(
+            self, av_creds, store_db, inject_transport, capsys):
+        # AAPL fully verified; MSFT not — MSFT must be processed
+        # immediately (skip is per-ticker, not per-batch).
+        _insert_verified_manifest(store_db, "AAPL", SPAN_START, SPAN_END)
+        inject_transport(fake_transport(
+            {"alphavantage.co": [(200, good_body(
+                "MSFT", "Microsoft rises on synthetic cloud numbers"))]}))
+        rc = run_job(["backtest", "fetch-alphavantage-news",
+                      "--tickers", "AAPL,MSFT",
+                      "--start", START, "--end", END])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "AAPL: already verified for requested NEWS span, skipped" in out
+        assert "MSFT: 2 headlines ingested" in out
+        assert len(headline_rows(store_db, "MSFT")) == 2
+        assert len(headline_rows(store_db, "AAPL")) == 0  # no replay publish
+        versions = manifest_rows(store_db)
+        assert len(versions) == 2  # AAPL seed + MSFT new
+
+    def test_verified_ticker_replay_path_avoided_idempotent_repub(
+            self, av_creds, store_db, inject_transport, tmp_path, capsys):
+        # A full successful run followed by a rerun: the second run must
+        # take the skip path (no HTTP, no replay, no publication), and
+        # DB state must be unchanged.
+        ckpt = tmp_path / "av-resume-idem-test"
+        inject_transport(fake_transport(
+            {"alphavantage.co": [(200, good_body())]}))
+        rc = run_job(["backtest", "fetch-alphavantage-news",
+                      "--tickers", "AAPL",
+                      "--start", START, "--end", END,
+                      "--checkpoint-dir", str(ckpt)])
+        assert rc == 0
+        headlines_before = headline_rows(store_db, "AAPL")
+        manifests_before = manifest_rows(store_db)
+        calls = []
+
+        def http(*a, **kw):
+            calls.append(1)
+            return 403, "{}"
+
+        inject_transport(http)
+        rc = run_job(["backtest", "fetch-alphavantage-news",
+                      "--tickers", "AAPL",
+                      "--start", START, "--end", END,
+                      "--checkpoint-dir", str(ckpt)])
+        assert rc == 0
+        assert calls == []  # skip happened before any provider/checkpoint work
+        assert headline_rows(store_db, "AAPL") == headlines_before
+        assert manifest_rows(store_db) == manifests_before
+        assert "already verified" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
 # Finnhub news job remains unchanged
 # ---------------------------------------------------------------------------
 
