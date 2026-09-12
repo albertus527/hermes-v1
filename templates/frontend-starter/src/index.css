@@ -1,0 +1,117 @@
+@import 'tailwindcss';
+
+/*
+ * Minimal global baseline for generated marketing / informational websites.
+ * Tailwind's Preflight already handles the bulk of the reset (margins, box
+ * sizing, border reset, default font stack). Everything below is the small
+ * amount of project-level baseline that Preflight intentionally leaves alone.
+ *
+ * Keep this file small. Design decisions belong in the generated project's
+ * own copy, not in the platform-owned starter.
+ */
+
+@theme {
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif, 'Apple Color Emoji',
+    'Segoe UI Emoji';
+}
+
+@layer base {
+  :root {
+    /* Neutral, overridable surface tokens. Generated projects replace these. */
+    --color-surface: #ffffff;
+    --color-ink: #18181b;
+    --color-muted: #52525b;
+    --color-hairline: #e4e4e7;
+
+    color-scheme: light dark;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --color-surface: #09090b;
+      --color-ink: #fafafa;
+      --color-muted: #a1a1aa;
+      --color-hairline: #27272a;
+    }
+  }
+
+  html {
+    /* Anchor links and in-page navigation should not jump under a sticky header. */
+    scroll-behavior: smooth;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    html {
+      scroll-behavior: auto;
+    }
+
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+
+  body {
+    background-color: var(--color-surface);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    line-height: 1.6;
+    min-height: 100vh;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Headings inherit a tighter measure; sizes come from the page itself. */
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    line-height: 1.2;
+    text-wrap: balance;
+  }
+
+  p {
+    text-wrap: pretty;
+  }
+
+  /* Responsive media baseline: never overflow the viewport. */
+  img,
+  picture,
+  video,
+  canvas,
+  svg {
+    display: block;
+    max-width: 100%;
+    height: auto;
+  }
+
+  /* Visible focus for keyboard users — required by the R1 QA gate. */
+  :focus-visible {
+    outline: 2px solid currentColor;
+    outline-offset: 2px;
+  }
+
+  /* Skip-link pattern: hidden until focused. */
+  .skip-link {
+    position: absolute;
+    left: -9999px;
+    top: 0;
+  }
+
+  .skip-link:focus {
+    left: 0.5rem;
+    top: 0.5rem;
+    z-index: 50;
+    padding: 0.5rem 0.75rem;
+    background-color: var(--color-surface);
+    border: 1px solid var(--color-hairline);
+    border-radius: 0.375rem;
+  }
+}

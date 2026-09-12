@@ -1,0 +1,17 @@
+# Build + install artifacts. package-lock.json is intentionally NOT ignored:
+# reproducible `npm ci` installs are part of the fixed R1 frontend runtime.
+node_modules
+dist
+dist-ssr
+*.local
+*.tsbuildinfo
+
+# Editor / OS noise
+.DS_Store
+.vscode/
+.idea/
+
+# Generated projects may add their own env files; never commit secrets.
+.env
+.env.*
+!.env.example
