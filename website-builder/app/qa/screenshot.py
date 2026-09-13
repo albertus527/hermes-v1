@@ -9,6 +9,8 @@ added to this project.
 
 from __future__ import annotations
 
+import os
+import shlex
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -32,6 +34,11 @@ def _default_capture_fn(url: str, width: int, height: int, out_path: Path) -> bo
 
     Returns False (never raises) on any failure — the caller decides how to
     treat a missing/failed capture as a deterministic QA finding.
+
+    Optional env-controlled browser-args seam: when ``AGENT_BROWSER_ARGS``
+    is set (e.g. ``--no-sandbox`` on sandbox-less VPS hosts), its value is
+    passed through to ``agent-browser``'s existing ``--args`` launch option.
+    Unset or empty preserves the original argv exactly.
     """
     browser_cmd = shutil.which("agent-browser")
     if not browser_cmd:
@@ -40,16 +47,21 @@ def _default_capture_fn(url: str, width: int, height: int, out_path: Path) -> bo
     out_path.parent.mkdir(parents=True, exist_ok=True)
     session_name = f"qa-{width}x{height}-{abs(hash((url, width, height))) % 100000}"
 
+    open_argv = [
+        browser_cmd,
+        "--session", session_name,
+        "--json",
+        "open", url,
+        "--width", str(width),
+        "--height", str(height),
+    ]
+    browser_args = os.environ.get("AGENT_BROWSER_ARGS", "").strip()
+    if browser_args:
+        open_argv.extend(["--args", " ".join(shlex.split(browser_args))])
+
     try:
         subprocess.run(
-            [
-                browser_cmd,
-                "--session", session_name,
-                "--json",
-                "open", url,
-                "--width", str(width),
-                "--height", str(height),
-            ],
+            open_argv,
             capture_output=True,
             text=True,
             timeout=30,

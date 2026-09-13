@@ -411,6 +411,115 @@ class TestRepairPromptNoFabrication(_FixtureBase):
         self.assertIn("Do NOT redesign unrelated areas", instructions)
 
 
+class TestAgentBrowserArgsEnv(unittest.TestCase):
+    """Regression: AGENT_BROWSER_ARGS env seam for VPS sandbox-less hosts.
+
+    Covers the Phase 8 runtime compatibility issue where ``agent-browser``
+    fails with "No usable sandbox!" unless launched with e.g. ``--no-sandbox``.
+    The seam must be opt-in only: unset/empty env preserves the original argv.
+    """
+
+    def _run_capture(self, env_value, tmpdir):
+        """Invoke _default_capture_fn with a mocked subprocess + which, return recorded argv lists."""
+        import app.qa.screenshot as screenshot_mod
+
+        out_path = Path(tmpdir) / "shot.png"
+        run_calls = []
+
+        def _fake_run(argv, **kwargs):
+            run_calls.append(list(argv))
+            # Simulate a successful screenshot on the screenshot call.
+            if "screenshot" in argv:
+                out_path.write_bytes(b"fake-png")
+                return MagicMock(returncode=0)
+            return MagicMock(returncode=0)
+
+        env = {}
+        if env_value is not None:
+            env["AGENT_BROWSER_ARGS"] = env_value
+
+        with patch.object(screenshot_mod.shutil, "which", return_value="/usr/bin/agent-browser"), \
+             patch.object(screenshot_mod.subprocess, "run", side_effect=_fake_run), \
+             patch.dict("os.environ", env, clear=False):
+            # Ensure unset case truly removes the var even if the host has it.
+            if env_value is None:
+                import os
+                os.environ.pop("AGENT_BROWSER_ARGS", None)
+            result = screenshot_mod._default_capture_fn(
+                "https://example.com", 1440, 900, out_path
+            )
+
+        return result, run_calls
+
+    def test_env_unset_emits_no_args_flag(self):
+        """A. env unset -> no --args emitted anywhere in the flow."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ok, calls = self._run_capture(None, tmpdir)
+        self.assertTrue(ok)
+        self.assertEqual(len(calls), 3)  # open, screenshot, close
+        for argv in calls:
+            self.assertNotIn("--args", argv)
+
+    def test_env_empty_emits_no_args_flag(self):
+        """A2. env set but empty/whitespace -> treated as unset."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ok, calls = self._run_capture("   ", tmpdir)
+        self.assertTrue(ok)
+        for argv in calls:
+            self.assertNotIn("--args", argv)
+
+    def test_env_single_arg_passed_through(self):
+        """B. AGENT_BROWSER_ARGS='--no-sandbox' -> open argv contains --args '--no-sandbox'."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ok, calls = self._run_capture("--no-sandbox", tmpdir)
+        self.assertTrue(ok)
+        open_argv = calls[0]
+        self.assertIn("open", open_argv)
+        self.assertIn("--args", open_argv)
+        idx = open_argv.index("--args")
+        self.assertEqual(open_argv[idx + 1], "--no-sandbox")
+
+    def test_env_multiple_args_remain_intact(self):
+        """C. Multiple args stay intact as a single --args payload."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ok, calls = self._run_capture(
+                "--no-sandbox --disable-dev-shm-usage", tmpdir
+            )
+        self.assertTrue(ok)
+        open_argv = calls[0]
+        idx = open_argv.index("--args")
+        self.assertEqual(
+            open_argv[idx + 1], "--no-sandbox --disable-dev-shm-usage"
+        )
+
+    def test_screenshot_close_flow_unchanged(self):
+        """D. screenshot + close invocations are identical with and without env args."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ok_noenv, calls_noenv = self._run_capture(None, tmpdir)
+            ok_env, calls_env = self._run_capture("--no-sandbox", tmpdir)
+
+        self.assertTrue(ok_noenv)
+        self.assertTrue(ok_env)
+        self.assertEqual(len(calls_noenv), 3)
+        self.assertEqual(len(calls_env), 3)
+
+        # Strip the open call's optional --args tail, then the flows must match
+        # command-for-command (same tmpdir + same inputs -> same session name
+        # and same out path, so argv must be identical apart from --args).
+        def _normalize(calls):
+            norm = []
+            for argv in calls:
+                if "--args" in argv:
+                    argv = argv[: argv.index("--args")]
+                norm.append(argv)
+            return norm
+
+        self.assertEqual(_normalize(calls_noenv), _normalize(calls_env))
+        # close must be the final call in both flows.
+        self.assertIn("close", calls_noenv[-1])
+        self.assertIn("close", calls_env[-1])
+
+
 class TestPreviousPhasesStillPass(unittest.TestCase):
     """15 & 16. Existing Phase 2-7 tests and timeout recovery remain passing.
 
