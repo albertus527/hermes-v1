@@ -710,6 +710,129 @@ Respond with a JSON summary:
 }}
 """
 
+    def vision_inspect(
+        self,
+        desktop_screenshot: Path,
+        mobile_screenshot: Path,
+        brief: Dict[str, Any],
+        design_dna: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Use Hermes VISION role to inspect QA screenshots. Evidence only.
+
+        VISION receives ZERO tool access (toolsets=[] via the CLI boundary
+        with no --toolsets flag is insufficient; VISION must never be able to
+        edit files, run shell, or mutate lifecycle). It runs through the same
+        zero-tool programmatic boundary as FAST, but with the screenshots
+        attached as local image paths in the prompt text — VISION never
+        writes to the workspace and never calls delegate/terminal/file tools
+        because the agent is constructed with enabled_toolsets=[].
+
+        Returns a structured evidence dict:
+        {"pass": bool, "critical": [...], "major": [...], "minor": [...],
+         "summary": str} or {"pass": False, "error": str} on failure.
+        """
+        prompt = self._build_vision_prompt(
+            desktop_screenshot, mobile_screenshot, brief, design_dna
+        )
+
+        result = self._run_fast_programmatic(
+            prompt=prompt,
+            skills=["website-builder-design-dna"],
+        )
+
+        if not result.success:
+            return {
+                "pass": False,
+                "critical": [],
+                "major": [],
+                "minor": [],
+                "summary": "",
+                "error": result.error or "VISION inspection failed",
+            }
+
+        return self._parse_vision_response(result.response)
+
+    def _build_vision_prompt(
+        self,
+        desktop_screenshot: Path,
+        mobile_screenshot: Path,
+        brief: Dict[str, Any],
+        design_dna: Optional[Dict[str, Any]],
+    ) -> str:
+        """Build the VISION inspection prompt. Evidence-only — no edit authority."""
+        name = brief.get("name", "Website")
+        what = brief.get("what", "")
+        why = brief.get("why", "")
+        dna_summary = json.dumps(design_dna, indent=2) if design_dna else "(none)"
+
+        return f"""You are VISION, the evidence-only visual QA inspector for Website Builder R1.
+
+You have READ-ONLY access to two screenshots on disk:
+- Desktop (1440x900): {desktop_screenshot}
+- Mobile (390x844): {mobile_screenshot}
+
+Brief:
+- Name: {name}
+- What: {what}
+- Why: {why}
+
+Design DNA:
+{dna_summary}
+
+Your job is to inspect the screenshots and report findings. You must NOT edit
+files, run commands, or take any action — you have zero tool access. Report
+only what you observe:
+- missing hero/content
+- clipping or overflow
+- responsive failures
+- overlapping UI
+- unreadable text
+- severe contrast problems
+- broken visual hierarchy
+- obvious placeholder leakage
+- broken CTA presentation
+- major visible accessibility issues
+- major mismatch with Design DNA
+
+Do not invent business facts. Do not judge subjective taste beyond the
+categories above.
+
+Respond in this exact JSON format:
+{{
+  "pass": true|false,
+  "critical": ["..."],
+  "major": ["..."],
+  "minor": ["..."],
+  "summary": "one paragraph summary"
+}}
+"""
+
+    def _parse_vision_response(self, response: str) -> Dict[str, Any]:
+        """Parse VISION JSON response. Fails closed (pass=false) on parse failure."""
+        try:
+            start = response.find("{")
+            end = response.rfind("}") + 1
+            if start >= 0 and end > start:
+                data = json.loads(response[start:end])
+                return {
+                    "pass": bool(data.get("pass", False)),
+                    "critical": list(data.get("critical") or []),
+                    "major": list(data.get("major") or []),
+                    "minor": list(data.get("minor") or []),
+                    "summary": data.get("summary", ""),
+                }
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        return {
+            "pass": False,
+            "critical": [],
+            "major": [],
+            "minor": [],
+            "summary": "",
+            "error": "Failed to parse VISION response",
+        }
+
     def _parse_frontend_response(
         self, response: str, workspace: Path
     ) -> Dict[str, Any]:

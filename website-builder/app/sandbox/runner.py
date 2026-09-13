@@ -326,6 +326,65 @@ class ProjectRunner:
             env.update(extra)
         return env
 
+    def start_background(
+        self,
+        project_id: str,
+        command: List[str],
+        cwd: Optional[Path] = None,
+        env: Optional[Dict[str, str]] = None,
+        port: Optional[int] = None,
+    ) -> subprocess.Popen:
+        """Start a long-running background process inside the project workspace.
+
+        Minimal Phase 8 integration seam: used for the local render server
+        (e.g. ``npm run preview``). The process is tracked so it can be
+        deterministically stopped via ``stop_background`` or
+        ``cleanup``/``cleanup_all``. Does NOT block waiting for the process
+        to exit — callers own readiness polling.
+        """
+        workspace = project_workspace_path(self.workspace_root, project_id)
+        if cwd is None:
+            cwd = workspace
+        cwd = Path(cwd).resolve()
+        if not str(cwd).startswith(str(workspace)):
+            raise WorkspaceError(
+                f"Command cwd {cwd} escapes project workspace {workspace}"
+            )
+
+        run_env = self._build_project_env(project_id, workspace, env)
+
+        popen_kwargs: Dict[str, object] = {}
+        if sys.platform == "win32":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
+
+        process = subprocess.Popen(
+            command,
+            cwd=str(cwd),
+            env=run_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            **popen_kwargs,
+        )
+        self.process_tracker.register(process.pid, command, port=port)
+        return process
+
+    def stop_background(self, process: subprocess.Popen, timeout: float = 5.0) -> None:
+        """Stop a background process started via ``start_background``."""
+        self.process_tracker.cleanup(process.pid)
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+                process.wait(timeout=timeout)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     def cleanup(self, project_id: str) -> None:
         """Clean up project resources."""
         self.process_tracker.cleanup_all()
