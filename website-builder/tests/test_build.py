@@ -18,6 +18,15 @@ from app.projects.build import FrontendBuilder, BuildResult
 from app.sandbox.runner import ProjectRunner
 
 
+def _queue_project(store: ProjectStateStore, project_id: str) -> None:
+    """Advance a fresh project through the canonical Phase 7 setup path.
+
+    DISCOVERING -> READY -> QUEUED
+    """
+    store.transition_lifecycle(project_id, ProjectLifecycle.READY)
+    store.transition_lifecycle(project_id, ProjectLifecycle.QUEUED)
+
+
 class TestCanonicalStarterResolution(unittest.TestCase):
     """Test that the canonical frontend starter path resolves correctly."""
 
@@ -78,7 +87,15 @@ class TestFrontendBuilderWithHermes(unittest.TestCase):
         }
 
         brief = {"name": "Northcut", "what": "barbershop", "why": "booking WA"}
-        result = self.builder.build("proj-hermes-1", brief)
+        _queue_project(self.store, "proj-hermes-1")
+
+        with patch.object(self.builder, "_run_fixed_checks") as mock_checks:
+            mock_checks.return_value = {
+                "npm_ci": {"success": True},
+                "npm_build": {"success": True},
+                "npm_typecheck": {"success": True},
+            }
+            result = self.builder.build("proj-hermes-1", brief)
 
         self.assertTrue(result.success)
         self.assertIsNotNone(result.design_dna)
@@ -89,6 +106,7 @@ class TestFrontendBuilderWithHermes(unittest.TestCase):
         """Build fails gracefully when Hermes adapter is not configured."""
         builder = FrontendBuilder(self.runner, self.store, hermes_adapter=None)
         brief = {"name": "Northcut", "what": "barbershop", "why": "booking WA"}
+        _queue_project(self.store, "proj-hermes-2")
         result = builder.build("proj-hermes-2", brief)
 
         self.assertFalse(result.success)
@@ -106,6 +124,7 @@ class TestFrontendBuilderWithHermes(unittest.TestCase):
         }
 
         brief = {"name": "Northcut", "what": "barbershop", "why": "booking WA"}
+        _queue_project(self.store, "proj-hermes-3")
         result = self.builder.build("proj-hermes-3", brief)
 
         self.assertFalse(result.success)
@@ -126,7 +145,15 @@ class TestFrontendBuilderWithHermes(unittest.TestCase):
         }
 
         brief = {"name": "Northcut", "what": "barbershop", "why": "booking WA"}
-        result = self.builder.build("proj-hermes-4", brief)
+        _queue_project(self.store, "proj-hermes-4")
+
+        with patch.object(self.builder, "_run_fixed_checks") as mock_checks:
+            mock_checks.return_value = {
+                "npm_ci": {"success": True},
+                "npm_build": {"success": True},
+                "npm_typecheck": {"success": True},
+            }
+            result = self.builder.build("proj-hermes-4", brief)
 
         self.assertTrue(result.success)
         # Destination must be None, not a fabricated URL
@@ -152,6 +179,7 @@ class TestFrontendBuilderWithHermes(unittest.TestCase):
                 "npm_build": {"success": True},
                 "npm_typecheck": {"success": True},
             }
+            _queue_project(self.store, "proj-hermes-5")
             result = self.builder.build("proj-hermes-5", brief)
 
         self.assertTrue(result.success)
@@ -162,6 +190,7 @@ class TestFrontendBuilderWithHermes(unittest.TestCase):
     def test_max_workers_enforced(self):
         self.runner.acquire_project("other-project")
         brief = {"name": "Northcut", "what": "barbershop", "why": "booking WA"}
+        _queue_project(self.store, "proj-hermes-6")
         result = self.builder.build("proj-hermes-6", brief)
 
         self.assertFalse(result.success)
@@ -182,6 +211,7 @@ class TestFrontendBuilderWithHermes(unittest.TestCase):
                 "npm_build": {"success": True},
                 "npm_typecheck": {"success": True},
             }
+            _queue_project(self.store, "proj-hermes-7")
             result = self.builder.build("proj-hermes-7", brief)
 
         self.assertTrue(result.success)
@@ -264,6 +294,7 @@ class TestFixedChecksThroughProjectRunner(unittest.TestCase):
 
         with patch.object(self.runner, "run_command") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            _queue_project(self.store, "proj-nofrontendchecks")
             self.builder.build("proj-nofrontendchecks", brief)
 
         # run_command should only be called for the three checks, not by FRONTEND
@@ -315,6 +346,7 @@ class TestFrontendBuilderStarterCopy(unittest.TestCase):
                 "npm_build": {"success": True},
                 "npm_typecheck": {"success": True},
             }
+            _queue_project(self.store, "proj-copy-1")
             result = self.builder.build("proj-copy-1", brief)
 
         self.assertTrue(result.success)
@@ -330,6 +362,7 @@ class TestFrontendBuilderStarterCopy(unittest.TestCase):
                 "npm_build": {"success": True},
                 "npm_typecheck": {"success": True},
             }
+            _queue_project(self.store, "proj-copy-2")
             result = self.builder.build("proj-copy-2", brief)
 
         self.assertTrue(result.success)
@@ -346,6 +379,7 @@ class TestFrontendBuilderStarterCopy(unittest.TestCase):
                 "npm_build": {"success": True},
                 "npm_typecheck": {"success": True},
             }
+            _queue_project(self.store, "proj-copy-3")
             result = self.builder.build("proj-copy-3", brief)
 
         self.assertTrue(result.success)
