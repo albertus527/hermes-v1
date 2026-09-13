@@ -495,6 +495,172 @@ class TestHermesAdapter(unittest.TestCase):
         self.assertNotEqual(argv[-1], prompt)
 
 
+class TestFrontendTimeoutRecovery(unittest.TestCase):
+    """Regression tests for Phase 7 timeout-recovery behavior."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.store = ProjectStateStore(Path(self.tmpdir) / "state")
+        self.adapter = HermesAdapter(
+            self.store,
+            hermes_home=Path(self.tmpdir) / ".hermes-website",
+            repo_root=Path(self.tmpdir) / "repo",
+        )
+        self.workspace = Path(self.tmpdir) / "workspaces" / "proj-timeout"
+        self.workspace.mkdir(parents=True)
+
+        # Create a fake repo starter so _has_complete_frontend_artifacts can
+        # compare against it.
+        starter_src = (
+            self.adapter.repo_root
+            / "templates"
+            / "frontend-starter"
+            / "src"
+        )
+        starter_src.mkdir(parents=True)
+        self.starter_app = starter_src / "App.tsx"
+        self.starter_app.write_text(
+            "// starter placeholder\n",
+            encoding="utf-8",
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _write_workspace_app(self, content: str) -> None:
+        src = self.workspace / "src"
+        src.mkdir(parents=True, exist_ok=True)
+        (src / "App.tsx").write_text(content, encoding="utf-8")
+
+    def _write_workspace_dna(self, data: dict) -> None:
+        (self.workspace / "design-dna.json").write_text(
+            json.dumps(data), encoding="utf-8"
+        )
+
+    def test_timeout_recovery_success(self):
+        """Timeout + valid artifacts -> recoverable FRONTEND completion."""
+        self._write_workspace_dna({"version": 1, "brand_personality": "premium"})
+        self._write_workspace_app("// generated implementation\n")
+
+        with patch.object(self.adapter, "_run_hermes_cli") as mock_cli:
+            mock_cli.return_value = HermesResult(
+                success=False,
+                error="Hermes oneshot timed out after 900s",
+                exit_code=124,
+            )
+            result = self.adapter.frontend_build(
+                project_id="proj-timeout",
+                brief={"name": "Northcut"},
+                workspace=self.workspace,
+            )
+
+        self.assertTrue(result["success"])
+        self.assertIsNotNone(result["design_dna"])
+        self.assertEqual(result["design_dna"]["brand_personality"], "premium")
+        self.assertIsNone(result["error"])
+
+    def test_timeout_recovery_missing_design_dna(self):
+        """Timeout + missing design-dna.json -> FAILED."""
+        self._write_workspace_app("// generated implementation\n")
+
+        with patch.object(self.adapter, "_run_hermes_cli") as mock_cli:
+            mock_cli.return_value = HermesResult(
+                success=False,
+                error="Hermes oneshot timed out after 900s",
+                exit_code=124,
+            )
+            result = self.adapter.frontend_build(
+                project_id="proj-timeout",
+                brief={"name": "Northcut"},
+                workspace=self.workspace,
+            )
+
+        self.assertFalse(result["success"])
+        self.assertIn("timed out", result["error"])
+
+    def test_timeout_recovery_unchanged_starter(self):
+        """Timeout + App.tsx identical to starter -> FAILED."""
+        self._write_workspace_dna({"version": 1})
+        self._write_workspace_app("// starter placeholder\n")
+
+        with patch.object(self.adapter, "_run_hermes_cli") as mock_cli:
+            mock_cli.return_value = HermesResult(
+                success=False,
+                error="Hermes oneshot timed out after 900s",
+                exit_code=124,
+            )
+            result = self.adapter.frontend_build(
+                project_id="proj-timeout",
+                brief={"name": "Northcut"},
+                workspace=self.workspace,
+            )
+
+        self.assertFalse(result["success"])
+        self.assertIn("timed out", result["error"])
+
+    def test_timeout_recovery_invalid_design_dna_json(self):
+        """Timeout + malformed design-dna.json -> FAILED."""
+        (self.workspace / "design-dna.json").write_text(
+            "{invalid json", encoding="utf-8"
+        )
+        self._write_workspace_app("// generated implementation\n")
+
+        with patch.object(self.adapter, "_run_hermes_cli") as mock_cli:
+            mock_cli.return_value = HermesResult(
+                success=False,
+                error="Hermes oneshot timed out after 900s",
+                exit_code=124,
+            )
+            result = self.adapter.frontend_build(
+                project_id="proj-timeout",
+                brief={"name": "Northcut"},
+                workspace=self.workspace,
+            )
+
+        self.assertFalse(result["success"])
+        self.assertIn("timed out", result["error"])
+
+    def test_non_timeout_failure_not_recovered(self):
+        """Non-timeout Hermes failure must NOT enter timeout recovery."""
+        self._write_workspace_dna({"version": 1})
+        self._write_workspace_app("// generated implementation\n")
+
+        with patch.object(self.adapter, "_run_hermes_cli") as mock_cli:
+            mock_cli.return_value = HermesResult(
+                success=False,
+                error="Authentication failed",
+                exit_code=1,
+            )
+            result = self.adapter.frontend_build(
+                project_id="proj-auth-fail",
+                brief={"name": "Northcut"},
+                workspace=self.workspace,
+            )
+
+        self.assertFalse(result["success"])
+        self.assertIn("Authentication failed", result["error"])
+
+    def test_normal_success_path_unchanged(self):
+        """Normal Hermes success path remains unchanged."""
+        self._write_workspace_dna({"version": 1, "brand_personality": "minimal"})
+        self._write_workspace_app("// generated implementation\n")
+
+        with patch.object(self.adapter, "_run_hermes_cli") as mock_cli:
+            mock_cli.return_value = HermesResult(
+                success=True,
+                response='{"success": true}',
+            )
+            result = self.adapter.frontend_build(
+                project_id="proj-normal",
+                brief={"name": "Northcut"},
+                workspace=self.workspace,
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["design_dna"]["brand_personality"], "minimal")
+        self.assertIsNone(result["error"])
+
+
 class TestSkillResolution(unittest.TestCase):
     """Test that skill names passed by FAST/FRONTEND are resolvable."""
 

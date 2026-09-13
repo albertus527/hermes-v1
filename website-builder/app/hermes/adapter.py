@@ -592,6 +592,12 @@ User text:{context_str}
         )
 
         if not result.success:
+            # Recoverable timeout: Hermes produced the required artifacts but
+            # missed its final response / exit before the subprocess timeout.
+            # The generated workspace artifacts and deterministic checks are
+            # authoritative for this recovery path.
+            if result.exit_code == 124 and self._has_complete_frontend_artifacts(workspace):
+                return self._parse_frontend_response("", workspace)
             return {
                 "success": False,
                 "error": result.error or "FRONTEND build failed",
@@ -600,6 +606,41 @@ User text:{context_str}
 
         # Parse FRONTEND response for Design DNA
         return self._parse_frontend_response(result.response, workspace)
+
+    def _has_complete_frontend_artifacts(self, workspace: Path) -> bool:
+        """Deterministically validate that Phase 7 artifacts were produced.
+
+        Checks:
+        - design-dna.json exists and contains valid JSON
+        - src/App.tsx exists
+        - src/App.tsx is no longer the untouched fixed-starter placeholder
+
+        Returns True only when all conditions hold.
+        """
+        dna_path = workspace / "design-dna.json"
+        if not dna_path.is_file():
+            return False
+        try:
+            with dna_path.open("r", encoding="utf-8") as f:
+                json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return False
+
+        app_path = workspace / "src" / "App.tsx"
+        if not app_path.is_file():
+            return False
+
+        starter_app = self.repo_root / "templates" / "frontend-starter" / "src" / "App.tsx"
+        if not starter_app.is_file():
+            return False
+
+        try:
+            current = app_path.read_bytes()
+            starter = starter_app.read_bytes()
+        except IOError:
+            return False
+
+        return current != starter
 
     def _build_frontend_prompt(
         self,

@@ -221,6 +221,94 @@ class TestFrontendBuilderWithHermes(unittest.TestCase):
         self.assertIsNone(getattr(result, "repair_passes", None))
 
 
+class TestFrontendBuilderTimeoutRecovery(unittest.TestCase):
+    """Phase 7 timeout-recovery integration tests through FrontendBuilder."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.workspace_root = Path(self.tmpdir) / "workspaces"
+        self.state_root = Path(self.tmpdir) / "state"
+        self.store = ProjectStateStore(self.state_root)
+        self.runner = ProjectRunner(self.workspace_root, self.store)
+
+        # Fake starter so workspace copying works.
+        self.starter_path = Path(self.tmpdir) / "starter"
+        (self.starter_path / "src").mkdir(parents=True)
+        (self.starter_path / "package.json").write_text(
+            json.dumps({"name": "starter", "scripts": {"build": "echo build"}})
+        )
+        (self.starter_path / "src" / "App.tsx").write_text(
+            "// starter placeholder\n", encoding="utf-8"
+        )
+
+        self.builder = FrontendBuilder(
+            self.runner,
+            self.store,
+            hermes_adapter=None,  # set per-test
+            starter_path=self.starter_path,
+        )
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _queue(self, project_id: str) -> None:
+        _queue_project(self.store, project_id)
+
+    def test_timeout_recovery_with_passing_checks_stays_running(self):
+        """Timeout + valid artifacts + passing cheap checks -> RUNNING."""
+        adapter = MagicMock()
+        adapter.frontend_build.return_value = {
+            "success": True,
+            "design_dna": {"version": 1, "brand_personality": "premium"},
+        }
+        self.builder.hermes_adapter = adapter
+
+        brief = {"name": "Northcut", "what": "barbershop", "why": "booking WA"}
+        self._queue("proj-recover-1")
+
+        with patch.object(self.builder, "_run_fixed_checks") as mock_checks:
+            mock_checks.return_value = {
+                "npm_ci": {"success": True},
+                "npm_build": {"success": True},
+                "npm_typecheck": {"success": True},
+            }
+            result = self.builder.build("proj-recover-1", brief)
+
+        self.assertTrue(result.success)
+        self.assertIsNotNone(result.design_dna)
+        state = self.store.load("proj-recover-1")
+        self.assertEqual(state.lifecycle, ProjectLifecycle.RUNNING.value)
+        self.assertEqual(state.revisions.design_dna_version, 1)
+        self.assertEqual(state.design_dna["brand_personality"], "premium")
+
+    def test_timeout_recovery_with_failing_checks_fails_cheap_checks(self):
+        """Timeout + valid artifacts + failing cheap checks -> FAILED(cheap_checks)."""
+        adapter = MagicMock()
+        adapter.frontend_build.return_value = {
+            "success": True,
+            "design_dna": {"version": 1},
+        }
+        self.builder.hermes_adapter = adapter
+
+        brief = {"name": "Northcut", "what": "barbershop", "why": "booking WA"}
+        self._queue("proj-recover-2")
+
+        with patch.object(self.builder, "_run_fixed_checks") as mock_checks:
+            mock_checks.return_value = {
+                "npm_ci": {"success": True},
+                "npm_build": {"success": False, "stderr": "tsc error"},
+                "npm_typecheck": {"success": True},
+            }
+            result = self.builder.build("proj-recover-2", brief)
+
+        self.assertFalse(result.success)
+        state = self.store.load("proj-recover-2")
+        self.assertEqual(state.lifecycle, ProjectLifecycle.FAILED.value)
+        self.assertEqual(state.failure["phase"], "cheap_checks")
+
+
 class TestFixedChecksThroughProjectRunner(unittest.TestCase):
     """Test that fixed checks execute through ProjectRunner."""
 
