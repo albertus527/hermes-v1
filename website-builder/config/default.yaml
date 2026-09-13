@@ -1,0 +1,31 @@
+# Website Builder R1 Configuration
+# Non-secret settings only. Secrets go in .env.
+
+website_builder:
+  # Workspace root for generated projects
+  workspace_root: '~/website-workspaces'
+
+  # Website Hermes profile home
+  hermes_home: '~/.hermes-website'
+
+  # MAX_WORKERS=1 — one active project mutation at a time
+  max_workers: 1
+
+  # Fixed frontend starter path (relative to repo root)
+  frontend_starter: 'templates/frontend-starter'
+
+  # Domain discovery
+  domain:
+    # Provider name — must be configured externally
+    provider: null
+    # Bounded candidate set size
+    max_candidates: 5
+    max_alternatives: 3
+
+  # Message debounce
+  intake:
+    debounce_seconds: 2.0
+
+  # Build
+  build:
+    timeout_seconds: 300
