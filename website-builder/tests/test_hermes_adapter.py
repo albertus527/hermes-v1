@@ -154,6 +154,72 @@ class TestHermesAdapter(unittest.TestCase):
         self.assertEqual(result["name"], "Northcut")
         self.assertEqual(result["what"], "barbershop")
 
+    def test_fast_prompt_encodes_name_what_why_sufficiency(self):
+        """The FAST prompt contract encodes the NAME+WHAT+WHY readiness rule.
+
+        This is the deterministic prompt/contract boundary: Hermes owns the
+        semantic interpretation, but the application owns the contract text the
+        interpreter is given. The prompt must state that NAME+WHAT+WHY is
+        sufficient for DISCOVERY_READY and that missing CTA/contact/business
+        facts are unresolved (never fabricated) and non-blocking.
+        """
+        prompt = self.adapter._build_fast_prompt(
+            "Northcut, barbershop, biar orang booking WA"
+        )
+
+        # Sufficiency bar: NAME + WHAT + WHY proceeds.
+        self.assertIn("NAME + WHAT + WHY", prompt)
+        self.assertIn("DISCOVERY_READY", prompt)
+        # Missing CTA/contact/business facts are non-blocking.
+        self.assertIn("NOT blocking", prompt)
+        self.assertIn("clarification_needed", prompt)
+        # No-fabrication rule preserved.
+        self.assertIn("Never fabricate", prompt)
+        self.assertIn("why_destination", prompt)
+
+    def test_fast_parse_northcut_semantic_contract(self):
+        """Northcut FAST response parses to the DISCOVERY_READY contract.
+
+        Regression lock for the real runtime case:
+          "Northcut, barbershop, biar orang booking WA"
+        NAME+WHAT+WHY are materially present; the WhatsApp number is an
+        unresolved downstream fact, NOT a blocking clarification.
+        """
+        response = (
+            '{"scope":"WEBSITE","name":"Northcut","what":"barbershop",'
+            '"why":"let visitors book via WhatsApp","why_destination":null,'
+            '"ambiguity":null,"clarification_needed":false,'
+            '"clarification_question":null,"readiness":"DISCOVERY_READY"}'
+        )
+        result = self.adapter._parse_fast_response(response)
+
+        self.assertEqual(result["scope"], "WEBSITE")
+        self.assertEqual(result["name"], "Northcut")
+        self.assertEqual(result["what"], "barbershop")
+        self.assertEqual(result["why"], "let visitors book via WhatsApp")
+        self.assertIsNone(result["why_destination"])
+        self.assertFalse(result["clarification_needed"])
+        self.assertIsNone(result["clarification_question"])
+        self.assertEqual(result["readiness"], "DISCOVERY_READY")
+        self.assertEqual(result["source"], "hermes_fast")
+
+    def test_fast_parse_missing_what_why_still_needs_clarification(self):
+        """A genuinely incomplete brief (missing WHAT/WHY) stays blocking."""
+        response = (
+            '{"scope":"WEBSITE","name":"Northcut","what":null,"why":null,'
+            '"why_destination":null,"ambiguity":null,"clarification_needed":true,'
+            '"clarification_question":"What is Northcut?",'
+            '"readiness":"NEEDS_CLARIFICATION"}'
+        )
+        result = self.adapter._parse_fast_response(response)
+
+        self.assertEqual(result["name"], "Northcut")
+        self.assertIsNone(result["what"])
+        self.assertIsNone(result["why"])
+        self.assertTrue(result["clarification_needed"])
+        self.assertEqual(result["clarification_question"], "What is Northcut?")
+        self.assertEqual(result["readiness"], "NEEDS_CLARIFICATION")
+
     def test_fast_never_fabricates_url(self):
         """FAST fallback never fabricates a WhatsApp URL from WHY text."""
         with patch.object(self.adapter, "_run_fast_programmatic") as mock_prog:

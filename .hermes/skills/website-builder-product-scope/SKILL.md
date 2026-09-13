@@ -57,6 +57,23 @@ The system must NOT invent:
 - claims
 - conversion goals
 
+## Readiness Rule
+
+The minimum sufficient website brief is **NAME + WHAT + WHY**.
+
+- If NAME, WHAT, and WHY are all materially present, the project proceeds:
+  readiness is `DISCOVERY_READY` and no clarification is asked.
+- Only return `NEEDS_CLARIFICATION` when NAME, WHAT, or WHY itself is
+  materially missing or genuinely ambiguous enough that the website intent
+  cannot safely proceed.
+
+Missing downstream business facts are **not** blocking and are **not** a
+clarification. A missing WhatsApp number, phone number, email address,
+physical address, booking URL, social URL, opening hours, prices, or any
+other CTA destination/contact detail must remain **unresolved** (never
+fabricated) and must not, by itself, trigger a clarification. `why_destination`
+holds only an explicitly supplied destination; otherwise it stays null.
+
 ## Scope Gate
 
 Interpret as: WEBSITE, WEBSITE_RELATED, MIXED, OUT_OF_SCOPE, or UNCLEAR.

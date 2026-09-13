@@ -385,11 +385,27 @@ Your job:
    - WHAT: what the website/business is (if present)
    - WHY: what the visitor should primarily understand or do (if present)
 
-3. Determine if a blocking clarification is needed. Ask only the smallest
-   question that materially changes the website.
+3. Apply the readiness rule exactly:
+   - The minimum sufficient website brief is NAME + WHAT + WHY.
+   - If NAME, WHAT, and WHY are all materially present, the project proceeds:
+     set readiness to DISCOVERY_READY, clarification_needed to false, and
+     clarification_question to null.
+   - Only set readiness to NEEDS_CLARIFICATION when NAME, WHAT, or WHY itself
+     is materially missing or genuinely ambiguous enough that the website
+     intent cannot safely proceed. Ask only the smallest question that
+     resolves the missing NAME/WHAT/WHY.
 
-4. Do NOT invent business facts. If WHY mentions a destination (e.g. WhatsApp)
-   but no actual phone number or URL is provided, mark it as unresolved.
+4. Missing downstream business facts are NOT blocking and are NOT a
+   clarification. A missing WhatsApp number, phone number, email address,
+   physical address, booking URL, social URL, opening hours, prices, or any
+   other CTA destination/contact detail must NEVER set clarification_needed
+   to true by itself. Leave such facts unresolved (null) and still return
+   DISCOVERY_READY when NAME + WHAT + WHY are present.
+
+5. Do NOT invent business facts. If WHY mentions a destination (e.g. WhatsApp)
+   but no actual phone number or URL is provided, set why_destination to null
+   (unresolved). Never fabricate a number, URL, email, address, booking link,
+   or any other business fact.
 
 Respond in this exact JSON format:
 {{
