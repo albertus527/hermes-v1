@@ -24,9 +24,11 @@ It preserves:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -83,6 +85,16 @@ class HermesResult:
 class HermesAdapter:
     """Thin adapter to existing Hermes runtime."""
 
+    # Website Builder skills that must be present in the profile-local
+    # $HERMES_HOME/skills/ directory so they are discoverable regardless of
+    # the current working directory.  The repo copies under .hermes/skills/
+    # are the source of truth; this list names the directories to sync.
+    _PROFILE_SKILL_NAMES: List[str] = [
+        "website-builder-environment",
+        "website-builder-product-scope",
+        "website-builder-design-dna",
+    ]
+
     def __init__(
         self,
         store: ProjectStateStore,
@@ -92,6 +104,60 @@ class HermesAdapter:
         self.store = store
         self.hermes_home = hermes_home or Path.home() / ".hermes-website"
         self.repo_root = repo_root or Path(__file__).parent.parent.parent.parent
+
+    # ------------------------------------------------------------------
+    # Profile-local skill sync
+    # ------------------------------------------------------------------
+
+    def _repo_skills_dir(self) -> Path:
+        """Source-of-truth skills directory inside the repository."""
+        return self.repo_root / ".hermes" / "skills"
+
+    def _profile_skills_dir(self) -> Path:
+        """Profile-local skills directory ($HERMES_HOME/skills/)."""
+        return self.hermes_home / "skills"
+
+    @staticmethod
+    def _dir_fingerprint(path: Path) -> str:
+        """Content-hash of every file under *path*, order-independent."""
+        h = hashlib.sha256()
+        if not path.is_dir():
+            return ""
+        for f in sorted(path.rglob("*")):
+            if f.is_file():
+                h.update(str(f.relative_to(path)).encode())
+                h.update(f.read_bytes())
+        return h.hexdigest()
+
+    def sync_skills_to_profile(self) -> None:
+        """Copy repo-local Website Builder skills into $HERMES_HOME/skills/.
+
+        Hermes discovers profile-local skills ($HERMES_HOME/skills/) regardless
+        of cwd, which makes them available even when FRONTEND runs inside an
+        isolated external workspace.  The repo copies under .hermes/skills/
+        remain the source of truth; this sync is idempotent — it only writes
+        when the content actually differs.
+        """
+        src_base = self._repo_skills_dir()
+        dst_base = self._profile_skills_dir()
+
+        for name in self._PROFILE_SKILL_NAMES:
+            src = src_base / name
+            dst = dst_base / name
+
+            if not src.is_dir():
+                logging.warning("Repo skill source missing: %s", src)
+                continue
+
+            # Idempotency: skip when content is identical.
+            if dst.is_dir() and self._dir_fingerprint(src) == self._dir_fingerprint(dst):
+                continue
+
+            # Remove stale destination and copy fresh.
+            if dst.exists():
+                shutil.rmtree(dst)
+            shutil.copytree(src, dst)
+            logging.debug("Synced skill %s -> %s", name, dst)
 
     def _run_hermes_cli(
         self,
@@ -108,6 +174,10 @@ class HermesAdapter:
         Uses `hermes -z` (or `python -m hermes_cli.main -z`) with explicit
         toolsets and skills. stdout is the final response text.
         """
+        # Ensure profile-local skills are up-to-date so they resolve
+        # regardless of the cwd Hermes will run in.
+        self.sync_skills_to_profile()
+
         # Build the command to run hermes oneshot
         # Use the existing Hermes CLI entry point
         cmd = [
@@ -210,6 +280,10 @@ class HermesAdapter:
         ``_oneshot_clarify_callback``). No new provider client, routing layer,
         or abstraction is introduced.
         """
+        # Ensure profile-local skills are up-to-date so they resolve
+        # regardless of the cwd Hermes will run in.
+        self.sync_skills_to_profile()
+
         if _HERMES_IMPORT_ERROR is not None:
             return HermesResult(
                 success=False,

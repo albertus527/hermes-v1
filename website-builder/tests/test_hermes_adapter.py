@@ -6,6 +6,7 @@ Verifies the thin adapter uses the existing Hermes seams correctly.
 from __future__ import annotations
 
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -387,6 +388,196 @@ class TestSkillResolution(unittest.TestCase):
         # UI UX Pro Max should NOT be in website-builder skills
         self.assertNotIn("ui-ux-pro-max", skill_names)
         self.assertNotIn("ui_ux_pro_max", skill_names)
+
+
+class TestSkillSyncToProfile(unittest.TestCase):
+    """Test that repo-local skills are synced to $HERMES_HOME/skills/."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmpdir, True)
+
+        # Create a fake repo with the three skill directories.
+        self.repo_root = Path(self.tmpdir) / "repo"
+        self.repo_skills = self.repo_root / ".hermes" / "skills"
+        for name in (
+            "website-builder-environment",
+            "website-builder-product-scope",
+            "website-builder-design-dna",
+        ):
+            skill_dir = self.repo_skills / name
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: Test skill {name}.\n---\n\n# {name}\n",
+                encoding="utf-8",
+            )
+
+        self.hermes_home = Path(self.tmpdir) / ".hermes-website"
+        self.store = ProjectStateStore(Path(self.tmpdir) / "state")
+        self.adapter = HermesAdapter(
+            self.store,
+            hermes_home=self.hermes_home,
+            repo_root=self.repo_root,
+        )
+
+    def _profile_skill_dir(self, name: str) -> Path:
+        return self.hermes_home / "skills" / name
+
+    def test_sync_creates_profile_skills(self):
+        """Skills are copied from repo to $HERMES_HOME/skills/."""
+        self.adapter.sync_skills_to_profile()
+
+        for name in self.adapter._PROFILE_SKILL_NAMES:
+            skill_md = self._profile_skill_dir(name) / "SKILL.md"
+            self.assertTrue(skill_md.is_file(), f"Missing: {skill_md}")
+            content = skill_md.read_text(encoding="utf-8")
+            self.assertIn(f"name: {name}", content)
+
+    def test_sync_is_idempotent(self):
+        """Second sync does not rewrite files (fingerprints match)."""
+        self.adapter.sync_skills_to_profile()
+
+        # Record mtimes after first sync.
+        mtimes = {}
+        for name in self.adapter._PROFILE_SKILL_NAMES:
+            skill_md = self._profile_skill_dir(name) / "SKILL.md"
+            mtimes[name] = skill_md.stat().st_mtime_ns
+
+        # Second sync — should be a no-op.
+        self.adapter.sync_skills_to_profile()
+
+        for name in self.adapter._PROFILE_SKILL_NAMES:
+            skill_md = self._profile_skill_dir(name) / "SKILL.md"
+            self.assertEqual(
+                skill_md.stat().st_mtime_ns,
+                mtimes[name],
+                f"{name} was rewritten on idempotent sync",
+            )
+
+    def test_sync_updates_stale_profile_skill(self):
+        """Stale profile skill is overwritten when repo source changes."""
+        self.adapter.sync_skills_to_profile()
+
+        # Mutate the repo source.
+        env_md = self.repo_skills / "website-builder-environment" / "SKILL.md"
+        env_md.write_text(
+            "---\nname: website-builder-environment\ndescription: Updated.\n---\n\n# Updated\n",
+            encoding="utf-8",
+        )
+
+        self.adapter.sync_skills_to_profile()
+
+        synced = self._profile_skill_dir("website-builder-environment") / "SKILL.md"
+        self.assertIn("Updated", synced.read_text(encoding="utf-8"))
+
+    def test_sync_preserves_existing_profile_skills(self):
+        """Pre-existing profile-local skills (e.g. ui-ux-pro-max) are untouched."""
+        # Simulate ui-ux-pro-max already installed in the profile.
+        ux_dir = self.hermes_home / "skills" / "ui-ux-pro-max"
+        ux_dir.mkdir(parents=True)
+        (ux_dir / "SKILL.md").write_text(
+            "---\nname: ui-ux-pro-max\ndescription: Design guidance.\n---\n\n# UI UX Pro Max\n",
+            encoding="utf-8",
+        )
+
+        self.adapter.sync_skills_to_profile()
+
+        # ui-ux-pro-max must still exist, unmodified.
+        self.assertTrue((ux_dir / "SKILL.md").is_file())
+        self.assertIn(
+            "UI UX Pro Max",
+            (ux_dir / "SKILL.md").read_text(encoding="utf-8"),
+        )
+
+    def test_sync_skips_missing_repo_source(self):
+        """Missing repo skill dirs are skipped with a warning, not an error."""
+        # Remove one repo skill.
+        shutil.rmtree(self.repo_skills / "website-builder-design-dna")
+
+        # Should not raise.
+        self.adapter.sync_skills_to_profile()
+
+        # The other two should still be synced.
+        self.assertTrue(
+            (self._profile_skill_dir("website-builder-environment") / "SKILL.md").is_file()
+        )
+        self.assertTrue(
+            (self._profile_skill_dir("website-builder-product-scope") / "SKILL.md").is_file()
+        )
+        # The missing one should NOT exist.
+        self.assertFalse(
+            self._profile_skill_dir("website-builder-design-dna").exists()
+        )
+
+    def test_run_hermes_cli_calls_sync(self):
+        """_run_hermes_cli triggers skill sync before spawning Hermes."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
+            self.adapter._run_hermes_cli("test")
+
+        for name in self.adapter._PROFILE_SKILL_NAMES:
+            self.assertTrue(
+                (self._profile_skill_dir(name) / "SKILL.md").is_file(),
+                f"{name} not synced by _run_hermes_cli",
+            )
+
+    def test_run_fast_programmatic_calls_sync(self):
+        """_run_fast_programmatic triggers skill sync before agent construction."""
+        with patch("app.hermes.adapter.AIAgent") as mock_agent_cls:
+            self.adapter  # ensure adapter exists
+            # Patch the runtime helpers so _run_fast_programmatic doesn't fail.
+            cfg = {"model": {"default": "m", "provider": "p"}}
+            with (
+                patch("app.hermes.adapter.load_config", return_value=cfg),
+                patch(
+                    "app.hermes.adapter.resolve_runtime_provider",
+                    return_value={
+                        "api_key": "k",
+                        "base_url": "https://x",
+                        "provider": "p",
+                        "requested_provider": "p",
+                        "api_mode": "chat_completions",
+                        "credential_pool": None,
+                    },
+                ),
+                patch("app.hermes.adapter.get_fallback_chain", return_value=[]),
+                patch(
+                    "app.hermes.adapter._build_preloaded_skills_prompt",
+                    return_value=None,
+                ),
+                patch(
+                    "app.hermes.adapter._create_session_db_for_oneshot",
+                    return_value=None,
+                ),
+            ):
+                agent_instance = MagicMock()
+                agent_instance.run_conversation.return_value = {
+                    "final_response": "{}"
+                }
+                mock_agent_cls.return_value = agent_instance
+                self.adapter._run_fast_programmatic("test")
+
+        for name in self.adapter._PROFILE_SKILL_NAMES:
+            self.assertTrue(
+                (self._profile_skill_dir(name) / "SKILL.md").is_file(),
+                f"{name} not synced by _run_fast_programmatic",
+            )
+
+    def test_dir_fingerprint_deterministic(self):
+        """Fingerprint is stable for identical content."""
+        fp1 = HermesAdapter._dir_fingerprint(
+            self.repo_skills / "website-builder-environment"
+        )
+        fp2 = HermesAdapter._dir_fingerprint(
+            self.repo_skills / "website-builder-environment"
+        )
+        self.assertEqual(fp1, fp2)
+        self.assertTrue(len(fp1) > 0)
+
+    def test_dir_fingerprint_empty_for_missing_dir(self):
+        """Fingerprint of a non-existent directory is empty string."""
+        fp = HermesAdapter._dir_fingerprint(Path(self.tmpdir) / "nonexistent")
+        self.assertEqual(fp, "")
 
 
 if __name__ == "__main__":
