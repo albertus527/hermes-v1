@@ -1,7 +1,8 @@
-"""Phase 7 tests: first frontend build, Design DNA, starter usage, no Phase 8.
+"""Phase 7 -> Phase 8 pipeline tests.
 
 FRONTEND uses Hermes when available. Application owns workspace/lifecycle.
-Application runs deterministic cheap checks through ProjectRunner.
+Application runs deterministic cheap checks through ProjectRunner, then hands
+off to Phase 8 QA inside the same worker ownership boundary.
 """
 
 from __future__ import annotations
@@ -95,7 +96,11 @@ class TestFrontendBuilderWithHermes(unittest.TestCase):
                 "npm_build": {"success": True},
                 "npm_typecheck": {"success": True},
             }
-            result = self.builder.build("proj-hermes-1", brief)
+            with patch("app.projects.build.QAOrchestrator") as mock_qa_cls:
+                mock_qa = MagicMock()
+                mock_qa.run.return_value = MagicMock(success=True, error=None)
+                mock_qa_cls.return_value = mock_qa
+                result = self.builder.build("proj-hermes-1", brief)
 
         self.assertTrue(result.success)
         self.assertIsNotNone(result.design_dna)
@@ -153,14 +158,18 @@ class TestFrontendBuilderWithHermes(unittest.TestCase):
                 "npm_build": {"success": True},
                 "npm_typecheck": {"success": True},
             }
-            result = self.builder.build("proj-hermes-4", brief)
+            with patch("app.projects.build.QAOrchestrator") as mock_qa_cls:
+                mock_qa = MagicMock()
+                mock_qa.run.return_value = MagicMock(success=True, error=None)
+                mock_qa_cls.return_value = mock_qa
+                result = self.builder.build("proj-hermes-4", brief)
 
         self.assertTrue(result.success)
         # Destination must be None, not a fabricated URL
         self.assertIsNone(result.design_dna["primary_cta"]["destination"])
         self.assertIn("cta_destination", result.design_dna["unresolved_facts"])
 
-    def test_successful_build_stays_running(self):
+    def test_successful_build_stays_running_until_qa(self):
         """Successful cheap checks do NOT advance to PREVIEW_READY.
 
         PREVIEW_READY requires Phase 8 QA. Phase 7 stops at RUNNING.
@@ -180,11 +189,16 @@ class TestFrontendBuilderWithHermes(unittest.TestCase):
                 "npm_typecheck": {"success": True},
             }
             _queue_project(self.store, "proj-hermes-5")
-            result = self.builder.build("proj-hermes-5", brief)
+            with patch("app.projects.build.QAOrchestrator") as mock_qa_cls:
+                mock_qa = MagicMock()
+                mock_qa.run.return_value = MagicMock(success=True, error=None)
+                mock_qa_cls.return_value = mock_qa
+                result = self.builder.build("proj-hermes-5", brief)
 
         self.assertTrue(result.success)
         state = self.store.load("proj-hermes-5")
-        # Must remain RUNNING, not PREVIEW_READY
+        # Must remain RUNNING, not PREVIEW_READY — the mocked QA did not
+        # perform the real transition.
         self.assertEqual(state.lifecycle, ProjectLifecycle.RUNNING.value)
 
     def test_max_workers_enforced(self):
@@ -196,8 +210,8 @@ class TestFrontendBuilderWithHermes(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("MAX_WORKERS=1", result.error)
 
-    def test_no_phase_8_implementation(self):
-        """Phase 7 stops before QA. No screenshot, no VISION, no repair loop."""
+    def test_build_result_has_no_qa_artifacts(self):
+        """BuildResult does not expose QA-specific artifacts."""
         self.mock_adapter.frontend_build.return_value = {
             "success": True,
             "design_dna": {"version": 1},
@@ -212,7 +226,11 @@ class TestFrontendBuilderWithHermes(unittest.TestCase):
                 "npm_typecheck": {"success": True},
             }
             _queue_project(self.store, "proj-hermes-7")
-            result = self.builder.build("proj-hermes-7", brief)
+            with patch("app.projects.build.QAOrchestrator") as mock_qa_cls:
+                mock_qa = MagicMock()
+                mock_qa.run.return_value = MagicMock(success=True, error=None)
+                mock_qa_cls.return_value = mock_qa
+                result = self.builder.build("proj-hermes-7", brief)
 
         self.assertTrue(result.success)
         # Build result should not contain QA artifacts
@@ -274,7 +292,11 @@ class TestFrontendBuilderTimeoutRecovery(unittest.TestCase):
                 "npm_build": {"success": True},
                 "npm_typecheck": {"success": True},
             }
-            result = self.builder.build("proj-recover-1", brief)
+            with patch("app.projects.build.QAOrchestrator") as mock_qa_cls:
+                mock_qa = MagicMock()
+                mock_qa.run.return_value = MagicMock(success=True, error=None)
+                mock_qa_cls.return_value = mock_qa
+                result = self.builder.build("proj-recover-1", brief)
 
         self.assertTrue(result.success)
         self.assertIsNotNone(result.design_dna)
@@ -383,7 +405,11 @@ class TestFixedChecksThroughProjectRunner(unittest.TestCase):
         with patch.object(self.runner, "run_command") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
             _queue_project(self.store, "proj-nofrontendchecks")
-            self.builder.build("proj-nofrontendchecks", brief)
+            with patch("app.projects.build.QAOrchestrator") as mock_qa_cls:
+                mock_qa = MagicMock()
+                mock_qa.run.return_value = MagicMock(success=True, error=None)
+                mock_qa_cls.return_value = mock_qa
+                self.builder.build("proj-nofrontendchecks", brief)
 
         # run_command should only be called for the three checks, not by FRONTEND
         self.assertEqual(mock_run.call_count, 3)
@@ -435,7 +461,11 @@ class TestFrontendBuilderStarterCopy(unittest.TestCase):
                 "npm_typecheck": {"success": True},
             }
             _queue_project(self.store, "proj-copy-1")
-            result = self.builder.build("proj-copy-1", brief)
+            with patch("app.projects.build.QAOrchestrator") as mock_qa_cls:
+                mock_qa = MagicMock()
+                mock_qa.run.return_value = MagicMock(success=True, error=None)
+                mock_qa_cls.return_value = mock_qa
+                result = self.builder.build("proj-copy-1", brief)
 
         self.assertTrue(result.success)
         self.assertIsNotNone(result.workspace)
@@ -451,7 +481,11 @@ class TestFrontendBuilderStarterCopy(unittest.TestCase):
                 "npm_typecheck": {"success": True},
             }
             _queue_project(self.store, "proj-copy-2")
-            result = self.builder.build("proj-copy-2", brief)
+            with patch("app.projects.build.QAOrchestrator") as mock_qa_cls:
+                mock_qa = MagicMock()
+                mock_qa.run.return_value = MagicMock(success=True, error=None)
+                mock_qa_cls.return_value = mock_qa
+                result = self.builder.build("proj-copy-2", brief)
 
         self.assertTrue(result.success)
         self.assertTrue((result.workspace / "package.json").exists())
@@ -468,13 +502,203 @@ class TestFrontendBuilderStarterCopy(unittest.TestCase):
                 "npm_typecheck": {"success": True},
             }
             _queue_project(self.store, "proj-copy-3")
-            result = self.builder.build("proj-copy-3", brief)
+            with patch("app.projects.build.QAOrchestrator") as mock_qa_cls:
+                mock_qa = MagicMock()
+                mock_qa.run.return_value = MagicMock(success=True, error=None)
+                mock_qa_cls.return_value = mock_qa
+                result = self.builder.build("proj-copy-3", brief)
 
         self.assertTrue(result.success)
         # The starter path should be unchanged
         self.assertTrue(self.starter_path.exists())
         # The workspace should be separate from the starter
         self.assertNotEqual(result.workspace, self.starter_path)
+
+
+class TestPhase8Handoff(unittest.TestCase):
+    """Focused tests for the Phase 7 -> Phase 8 application handoff."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.workspace_root = Path(self.tmpdir) / "workspaces"
+        self.state_root = Path(self.tmpdir) / "state"
+        self.store = ProjectStateStore(self.state_root)
+        self.runner = ProjectRunner(self.workspace_root, self.store)
+        self.mock_adapter = MagicMock()
+        self.builder = FrontendBuilder(
+            self.runner, self.store, hermes_adapter=self.mock_adapter
+        )
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _brief(self):
+        return {"name": "Northcut", "what": "barbershop", "why": "booking WA"}
+
+    def _queue(self, project_id: str) -> None:
+        _queue_project(self.store, project_id)
+
+    def _passing_frontend(self):
+        self.mock_adapter.frontend_build.return_value = {
+            "success": True,
+            "design_dna": {"version": 1, "brand_personality": "premium"},
+        }
+
+    def _passing_checks(self):
+        return {
+            "npm_ci": {"success": True},
+            "npm_build": {"success": True},
+            "npm_typecheck": {"success": True},
+        }
+
+    def test_phase7_success_invokes_qa_exactly_once(self):
+        """A. Phase 7 success -> QAOrchestrator invoked exactly once."""
+        self._passing_frontend()
+        self._queue("proj-handoff-a")
+
+        with patch.object(self.builder, "_run_fixed_checks") as mock_checks:
+            mock_checks.return_value = self._passing_checks()
+            with patch("app.projects.build.QAOrchestrator") as mock_qa_cls:
+                mock_qa = MagicMock()
+                mock_qa.run.return_value = MagicMock(success=True, error=None)
+                mock_qa_cls.return_value = mock_qa
+                result = self.builder.build("proj-handoff-a", self._brief())
+
+        self.assertTrue(result.success)
+        mock_qa_cls.assert_called_once_with(
+            self.runner,
+            self.store,
+            hermes_adapter=self.mock_adapter,
+        )
+        mock_qa.run.assert_called_once()
+
+    def test_phase7_failure_does_not_invoke_qa(self):
+        """B. Phase 7 failure -> QA not invoked."""
+        self.mock_adapter.frontend_build.return_value = {
+            "success": False,
+            "error": "FRONTEND failed",
+        }
+        self._queue("proj-handoff-b")
+
+        with patch("app.projects.build.QAOrchestrator") as mock_qa_cls:
+            result = self.builder.build("proj-handoff-b", self._brief())
+
+        self.assertFalse(result.success)
+        mock_qa_cls.assert_not_called()
+
+    def test_worker_slot_acquired_once_released_once(self):
+        """C. Worker slot acquired once -> released once after Phase 8."""
+        self._passing_frontend()
+        self._queue("proj-handoff-c")
+
+        with patch.object(self.builder, "_run_fixed_checks") as mock_checks:
+            mock_checks.return_value = self._passing_checks()
+            with patch("app.projects.build.QAOrchestrator") as mock_qa_cls:
+                mock_qa = MagicMock()
+                mock_qa.run.return_value = MagicMock(success=True, error=None)
+                mock_qa_cls.return_value = mock_qa
+                with patch.object(self.runner, "acquire_project", wraps=self.runner.acquire_project) as mock_acquire, \
+                     patch.object(self.runner, "release_project", wraps=self.runner.release_project) as mock_release:
+                    result = self.builder.build("proj-handoff-c", self._brief())
+
+        self.assertTrue(result.success)
+        mock_acquire.assert_called_once_with("proj-handoff-c")
+        mock_release.assert_called_once_with("proj-handoff-c")
+
+    def test_qa_success_reaches_preview_ready(self):
+        """D. QA success -> final lifecycle PREVIEW_READY."""
+        self._passing_frontend()
+        self._queue("proj-handoff-d")
+
+        with patch.object(self.builder, "_run_fixed_checks") as mock_checks:
+            mock_checks.return_value = self._passing_checks()
+            with patch("app.projects.build.QAOrchestrator") as mock_qa_cls:
+                mock_qa = MagicMock()
+
+                def _run_qa(project_id, workspace, brief, design_dna):
+                    with self.store.acquire_writer(project_id) as state:
+                        self.store.transition_lifecycle_locked(state, ProjectLifecycle.PREVIEW_READY)
+                        self.store.save(state)
+                    return MagicMock(success=True, error=None)
+
+                mock_qa.run.side_effect = _run_qa
+                mock_qa_cls.return_value = mock_qa
+                result = self.builder.build("proj-handoff-d", self._brief())
+
+        self.assertTrue(result.success)
+        state = self.store.load("proj-handoff-d")
+        self.assertEqual(state.lifecycle, ProjectLifecycle.PREVIEW_READY.value)
+
+    def test_qa_failure_reaches_failed(self):
+        """E. QA failure -> final lifecycle FAILED."""
+        self._passing_frontend()
+        self._queue("proj-handoff-e")
+
+        with patch.object(self.builder, "_run_fixed_checks") as mock_checks:
+            mock_checks.return_value = self._passing_checks()
+            with patch("app.projects.build.QAOrchestrator") as mock_qa_cls:
+                mock_qa = MagicMock()
+
+                def _run_qa(project_id, workspace, brief, design_dna):
+                    with self.store.acquire_writer(project_id) as state:
+                        self.store.transition_lifecycle_locked(state, ProjectLifecycle.FAILED)
+                        state.failure = {"phase": "qa", "error": "QA exhausted"}
+                        self.store.save(state)
+                    return MagicMock(success=False, error="QA exhausted")
+
+                mock_qa.run.side_effect = _run_qa
+                mock_qa_cls.return_value = mock_qa
+                result = self.builder.build("proj-handoff-e", self._brief())
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error, "QA exhausted")
+        state = self.store.load("proj-handoff-e")
+        self.assertEqual(state.lifecycle, ProjectLifecycle.FAILED.value)
+
+    def test_same_context_passed_to_phase8(self):
+        """F. Same project_id/workspace/brief/design_dna passed to Phase 8."""
+        design_dna = {"version": 1, "brand_personality": "premium"}
+        self.mock_adapter.frontend_build.return_value = {
+            "success": True,
+            "design_dna": design_dna,
+        }
+        self._queue("proj-handoff-f")
+        brief = self._brief()
+
+        with patch.object(self.builder, "_run_fixed_checks") as mock_checks:
+            mock_checks.return_value = self._passing_checks()
+            with patch("app.projects.build.QAOrchestrator") as mock_qa_cls:
+                mock_qa = MagicMock()
+                mock_qa.run.return_value = MagicMock(success=True, error=None)
+                mock_qa_cls.return_value = mock_qa
+                result = self.builder.build("proj-handoff-f", brief)
+
+        self.assertTrue(result.success)
+        mock_qa.run.assert_called_once_with(
+            project_id="proj-handoff-f",
+            workspace=result.workspace,
+            brief=brief,
+            design_dna=design_dna,
+        )
+
+    def test_no_duplicate_acquire_inside_phase8(self):
+        """G. No duplicate acquire_project call inside Phase 8."""
+        self._passing_frontend()
+        self._queue("proj-handoff-g")
+
+        with patch.object(self.builder, "_run_fixed_checks") as mock_checks:
+            mock_checks.return_value = self._passing_checks()
+            with patch("app.projects.build.QAOrchestrator") as mock_qa_cls:
+                mock_qa = MagicMock()
+                mock_qa.run.return_value = MagicMock(success=True, error=None)
+                mock_qa_cls.return_value = mock_qa
+                with patch.object(self.runner, "acquire_project", wraps=self.runner.acquire_project) as mock_acquire:
+                    result = self.builder.build("proj-handoff-g", self._brief())
+
+        self.assertTrue(result.success)
+        mock_acquire.assert_called_once_with("proj-handoff-g")
 
 
 if __name__ == "__main__":

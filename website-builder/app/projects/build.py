@@ -1,8 +1,8 @@
-"""First FRONTEND build for Website Builder R1.
+"""Phase 7 frontend build for Website Builder R1.
 
 Uses the existing Hermes FRONTEND logical role through the oneshot seam.
 FRONTEND owns design/build decisions. Application owns workspace/lifecycle.
-Stops BEFORE Phase 8 QA.
+On success, hands off to Phase 8 QA within the same worker ownership.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 
 from app.core.lifecycle import ProjectLifecycle
 from app.core.state import ProjectStateStore
+from app.qa.orchestrator import QAOrchestrator
 from app.sandbox.runner import ProjectRunner, WorkspaceError
 
 
@@ -28,7 +29,7 @@ _STARTER_PATH = Path(__file__).parent.parent.parent.parent / "templates" / "fron
 
 @dataclass
 class BuildResult:
-    """Result of a Phase 7 build."""
+    """Result of the Phase 7 -> Phase 8 build pipeline."""
 
     success: bool
     project_id: str
@@ -124,9 +125,11 @@ class FrontendBuilder:
         return results
 
     def build(self, project_id: str, brief: Dict[str, Any]) -> BuildResult:
-        """Execute the Phase 7 build for a project.
+        """Execute the Phase 7 -> Phase 8 build pipeline for a project.
 
-        Stops BEFORE Phase 8 QA. Output is a generated project ready for Phase 8.
+        Acquires the single worker slot once, runs Phase 7, and on success
+        invokes Phase 8 QA before releasing the slot. Phase 8 owns the
+        RUNNING -> PREVIEW_READY transition.
         """
         start_time = time.time()
 
@@ -205,9 +208,8 @@ class FrontendBuilder:
             # Update state with results
             with self.store.acquire_writer(project_id) as state:
                 if build_success:
-                    # Successful build means RUNNING -> RUNNING (still in build phase)
-                    # PREVIEW_READY is only reached after Phase 8 QA passes.
-                    # We stay in RUNNING and let Phase 8 advance when implemented.
+                    # Successful Phase 7 keeps lifecycle RUNNING. Only Phase 8
+                    # may advance RUNNING -> PREVIEW_READY.
                     state.revisions.design_dna_version = design_dna.get("version", 1) if design_dna else 0
                     state.design_dna = design_dna or {}
                 else:
@@ -219,14 +221,40 @@ class FrontendBuilder:
                     }
                 self.store.save(state)
 
+            if not build_success:
+                return BuildResult(
+                    success=False,
+                    project_id=project_id,
+                    workspace=workspace,
+                    design_dna=design_dna,
+                    build_output=json.dumps(checks, indent=2),
+                    duration_seconds=time.time() - start_time,
+                )
+
+            # Phase 7 succeeded — hand off to Phase 8 QA inside the same
+            # worker ownership boundary. QAOrchestrator does not acquire or
+            # release the project slot; that stays here.
+            qa_orchestrator = QAOrchestrator(
+                self.runner,
+                self.store,
+                hermes_adapter=self.hermes_adapter,
+            )
+            qa_result = qa_orchestrator.run(
+                project_id=project_id,
+                workspace=workspace,
+                brief=brief,
+                design_dna=design_dna,
+            )
+
             duration = time.time() - start_time
 
             return BuildResult(
-                success=build_success,
+                success=qa_result.success,
                 project_id=project_id,
                 workspace=workspace,
                 design_dna=design_dna,
                 build_output=json.dumps(checks, indent=2),
+                error=qa_result.error,
                 duration_seconds=duration,
             )
 
