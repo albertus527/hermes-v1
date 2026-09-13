@@ -64,11 +64,21 @@ class QAOrchestrator:
         attempts: list = []
         repair_count = 0
 
+        # Monotonic attempt counter: every entry appended to ``attempts``
+        # (whether a real QA pass or a synthetic failing entry recording a
+        # broken post-repair rebuild) consumes the next sequential number.
+        # This guarantees no two attempts ever share a number — the prior
+        # scheme reused a repair's number for both the synthetic rebuild-
+        # failure entry AND the following retry's fresh QA attempt, which
+        # produced duplicate ``attempt`` values.
+        next_attempt_num = 0
+
         try:
-            for attempt_num in range(MAX_REPAIR_ATTEMPTS + 1):
+            while True:
                 qa_attempt = self._run_one_attempt(
-                    project_id, workspace, qa_dir, attempt_num, brief, design_dna
+                    project_id, workspace, qa_dir, next_attempt_num, brief, design_dna
                 )
+                next_attempt_num += 1
                 attempts.append(qa_attempt)
 
                 if qa_attempt.final_pass:
@@ -80,7 +90,7 @@ class QAOrchestrator:
                         repair_attempts=repair_count,
                     )
 
-                if attempt_num >= MAX_REPAIR_ATTEMPTS:
+                if repair_count >= MAX_REPAIR_ATTEMPTS:
                     # Repair budget exhausted — no third repair.
                     break
 
@@ -98,9 +108,11 @@ class QAOrchestrator:
                 build_ok, typecheck_ok = self._run_rebuild_checks(project_id, workspace)
                 if not build_ok or not typecheck_ok:
                     # Record a synthetic failing attempt reflecting the
-                    # broken rebuild, then continue the loop (still bounded
-                    # by MAX_REPAIR_ATTEMPTS) so the next iteration can
-                    # either repair again or exhaust the budget.
+                    # broken rebuild. A failed deterministic rebuild is
+                    # metadata about this repair, not a fresh QA pass — but
+                    # it still consumes the next sequential attempt number
+                    # so the history stays strictly increasing and never
+                    # corrupts the repair budget or attempt numbering.
                     failing = DeterministicFindings(
                         render_ok=False,
                         desktop_screenshot_ok=False,
@@ -116,13 +128,17 @@ class QAOrchestrator:
                         failing.failures.append("npm run typecheck failed after repair")
                     attempts.append(
                         QAAttempt(
-                            attempt=attempt_num + 1,
+                            attempt=next_attempt_num,
                             deterministic=failing,
                             vision=None,
                         )
                     )
-                    if attempt_num + 1 >= MAX_REPAIR_ATTEMPTS:
+                    next_attempt_num += 1
+                    if repair_count >= MAX_REPAIR_ATTEMPTS:
                         break
+                    # Budget remains: retry with another repair; the next
+                    # loop iteration's fresh QA attempt gets the next number.
+                    continue
 
             # Exhausted repair budget without a passing attempt -> FAILED.
             self._finalize_failure(project_id, attempts, repair_count)

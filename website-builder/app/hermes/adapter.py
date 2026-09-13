@@ -260,6 +260,8 @@ class HermesAdapter:
         model: Optional[str] = None,
         provider: Optional[str] = None,
         skills: Optional[List[str]] = None,
+        content_parts: Optional[List[Dict[str, Any]]] = None,
+        require_vision: bool = False,
     ) -> HermesResult:
         """Run FAST with a guaranteed zero-tool agent.
 
@@ -352,6 +354,34 @@ class HermesAdapter:
                 explicit_base_url=explicit_base_url_from_alias,
             )
 
+            # VISION must resolve to a model/provider that actually supports
+            # image input. The logical role name is NOT proof of capability —
+            # verify via the same capability lookup the rest of Hermes uses
+            # (agent.image_routing._lookup_supports_vision: config override ->
+            # models.dev capability data). Fail closed rather than silently
+            # sending images to a text-only model.
+            if require_vision:
+                try:
+                    from agent.image_routing import _lookup_supports_vision
+
+                    _vision_provider = str(
+                        runtime.get("requested_provider") or runtime.get("provider") or ""
+                    ).strip()
+                    _vision_model = str(effective_model or "").strip()
+                    _supports = _lookup_supports_vision(_vision_provider, _vision_model, cfg)
+                except Exception:
+                    _supports = None
+                if _supports is False:
+                    return HermesResult(
+                        success=False,
+                        error=(
+                            f"VISION model/provider ({_vision_provider}/{_vision_model}) "
+                            "does not support image input. Configure a vision-capable "
+                            "model for the Website Builder Hermes profile."
+                        ),
+                        exit_code=1,
+                    )
+
             # Preload skills via the same helper the oneshot path uses.
             # Raises ValueError on unknown skills -> surfaced as failure below.
             skills_prompt = _build_preloaded_skills_prompt(skills)
@@ -382,7 +412,7 @@ class HermesAdapter:
                 agent.stream_delta_callback = None
                 agent.tool_gen_callback = None
 
-                result = agent.run_conversation(prompt)
+                result = agent.run_conversation(content_parts if content_parts else prompt)
                 response = result.get("final_response") or ""
                 return HermesResult(
                     success=True,
@@ -719,25 +749,61 @@ Respond with a JSON summary:
     ) -> Dict[str, Any]:
         """Use Hermes VISION role to inspect QA screenshots. Evidence only.
 
-        VISION receives ZERO tool access (toolsets=[] via the CLI boundary
-        with no --toolsets flag is insufficient; VISION must never be able to
-        edit files, run shell, or mutate lifecycle). It runs through the same
-        zero-tool programmatic boundary as FAST, but with the screenshots
-        attached as local image paths in the prompt text — VISION never
-        writes to the workspace and never calls delegate/terminal/file tools
-        because the agent is constructed with enabled_toolsets=[].
+        VISION receives ZERO tool access — it runs through the same zero-tool
+        programmatic boundary as FAST (enabled_toolsets=[]), so it never
+        writes to the workspace and never calls delegate/terminal/file tools.
 
-        Returns a structured evidence dict:
-        {"pass": bool, "critical": [...], "major": [...], "minor": [...],
-         "summary": str} or {"pass": False, "error": str} on failure.
+        The screenshots are attached as REAL multimodal image input (OpenAI-
+        style ``image_url`` content parts) via the existing Hermes-native
+        seam ``agent.image_routing.build_native_content_parts`` — the same
+        helper the CLI/gateway/TUI image-attachment paths use. This is NOT a
+        text prompt containing filesystem paths: VISION receives actual
+        pixels. Both desktop and mobile screenshots must attach successfully;
+        if either cannot be attached (missing file, unreadable, or otherwise
+        skipped by the routing helper), this fails closed rather than running
+        VISION half-blind.
         """
-        prompt = self._build_vision_prompt(
-            desktop_screenshot, mobile_screenshot, brief, design_dna
-        )
+        try:
+            from agent.image_routing import build_native_content_parts
+        except ImportError as exc:
+            return {
+                "pass": False,
+                "critical": [],
+                "major": [],
+                "minor": [],
+                "summary": "",
+                "error": f"Failed to import Hermes image routing: {exc}",
+            }
+
+        prompt_text = self._build_vision_prompt(brief, design_dna)
+
+        image_paths = [str(desktop_screenshot), str(mobile_screenshot)]
+        parts, skipped = build_native_content_parts(prompt_text, image_paths)
+
+        # Fail closed: both screenshots MUST attach. A partial/failed
+        # attachment must never let VISION silently run text-only or with
+        # only one viewport — that is exactly the "VISION is blind" failure
+        # mode this seam exists to prevent.
+        if skipped:
+            return {
+                "pass": False,
+                "critical": [],
+                "major": [],
+                "minor": [],
+                "summary": "",
+                "error": (
+                    "VISION failed to attach required screenshot(s): "
+                    f"{skipped}. Both desktop and mobile screenshots must be "
+                    "attached as multimodal image input; this is a blocking "
+                    "QA condition."
+                ),
+            }
 
         result = self._run_fast_programmatic(
-            prompt=prompt,
+            prompt=prompt_text,
             skills=["website-builder-design-dna"],
+            content_parts=parts,
+            require_vision=True,
         )
 
         if not result.success:
@@ -754,8 +820,6 @@ Respond with a JSON summary:
 
     def _build_vision_prompt(
         self,
-        desktop_screenshot: Path,
-        mobile_screenshot: Path,
         brief: Dict[str, Any],
         design_dna: Optional[Dict[str, Any]],
     ) -> str:
@@ -767,9 +831,9 @@ Respond with a JSON summary:
 
         return f"""You are VISION, the evidence-only visual QA inspector for Website Builder R1.
 
-You have READ-ONLY access to two screenshots on disk:
-- Desktop (1440x900): {desktop_screenshot}
-- Mobile (390x844): {mobile_screenshot}
+Two screenshots are attached to this message:
+- Desktop viewport (1440x900)
+- Mobile viewport (390x844)
 
 Brief:
 - Name: {name}
@@ -779,9 +843,9 @@ Brief:
 Design DNA:
 {dna_summary}
 
-Your job is to inspect the screenshots and report findings. You must NOT edit
-files, run commands, or take any action — you have zero tool access. Report
-only what you observe:
+Your job is to inspect the attached screenshots and report findings. You must
+NOT edit files, run commands, or take any action — you have zero tool access.
+Report only what you observe:
 - missing hero/content
 - clipping or overflow
 - responsive failures

@@ -60,13 +60,20 @@ def _default_capture_fn(url: str, width: int, height: int, out_path: Path) -> bo
         open_argv.extend(["--args", " ".join(shlex.split(browser_args))])
 
     try:
-        subprocess.run(
+        open_result = subprocess.run(
             open_argv,
             capture_output=True,
             text=True,
             timeout=30,
             check=False,
         )
+        # A failed `open` must never fall through to a screenshot: without
+        # this check a nonzero-exit open (bad URL, browser launch failure,
+        # missing sandbox flags, ...) could still produce a "successful"
+        # screenshot of a blank/error page, silently corrupting QA evidence.
+        if open_result.returncode != 0:
+            return False
+
         result = subprocess.run(
             [
                 browser_cmd,

@@ -25,8 +25,16 @@ class VisionFindings:
 
     @property
     def blocking(self) -> bool:
-        """VISION findings are blocking only when critical/major are present."""
-        return bool(self.critical) or bool(self.major)
+        """VISION findings are blocking when critical/major findings are
+        present, OR when VISION itself failed to run (raw_error set).
+
+        A VISION runtime failure (image attach failure, unsupported vision
+        model, provider error, malformed JSON, missing screenshot) must
+        never be silently treated as "no findings" — that would let a QA
+        attempt pass without VISION ever having actually inspected the
+        pixels. Fail closed.
+        """
+        return bool(self.critical) or bool(self.major) or bool(self.raw_error)
 
     def to_dict(self) -> Dict[str, Any]:
         return {

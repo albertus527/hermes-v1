@@ -78,9 +78,19 @@ class LocalRenderer:
         port = self.runner.port_allocator.allocate()
         url = f"http://127.0.0.1:{port}/"
 
+        # The generated project's vite.config.ts sets `preview.host: true`
+        # (public bind) so a real deployment/dev-container QA pass can reach
+        # it from outside its own network namespace. Phase 8's local QA
+        # render only needs localhost access, so explicitly override the
+        # host here rather than editing the generated project's vite config
+        # (which stays intentionally public-bindable for other flows).
         process = self.runner.start_background(
             project_id,
-            ["npm", "run", "preview", "--", "--port", str(port), "--strictPort"],
+            [
+                "npm", "run", "preview", "--",
+                "--port", str(port), "--strictPort",
+                "--host", "127.0.0.1",
+            ],
             cwd=workspace,
             port=port,
         )
