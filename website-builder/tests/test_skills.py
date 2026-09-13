@@ -13,7 +13,8 @@ import unittest
 from pathlib import Path
 
 
-SKILLS_DIR = Path(__file__).parent.parent / "skills"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SKILLS_DIR = REPO_ROOT / ".hermes" / "skills"
 
 REQUIRED_SKILLS = [
     "website-builder-environment",
