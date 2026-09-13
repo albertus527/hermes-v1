@@ -311,6 +311,95 @@ class TestHermesAdapter(unittest.TestCase):
         self.assertEqual(call_kwargs["toolsets"], ["file", "terminal", "skills"])
         self.assertEqual(call_kwargs["cwd"], workspace)
 
+    def test_frontend_build_requests_extended_timeout(self):
+        """FRONTEND build requests the longer 900s timeout.
+
+        Real FRONTEND design + implementation calls exceed the generic 300s
+        default; the build must explicitly request the extended budget.
+        """
+        workspace = Path(self.tmpdir) / "workspaces" / "proj-timeout"
+        workspace.mkdir(parents=True)
+
+        with patch.object(self.adapter, "_run_hermes_cli") as mock_cli:
+            mock_cli.return_value = HermesResult(
+                success=True,
+                response='{"success": true}',
+            )
+            self.adapter.frontend_build(
+                project_id="proj-timeout",
+                brief={"name": "Northcut", "what": "barbershop", "why": "booking"},
+                workspace=workspace,
+            )
+
+        call_kwargs = mock_cli.call_args[1]
+        self.assertEqual(call_kwargs["timeout_seconds"], 900)
+
+    def test_run_hermes_cli_default_timeout_is_300(self):
+        """Generic _run_hermes_cli retains the 300s default timeout."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0, stdout='{"success": true}', stderr=""
+            )
+            self.adapter._run_hermes_cli("test prompt")
+
+        self.assertEqual(mock_run.call_args[1]["timeout"], 300)
+
+    def test_run_hermes_cli_timeout_seconds_override(self):
+        """_run_hermes_cli passes an explicit timeout_seconds to subprocess."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0, stdout='{"success": true}', stderr=""
+            )
+            self.adapter._run_hermes_cli("test prompt", timeout_seconds=900)
+
+        self.assertEqual(mock_run.call_args[1]["timeout"], 900)
+
+    def test_run_hermes_cli_timeout_error_reports_seconds(self):
+        """Timeout failure message reflects the configured timeout."""
+        import subprocess as _sp
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.side_effect = _sp.TimeoutExpired(cmd=["x"], timeout=900)
+            result = self.adapter._run_hermes_cli("test prompt", timeout_seconds=900)
+
+        self.assertFalse(result.success)
+        self.assertIn("900s", result.error)
+        self.assertEqual(result.exit_code, 124)
+
+    def test_frontend_prompt_requires_source_implementation_after_design_dna(self):
+        """FRONTEND prompt bounds design discovery and requires src/ implementation.
+
+        Regression lock for the Phase 7 timeout: the prompt must make Design DNA
+        a bounded step, not the finish line — design discovery is bounded, and
+        the starter placeholder must actually be replaced before stopping.
+        """
+        import re
+
+        workspace = Path(self.tmpdir) / "workspaces" / "proj-prompt"
+        prompt = self.adapter._build_frontend_prompt(
+            {"name": "Northcut", "what": "barbershop", "why": "booking"},
+            workspace,
+        )
+        # Normalize whitespace so assertions are robust to line wrapping.
+        flat = re.sub(r"\s+", " ", prompt)
+
+        # Bounded design discovery.
+        self.assertIn("Keep design discovery bounded", flat)
+        self.assertIn("Choose a coherent direction quickly", flat)
+        self.assertIn("design-dna.json alone does not complete this task", flat)
+        # Immediate implementation after Design DNA.
+        self.assertIn("IMMEDIATELY after writing design-dna.json", flat)
+        self.assertIn("immediately implement the website", flat)
+        # Placeholder replacement is the completion bar.
+        self.assertIn(
+            "starter placeholder in src/ has actually been replaced with the "
+            "website implementation",
+            flat,
+        )
+        self.assertIn("Do not stop after producing Design DNA", flat)
+        # Application-owned npm checks preserved.
+        self.assertIn("Do NOT run npm ci, npm run build, or npm run typecheck", flat)
+
     def test_frontend_build_loads_design_dna(self):
         """FRONTEND build loads Design DNA from workspace."""
         workspace = Path(self.tmpdir) / "workspaces" / "proj-2"

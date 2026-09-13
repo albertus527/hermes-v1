@@ -168,6 +168,7 @@ class HermesAdapter:
         skills: Optional[List[str]] = None,
         cwd: Optional[Path] = None,
         env_extra: Optional[Dict[str, str]] = None,
+        timeout_seconds: int = 300,
     ) -> HermesResult:
         """Run a single Hermes oneshot turn via the scripted CLI boundary.
 
@@ -228,7 +229,7 @@ class HermesAdapter:
                 env=env,
                 capture_output=True,
                 text=True,
-                timeout=300,
+                timeout=timeout_seconds,
             )
 
             # stdout is the final one-shot response text
@@ -243,7 +244,7 @@ class HermesAdapter:
         except subprocess.TimeoutExpired:
             return HermesResult(
                 success=False,
-                error="Hermes oneshot timed out after 300s",
+                error=f"Hermes oneshot timed out after {timeout_seconds}s",
                 exit_code=124,
             )
         except Exception as exc:
@@ -587,6 +588,7 @@ User text:{context_str}
                 "PROJECT_ID": project_id,
                 "WORKSPACE_ROOT": str(workspace),
             },
+            timeout_seconds=900,
         )
 
         if not result.success:
@@ -636,8 +638,9 @@ Your tasks:
 2. Derive a concrete design direction based on the brief and UI UX Pro Max guidance.
 3. Create a Design DNA document at {workspace}/design-dna.json following the
    minimal Design DNA contract. Do NOT invent business facts.
-4. Edit the website source in {workspace}/src/ using the fixed starter.
-   Replace the placeholder App.tsx with a real implementation.
+4. IMMEDIATELY after writing design-dna.json, edit the website source in
+   {workspace}/src/ using the fixed starter. Replace the placeholder App.tsx
+   with a real implementation.
 5. Stop. Do NOT run npm ci, npm run build, or npm run typecheck.
    The application will run deterministic checks after you finish.
 
@@ -648,6 +651,13 @@ Rules:
   testimonials, claims).
 - If a CTA destination is unresolved, use a placeholder and mark it clearly.
 - Keep the build sequential.
+- Keep design discovery bounded. Choose a coherent direction quickly rather
+  than exhaustively exploring alternatives. Once Design DNA is written,
+  immediately implement the website. Creating design-dna.json alone does
+  not complete this task.
+- The task is incomplete until the starter placeholder in src/ has actually
+  been replaced with the website implementation. Do not stop after producing
+  Design DNA.
 
 {instructions}
 
