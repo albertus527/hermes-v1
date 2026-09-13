@@ -180,11 +180,16 @@ class HermesAdapter:
 
         # Build the command to run hermes oneshot
         # Use the existing Hermes CLI entry point
+        # `-z`/`--oneshot` takes the prompt as its immediate argument, so the
+        # prompt must directly follow the flag. Any options appended between
+        # `-z` and the prompt are consumed by argparse as the oneshot value,
+        # which then fails with "argument -z/--oneshot: expected one argument".
         cmd = [
             sys.executable,
             "-m",
             "hermes_cli.main",
             "-z",
+            prompt,
         ]
 
         if model:
@@ -204,9 +209,6 @@ class HermesAdapter:
         if skills:
             for skill in skills:
                 cmd.extend(["--skills", skill])
-
-        # Add the prompt
-        cmd.append(prompt)
 
         # Build environment
         env = os.environ.copy()

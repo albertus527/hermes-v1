@@ -357,6 +357,54 @@ class TestHermesAdapter(unittest.TestCase):
         self.assertEqual(result.response, "The final response text")
         self.assertTrue(result.success)
 
+    def test_oneshot_prompt_immediately_follows_z_flag(self):
+        """Regression: the oneshot prompt is the immediate argument to -z.
+
+        Hermes argparse defines `-z PROMPT` / `--oneshot PROMPT`, so the
+        prompt MUST directly follow the flag. Previously the prompt was
+        appended at the very end of argv, after --toolsets/--skills, which
+        made argparse consume the next option as the oneshot value and fail
+        with "argument -z/--oneshot: expected one argument".
+        """
+        prompt = "Build the Northcut barbershop landing page."
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0, stdout='{"success": true}', stderr=""
+            )
+            self.adapter._run_hermes_cli(
+                prompt,
+                model="test-model",
+                provider="test-provider",
+                toolsets=["file", "terminal", "skills"],
+                skills=[
+                    "website-builder-environment",
+                    "website-builder-product-scope",
+                    "website-builder-design-dna",
+                ],
+            )
+
+        argv = mock_run.call_args[0][0]
+
+        # The prompt is the immediate argument to -z.
+        z_index = argv.index("-z")
+        self.assertEqual(argv[z_index + 1], prompt)
+
+        # Toolset/skill/provider/model flags remain present and correct.
+        self.assertIn("--toolsets", argv)
+        self.assertEqual(
+            argv[argv.index("--toolsets") + 1], "file,terminal,skills"
+        )
+        self.assertEqual(argv.count("--skills"), 3)
+        self.assertIn("website-builder-environment", argv)
+        self.assertIn("website-builder-product-scope", argv)
+        self.assertIn("website-builder-design-dna", argv)
+        self.assertEqual(argv[argv.index("--model") + 1], "test-model")
+        self.assertEqual(argv[argv.index("--provider") + 1], "test-provider")
+
+        # The prompt appears exactly once, right after -z (not at the tail).
+        self.assertEqual(argv.count(prompt), 1)
+        self.assertNotEqual(argv[-1], prompt)
+
 
 class TestSkillResolution(unittest.TestCase):
     """Test that skill names passed by FAST/FRONTEND are resolvable."""
