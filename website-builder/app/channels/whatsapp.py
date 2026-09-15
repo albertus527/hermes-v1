@@ -29,7 +29,7 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 from app.channels.telegram import NormalizedMessage
@@ -40,6 +40,26 @@ from app.deploy.adapters import UrllibHttpTransport, _json_call
 def _fail(code: str) -> OperationResult:
     # Never expose provider responses/exceptions -- they can contain tokens.
     return OperationResult.fail(code, error_code=code, retryable=False)
+
+
+def _valid_bool(value: Any) -> bool:
+    return isinstance(value, bool)
+
+
+def _valid_graph_api_version(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    if any(ch.isspace() for ch in value) or any(ch in value for ch in "/?#"):
+        return False
+    return bool(re.fullmatch(r"v\d+\.\d+", value))
+
+
+def _valid_phone_number_id(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    if any(ch.isspace() for ch in value) or any(ord(ch) < 32 or ord(ch) > 126 for ch in value):
+        return False
+    return bool(re.fullmatch(r"\d+", value))
 
 
 @dataclass(frozen=True)
@@ -53,10 +73,10 @@ class WhatsAppConfig:
     """
 
     enabled: bool = False
-    access_token: Optional[str] = None
+    access_token: Optional[str] = field(default=None, repr=False)
     phone_number_id: Optional[str] = None
-    verify_token: Optional[str] = None
-    app_secret: Optional[str] = None
+    verify_token: Optional[str] = field(default=None, repr=False)
+    app_secret: Optional[str] = field(default=None, repr=False)
     graph_api_version: Optional[str] = None
 
     def validate_enabled(self) -> Optional[str]:
@@ -66,7 +86,7 @@ class WhatsAppConfig:
         checked -- the feature is simply off, and the rest of Website
         Builder behaves exactly as before this phase.
         """
-        if not self.enabled:
+        if not _valid_bool(self.enabled) or not self.enabled:
             return None
         for name in (
             "access_token", "phone_number_id", "verify_token",
@@ -75,11 +95,15 @@ class WhatsAppConfig:
             value = getattr(self, name)
             if not isinstance(value, str) or not value.strip():
                 return "CONFIGURATION_ERROR"
+        if not _valid_graph_api_version(self.graph_api_version):
+            return "CONFIGURATION_ERROR"
+        if not _valid_phone_number_id(self.phone_number_id):
+            return "CONFIGURATION_ERROR"
         return None
 
     @property
     def ready(self) -> bool:
-        return self.enabled and self.validate_enabled() is None
+        return isinstance(self.enabled, bool) and self.enabled and self.validate_enabled() is None
 
 
 def load_whatsapp_config(
@@ -105,8 +129,10 @@ def load_whatsapp_config(
             candidate = wb.get("whatsapp")
             if isinstance(candidate, dict):
                 section = candidate
+    enabled_raw = section.get("enabled", False)
+    enabled = enabled_raw if _valid_bool(enabled_raw) else False
     return WhatsAppConfig(
-        enabled=bool(section.get("enabled", False)),
+        enabled=enabled,
         access_token=(env.get("WHATSAPP_ACCESS_TOKEN") or None),
         phone_number_id=(env.get("WHATSAPP_PHONE_NUMBER_ID") or None),
         verify_token=(env.get("WHATSAPP_VERIFY_TOKEN") or None),
@@ -178,12 +204,59 @@ class WhatsAppNormalizer:
     """
 
     @staticmethod
-    def normalize(payload: Dict[str, Any]) -> Optional[NormalizedMessage]:
-        if not isinstance(payload, dict) or payload.get("object") != "whatsapp_business_account":
+    def _normalize_one(message: Any) -> Optional[NormalizedMessage]:
+        if not isinstance(message, dict):
             return None
+
+        event_id = message.get("id")
+        sender = message.get("from")
+        if (
+            not isinstance(event_id, str) or not event_id.strip()
+            or not isinstance(sender, str) or not sender.strip()
+        ):
+            return None
+
+        if message.get("type") != "text":
+            # Unsupported message type: deterministic safe no-op,
+            # never a crash and never fabricated text.
+            return None
+
+        text_obj = message.get("text")
+        text = text_obj.get("body") if isinstance(text_obj, dict) else None
+        if not isinstance(text, str):
+            return None
+
+        try:
+            timestamp = float(message.get("timestamp"))
+        except (TypeError, ValueError):
+            timestamp = time.time()
+
+        reply_to = None
+        context = message.get("context")
+        if isinstance(context, dict):
+            context_id = context.get("id")
+            if isinstance(context_id, str) and context_id:
+                reply_to = {"message_id": context_id}
+
+        return NormalizedMessage(
+            event_id=event_id,
+            channel="whatsapp",
+            user_id=sender,
+            conversation_id=sender,
+            text=text,
+            attachments=[],
+            reply_to=reply_to,
+            timestamp=timestamp,
+        )
+
+    @staticmethod
+    def normalize_all(payload: Dict[str, Any]) -> list[NormalizedMessage]:
+        if not isinstance(payload, dict) or payload.get("object") != "whatsapp_business_account":
+            return []
         entries = payload.get("entry")
         if not isinstance(entries, list):
-            return None
+            return []
+        normalized: list[NormalizedMessage] = []
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
@@ -199,51 +272,16 @@ class WhatsAppNormalizer:
                 messages = value.get("messages")
                 if not isinstance(messages, list) or not messages:
                     continue
-                message = messages[0]
-                if not isinstance(message, dict):
-                    return None
+                for message in messages:
+                    item = WhatsAppNormalizer._normalize_one(message)
+                    if item is not None:
+                        normalized.append(item)
+        return normalized
 
-                event_id = message.get("id")
-                sender = message.get("from")
-                if (
-                    not isinstance(event_id, str) or not event_id.strip()
-                    or not isinstance(sender, str) or not sender.strip()
-                ):
-                    return None
-
-                if message.get("type") != "text":
-                    # Unsupported message type: deterministic safe no-op,
-                    # never a crash and never fabricated text.
-                    return None
-
-                text_obj = message.get("text")
-                text = text_obj.get("body") if isinstance(text_obj, dict) else None
-                if not isinstance(text, str):
-                    return None
-
-                try:
-                    timestamp = float(message.get("timestamp"))
-                except (TypeError, ValueError):
-                    timestamp = time.time()
-
-                reply_to = None
-                context = message.get("context")
-                if isinstance(context, dict):
-                    context_id = context.get("id")
-                    if isinstance(context_id, str) and context_id:
-                        reply_to = {"message_id": context_id}
-
-                return NormalizedMessage(
-                    event_id=event_id,
-                    channel="whatsapp",
-                    user_id=sender,
-                    conversation_id=sender,
-                    text=text,
-                    attachments=[],
-                    reply_to=reply_to,
-                    timestamp=timestamp,
-                )
-        return None
+    @staticmethod
+    def normalize(payload: Dict[str, Any]) -> Optional[NormalizedMessage]:
+        messages = WhatsAppNormalizer.normalize_all(payload)
+        return messages[0] if messages else None
 
 
 class MetaCloudApiAdapter:
@@ -386,12 +424,17 @@ class WhatsAppWebhookApplication:
         except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
             return respond("400 Bad Request")
 
-        message = WhatsAppNormalizer.normalize(payload)
-        if message is not None:
+        messages = WhatsAppNormalizer.normalize_all(payload)
+        if not messages:
+            return respond("200 OK")
+
+        for message in messages:
             try:
-                self.on_message(message)
+                result = self.on_message(message)
+                if isinstance(result, OperationResult) and not result.success:
+                    return respond("500 Internal Server Error")
             except Exception:
                 # Application-side failures never leak transport/signature
                 # detail back to Meta; Meta will retry the webhook.
-                pass
+                return respond("500 Internal Server Error")
         return respond("200 OK")

@@ -14,7 +14,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 
-from app.channels.telegram import TelegramNormalizer
+from app.channels.telegram import NormalizedMessage, TelegramNormalizer
 from app.channels.whatsapp import WhatsAppNormalizer
 from app.core.authz import AuthzError, ProjectAccess, require_mutating_role, require_owner_role, valid_principal
 from app.core.contracts import OperationResult
@@ -56,6 +56,28 @@ class AuthenticatedWhatsAppContext:
         return "whatsapp:" + self.user_id
 
 
+def dispatch_normalized(dispatcher, message, project_id, action, *, authenticated=None, seq=None,
+                       reference_token=None, data=None, role=None, url=None, brief=None,
+                       index=None, hostname=None, ownership_claim=False):
+    if not isinstance(authenticated, (AuthenticatedWhatsAppContext, AuthenticatedTelegramContext)):
+        raise AuthzError()
+    return dispatcher.dispatch(
+        message,
+        project_id,
+        action,
+        authenticated=authenticated,
+        seq=seq,
+        reference_token=reference_token,
+        data=data,
+        role=role,
+        url=url,
+        brief=brief,
+        index=index,
+        hostname=hostname,
+        ownership_claim=ownership_claim,
+    )
+
+
 class TelegramDispatcher:
     def __init__(self, store, intake, revise=None, promote=None, workspace_for=None,
                  reference_intake=None, directions=None, domain=None, builder=None):
@@ -78,7 +100,10 @@ class TelegramDispatcher:
                 raise AuthzError()
             principal = authenticated.principal_id
             try:
-                message = normalizer.normalize(payload)
+                if isinstance(payload, NormalizedMessage):
+                    message = payload
+                else:
+                    message = normalizer.normalize(payload)
             except (AttributeError, TypeError, ValueError):
                 raise AuthzError() from None
             if (message is None or message.user_id != authenticated.user_id

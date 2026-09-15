@@ -85,12 +85,26 @@ class TestConfig:
         assert cfg.validate_enabled() is None
         assert cfg.ready is False
 
+    def test_enabled_string_false_is_rejected(self):
+        cfg = load_whatsapp_config(
+            {"website_builder": {"whatsapp": {"enabled": "false", "graph_api_version": "v21.0"}}},
+            env={
+                "WHATSAPP_ACCESS_TOKEN": "t",
+                "WHATSAPP_PHONE_NUMBER_ID": "1234567890",
+                "WHATSAPP_VERIFY_TOKEN": "v",
+                "WHATSAPP_APP_SECRET": "s",
+            },
+        )
+        assert cfg.enabled is False
+        assert cfg.ready is False
+        assert cfg.validate_enabled() is None
+
     def test_enabled_complete_config(self):
         cfg = load_whatsapp_config(
             {"website_builder": {"whatsapp": {"enabled": True, "graph_api_version": "v21.0"}}},
             env={
                 "WHATSAPP_ACCESS_TOKEN": "t",
-                "WHATSAPP_PHONE_NUMBER_ID": "p",
+                "WHATSAPP_PHONE_NUMBER_ID": "1234567890",
                 "WHATSAPP_VERIFY_TOKEN": "v",
                 "WHATSAPP_APP_SECRET": "s",
             },
@@ -125,16 +139,19 @@ class TestConfig:
         assert cfg.validate_enabled() == "CONFIGURATION_ERROR"
 
     def test_no_secret_leakage_in_repr(self):
-        cfg = _cfg()
-        # dataclass repr includes field values by default; ensure no
-        # exception-based leakage path exists elsewhere (adapter methods
-        # never expose config/tokens in return values).
-        assert isinstance(repr(cfg), str)  # sanity: constructible/reprable
+        cfg = _cfg(access_token="secret-token-abc", verify_token="verify-secret", app_secret="app-secret")
+        text = repr(cfg)
+        assert "secret-token-abc" not in text
+        assert "verify-secret" not in text
+        assert "app-secret" not in text
+        assert isinstance(text, str)
         try:
             MetaCloudApiAdapter(_cfg(access_token=""))
             assert False, "should have raised"
         except ValueError as exc:
             assert cfg.access_token not in str(exc)
+            assert cfg.verify_token not in str(exc)
+            assert cfg.app_secret not in str(exc)
 
 
 # ---------------------------------------------------------------------
@@ -238,6 +255,23 @@ class TestNormalization:
         payload["entry"][0]["changes"][0]["value"]["messages"][0]["role"] = "owner"
         msg = WhatsAppNormalizer.normalize(payload)
         assert msg.user_id == "60111111111"
+
+    def test_multiple_supported_messages_are_not_silently_dropped(self):
+        payload = {
+            "object": "whatsapp_business_account",
+            "entry": [{
+                "changes": [{
+                    "field": "messages",
+                    "value": {"messages": [
+                        {"id": "wamid.1", "from": "60123456789", "timestamp": "1", "type": "text", "text": {"body": "first"}},
+                        {"id": "wamid.2", "from": "60123456789", "timestamp": "2", "type": "text", "text": {"body": "second"}},
+                    ]},
+                }],
+            }],
+        }
+        msgs = WhatsAppNormalizer.normalize_all(payload)
+        assert [m.event_id for m in msgs] == ["wamid.1", "wamid.2"]
+        assert [m.text for m in msgs] == ["first", "second"]
 
 
 # ---------------------------------------------------------------------
@@ -443,3 +477,46 @@ class TestWebhookApplication:
         environ = self._environ_get("hub.mode=subscribe")
         list(app(environ, self._start_response))
         assert self.last_status == "503 Service Unavailable"
+
+    def test_application_exception_is_not_acknowledged_as_success(self):
+        def boom(message):
+            raise RuntimeError("retry me")
+
+        app = WhatsAppWebhookApplication(_cfg(), on_message=boom)
+        body = json.dumps(_text_payload()).encode()
+        environ = self._environ_post(body, _sign(body))
+        list(app(environ, self._start_response))
+        assert self.last_status == "500 Internal Server Error"
+
+    def test_signed_webhook_routes_to_existing_dispatcher(self, tmp_path):
+        store = _owned_store(tmp_path)
+        from unittest.mock import MagicMock
+        refs = MagicMock()
+        refs.add_upload.return_value = OperationResult.ok()
+        dispatcher = TelegramDispatcher(store, None, reference_intake=refs)
+
+        def callback(message):
+            from app.channels.dispatch import dispatch_normalized
+            return dispatch_normalized(
+                dispatcher,
+                message,
+                project_id="app",
+                action="reference_upload",
+                authenticated=AuthenticatedWhatsAppContext(message.user_id, message.conversation_id),
+                data=b"x",
+                role="UX",
+            )
+
+        app = WhatsAppWebhookApplication(_cfg(), on_message=callback)
+        body = json.dumps(_text_payload(sender="60123456789")).encode()
+        environ = self._environ_post(body, _sign(body))
+        result = list(app(environ, self._start_response))
+        assert self.last_status == "200 OK"
+        assert refs.add_upload.call_count == 1
+        assert result == [b""]
+
+        replay = list(WhatsAppWebhookApplication(_cfg(), on_message=callback)(
+            self._environ_post(body, _sign(body)), self._start_response
+        ))
+        assert self.last_status == "200 OK"
+        assert refs.add_upload.call_count == 1
