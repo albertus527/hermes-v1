@@ -2,12 +2,20 @@
 
 Claims are saved under the project writer before effects. Unknown outcomes stay
 claimed across restarts; replay never retries an ambiguous mutation.
+
+WhatsApp is ONLY another transport/channel adapter feeding this SAME
+dispatch pipeline (see app/channels/whatsapp.py). It does not create a
+parallel project lifecycle, revision system, deployment system, or
+authorization/deduplication store -- ``AuthenticatedWhatsAppContext`` below
+mirrors ``AuthenticatedTelegramContext`` exactly, and ``TelegramDispatcher``
+picks the matching normalizer purely from the context type.
 """
 import hashlib
 import json
 from dataclasses import dataclass
 
 from app.channels.telegram import TelegramNormalizer
+from app.channels.whatsapp import WhatsAppNormalizer
 from app.core.authz import AuthzError, ProjectAccess, require_mutating_role, require_owner_role, valid_principal
 from app.core.contracts import OperationResult
 from app.core.lifecycle import ProjectLifecycle
@@ -26,6 +34,28 @@ class AuthenticatedTelegramContext:
         return "telegram:" + self.user_id
 
 
+@dataclass(frozen=True)
+class AuthenticatedWhatsAppContext:
+    """Trusted WhatsApp principal, derived ONLY after webhook signature
+    verification (see app.channels.whatsapp.verify_webhook_signature).
+
+    ``user_id``/``conversation_id`` are the verified WhatsApp sender
+    identifier (Meta's ``messages[0].from``). Website Builder only ever
+    exchanges direct 1:1 messages with a sender, so both fields are the
+    same verified identifier -- mirroring how Telegram's private-chat
+    principal derivation collapses user_id/conversation_id for DMs.
+    """
+
+    user_id: str
+    conversation_id: str
+
+    @property
+    def principal_id(self):
+        if not valid_principal(self.user_id) or not valid_principal(self.conversation_id):
+            raise AuthzError()
+        return "whatsapp:" + self.user_id
+
+
 class TelegramDispatcher:
     def __init__(self, store, intake, revise=None, promote=None, workspace_for=None,
                  reference_intake=None, directions=None, domain=None, builder=None):
@@ -40,18 +70,23 @@ class TelegramDispatcher:
                  reference_token=None, data=None, role=None, url=None, brief=None,
                  index=None, hostname=None, ownership_claim=False):
         try:
-            if not isinstance(authenticated, AuthenticatedTelegramContext):
+            if isinstance(authenticated, AuthenticatedTelegramContext):
+                normalizer = TelegramNormalizer
+            elif isinstance(authenticated, AuthenticatedWhatsAppContext):
+                normalizer = WhatsAppNormalizer
+            else:
                 raise AuthzError()
             principal = authenticated.principal_id
             try:
-                message = TelegramNormalizer.normalize(payload)
+                message = normalizer.normalize(payload)
             except (AttributeError, TypeError, ValueError):
                 raise AuthzError() from None
             if (message is None or message.user_id != authenticated.user_id
                     or message.conversation_id != authenticated.conversation_id):
                 raise AuthzError()
             if action == "create":
-                self.access.create(project_id, principal, channel="telegram",
+                channel = "whatsapp" if isinstance(authenticated, AuthenticatedWhatsAppContext) else "telegram"
+                self.access.create(project_id, principal, channel=channel,
                                    conversation_id=authenticated.conversation_id)
                 return OperationResult.ok({"project_id": project_id})
             if action == "read":

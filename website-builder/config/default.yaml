@@ -2,6 +2,17 @@
 # Non-secret settings only. Secrets go in .env.
 
 website_builder:
+  # Phase 15: WhatsApp Cloud API channel (official Meta Business Platform
+  # only). Disabled by default -- enabling requires real Meta credentials
+  # in .env (WHATSAPP_ACCESS_TOKEN, WHATSAPP_PHONE_NUMBER_ID,
+  # WHATSAPP_VERIFY_TOKEN, WHATSAPP_APP_SECRET) and webhook registration.
+  # See app/channels/whatsapp.py for the full contract.
+  whatsapp:
+    enabled: false
+    # Configurable Meta Graph API version. Never hardcode a stale version;
+    # set this once real credentials/webhooks are configured.
+    graph_api_version: null
+
   # Workspace root for generated projects
   workspace_root: '~/website-workspaces'
 
