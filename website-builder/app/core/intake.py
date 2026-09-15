@@ -14,6 +14,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from app.channels.telegram import NormalizedMessage
+from app.core.authz import require_mutating_role
 from app.core.lifecycle import ProjectLifecycle
 from app.core.state import ProjectStateStore
 
@@ -252,9 +253,13 @@ class IntakeProcessor:
             return f"What should visitors primarily understand or do on {brief['name']}?"
         return None
 
-    def apply_to_project(self, project_id: str, result: IntakeResult) -> None:
+    def apply_to_project(self, project_id: str, result: IntakeResult,
+                         principal_id=None, event_id=None) -> None:
         """Apply intake result to project state. Application owns transitions."""
         with self.store.acquire_writer(project_id) as state:
+            require_mutating_role(state, principal_id)
+            if event_id is not None and event_id in state.processed_events:
+                return
             # Update brief if we have new information
             if result.brief.get("name"):
                 state.brief["name"] = result.brief["name"]
@@ -284,4 +289,6 @@ class IntakeProcessor:
                 if state.lifecycle == ProjectLifecycle.DISCOVERING.value:
                     self.store.transition_lifecycle_locked(state, ProjectLifecycle.WAITING_INPUT)
 
+            if event_id is not None:
+                state.processed_events.add(event_id)
             self.store.save(state)

@@ -159,6 +159,31 @@ class HermesAdapter:
             shutil.copytree(src, dst)
             logging.debug("Synced skill %s -> %s", name, dst)
 
+    def _load_role_config(self):
+        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+        token = set_hermes_home_override(self.hermes_home)
+        try:
+            if load_config is None:
+                raise ValueError("Hermes configuration unavailable")
+            return load_config()
+        finally:
+            reset_hermes_home_override(token)
+
+    @staticmethod
+    def _role_selection(cfg, role):
+        if role not in {"FAST", "FRONTEND", "VISION"}:
+            raise ValueError("Unknown Website Builder model role")
+        try:
+            selection = cfg["website_builder"]["models"][role]
+            if not isinstance(selection, dict):
+                raise ValueError()
+            model, provider = selection["model"], selection["provider"]
+            if not all(isinstance(v, str) and v.strip() for v in (model, provider)):
+                raise ValueError()
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("Missing or malformed Website Builder model role: " + role) from None
+        return model.strip(), provider.strip()
+
     def _run_hermes_cli(
         self,
         prompt: str,
@@ -169,12 +194,20 @@ class HermesAdapter:
         cwd: Optional[Path] = None,
         env_extra: Optional[Dict[str, str]] = None,
         timeout_seconds: int = 300,
+        role: Optional[str] = None,
     ) -> HermesResult:
         """Run a single Hermes oneshot turn via the scripted CLI boundary.
 
         Uses `hermes -z` (or `python -m hermes_cli.main -z`) with explicit
         toolsets and skills. stdout is the final response text.
         """
+        if role is not None:
+            try:
+                if load_config is None:
+                    raise ValueError("Hermes configuration unavailable")
+                model, provider = self._role_selection(self._load_role_config(), role)
+            except Exception as exc:
+                return HermesResult(False, error=str(exc), exit_code=1)
         # Ensure profile-local skills are up-to-date so they resolve
         # regardless of the cwd Hermes will run in.
         self.sync_skills_to_profile()
@@ -262,6 +295,7 @@ class HermesAdapter:
         skills: Optional[List[str]] = None,
         content_parts: Optional[List[Dict[str, Any]]] = None,
         require_vision: bool = False,
+        role: Optional[str] = None,
     ) -> HermesResult:
         """Run FAST with a guaranteed zero-tool agent.
 
@@ -297,7 +331,10 @@ class HermesAdapter:
             )
 
         try:
-            cfg = load_config()
+            cfg = self._load_role_config()
+
+            if role is not None:
+                model, provider = self._role_selection(cfg, role)
 
             # Resolve effective model: explicit arg -> env var -> config.
             # Mirrors hermes_cli.oneshot._run_agent exactly.
@@ -371,7 +408,7 @@ class HermesAdapter:
                     _supports = _lookup_supports_vision(_vision_provider, _vision_model, cfg)
                 except Exception:
                     _supports = None
-                if _supports is False:
+                if _supports is not True:
                     return HermesResult(
                         success=False,
                         error=(
@@ -389,7 +426,8 @@ class HermesAdapter:
             session_db = _create_session_db_for_oneshot()
             agent = None
             try:
-                _fb = get_fallback_chain(cfg)
+                # Generic profile fallbacks are not qualified for these roles.
+                _fb = [] if role is not None else get_fallback_chain(cfg)
 
                 agent = AIAgent(
                     api_key=runtime.get("api_key"),
@@ -462,6 +500,7 @@ class HermesAdapter:
         # FAST uses the programmatic boundary to guarantee zero tools.
         result = self._run_fast_programmatic(
             prompt=prompt,
+            role="FAST",
             skills=["website-builder-environment", "website-builder-product-scope"],
         )
 
@@ -588,6 +627,129 @@ User text:{context_str}
             "source": "fallback_heuristic",
         }
 
+    def frontend_propose_directions(
+        self,
+        brief: Dict[str, Any],
+        workspace: Path,
+    ) -> Dict[str, Any]:
+        """Phase 13: FRONTEND proposes 2-3 LIGHTWEIGHT design directions.
+
+        Bounded and cheap by construction: this call uses the same zero-tool
+        programmatic FAST/VISION boundary (``_run_fast_programmatic`` with
+        ``enabled_toolsets=[]``) as ``fast_interpret``/``vision_inspect`` — it
+        NEVER grants file/terminal tools, so it is structurally incapable of
+        writing a workspace or running a full FRONTEND build. Each direction
+        is a short text/style descriptor plus a palette swatch only, never a
+        rendered mockup or a build artifact.
+
+        Returns ``{"success": bool, "directions": [{"label", "descriptor",
+        "palette": {...}}, ...2-3 entries...], "error": Optional[str]}``.
+        Fails closed (success=False, empty directions) on any parse failure
+        or Hermes error — callers must never fabricate a fallback direction
+        set from an empty/failed response.
+        """
+        prompt = self._build_directions_prompt(brief)
+
+        result = self._run_fast_programmatic(
+            prompt=prompt,
+            role="FRONTEND",
+            skills=["website-builder-product-scope", "website-builder-design-dna"],
+        )
+
+        if not result.success:
+            return {
+                "success": False,
+                "directions": [],
+                "error": result.error or "FRONTEND direction proposal failed",
+            }
+
+        return self._parse_directions_response(result.response)
+
+    def _build_directions_prompt(self, brief: Dict[str, Any]) -> str:
+        name = brief.get("name", "Website")
+        what = brief.get("what", "")
+        why = brief.get("why", "")
+
+        return f"""You are FRONTEND, proposing LIGHTWEIGHT design directions for
+Website Builder R1 Phase 13 (no-reference, non-delegated design choice).
+
+Brief:
+- Name: {name}
+- What: {what}
+- Why: {why}
+
+The user has NOT delegated design authority and has NOT provided any
+reference images/URLs. Propose exactly 2 or 3 distinct, coherent design
+directions. Each direction must be a SHORT, cheap descriptor only:
+- a one-line style label
+- a one-paragraph descriptor of brand personality / layout feel
+- a small palette (primary/secondary/accent hex colors)
+
+Do NOT design a full page. Do NOT write any code. Do NOT invent business
+facts (services, pricing, addresses, contact details, testimonials, claims).
+This is a lightweight menu of directions for the user to pick from, not a
+build.
+
+Respond in this exact JSON format:
+{{
+  "directions": [
+    {{
+      "label": "short style label",
+      "descriptor": "one paragraph description",
+      "palette": {{"primary": "#000000", "secondary": "#ffffff", "accent": "#000000"}}
+    }}
+  ]
+}}
+"""
+
+    def _parse_directions_response(self, response: str) -> Dict[str, Any]:
+        try:
+            start = response.find("{")
+            end = response.rfind("}") + 1
+            if start >= 0 and end > start:
+                data = json.loads(response[start:end])
+                raw = data.get("directions")
+                if isinstance(raw, list) and 2 <= len(raw) <= 3:
+                    directions = []
+                    for entry in raw:
+                        if not isinstance(entry, dict):
+                            return {
+                                "success": False,
+                                "directions": [],
+                                "error": "Malformed direction entry",
+                            }
+                        label = entry.get("label")
+                        descriptor = entry.get("descriptor")
+                        palette = entry.get("palette")
+                        if not (
+                            isinstance(label, str)
+                            and label
+                            and isinstance(descriptor, str)
+                            and descriptor
+                            and isinstance(palette, dict)
+                        ):
+                            return {
+                                "success": False,
+                                "directions": [],
+                                "error": "Incomplete direction entry",
+                            }
+                        directions.append(
+                            {"label": label, "descriptor": descriptor, "palette": palette}
+                        )
+                    return {"success": True, "directions": directions}
+                return {
+                    "success": False,
+                    "directions": [],
+                    "error": "FRONTEND must propose exactly 2-3 directions",
+                }
+        except (json.JSONDecodeError, ValueError):
+            pass
+        return {
+            "success": False,
+            "directions": [],
+            "error": "Failed to parse FRONTEND directions response",
+        }
+
     def frontend_build(
         self,
         project_id: str,
@@ -607,6 +769,7 @@ User text:{context_str}
         # It does NOT silently inherit the broader default hermes-cli toolset.
         result = self._run_hermes_cli(
             prompt=prompt,
+            role="FRONTEND",
             toolsets=["file", "terminal", "skills"],
             skills=[
                 "website-builder-environment",
@@ -804,6 +967,7 @@ Respond with a JSON summary:
             skills=["website-builder-design-dna"],
             content_parts=parts,
             require_vision=True,
+            role="VISION",
         )
 
         if not result.success:
@@ -870,6 +1034,110 @@ Respond in this exact JSON format:
   "summary": "one paragraph summary"
 }}
 """
+
+    def vision_extract_references(
+        self,
+        reference_files: Dict[str, Path],
+    ) -> Dict[str, Any]:
+        """Use Hermes VISION to extract per-role characteristics from Phase 12
+        design references. Evidence-only — VISION never edits, never copies
+        source/assets, and receives ZERO tool access (same zero-tool
+        programmatic boundary as ``vision_inspect``/``fast_interpret``).
+
+        ``reference_files`` maps role name (UX/COLOR/LAYOUT/MOTION) to a
+        staged image path. Returns ``{"success": bool, "characteristics":
+        {role: str}, "error": Optional[str]}``. Fails closed (success=False)
+        if any reference cannot be attached as real multimodal image input.
+        """
+        try:
+            from agent.image_routing import build_native_content_parts
+        except ImportError as exc:
+            return {
+                "success": False,
+                "characteristics": {},
+                "error": f"Failed to import Hermes image routing: {exc}",
+            }
+
+        if not reference_files:
+            return {"success": True, "characteristics": {}}
+
+        roles = sorted(reference_files.keys())
+        prompt_text = self._build_reference_extraction_prompt(roles)
+        image_paths = [str(reference_files[role]) for role in roles]
+        parts, skipped = build_native_content_parts(prompt_text, image_paths)
+
+        if skipped:
+            return {
+                "success": False,
+                "characteristics": {},
+                "error": (
+                    "VISION failed to attach required reference image(s): "
+                    f"{skipped}. Every reference must attach as multimodal "
+                    "image input; this is a blocking condition."
+                ),
+            }
+
+        result = self._run_fast_programmatic(
+            prompt=prompt_text,
+            skills=["website-builder-design-dna"],
+            content_parts=parts,
+            require_vision=True,
+            role="VISION",
+        )
+
+        if not result.success:
+            return {
+                "success": False,
+                "characteristics": {},
+                "error": result.error or "VISION reference extraction failed",
+            }
+
+        return self._parse_reference_extraction_response(result.response, roles)
+
+    def _build_reference_extraction_prompt(self, roles: List[str]) -> str:
+        role_order = ", ".join(roles)
+        return f"""You are VISION, the evidence-only design reference inspector for
+Website Builder R1 Phase 12 (multi-reference composition).
+
+Attached images are, in order: {role_order}. Each image contributes ONLY
+the named characteristic to the final design:
+- UX: interaction patterns, information architecture, navigation feel
+- COLOR: palette, contrast, mood
+- LAYOUT: grid, spacing, composition, page structure
+- MOTION: transitions, animation character, pacing (if depicted)
+
+You must NOT edit files, run commands, or take any action — you have zero
+tool access. Describe only the characteristic named for each image as
+observed EVIDENCE (a short factual description), never as instructions to
+literally copy the image's layout, code, or assets. Do not invent business
+facts from the image content.
+
+Respond in this exact JSON format, one entry per attached role in order:
+{{
+  "characteristics": {{
+    "ROLE_NAME": "short evidence-based description"
+  }}
+}}
+"""
+
+    def _parse_reference_extraction_response(
+        self, response: str, roles: List[str]
+    ) -> Dict[str, Any]:
+        try:
+            start = response.find("{")
+            end = response.rfind("}") + 1
+            if start >= 0 and end > start:
+                data = json.loads(response[start:end])
+                from app.core.references import validate_characteristics
+                characteristics = validate_characteristics(data.get("characteristics"), roles)
+                return {"success": True, "characteristics": characteristics}
+        except (json.JSONDecodeError, ValueError):
+            pass
+        return {
+            "success": False,
+            "characteristics": {},
+            "error": "Failed to parse VISION reference extraction response",
+        }
 
     def _parse_vision_response(self, response: str) -> Dict[str, Any]:
         """Parse VISION JSON response. Fails closed (pass=false) on parse failure."""

@@ -259,7 +259,8 @@ class TestVisionMultimodalRouting(unittest.TestCase):
 
         with patch("app.hermes.adapter.AIAgent") as mock_agent_cls, patch(
             "app.hermes.adapter.load_config",
-            return_value={"model": {"default": "m", "provider": "p"}},
+            return_value={"website_builder": {"models": {"VISION": {"model": "m", "provider": "p"}}}},
+        ), patch("agent.image_routing._lookup_supports_vision", return_value=True
         ), patch(
             "app.hermes.adapter.resolve_runtime_provider",
             return_value={
@@ -293,7 +294,8 @@ class TestVisionMultimodalRouting(unittest.TestCase):
         """VISION remains zero-tools even with multimodal content."""
         with patch("app.hermes.adapter.AIAgent") as mock_agent_cls, patch(
             "app.hermes.adapter.load_config",
-            return_value={"model": {"default": "m", "provider": "p"}},
+            return_value={"website_builder": {"models": {"VISION": {"model": "m", "provider": "p"}}}},
+        ), patch("agent.image_routing._lookup_supports_vision", return_value=True
         ), patch(
             "app.hermes.adapter.resolve_runtime_provider",
             return_value={
@@ -347,7 +349,7 @@ class TestVisionMultimodalRouting(unittest.TestCase):
 
     def test_vision_model_capability_check_fails_closed(self):
         """A confirmed non-vision-capable model/provider blocks VISION."""
-        with patch("app.hermes.adapter.load_config", return_value={"model": {"default": "m", "provider": "p"}}), patch(
+        with patch("app.hermes.adapter.load_config", return_value={"website_builder": {"models": {"VISION": {"model": "m", "provider": "p"}}}}), patch(
             "app.hermes.adapter.resolve_runtime_provider",
             return_value={
                 "api_key": "k", "base_url": "https://x", "provider": "p",

@@ -13,6 +13,21 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def fake_build_artifact(monkeypatch):
+    """These orchestration tests stub npm; supply its output in the workspace."""
+    original = ProjectRunner.create_workspace
+    def create(runner, project_id):
+        workspace = original(runner, project_id)
+        (workspace / 'dist').mkdir(exist_ok=True)
+        (workspace / 'dist' / 'index.html').write_bytes(b'<html>local fake build</html>')
+        return workspace
+    monkeypatch.setattr(ProjectRunner, 'create_workspace', create)
+
+
 from app.core.lifecycle import ProjectLifecycle
 from app.core.state import ProjectStateStore
 from app.projects.build import FrontendBuilder, BuildResult
@@ -571,6 +586,7 @@ class TestPhase8Handoff(unittest.TestCase):
             self.runner,
             self.store,
             hermes_adapter=self.mock_adapter,
+            web3forms_access_key=None,
         )
         mock_qa.run.assert_called_once()
 

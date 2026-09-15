@@ -216,7 +216,9 @@ class TestIntakeProcessorWithHermes(unittest.TestCase):
 
         msg = NormalizedMessage(event_id="e3", text="Bikin Northcut, barbershop, biar orang booking WA.")
         result = self.processor.process(msg)
-        self.processor.apply_to_project("proj-fast", result)
+        from app.core.authz import ProjectAccess
+        ProjectAccess(self.store).create("proj-fast", "owner")
+        self.processor.apply_to_project("proj-fast", result, principal_id="owner")
 
         state = self.store.load("proj-fast")
         self.assertEqual(state.lifecycle, ProjectLifecycle.READY.value)
@@ -317,7 +319,9 @@ class TestIntakeProcessorFallback(unittest.TestCase):
     def test_apply_to_project_pauses(self):
         msg = NormalizedMessage(event_id="e11", text="eh bentar")
         result = self.processor.process(msg)
-        self.processor.apply_to_project("proj-pause", result)
+        from app.core.authz import ProjectAccess
+        ProjectAccess(self.store).create("proj-pause", "owner")
+        self.processor.apply_to_project("proj-pause", result, principal_id="owner")
 
         state = self.store.load("proj-pause")
         self.assertEqual(state.lifecycle, ProjectLifecycle.PAUSED.value)
@@ -328,7 +332,9 @@ class TestIntakeProcessorFallback(unittest.TestCase):
             event_id="e12", text="Northcut, barbershop, biar orang booking WA."
         )
         result = self.processor.process(msg)
-        self.processor.apply_to_project("proj-ready", result)
+        from app.core.authz import ProjectAccess
+        ProjectAccess(self.store).create("proj-ready", "owner")
+        self.processor.apply_to_project("proj-ready", result, principal_id="owner")
 
         state = self.store.load("proj-ready")
         self.assertEqual(state.lifecycle, ProjectLifecycle.READY.value)
@@ -338,7 +344,9 @@ class TestIntakeProcessorFallback(unittest.TestCase):
     def test_deduplication_integration(self):
         msg = NormalizedMessage(event_id="e13", text="Bikin Northcut.")
         result = self.processor.process(msg)
-        self.processor.apply_to_project("proj-dedup", result)
+        from app.core.authz import ProjectAccess
+        ProjectAccess(self.store).create("proj-dedup", "owner")
+        self.processor.apply_to_project("proj-dedup", result, principal_id="owner")
 
         self.assertFalse(self.store.is_event_processed("proj-dedup", "e13"))
         self.store.mark_event_processed("proj-dedup", "e13")

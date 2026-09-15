@@ -45,7 +45,7 @@ def validate_project_id(project_id: str) -> str:
         raise WorkspaceError("Project ID cannot be empty")
     if len(project_id) > 64:
         raise WorkspaceError("Project ID too long (max 64 chars)")
-    if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9\-_]*[a-zA-Z0-9]$", project_id):
+    if not re.fullmatch(r"[a-zA-Z0-9](?:[a-zA-Z0-9_-]*[a-zA-Z0-9])?", project_id):
         raise WorkspaceError(
             f"Invalid project ID: {project_id!r}. "
             "Must be alphanumeric with hyphens/underscores, "
@@ -53,6 +53,10 @@ def validate_project_id(project_id: str) -> str:
         )
     if ".." in project_id or "/" in project_id or "\\" in project_id:
         raise WorkspaceError(f"Path traversal detected in project ID: {project_id!r}")
+    try:
+        ProjectStateStore._validate_id(project_id)
+    except ValueError as exc:
+        raise WorkspaceError(str(exc)) from exc
     return project_id
 
 
@@ -73,7 +77,7 @@ def project_workspace_path(workspace_root: Path, project_id: str) -> Path:
     path = (root / project_id).resolve()
 
     # Ensure containment
-    if not str(path).startswith(str(root)):
+    if not path.is_relative_to(root):
         raise WorkspaceError(
             f"Project path {path} escapes workspace root {root}"
         )
@@ -224,7 +228,7 @@ class ProjectRunner:
 
         # Ensure cwd is within workspace
         cwd = Path(cwd).resolve()
-        if not str(cwd).startswith(str(workspace)):
+        if not cwd.is_relative_to(workspace):
             raise WorkspaceError(
                 f"Command cwd {cwd} escapes project workspace {workspace}"
             )
@@ -251,6 +255,10 @@ class ProjectRunner:
                 stdout=stdout,
                 stderr=stderr,
             )
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            raise
         finally:
             self.process_tracker.unregister(process.pid)
 
@@ -346,7 +354,7 @@ class ProjectRunner:
         if cwd is None:
             cwd = workspace
         cwd = Path(cwd).resolve()
-        if not str(cwd).startswith(str(workspace)):
+        if not cwd.is_relative_to(workspace):
             raise WorkspaceError(
                 f"Command cwd {cwd} escapes project workspace {workspace}"
             )
@@ -398,7 +406,7 @@ class ProjectRunner:
         """
         repo_path = Path(repo_path).resolve()
         if not repo_path.exists():
-            return True
+            return False
 
         try:
             result = subprocess.run(

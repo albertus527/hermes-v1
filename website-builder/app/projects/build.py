@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from app.deploy.snapshot import source_fingerprint, record_checks
+from app.core.composition import compose_project_instructions, prebuild_error, validate_composed_dna
 from app.core.lifecycle import ProjectLifecycle
 from app.core.state import ProjectStateStore
 from app.qa.orchestrator import QAOrchestrator
@@ -53,11 +55,17 @@ class FrontendBuilder:
         store: ProjectStateStore,
         hermes_adapter=None,
         starter_path: Optional[Path] = None,
+        preview_orchestrator=None,
+        web3forms_access_key: Optional[str] = None,
     ):
+        self.preview_orchestrator = preview_orchestrator
         self.runner = runner
         self.store = store
         self.hermes_adapter = hermes_adapter
         self.starter_path = starter_path or _STARTER_PATH
+        # Phase 14: caller-injected verified destination secret, never
+        # hardcoded. None selects the deterministic fallback-link path.
+        self.web3forms_access_key = web3forms_access_key
 
     def _copy_starter(self, workspace: Path) -> None:
         """Copy the fixed frontend starter into the project workspace."""
@@ -142,14 +150,22 @@ class FrontendBuilder:
             )
 
         try:
-            # Create isolated workspace
-            workspace = self.runner.create_workspace(project_id)
-
-            # Copy fixed starter
-            self._copy_starter(workspace)
-
-            # Update project state: QUEUED -> RUNNING
+            # Admission and first workspace mutation share the writer lock.
             with self.store.acquire_writer(project_id) as state:
+                # Legacy direct callers may supply initial requirements once;
+                # persisted requirements always win thereafter.
+                if not state.brief:
+                    state.brief = dict(brief)
+                error = prebuild_error(state)
+                if error:
+                    return BuildResult(False, project_id, error=error)
+                brief = dict(state.brief)
+                combined_instructions = compose_project_instructions(
+                    state, access_key=self.web3forms_access_key
+                )
+                policy_state = state
+                workspace = self.runner.create_workspace(project_id)
+                self._copy_starter(workspace)
                 self.store.transition_lifecycle_locked(state, ProjectLifecycle.RUNNING)
                 state.revisions.source_revision += 1
                 self.store.save(state)
@@ -160,7 +176,14 @@ class FrontendBuilder:
                     project_id=project_id,
                     brief=brief,
                     workspace=workspace,
+                    design_dna_instructions=combined_instructions,
                 )
+
+                if frontend_result.get("success"):
+                    try:
+                        validate_composed_dna(frontend_result.get("design_dna"), policy_state)
+                    except ValueError as exc:
+                        frontend_result = {"success": False, "error": str(exc)}
 
                 if not frontend_result.get("success"):
                     with self.store.acquire_writer(project_id) as state:
@@ -202,8 +225,11 @@ class FrontendBuilder:
 
             # Run fixed cheap checks (deterministic, application-owned)
             # FRONTEND does NOT run these. Application code does.
+            before = source_fingerprint(workspace)
             checks = self._run_fixed_checks(project_id, workspace)
             build_success = all(r.get("success", False) for r in checks.values())
+            if build_success:
+                record_checks(self.store, project_id, workspace, before)
 
             # Update state with results
             with self.store.acquire_writer(project_id) as state:
@@ -238,6 +264,7 @@ class FrontendBuilder:
                 self.runner,
                 self.store,
                 hermes_adapter=self.hermes_adapter,
+                web3forms_access_key=self.web3forms_access_key,
             )
             qa_result = qa_orchestrator.run(
                 project_id=project_id,
@@ -245,6 +272,13 @@ class FrontendBuilder:
                 brief=brief,
                 design_dna=design_dna,
             )
+
+            if qa_result.success and self.preview_orchestrator is not None:
+                preview = self.preview_orchestrator.run_owned(project_id, workspace)
+                if not preview.success:
+                    return BuildResult(False, project_id, workspace=workspace,
+                                       error=preview.error or preview.error_code,
+                                       duration_seconds=time.time() - start_time)
 
             duration = time.time() - start_time
 

@@ -60,6 +60,7 @@ class TestHermesAdapter(unittest.TestCase):
         mock_agent_cls.return_value = agent_instance
 
         patches = {
+            "import_error": patch("app.hermes.adapter._HERMES_IMPORT_ERROR", None),
             "load_config": patch(
                 "app.hermes.adapter.load_config", return_value=cfg_with_toolsets
             ),
@@ -95,6 +96,53 @@ class TestHermesAdapter(unittest.TestCase):
             self.addCleanup(p.stop)
         mocks["agent_instance"] = agent_instance
         return mocks
+
+    def test_configured_roles_execute_real_adapter(self):
+        import sys
+        from types import ModuleType
+        routing = ModuleType("agent.image_routing")
+        parts = [{"type": "text", "text": "references"},
+                 {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]
+        routing.build_native_content_parts = MagicMock(return_value=(parts, []))
+        routing._lookup_supports_vision = MagicMock(return_value=True)
+        with patch("app.hermes.adapter.AIAgent") as agent_cls, patch.dict(sys.modules, {"agent.image_routing": routing}):
+            mocks = self._patch_fast_runtime(agent_cls)
+            mocks["load_config"].return_value = {
+                "website_builder": {"models": {
+                    role: {"model": role.lower() + "-model", "provider": "router"}
+                    for role in ("FAST", "FRONTEND", "VISION")}},
+                "model": {"default": "wrong-default"}}
+            agent = mocks["agent_instance"]
+            self.assertEqual(self.adapter.fast_interpret("brief")["source"], "hermes_fast")
+            self.assertEqual(agent_cls.call_args.kwargs["model"], "fast-model")
+            agent.run_conversation.return_value = {"final_response": json.dumps({"directions": [
+                {"label": label, "descriptor": "calm spacing", "palette": {"primary": "#112233"}}
+                for label in ("Calm", "Bold")]})}
+            self.assertTrue(self.adapter.frontend_propose_directions({}, Path(self.tmpdir))["success"])
+            self.assertEqual(agent_cls.call_args.kwargs["model"], "frontend-model")
+            agent.run_conversation.return_value = {"final_response": '{"characteristics":{"UX":"clear navigation"}}'}
+            self.assertTrue(self.adapter.vision_extract_references({"UX": Path("reference.png")})["success"])
+            agent.run_conversation.assert_called_with(parts)
+            self.assertEqual(agent_cls.call_args.kwargs["model"], "vision-model")
+            self.assertEqual(agent_cls.call_args.kwargs["enabled_toolsets"], [])
+            self.assertIsNone(agent_cls.call_args.kwargs["fallback_model"])
+            mocks["resolve_runtime_provider"].assert_called_with(requested="router", target_model="vision-model", explicit_base_url=None)
+            routing._lookup_supports_vision.return_value = None
+            agent_cls.reset_mock()
+            self.assertFalse(self.adapter.vision_extract_references({"UX": Path("reference.png")})["success"])
+            agent_cls.assert_not_called()
+
+    def test_reference_evidence_rejects_missing_extra_and_nonstring(self):
+        for raw in ({}, {"UX": 1}, {"UX": " "}, {"UX": "ok", "COLOR": "extra"}):
+            self.assertFalse(self.adapter._parse_reference_extraction_response(
+                json.dumps({"characteristics": raw}), ["UX"])["success"])
+
+    def test_missing_role_configuration_never_constructs_agent(self):
+        with patch("app.hermes.adapter.AIAgent") as agent_cls:
+            self._patch_fast_runtime(agent_cls)
+            result = self.adapter.frontend_propose_directions({}, Path(self.tmpdir))
+            self.assertFalse(result["success"])
+            agent_cls.assert_not_called()
 
     def test_fast_uses_programmatic_boundary(self):
         """FAST uses the programmatic boundary for zero-tool guarantee."""

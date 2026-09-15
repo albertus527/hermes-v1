@@ -12,7 +12,9 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from app.deploy.snapshot import TestedSnapshot, source_fingerprint, record_checks
 from app.core.lifecycle import ProjectLifecycle
+from app.core.composition import compose_project_instructions, validate_composed_dna, invalidate_artifact
 from app.core.state import ProjectStateStore
 from app.qa.deterministic import run_deterministic_checks
 from app.qa.findings import DeterministicFindings, QAAttempt, QAResult, VisionFindings
@@ -36,10 +38,12 @@ class QAOrchestrator:
         hermes_adapter=None,
         renderer: Optional[LocalRenderer] = None,
         screenshot_capture: Optional[ScreenshotCapture] = None,
+        web3forms_access_key: Optional[str] = None,
     ):
         self.runner = runner
         self.store = store
         self.hermes_adapter = hermes_adapter
+        self.web3forms_access_key = web3forms_access_key
         self.renderer = renderer or LocalRenderer(runner)
         self.screenshot_capture = screenshot_capture or ScreenshotCapture()
 
@@ -74,14 +78,30 @@ class QAOrchestrator:
         next_attempt_num = 0
 
         try:
+            rebuild_failure = None
             while True:
-                qa_attempt = self._run_one_attempt(
+                # Never render stale dist after a failed rebuild. Feed the
+                # deterministic failure directly into the next bounded repair.
+                qa_attempt = rebuild_failure or self._run_one_attempt(
                     project_id, workspace, qa_dir, next_attempt_num, brief, design_dna
                 )
+                rebuild_failure = None
                 next_attempt_num += 1
                 attempts.append(qa_attempt)
 
                 if qa_attempt.final_pass:
+                    state = self.store.load(project_id)
+                    checked = state.deployment.get('checked') or {}
+                    if checked:
+                        snapshot = TestedSnapshot.capture(workspace, checked['source_sha256'],
+                                                          checked['artifact_sha256'])
+                        if checked['source_revision'] != state.revisions.source_revision:
+                            raise ValueError('STALE_QA_BINDING')
+                        if qa_attempt.vision is None or qa_attempt.vision.pass_ is not True:
+                            raise ValueError('VISION_REQUIRED')
+                        with self.store.acquire_writer(project_id) as locked:
+                            locked.deployment['tested_snapshot'] = snapshot.to_dict()
+                            self.store.save(locked)
                     self._finalize_success(project_id, qa_attempt)
                     return QAResult(
                         project_id=project_id,
@@ -103,6 +123,8 @@ class QAOrchestrator:
                     # Repair itself failed to execute; stop the loop and
                     # fail with what we have rather than silently retrying.
                     break
+
+                design_dna = self.store.load(project_id).design_dna
 
                 # Deterministic rebuild checks after repair.
                 build_ok, typecheck_ok = self._run_rebuild_checks(project_id, workspace)
@@ -126,18 +148,11 @@ class QAOrchestrator:
                         failing.failures.append("npm run build failed after repair")
                     if not typecheck_ok:
                         failing.failures.append("npm run typecheck failed after repair")
-                    attempts.append(
-                        QAAttempt(
-                            attempt=next_attempt_num,
-                            deterministic=failing,
-                            vision=None,
-                        )
+                    rebuild_failure = QAAttempt(
+                        attempt=next_attempt_num,
+                        deterministic=failing,
+                        vision=None,
                     )
-                    next_attempt_num += 1
-                    if repair_count >= MAX_REPAIR_ATTEMPTS:
-                        break
-                    # Budget remains: retry with another repair; the next
-                    # loop iteration's fresh QA attempt gets the next number.
                     continue
 
             # Exhausted repair budget without a passing attempt -> FAILED.
@@ -246,14 +261,36 @@ class QAOrchestrator:
         if self.hermes_adapter is None:
             return False
 
-        instructions = self._build_repair_instructions(design_dna, failed_attempt)
+        # Invalidate before invoking a mutating tool: even a failed or timed
+        # out invocation may have changed source on disk.
+        with self.store.acquire_writer(project_id) as state:
+            instructions = compose_project_instructions(
+                state, access_key=self.web3forms_access_key,
+                task=self._build_repair_instructions(state.design_dna or design_dna, failed_attempt),
+            )
+            brief = dict(state.brief)
+            state.revisions.source_revision += 1
+            invalidate_artifact(state)
+            self.store.save(state)
         result = self.hermes_adapter.frontend_build(
             project_id=project_id,
             brief=brief,
             workspace=workspace,
             design_dna_instructions=instructions,
         )
-        return bool(result.get("success"))
+        if not result.get("success"):
+            return False
+        dna = result.get("design_dna")
+        try:
+            validate_composed_dna(dna, state)
+        except ValueError:
+            return False
+        with self.store.acquire_writer(project_id) as locked:
+            locked.design_dna = dna
+            locked.revisions.design_dna_version = dna.get("version", locked.revisions.design_dna_version + 1)
+            invalidate_artifact(locked)
+            self.store.save(locked)
+        return True
 
     def _build_repair_instructions(
         self, design_dna: Optional[Dict[str, Any]], failed_attempt: QAAttempt
@@ -290,12 +327,15 @@ Instructions:
 
     def _run_rebuild_checks(self, project_id: str, workspace: Path) -> tuple:
         """Run build + typecheck once after a repair. Does not re-run npm ci."""
+        before = source_fingerprint(workspace)
         build_proc = self.runner.run_command(
             project_id, ["npm", "run", "build"], cwd=workspace, timeout=300,
         )
         typecheck_proc = self.runner.run_command(
             project_id, ["npm", "run", "typecheck"], cwd=workspace, timeout=120,
         )
+        if build_proc.returncode == 0 and typecheck_proc.returncode == 0:
+            record_checks(self.store, project_id, workspace, before)
         return build_proc.returncode == 0, typecheck_proc.returncode == 0
 
     # ------------------------------------------------------------------
@@ -305,8 +345,9 @@ Instructions:
     def _finalize_success(self, project_id: str, qa_attempt: QAAttempt) -> None:
         with self.store.acquire_writer(project_id) as state:
             self.store.transition_lifecycle_locked(state, ProjectLifecycle.PREVIEW_READY)
-            state.revisions.qa_revision += 1
-            state.revisions.preview_revision += 1
+            state.revisions.qa_revision = state.revisions.source_revision
+            # External preview identity belongs to Phase 9, not local QA.
+            state.revisions.preview_revision = 0
             state.deployment["qa"] = qa_attempt.to_dict()
             self.store.save(state)
 
