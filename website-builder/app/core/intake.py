@@ -90,12 +90,97 @@ class IntakeProcessor:
         self.store = store
         self.hermes_adapter = hermes_adapter
 
+    # Brief fields the multi-turn merge accumulates. Order matters: the
+    # smallest sufficient website brief is NAME + WHAT + WHY.
+    _BRIEF_FIELDS = ("name", "what", "why", "why_destination")
+
+    def _persisted_brief(self, project_id: Optional[str]) -> Dict[str, Any]:
+        """Return the brief already collected for this project.
+
+        Multi-turn accumulation authority is the STORED brief, never the
+        current turn in isolation: NAME collected on turn 1 must survive a
+        turn that only answers WHAT. Returns {} when there is no project yet.
+
+        Only a genuinely missing/invalid project ID is treated as "no brief
+        yet". A real load failure (corrupt state file, I/O error) must NOT be
+        silently swallowed into an empty brief -- that would silently erase
+        already-accumulated NAME/WHAT/WHY for this turn. Such failures
+        propagate to the caller (the runtime's per-update try/except logs and
+        skips rather than persisting on top of an unreadable state).
+        """
+        if not project_id:
+            return {}
+        state = self.store.load(project_id)
+        return dict(state.brief) if state is not None else {}
+
+    def _context_messages(self, persisted: Dict[str, Any]) -> Optional[List[Dict[str, str]]]:
+        """Prior accumulated brief, handed to FAST as conversation context.
+
+        The prompt gets the already-collected values so a follow-up turn is
+        interpreted as the answer to the outstanding clarification rather
+        than as a brand-new brief.
+        """
+        known = [f"{f}={persisted[f]}" for f in self._BRIEF_FIELDS if persisted.get(f)]
+        if not known:
+            return None
+        return [{"role": "assistant", "content": "Known brief so far: " + ", ".join(known)}]
+
+    def _merge_brief(
+        self, persisted: Dict[str, Any], extracted: Dict[str, Any],
+        used_fallback: bool = False,
+    ) -> Dict[str, Any]:
+        """Merge this turn's interpretation into the accumulated brief.
+
+        Preserves already-collected values. FAST is handed the accumulated
+        brief as context (see ``_context_messages``) and is trusted to label
+        NAME/WHAT/WHY correctly for the turn it actually saw -- FAST's field
+        assignment is semantic authority and is applied as-is. Only the
+        deterministic fallback extractor (used_fallback=True), which has no
+        real semantic understanding and always maps a lone segment to
+        "name", needs the shift-into-next-missing-field heuristic so a bare
+        one-word answer to an outstanding WHAT/WHY question doesn't clobber
+        an already-established NAME with a stray token.
+        """
+        merged = {f: (persisted or {}).get(f) for f in self._BRIEF_FIELDS}
+        only_name = (
+            used_fallback
+            and bool(extracted.get("name"))
+            and not extracted.get("what")
+            and not extracted.get("why")
+        )
+        if only_name and merged.get("name"):
+            if not merged.get("what"):
+                merged["what"] = extracted["name"]
+            elif not merged.get("why"):
+                merged["why"] = extracted["name"]
+        else:
+            for field in ("name", "what", "why"):
+                if extracted.get(field):
+                    merged[field] = extracted[field]
+        if extracted.get("why_destination"):
+            merged["why_destination"] = extracted["why_destination"]
+        return merged
+
+    def _readiness_for(self, scope: Scope, brief: Dict[str, Any]) -> Readiness:
+        """Deterministic readiness from the ACCUMULATED brief + scope.
+
+        Application code owns this gate; FAST only interprets text.
+        """
+        if scope in (Scope.OUT_OF_SCOPE, Scope.MIXED, Scope.UNCLEAR):
+            return Readiness.NEEDS_CLARIFICATION
+        if all(brief.get(f) for f in ("name", "what", "why")):
+            return Readiness.DISCOVERY_READY
+        return Readiness.NEEDS_CLARIFICATION
+
     def process(
         self, message: NormalizedMessage, project_id: Optional[str] = None
     ) -> IntakeResult:
         """Process a normalized message and return intake result.
 
         The application owns state transitions. FAST interprets; code enforces.
+        The accumulated (persisted) brief is merged with this turn's
+        interpretation, so NAME/WHAT/WHY collected across turns are preserved
+        and readiness is computed on the merged brief.
         """
         text = message.text.strip()
         if not text:
@@ -110,44 +195,70 @@ class IntakeProcessor:
         pause_detected = _contains_phrase(text, _PAUSE_PHRASES)
         resume_detected = _contains_phrase(text, _RESUME_PHRASES)
 
-        # Use Hermes FAST for semantic interpretation when available.
-        # If FAST fails (raises), the application executes the deterministic
-        # fallback — FAST owns interpretation, never state-transition authority.
+        persisted = self._persisted_brief(project_id)
+
+        # Use Hermes FAST for semantic interpretation when available, handing
+        # it the accumulated brief as context. If FAST fails (raises), the
+        # application executes the deterministic fallback — FAST owns
+        # interpretation, never state-transition authority.
+        used_fallback = False
+        fast_ambiguity_question: Optional[str] = None
         if self.hermes_adapter is not None:
             try:
-                fast_result = self.hermes_adapter.fast_interpret(text, project_id)
+                fast_result = self.hermes_adapter.fast_interpret(
+                    text, project_id, self._context_messages(persisted)
+                )
             except Exception:
                 fast_result = None
 
             if fast_result is not None:
                 scope = Scope(fast_result.get("scope", "UNCLEAR"))
-                brief = {
+                extracted = {
                     "name": fast_result.get("name"),
                     "what": fast_result.get("what"),
                     "why": fast_result.get("why"),
                     "why_destination": fast_result.get("why_destination"),
                 }
-                readiness_str = fast_result.get("readiness", "NEEDS_CLARIFICATION")
-                readiness = Readiness(readiness_str) if readiness_str in Readiness.__members__ else Readiness.NEEDS_CLARIFICATION
-                clarification_question = fast_result.get("clarification_question")
+                # FAST owns ambiguity/correction semantics: when it flags a
+                # material clarification need with its own question, that
+                # question is preserved rather than silently replaced by the
+                # generic per-field fallback prompt.
+                if fast_result.get("clarification_needed") and fast_result.get(
+                    "clarification_question"
+                ):
+                    fast_ambiguity_question = fast_result["clarification_question"]
             else:
                 # Deterministic fallback after FAST failure (bounded, safe)
+                used_fallback = True
                 scope = self._fallback_scope(text)
-                brief = self._fallback_extract(text)
-                readiness = self._fallback_readiness(scope, brief)
-                clarification_question = self._fallback_clarification(brief)
+                extracted = self._fallback_extract(text)
         else:
             # Deterministic fallback (bounded, safe)
+            used_fallback = True
             scope = self._fallback_scope(text)
-            brief = self._fallback_extract(text)
-            readiness = self._fallback_readiness(scope, brief)
+            extracted = self._fallback_extract(text)
+
+        brief = self._merge_brief(persisted, extracted, used_fallback=used_fallback)
+        readiness = self._readiness_for(scope, brief)
+
+        # The clarification question is derived from the ACCUMULATED brief —
+        # the smallest question that resolves the still-missing field —
+        # unless FAST flagged a specific material ambiguity/correction for
+        # THIS turn, in which case FAST's own question is authoritative.
+        if readiness == Readiness.DISCOVERY_READY:
+            clarification_question = None
+        elif fast_ambiguity_question:
+            clarification_question = fast_ambiguity_question
+        else:
             clarification_question = self._fallback_clarification(brief)
 
         # Application enforces pause/resume regardless of FAST result
         if pause_detected:
             readiness = Readiness.PAUSED
+            clarification_question = None
         elif resume_detected:
             readiness = Readiness.RESUMED
+            clarification_question = None
 
         return IntakeResult(
             readiness=readiness,

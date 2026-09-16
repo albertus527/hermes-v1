@@ -159,15 +159,67 @@ class HermesAdapter:
             shutil.copytree(src, dst)
             logging.debug("Synced skill %s -> %s", name, dst)
 
+    def _hermes_home_scope(self):
+        """Context manager scoping ALL Hermes resolution to this profile.
+
+        ``hermes_cli.runtime_provider.resolve_runtime_provider`` calls
+        ``load_config()`` internally and credential resolution reads
+        ``$HERMES_HOME/.env`` via ``get_hermes_home()``. Scoping only the
+        initial ``load_config()`` call (the previous behavior) therefore
+        leaked the DEFAULT profile's config/credentials into provider
+        resolution for every role. The override must stay installed for the
+        entire in-process resolution span: role config load, provider
+        resolution, vision capability lookup, and agent construction.
+        """
+        from contextlib import contextmanager
+
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from agent.secret_scope import (
+            build_profile_secret_scope, reset_secret_scope, set_secret_scope,
+        )
+
+        class ProfileSecrets(dict):
+            def get(self, key, default=None):
+                # get_secret falls through to process credentials on None in
+                # non-multiplex deployments. An explicit empty value blocks
+                # that fallback without changing the process-global mode.
+                return super().get(key, "")
+
+        @contextmanager
+        def _scope():
+            token = set_hermes_home_override(self.hermes_home)
+            try:
+                secrets_token = set_secret_scope(ProfileSecrets(
+                    build_profile_secret_scope(self.hermes_home)
+                ))
+                try:
+                    yield
+                finally:
+                    reset_secret_scope(secrets_token)
+            finally:
+                reset_hermes_home_override(token)
+
+        return _scope()
+
     def _load_role_config(self):
-        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
-        token = set_hermes_home_override(self.hermes_home)
-        try:
+        with self._hermes_home_scope():
             if load_config is None:
                 raise ValueError("Hermes configuration unavailable")
+            # Hermes' tolerant loader may retain last-known-good config and
+            # echo YAML source lines directly to stderr on parse failures.
+            # Roles must fail closed instead, without global stderr redirection.
+            import yaml
+
+            try:
+                with (self.hermes_home / "config.yaml").open(encoding="utf-8-sig") as source:
+                    raw = yaml.safe_load(source)
+                if not isinstance(raw, dict):
+                    raise ValueError()
+            except FileNotFoundError:
+                pass  # Hermes defaults contain no Website Builder role mapping.
+            except Exception:
+                raise ValueError("Profile configuration unavailable") from None
             return load_config()
-        finally:
-            reset_hermes_home_override(token)
 
     @staticmethod
     def _role_selection(cfg, role):
@@ -183,6 +235,157 @@ class HermesAdapter:
         except (KeyError, TypeError, ValueError):
             raise ValueError("Missing or malformed Website Builder model role: " + role) from None
         return model.strip(), provider.strip()
+
+    @staticmethod
+    def _role_vision_support(runtime, model, cfg):
+        from agent.image_routing import _lookup_supports_vision
+
+        provider = str(runtime.get("requested_provider") or runtime.get("provider") or "").strip()
+        # The top-level shortcut describes the DEFAULT model, not VISION.
+        # Do not let its capability or provider fallback qualify another role.
+        model_cfg = cfg.get("model")
+        model_cfg = dict(model_cfg) if isinstance(model_cfg, dict) else {}
+        if (model_cfg.get("default"), model_cfg.get("provider")) != (model, provider):
+            model_cfg.pop("supports_vision", None)
+        model_cfg.update(default=model, provider=provider)
+        return _lookup_supports_vision(provider, model, {**cfg, "model": model_cfg})
+
+    @staticmethod
+    def _require_runtime_credentials(runtime):
+        # Keep Hermes' intentional no-auth placeholders and callable token
+        # providers; an empty key is not a successfully resolved runtime.
+        if not runtime.get("api_key"):
+            raise ValueError("Provider credentials unavailable")
+
+    # Roles whose configuration is required before the runtime may start.
+    REQUIRED_ROLES: List[str] = ["FAST", "FRONTEND", "VISION"]
+
+    def validate_role_configuration(self) -> Dict[str, Any]:
+        """Expose static diagnostics, including logs from real resolver helpers.
+
+        Filters apply only to this calling thread and are removed on exit;
+        other conversations' diagnostics and logging levels are unchanged.
+        """
+        import threading
+
+        thread_id = threading.get_ident()
+
+        class PreflightDiagnosticFilter(logging.Filter):
+            def filter(self, record):
+                if record.thread == thread_id:
+                    record.msg = "Website Builder preflight dependency diagnostic"
+                    record.args = ()
+                    record.exc_info = None
+                    record.exc_text = None
+                    record.stack_info = None
+                return True
+
+        diagnostic_filter = PreflightDiagnosticFilter()
+        dependencies = [logging.getLogger(name) for name in (
+            "hermes_cli.config", "hermes_cli.runtime_provider",
+            "agent.image_routing", "agent.credential_pool",
+            # resolve_runtime_provider delegates heavily into hermes_cli.auth
+            # (resolve_provider, resolve_api_key_provider_credentials, Z.AI
+            # endpoint probing, OAuth/base_url override warnings, ...). Its
+            # logger was missing here, so any diagnostic it emitted during
+            # preflight resolution (e.g. a malformed base_url override
+            # warning that interpolates the raw configured value) reached
+            # the real log handlers unsanitized instead of the static label
+            # below. See test_diagnostic_filter_covers_auth_logger.
+            "hermes_cli.auth",
+        )]
+        for dependency in dependencies:
+            dependency.addFilter(diagnostic_filter)
+        try:
+            return self._validate_role_configuration()
+        finally:
+            for dependency in dependencies:
+                dependency.removeFilter(diagnostic_filter)
+
+    def _validate_role_configuration(self) -> Dict[str, Any]:
+        """Fail-closed preflight validation of all Website Builder model roles.
+
+        Resolves every required role against the REAL profile configuration
+        (``$HERMES_HOME/config.yaml`` for this adapter's ``hermes_home``) using
+        the same ``load_config`` + ``_role_selection`` seam the runtime paths
+        use, AND real-resolves every role (not just VISION) through
+        ``resolve_runtime_provider`` — the same seam ``_run_fast_programmatic``
+        uses to obtain credentials/base_url/api_mode before constructing an
+        agent. A role whose model/provider is well-formed in config.yaml but
+        cannot actually be resolved (missing credential, disabled provider,
+        unknown custom-provider name, ...) must fail closed here rather than
+        only failing at first real use. VISION is additionally gated on
+        image-input capability via the same ``_lookup_supports_vision`` check
+        the runtime VISION path enforces.
+
+        Returns ``{"ok": bool, "roles": {role: {"model":..., "provider":...}},
+        "errors": {role: str}, "config_path": str}``. Never raises and never
+        logs secret values (api keys, tokens, base URLs, or raw exception
+        text that could embed them). Application logs use only role names,
+        the profile config path, and static sanitized diagnostic labels.
+        Model/provider selections in the return value are not log-safe.
+        """
+        roles: Dict[str, Dict[str, str]] = {}
+        errors: Dict[str, str] = {}
+        config_path = str(self.hermes_home / "config.yaml")
+
+        cfg = None
+        try:
+            with self._hermes_home_scope():
+                cfg = self._load_role_config()
+        except Exception:
+            for role in self.REQUIRED_ROLES:
+                errors[role] = "profile configuration unavailable"
+            return {"ok": False, "roles": roles, "errors": errors,
+                    "config_path": config_path}
+
+        for role in self.REQUIRED_ROLES:
+            try:
+                model, provider = self._role_selection(cfg, role)
+            except ValueError:
+                errors[role] = "missing or malformed role configuration"
+                continue
+            roles[role] = {"model": model, "provider": provider}
+
+        # Real-resolve every well-formed role through the same provider seam
+        # the runtime uses. This is a local resolution proof only (credential
+        # presence, provider enablement, known custom-provider identity) —
+        # it does not perform a live model call. Held under a single
+        # in-process HERMES_HOME scope for the whole loop so every role's
+        # resolution (and the internal load_config() resolve_runtime_provider
+        # performs) reads the SAME website profile, never the process-env
+        # default profile.
+        with self._hermes_home_scope():
+            for role in list(roles):
+                try:
+                    runtime = resolve_runtime_provider(
+                        requested=roles[role]["provider"],
+                        target_model=roles[role]["model"],
+                    )
+                    self._require_runtime_credentials(runtime)
+                except Exception:
+                    errors[role] = "provider resolution failed"
+                    del roles[role]
+                    continue
+
+                if role != "VISION":
+                    continue
+
+                # Vision capability gate: the logical VISION role name is not
+                # proof of capability. Resolve through the real provider seam
+                # and verify image input support exactly as the runtime
+                # VISION path does.
+                try:
+                    supports = self._role_vision_support(runtime, roles["VISION"]["model"], cfg)
+                except Exception:
+                    supports = None
+                if supports is not True:
+                    errors["VISION"] = "VISION model/provider does not support image input"
+                    del roles["VISION"]
+
+        ok = not errors
+        return {"ok": ok, "roles": roles, "errors": errors,
+                "config_path": config_path}
 
     def _run_hermes_cli(
         self,
@@ -330,7 +533,21 @@ class HermesAdapter:
                 exit_code=1,
             )
 
+        # Hold the profile override for the ENTIRE in-process resolution span:
+        # load_config, role selection, provider/credential resolution, vision
+        # capability lookup, and agent construction all read profile-scoped
+        # state (config.yaml, .env) via get_hermes_home(). Scoping only the
+        # initial load_config() call leaks the default profile into
+        # resolve_runtime_provider. ExitStack keeps the span open through the
+        # agent's conversation turn; the finally below closes it last.
+        import contextlib
+
+        _scope_stack = contextlib.ExitStack()
         try:
+            _scope_stack.enter_context(self._hermes_home_scope())
+
+            if load_config is None:
+                raise ValueError("Hermes configuration unavailable")
             cfg = self._load_role_config()
 
             if role is not None:
@@ -391,6 +608,8 @@ class HermesAdapter:
                 explicit_base_url=explicit_base_url_from_alias,
             )
 
+            self._require_runtime_credentials(runtime)
+
             # VISION must resolve to a model/provider that actually supports
             # image input. The logical role name is NOT proof of capability —
             # verify via the same capability lookup the rest of Hermes uses
@@ -399,21 +618,14 @@ class HermesAdapter:
             # sending images to a text-only model.
             if require_vision:
                 try:
-                    from agent.image_routing import _lookup_supports_vision
-
-                    _vision_provider = str(
-                        runtime.get("requested_provider") or runtime.get("provider") or ""
-                    ).strip()
-                    _vision_model = str(effective_model or "").strip()
-                    _supports = _lookup_supports_vision(_vision_provider, _vision_model, cfg)
+                    _supports = self._role_vision_support(runtime, effective_model, cfg)
                 except Exception:
                     _supports = None
                 if _supports is not True:
                     return HermesResult(
                         success=False,
                         error=(
-                            f"VISION model/provider ({_vision_provider}/{_vision_model}) "
-                            "does not support image input. Configure a vision-capable "
+                            "VISION model/provider does not support image input. Configure a vision-capable "
                             "model for the Website Builder Hermes profile."
                         ),
                         exit_code=1,
@@ -482,6 +694,10 @@ class HermesAdapter:
                 error=str(exc),
                 exit_code=1,
             )
+        finally:
+            # Release the profile override LAST — after agent/session cleanup
+            # (which may also read profile-scoped state) has completed.
+            _scope_stack.close()
 
     def fast_interpret(
         self,

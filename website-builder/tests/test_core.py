@@ -100,24 +100,35 @@ class TestProjectStateStore(unittest.TestCase):
     def test_one_writer_lock(self):
         """Only one writer holds the lock at a time; the contender times out.
 
-        The first writer holds the lock (0.3s) longer than the second writer's
-        acquisition timeout (0.1s), so the second cannot acquire and times out.
+        Synchronized on an Event that the first writer sets only AFTER it
+        has actually acquired the lock (entered the `with` body), so the
+        second writer never starts racing for the lock until the first
+        writer provably holds it -- no wall-clock timing assumption.
         """
         acquired = []
+        first_holds_lock = threading.Event()
+        release_first = threading.Event()
 
-        def writer(name: str, delay: float, timeout: float):
+        def first_writer():
+            with self.store.acquire_writer("proj-4", timeout=2.0):
+                acquired.append("first")
+                first_holds_lock.set()
+                # Hold the lock until the contender has proven it timed out.
+                release_first.wait(5)
+
+        def second_writer():
+            assert first_holds_lock.wait(5)
             try:
-                with self.store.acquire_writer("proj-4", timeout=timeout):
-                    acquired.append(name)
-                    time.sleep(delay)
+                with self.store.acquire_writer("proj-4", timeout=0.1):
+                    acquired.append("second")
             except TimeoutError:
                 pass
+            finally:
+                release_first.set()
 
-        t1 = threading.Thread(target=writer, args=("first", 0.3, 2.0))
-        t2 = threading.Thread(target=writer, args=("second", 0.1, 0.1))
+        t1 = threading.Thread(target=first_writer)
+        t2 = threading.Thread(target=second_writer)
         t1.start()
-        # Ensure the first writer holds the lock before the contender attempts.
-        time.sleep(0.05)
         t2.start()
         t1.join()
         t2.join()

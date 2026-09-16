@@ -440,12 +440,22 @@ class TestDispatcherInvocation:
         assert calls[1][0][2] == "intake"
 
     def test_build_triggered_when_ready(self):
+        """The dispatcher's own "intake" claim admits the follow-on build as
+        a sub-claim (see TelegramDispatcher.dispatch()) -- the runtime no
+        longer issues a second top-level dispatch("build", ...) call, since
+        that would derive an identical claim key from the same
+        (principal, conversation_id, event_id) tuple as the intake claim
+        and collide with it on replay. The runtime only needs to react to
+        the dispatcher's reported build outcome.
+        """
         dispatcher = MagicMock()
         state = MagicMock()
         state.lifecycle = "READY"
         state.revisions.source_revision = 0
         dispatcher.store.load.return_value = state
-        dispatcher.dispatch.return_value = MagicMock(success=True)
+        dispatcher.dispatch.return_value = MagicMock(
+            success=True, data={"build_triggered": True, "build_success": True}
+        )
 
         loop = TelegramReceiveLoop(
             bot_token="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
@@ -462,7 +472,11 @@ class TestDispatcherInvocation:
 
         calls = dispatcher.dispatch.call_args_list
         actions = [c[0][2] for c in calls]
-        assert "build" in actions
+        # Project already exists (store.load returns a state), so "create"
+        # is skipped. Build is admitted as a sub-claim INSIDE the "intake"
+        # dispatch call, never as a second top-level dispatch under the
+        # same event.
+        assert actions == ["intake"]
 
 
 # ---------------------------------------------------------------------------

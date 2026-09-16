@@ -187,6 +187,55 @@ def _load_smoke_browser_factory():
 
 
 # ---------------------------------------------------------------------------
+# Startup role preflight
+# ---------------------------------------------------------------------------
+
+
+# Expected per-role schema surfaced in startup diagnostics. Operator-owned —
+# the runtime never invents or seeds concrete model/provider mappings.
+ROLE_CONFIG_SCHEMA_HINT = (
+    "website_builder.models.<ROLE>.model (non-empty string) and "
+    "website_builder.models.<ROLE>.provider (non-empty string) "
+    "for <ROLE> in FAST, FRONTEND, VISION"
+)
+
+
+def preflight_role_validation(config: RuntimeConfig) -> bool:
+    """Fail-closed startup validation of all Website Builder model roles.
+
+    Resolves FAST/FRONTEND/VISION against the REAL profile configuration
+    before any polling begins. Aggregates per-role diagnostics and logs the
+    exact profile config path plus the expected schema. Never logs secrets,
+    never invents operator configuration, and never starts the runtime when
+    any role is missing or malformed.
+
+    Returns True only when every required role resolves (and VISION passes
+    the image-input capability gate).
+    """
+    from app.hermes.adapter import HermesAdapter
+
+    probe = HermesAdapter(store=None, hermes_home=config.hermes_home)  # type: ignore[arg-type]
+    report = probe.validate_role_configuration()
+
+    if report["ok"]:
+        logger.info("Model role preflight OK: FAST, FRONTEND, VISION")
+        return True
+
+    logger.error(
+        "Website Builder model role configuration is incomplete — refusing to start."
+    )
+    for role in sorted(report["errors"]):
+        logger.error("  role %s: %s", role, report["errors"][role])
+    logger.error("Profile config path: %s", report["config_path"])
+    logger.error("Expected schema: %s", ROLE_CONFIG_SCHEMA_HINT)
+    logger.error(
+        "Set these keys in the Website Builder profile config (no defaults are "
+        "invented; this installation is operator-configured)."
+    )
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Composition root
 # ---------------------------------------------------------------------------
 
@@ -639,7 +688,18 @@ User message:
         message: NormalizedMessage,
         state,
     ) -> None:
-        """Handle INTAKE intent — ordinary conversation / requirements."""
+        """Handle INTAKE intent — ordinary conversation / requirements.
+
+        The dispatcher's "intake" action now admits the follow-on build (when
+        the requirements gate becomes READY) as a SEPARATE sub-claim under
+        the SAME single "one Telegram event -> claim before effects"
+        boundary — see TelegramDispatcher.dispatch(). There is no second
+        top-level dispatch("build", ...) call here: that would derive its
+        claim key from the identical (principal, conversation_id, event_id)
+        tuple as the intake claim already recorded above and collide with
+        it (EVENT_ACTION_MISMATCH) on replay, or -- if issued before this
+        function returns -- run outside any claim at all.
+        """
         result = self.dispatcher.dispatch(
             update,
             project_id,
@@ -656,30 +716,13 @@ User message:
             self._send_error_reply(message.conversation_id, result.error_code)
             return
 
-        # After successful intake, check if we should trigger build.
-        # The intake processor sets lifecycle to READY when NAME+WHAT+WHY
-        # are present. The dispatcher's build action requires READY
-        # lifecycle and source_revision == 0.
-        state = self.dispatcher.store.load(project_id)
-        if (
-            state
-            and state.lifecycle == "READY"
-            and state.revisions.source_revision == 0
-        ):
-            logger.info("Project %s is READY, triggering build", project_id)
-            build_result = self.dispatcher.dispatch(
-                update,
+        if result.data.get("build_triggered") and not result.data.get("build_success"):
+            logger.warning(
+                "Build dispatch failed for project %s: %s",
                 project_id,
-                "build",
-                authenticated=authenticated,
+                result.data.get("build_error"),
             )
-            if not build_result.success:
-                logger.warning(
-                    "Build dispatch failed for project %s: %s",
-                    project_id,
-                    build_result.error_code,
-                )
-                self._send_error_reply(message.conversation_id, build_result.error_code)
+            self._send_error_reply(message.conversation_id, result.data.get("build_error"))
 
     def _handle_revise(
         self,
@@ -849,6 +892,13 @@ def main() -> int:
         config = load_runtime_config()
     except ConfigurationError as exc:
         logger.error("Configuration error: %s", exc)
+        return 1
+
+    # Fail closed BEFORE any polling or composition: every model role must
+    # resolve against the real profile config (and VISION must be
+    # vision-capable). A partial role set previously started the loop and
+    # failed per-message at runtime.
+    if not preflight_role_validation(config):
         return 1
 
     try:

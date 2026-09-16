@@ -164,9 +164,63 @@ class TelegramDispatcher:
             auth = {"principal_id": principal, "reference_token": reference_token}
             try:
                 if action == "intake":
-                    result = self.intake.process(message, project_id)
-                    self.intake.apply_to_project(project_id, result, principal_id=principal, event_id="dispatch:" + key)
-                    result = OperationResult.ok({"readiness": result.readiness.value})
+                    intake_result = self.intake.process(message, project_id)
+                    self.intake.apply_to_project(project_id, intake_result, principal_id=principal, event_id="dispatch:" + key)
+                    # Surface the persisted intake outcome so the caller can
+                    # reply/clarify without re-interpreting or re-persisting.
+                    result = OperationResult.ok({
+                        "readiness": intake_result.readiness.value,
+                        "scope": intake_result.scope.value,
+                        "clarification_question": intake_result.clarification_question,
+                        "pause_detected": intake_result.pause_detected,
+                        "resume_detected": intake_result.resume_detected,
+                    })
+                    # Auto-trigger build when intake completed the
+                    # requirements gate, as a SEPARATE sub-claim keyed off
+                    # this same event. This keeps "one Telegram event -> one
+                    # dispatch claim" for intake while still admitting the
+                    # build under its own claim, so replay of the SAME
+                    # update never triggers a second build and the caller
+                    # never needs a second top-level dispatch() call whose
+                    # event-derived key would otherwise collide with this
+                    # intake claim (same principal/conversation/event_id).
+                    if self.builder is not None:
+                        build_key = hashlib.sha256(
+                            (key + ":auto_build").encode()
+                        ).hexdigest()
+                        with self.store.acquire_writer(project_id) as bstate:
+                            already_claimed = build_key in bstate.dispatch_events
+                            admissible = (
+                                not already_claimed
+                                and bstate.lifecycle == "READY"
+                                and bstate.revisions.source_revision == 0
+                                and not bstate.pause_state.get("paused")
+                                and not direction_choice_pending(bstate)
+                            )
+                            if admissible:
+                                self.store.transition_lifecycle_locked(bstate, ProjectLifecycle.QUEUED)
+                                auto_build_brief = dict(bstate.brief)
+                                bstate.dispatch_events[build_key] = {"action": "build", "status": "CLAIMED"}
+                                self.store.save(bstate)
+                            else:
+                                auto_build_brief = None
+                        if auto_build_brief is not None:
+                            try:
+                                build_result = self.builder.build(project_id, auto_build_brief)
+                            except Exception:
+                                build_result = OperationResult.fail(
+                                    "EVENT_RECONCILIATION_REQUIRED",
+                                    error_code="EVENT_RECONCILIATION_REQUIRED",
+                                )
+                            with self.store.acquire_writer(project_id) as bstate:
+                                bstate.dispatch_events[build_key]["status"] = (
+                                    "DONE" if getattr(build_result, "success", False) else "FAILED"
+                                )
+                                self.store.save(bstate)
+                            result.data["build_triggered"] = True
+                            result.data["build_success"] = bool(getattr(build_result, "success", False))
+                            if not getattr(build_result, "success", False):
+                                result.data["build_error"] = getattr(build_result, "error", None)
                 elif action == "reference_upload":
                     result = self.reference_intake.add_upload(project_id, data, role, **auth)
                 elif action == "reference_url":
