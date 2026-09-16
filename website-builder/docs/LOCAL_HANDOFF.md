@@ -18,7 +18,7 @@ The production runtime composition root is now implemented:
 
 - `app/runtime.py` — composition root constructing all existing collaborators
 - `app/__main__.py` — canonical executable entrypoint (`python -m app`)
-- `app/runtime.py:TelegramReceiveLoop` — bounded getUpdates long-polling loop
+- `app/runtime.py:TelegramReceiveLoop` — bounded getUpdates long-polling loop with natural-conversation intent routing
 
 Canonical invocation:
 
@@ -51,6 +51,24 @@ The runtime wires:
 - `TelegramDispatcher` as the single mutation authority
 - `TelegramReceiveLoop` feeding normalized Updates through `AuthenticatedTelegramContext` into the dispatcher
 
+Natural-conversation routing:
+
+- `TelegramReceiveLoop._classify_intent()` uses the existing FAST Hermes role
+  (zero-tool programmatic boundary) to classify each natural-language turn into
+  a bounded intent: INTAKE, REVISE, APPROVE, or PUBLISH.
+- Intent vocabulary is state-aware: only lifecycle-appropriate intents are
+  offered to FAST (e.g. PREVIEW_READY offers REVISE/APPROVE/PUBLISH;
+  DISCOVERING offers only INTAKE).
+- Fail-safe: FAST failure, malformed output, unsupported intent, or ambiguity
+  always falls back to INTAKE — never a destructive action.
+- REVISE derives `seq` from persisted `queued_revision_seq + 1` and dispatches
+  through the existing `TelegramDispatcher` revise action.
+- PUBLISH dispatches approve then publish (canonical two-step artifact-specific
+  approval contract), both through the dispatcher's existing dedup/authz/
+  lifecycle gates.
+- The dispatcher's `dispatch_events` dedup ensures replay of the same Telegram
+  update is idempotent for both revision and publication.
+
 WhatsApp remains IMPLEMENTED_DORMANT. No WhatsApp credentials are required for startup.
 
 ## Current verification
@@ -64,7 +82,7 @@ scripts/run_tests.sh website-builder/tests -j 1
 Result as of this pass:
 
 - 26 files
-- 617 tests passed (baseline) + 26 new runtime tests passed
+- 617 tests passed (baseline) + 47 runtime tests passed (26 bootstrap + 21 routing)
 - 23 pre-existing failures (Windows environment: missing Hermes repo root on sys.path)
 - 16 skipped
 

@@ -19,8 +19,9 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
 
 import yaml
@@ -353,6 +354,45 @@ class TelegramProviderError(RuntimeError):
     """Structured Telegram provider failure. Never contains the token."""
 
 
+class ConversationIntent(str, Enum):
+    """Bounded intent vocabulary for natural-conversation routing.
+
+    AI interprets intent; deterministic application code retains authority.
+    FAST classifies into this bounded set only. Never an arbitrary string.
+    """
+
+    INTAKE = "INTAKE"
+    REVISE = "REVISE"
+    APPROVE = "APPROVE"
+    PUBLISH = "PUBLISH"
+
+
+# Intents that are valid for each lifecycle state. FAST is only offered
+# the subset that makes sense for the current project state.
+_LIFECYCLE_INTENTS: Dict[str, List[ConversationIntent]] = {
+    "DISCOVERING": [ConversationIntent.INTAKE],
+    "WAITING_INPUT": [ConversationIntent.INTAKE],
+    "READY": [ConversationIntent.INTAKE],
+    "QUEUED": [ConversationIntent.INTAKE],
+    "RUNNING": [ConversationIntent.INTAKE],
+    "PREVIEW_READY": [
+        ConversationIntent.INTAKE,
+        ConversationIntent.REVISE,
+        ConversationIntent.APPROVE,
+        ConversationIntent.PUBLISH,
+    ],
+    "REVISION_REQUESTED": [ConversationIntent.INTAKE],
+    "PUBLISHING": [ConversationIntent.INTAKE],
+    "LIVE": [
+        ConversationIntent.INTAKE,
+        ConversationIntent.REVISE,
+    ],
+    "FAILED": [ConversationIntent.INTAKE],
+    "PAUSED": [ConversationIntent.INTAKE],
+    "CANCELED": [ConversationIntent.INTAKE],
+}
+
+
 class TelegramReceiveLoop:
     """Bounded getUpdates long-polling loop.
 
@@ -365,6 +405,7 @@ class TelegramReceiveLoop:
         bot_token: str,
         dispatcher: TelegramDispatcher,
         telegram_out: TelegramAdapter,
+        hermes: Optional[HermesAdapter] = None,
         transport=None,
         poll_timeout: int = 30,
         error_backoff: float = 5.0,
@@ -372,6 +413,7 @@ class TelegramReceiveLoop:
         self.bot_token = bot_token
         self.dispatcher = dispatcher
         self.telegram_out = telegram_out
+        self.hermes = hermes
         self.transport = transport or UrllibHttpTransport()
         self.poll_timeout = poll_timeout
         self.error_backoff = error_backoff
@@ -414,6 +456,108 @@ class TelegramReceiveLoop:
             )
 
         return result
+
+    # ------------------------------------------------------------------
+    # Natural-conversation intent classification
+    # ------------------------------------------------------------------
+
+    def _classify_intent(
+        self,
+        text: str,
+        lifecycle: str,
+        project_id: Optional[str] = None,
+    ) -> ConversationIntent:
+        """Classify a natural-language turn into a bounded intent.
+
+        Uses the EXISTING FAST Hermes role via the same zero-tool
+        programmatic boundary as fast_interpret. AI interprets intent;
+        deterministic application code retains authority over whether
+        the resulting action is authorized or valid.
+
+        Fail-safe: any FAST failure, malformed output, unsupported intent,
+        or material ambiguity returns INTAKE — never a destructive action.
+        """
+        valid_intents = _LIFECYCLE_INTENTS.get(lifecycle, [ConversationIntent.INTAKE])
+
+        # If only INTAKE is valid for this lifecycle, skip FAST entirely.
+        if valid_intents == [ConversationIntent.INTAKE]:
+            return ConversationIntent.INTAKE
+
+        # If Hermes is unavailable, fall back to INTAKE.
+        if self.hermes is None:
+            return ConversationIntent.INTAKE
+
+        # Build the bounded intent-classification prompt.
+        intent_names = [i.value for i in valid_intents]
+        prompt = self._build_intent_prompt(text, lifecycle, intent_names)
+
+        try:
+            result = self.hermes._run_fast_programmatic(
+                prompt=prompt,
+                role="FAST",
+                skills=["website-builder-environment", "website-builder-product-scope"],
+            )
+        except Exception:
+            return ConversationIntent.INTAKE
+
+        if not result.success:
+            return ConversationIntent.INTAKE
+
+        return self._parse_intent_response(result.response, valid_intents)
+
+    def _build_intent_prompt(
+        self, text: str, lifecycle: str, valid_intents: List[str]
+    ) -> str:
+        """Build the bounded intent-classification prompt for FAST."""
+        return f"""You are FAST, classifying a user's natural-language message
+into exactly one bounded intent for Website Builder R1.
+
+Current project lifecycle: {lifecycle}
+Valid intents for this state: {', '.join(valid_intents)}
+
+Intent definitions:
+- INTAKE: Initial requirements, requirement continuation, clarification
+  answers, ordinary pre-build conversation, or any ambiguous/unclear intent.
+- REVISE: The user requests changes to the current preview/site (e.g. "make
+  the hero smaller", "change the button color", "hero kegedean").
+- APPROVE: The user clearly intends to accept the current preview (e.g.
+  "looks good", "approve", "ok"). This binds the preview but does NOT publish.
+- PUBLISH: The user clearly intends to go-live / publish to production
+  (e.g. "oke live", "publish", "go live", "launch"). This requires an
+  existing approval and triggers production promotion.
+
+Rules:
+- Respond with ONLY the intent name, nothing else.
+- If the intent is ambiguous or could be multiple things, respond INTAKE.
+- Never guess PUBLISH for ambiguous text. PUBLISH requires explicit go-live
+  language.
+- Never guess APPROVE for ambiguous text. APPROVE requires clear acceptance
+  of the current preview.
+- REVISE requires the user to be asking for a change to something that
+  already exists (a preview or live site).
+
+User message:
+{text}
+"""
+
+    def _parse_intent_response(
+        self, response: str, valid_intents: List[ConversationIntent]
+    ) -> ConversationIntent:
+        """Parse FAST intent response. Fail-safe to INTAKE on any ambiguity."""
+        text = response.strip().upper()
+        # Remove any markdown fences, quotes, or extra whitespace
+        text = text.strip("`\"' \n\r")
+
+        for intent in valid_intents:
+            if text == intent.value:
+                return intent
+
+        # Any non-exact match is ambiguous → INTAKE
+        return ConversationIntent.INTAKE
+
+    # ------------------------------------------------------------------
+    # Update processing
+    # ------------------------------------------------------------------
 
     def _process_update(self, update: dict) -> None:
         """Process a single Telegram Update through the existing dispatcher.
@@ -462,54 +606,177 @@ class TelegramReceiveLoop:
                         create_result.error_code,
                     )
                     return
+                state = self.dispatcher.store.load(project_id)
 
-            # Dispatch as intake — the existing pipeline handles scope,
-            # brief extraction, pause/resume, and lifecycle transitions.
-            result = self.dispatcher.dispatch(
-                update,
-                project_id,
-                "intake",
-                authenticated=authenticated,
-            )
+            # Classify the natural-language intent using FAST, bounded by
+            # the current lifecycle state. AI interprets; code enforces.
+            lifecycle = state.lifecycle if state else "DISCOVERING"
+            intent = self._classify_intent(message.text, lifecycle, project_id)
 
-            if not result.success:
-                logger.warning(
-                    "Intake dispatch failed for project %s: %s",
-                    project_id,
-                    result.error_code,
-                )
-                self._send_error_reply(conversation_id, result.error_code)
-                return
-
-            # After successful intake, check if we should trigger build.
-            # The intake processor sets lifecycle to READY when NAME+WHAT+WHY
-            # are present. The dispatcher's build action requires READY
-            # lifecycle and source_revision == 0.
-            state = self.dispatcher.store.load(project_id)
-            if (
-                state
-                and state.lifecycle == "READY"
-                and state.revisions.source_revision == 0
-            ):
-                logger.info("Project %s is READY, triggering build", project_id)
-                build_result = self.dispatcher.dispatch(
-                    update,
-                    project_id,
-                    "build",
-                    authenticated=authenticated,
-                )
-                if not build_result.success:
-                    logger.warning(
-                        "Build dispatch failed for project %s: %s",
-                        project_id,
-                        build_result.error_code,
-                    )
-                    self._send_error_reply(conversation_id, build_result.error_code)
+            # Route to the appropriate dispatcher action(s) based on the
+            # classified intent. The dispatcher's existing authz/lifecycle/
+            # dedup gates remain authoritative — FAST never bypasses them.
+            if intent == ConversationIntent.REVISE:
+                self._handle_revise(update, project_id, authenticated, message, state)
+            elif intent == ConversationIntent.APPROVE:
+                self._handle_approve(update, project_id, authenticated, state)
+            elif intent == ConversationIntent.PUBLISH:
+                self._handle_publish(update, project_id, authenticated, state)
+            else:
+                # INTAKE — default conversational flow
+                self._handle_intake(update, project_id, authenticated, message, state)
 
         except Exception:
             logger.exception(
                 "Unexpected error processing update %s", update.get("update_id")
             )
+
+    def _handle_intake(
+        self,
+        update: dict,
+        project_id: str,
+        authenticated: AuthenticatedTelegramContext,
+        message: NormalizedMessage,
+        state,
+    ) -> None:
+        """Handle INTAKE intent — ordinary conversation / requirements."""
+        result = self.dispatcher.dispatch(
+            update,
+            project_id,
+            "intake",
+            authenticated=authenticated,
+        )
+
+        if not result.success:
+            logger.warning(
+                "Intake dispatch failed for project %s: %s",
+                project_id,
+                result.error_code,
+            )
+            self._send_error_reply(message.conversation_id, result.error_code)
+            return
+
+        # After successful intake, check if we should trigger build.
+        # The intake processor sets lifecycle to READY when NAME+WHAT+WHY
+        # are present. The dispatcher's build action requires READY
+        # lifecycle and source_revision == 0.
+        state = self.dispatcher.store.load(project_id)
+        if (
+            state
+            and state.lifecycle == "READY"
+            and state.revisions.source_revision == 0
+        ):
+            logger.info("Project %s is READY, triggering build", project_id)
+            build_result = self.dispatcher.dispatch(
+                update,
+                project_id,
+                "build",
+                authenticated=authenticated,
+            )
+            if not build_result.success:
+                logger.warning(
+                    "Build dispatch failed for project %s: %s",
+                    project_id,
+                    build_result.error_code,
+                )
+                self._send_error_reply(message.conversation_id, build_result.error_code)
+
+    def _handle_revise(
+        self,
+        update: dict,
+        project_id: str,
+        authenticated: AuthenticatedTelegramContext,
+        message: NormalizedMessage,
+        state,
+    ) -> None:
+        """Handle REVISE intent — user requests changes to current preview/site.
+
+        Derives the revision sequence from existing persisted state.
+        The dispatcher's revise action handles reserve() + apply() atomically.
+        """
+        if state is None:
+            self._send_error_reply(message.conversation_id, "NO_PROJECT_STATE")
+            return
+
+        # Derive revision sequence from existing persisted state.
+        # The RevisionOrchestrator contract requires seq = queued_revision_seq + 1.
+        seq = state.revisions.queued_revision_seq + 1
+
+        result = self.dispatcher.dispatch(
+            update,
+            project_id,
+            "revise",
+            authenticated=authenticated,
+            seq=seq,
+        )
+
+        if not result.success:
+            logger.warning(
+                "Revise dispatch failed for project %s: %s",
+                project_id,
+                result.error_code,
+            )
+            self._send_error_reply(message.conversation_id, result.error_code)
+
+    def _handle_approve(
+        self,
+        update: dict,
+        project_id: str,
+        authenticated: AuthenticatedTelegramContext,
+        state,
+    ) -> None:
+        """Handle APPROVE intent — user accepts the current preview.
+
+        This binds the approval to the exact shown preview identity.
+        It does NOT publish — publication is a separate step.
+        """
+        result = self.dispatcher.dispatch(
+            update,
+            project_id,
+            "approve",
+            authenticated=authenticated,
+        )
+
+        if not result.success:
+            logger.warning(
+                "Approve dispatch failed for project %s: %s",
+                project_id,
+                result.error_code,
+            )
+            self._send_error_reply(
+                state.conversation_id if state else "unknown", result.error_code
+            )
+
+    def _handle_publish(
+        self,
+        update: dict,
+        project_id: str,
+        authenticated: AuthenticatedTelegramContext,
+        state,
+    ) -> None:
+        """Handle PUBLISH intent — user explicitly intends to go-live.
+
+        The dispatcher's "publish" action is the single application-owned
+        go-live operation: it approves the current exact shown preview and,
+        if approval succeeds, promotes that exact approved preview. One
+        Telegram event = one dispatch claim, so replay is idempotent.
+        """
+        conversation_id = state.conversation_id if state else "unknown"
+
+        result = self.dispatcher.dispatch(
+            update,
+            project_id,
+            "publish",
+            authenticated=authenticated,
+        )
+
+        if not result.success:
+            logger.warning(
+                "Publish dispatch failed for project %s: %s",
+                project_id,
+                result.error_code,
+            )
+            self._send_error_reply(conversation_id, result.error_code)
 
     def _send_error_reply(self, chat_id: str, error_code: Optional[str]) -> None:
         """Send a sanitized error reply to the user. Never leaks internals."""
@@ -519,6 +786,15 @@ class TelegramReceiveLoop:
             "DIRECTION_CHOICE_PENDING": "Please choose a design direction first.",
             "EVENT_RECONCILIATION_REQUIRED": "A previous operation needs reconciliation. Please try again.",
             "UNSUPPORTED_ACTION": "That action is not supported.",
+            "REVISION_NOT_ALLOWED_IN_LIFECYCLE": "Revisions are not allowed right now.",
+            "APPROVAL_NOT_ALLOWED_IN_LIFECYCLE": "Approval is not allowed right now.",
+            "PROMOTION_NOT_ALLOWED_IN_LIFECYCLE": "Publication is not allowed right now.",
+            "NO_SHOWN_PREVIEW": "No preview has been shown yet.",
+            "STALE_APPROVAL": "The approval is stale. Please review the latest preview.",
+            "STALE_QA_BINDING": "The preview is outdated. Please wait for the latest build.",
+            "NOT_APPROVED": "The preview must be approved before publication.",
+            "OUT_OF_ORDER_REVISION": "Revision is out of order. Please try again.",
+            "REVISION_ALREADY_APPLIED": "This revision has already been applied.",
         }
         text = messages.get(error_code, "Something went wrong. Please try again.")
         try:
@@ -585,6 +861,7 @@ def main() -> int:
         bot_token=config.telegram_bot_token,
         dispatcher=composition.dispatcher,
         telegram_out=composition.telegram_out,
+        hermes=composition.hermes,
     )
 
     # Graceful shutdown on SIGINT/SIGTERM

@@ -24,6 +24,7 @@ from app.channels.telegram import TelegramNormalizer
 from app.core.state import ProjectStateStore
 from app.runtime import (
     ConfigurationError,
+    ConversationIntent,
     RuntimeComposition,
     TelegramProviderError,
     TelegramReceiveLoop,
@@ -557,3 +558,476 @@ class TestMainEntrypoint:
         with patch.dict(os.environ, _env(), clear=False):
             with patch("app.runtime.compose", side_effect=RuntimeError("boom")):
                 assert main() == 1
+
+
+# ---------------------------------------------------------------------------
+# 12. Natural-conversation intent classification
+# ---------------------------------------------------------------------------
+
+
+class TestIntentClassification:
+    def _loop(self, hermes=None, lifecycle="PREVIEW_READY"):
+        dispatcher = MagicMock()
+        state = MagicMock()
+        state.lifecycle = lifecycle
+        state.revisions.queued_revision_seq = 0
+        state.revisions.source_revision = 1
+        state.conversation_id = "555"
+        dispatcher.store.load.return_value = state
+        dispatcher.dispatch.return_value = MagicMock(success=True)
+        return TelegramReceiveLoop(
+            bot_token="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+            dispatcher=dispatcher,
+            telegram_out=MagicMock(),
+            hermes=hermes,
+            transport=MagicMock(),
+        )
+
+    def test_pre_build_lifecycle_always_intake(self):
+        """Pre-build states only offer INTAKE — no FAST call needed."""
+        hermes = MagicMock()
+        loop = self._loop(hermes=hermes, lifecycle="DISCOVERING")
+        intent = loop._classify_intent("make the hero smaller", "DISCOVERING")
+        assert intent == ConversationIntent.INTAKE
+        hermes._run_fast_programmatic.assert_not_called()
+
+    def test_preview_ready_change_request_classified_revise(self):
+        """PREVIEW_READY + change request -> REVISE."""
+        hermes = MagicMock()
+        hermes._run_fast_programmatic.return_value = MagicMock(
+            success=True, response="REVISE"
+        )
+        loop = self._loop(hermes=hermes, lifecycle="PREVIEW_READY")
+        intent = loop._classify_intent("make the hero smaller", "PREVIEW_READY")
+        assert intent == ConversationIntent.REVISE
+
+    def test_preview_ready_go_live_classified_publish(self):
+        """PREVIEW_READY + explicit go-live -> PUBLISH."""
+        hermes = MagicMock()
+        hermes._run_fast_programmatic.return_value = MagicMock(
+            success=True, response="PUBLISH"
+        )
+        loop = self._loop(hermes=hermes, lifecycle="PREVIEW_READY")
+        intent = loop._classify_intent("oke live", "PREVIEW_READY")
+        assert intent == ConversationIntent.PUBLISH
+
+    def test_preview_ready_approve_classified_approve(self):
+        """PREVIEW_READY + clear acceptance -> APPROVE."""
+        hermes = MagicMock()
+        hermes._run_fast_programmatic.return_value = MagicMock(
+            success=True, response="APPROVE"
+        )
+        loop = self._loop(hermes=hermes, lifecycle="PREVIEW_READY")
+        intent = loop._classify_intent("looks good", "PREVIEW_READY")
+        assert intent == ConversationIntent.APPROVE
+
+    def test_ambiguous_intent_falls_back_to_intake(self):
+        """Ambiguous FAST response -> INTAKE."""
+        hermes = MagicMock()
+        hermes._run_fast_programmatic.return_value = MagicMock(
+            success=True, response="MAYBE_REVISE"
+        )
+        loop = self._loop(hermes=hermes, lifecycle="PREVIEW_READY")
+        intent = loop._classify_intent("hmm not sure", "PREVIEW_READY")
+        assert intent == ConversationIntent.INTAKE
+
+    def test_malformed_fast_result_falls_back_to_intake(self):
+        """Malformed FAST response -> INTAKE."""
+        hermes = MagicMock()
+        hermes._run_fast_programmatic.return_value = MagicMock(
+            success=True, response="not a valid intent at all"
+        )
+        loop = self._loop(hermes=hermes, lifecycle="PREVIEW_READY")
+        intent = loop._classify_intent("hello", "PREVIEW_READY")
+        assert intent == ConversationIntent.INTAKE
+
+    def test_fast_failure_falls_back_to_intake(self):
+        """FAST failure -> INTAKE."""
+        hermes = MagicMock()
+        hermes._run_fast_programmatic.return_value = MagicMock(
+            success=False, error="provider error"
+        )
+        loop = self._loop(hermes=hermes, lifecycle="PREVIEW_READY")
+        intent = loop._classify_intent("hello", "PREVIEW_READY")
+        assert intent == ConversationIntent.INTAKE
+
+    def test_fast_exception_falls_back_to_intake(self):
+        """FAST exception -> INTAKE."""
+        hermes = MagicMock()
+        hermes._run_fast_programmatic.side_effect = RuntimeError("boom")
+        loop = self._loop(hermes=hermes, lifecycle="PREVIEW_READY")
+        intent = loop._classify_intent("hello", "PREVIEW_READY")
+        assert intent == ConversationIntent.INTAKE
+
+    def test_hermes_unavailable_falls_back_to_intake(self):
+        """No Hermes adapter -> INTAKE."""
+        loop = self._loop(hermes=None, lifecycle="PREVIEW_READY")
+        intent = loop._classify_intent("hello", "PREVIEW_READY")
+        assert intent == ConversationIntent.INTAKE
+
+    def test_live_allows_revise_but_not_publish(self):
+        """LIVE state allows REVISE but not PUBLISH."""
+        hermes = MagicMock()
+        hermes._run_fast_programmatic.return_value = MagicMock(
+            success=True, response="PUBLISH"
+        )
+        loop = self._loop(hermes=hermes, lifecycle="LIVE")
+        intent = loop._classify_intent("publish again", "LIVE")
+        # PUBLISH is not in LIVE's valid intents, so it falls back to INTAKE
+        assert intent == ConversationIntent.INTAKE
+
+
+# ---------------------------------------------------------------------------
+# 13. Intent routing through dispatcher
+# ---------------------------------------------------------------------------
+
+
+class TestIntentRouting:
+    def _loop_with_state(self, lifecycle="PREVIEW_READY", queued_seq=0):
+        dispatcher = MagicMock()
+        state = MagicMock()
+        state.lifecycle = lifecycle
+        state.revisions.queued_revision_seq = queued_seq
+        state.revisions.source_revision = 1
+        state.conversation_id = "555"
+        dispatcher.store.load.return_value = state
+        dispatcher.dispatch.return_value = MagicMock(success=True)
+        return dispatcher, state
+
+    def test_revise_dispatches_with_correct_seq(self):
+        """REVISE intent dispatches revise with seq = queued_revision_seq + 1."""
+        dispatcher, state = self._loop_with_state(queued_seq=2)
+        hermes = MagicMock()
+        hermes._run_fast_programmatic.return_value = MagicMock(
+            success=True, response="REVISE"
+        )
+        loop = TelegramReceiveLoop(
+            bot_token="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+            dispatcher=dispatcher,
+            telegram_out=MagicMock(),
+            hermes=hermes,
+            transport=MagicMock(),
+        )
+        update = {
+            "update_id": 1,
+            "message": {"from": {"id": 1}, "chat": {"id": 555}, "text": "make hero smaller", "date": 1},
+        }
+        loop._process_update(update)
+
+        calls = dispatcher.dispatch.call_args_list
+        revise_calls = [c for c in calls if c[0][2] == "revise"]
+        assert len(revise_calls) == 1
+        assert revise_calls[0][1]["seq"] == 3  # queued_seq(2) + 1
+
+    def test_approve_dispatches_approve_action(self):
+        """APPROVE intent dispatches approve action."""
+        dispatcher, state = self._loop_with_state()
+        hermes = MagicMock()
+        hermes._run_fast_programmatic.return_value = MagicMock(
+            success=True, response="APPROVE"
+        )
+        loop = TelegramReceiveLoop(
+            bot_token="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+            dispatcher=dispatcher,
+            telegram_out=MagicMock(),
+            hermes=hermes,
+            transport=MagicMock(),
+        )
+        update = {
+            "update_id": 1,
+            "message": {"from": {"id": 1}, "chat": {"id": 555}, "text": "looks good", "date": 1},
+        }
+        loop._process_update(update)
+
+        calls = dispatcher.dispatch.call_args_list
+        approve_calls = [c for c in calls if c[0][2] == "approve"]
+        assert len(approve_calls) == 1
+
+    def test_publish_dispatches_single_publish_action(self):
+        """PUBLISH intent dispatches exactly one publish action."""
+        dispatcher, state = self._loop_with_state()
+        hermes = MagicMock()
+        hermes._run_fast_programmatic.return_value = MagicMock(
+            success=True, response="PUBLISH"
+        )
+        loop = TelegramReceiveLoop(
+            bot_token="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+            dispatcher=dispatcher,
+            telegram_out=MagicMock(),
+            hermes=hermes,
+            transport=MagicMock(),
+        )
+        update = {
+            "update_id": 1,
+            "message": {"from": {"id": 1}, "chat": {"id": 555}, "text": "oke live", "date": 1},
+        }
+        loop._process_update(update)
+
+        calls = dispatcher.dispatch.call_args_list
+        actions = [c[0][2] for c in calls]
+        assert "publish" in actions
+        assert "approve" not in actions
+        assert actions.count("publish") == 1
+
+    def test_publish_failure_sends_error_reply(self):
+        """PUBLISH dispatch failure sends error reply to user."""
+        dispatcher, state = self._loop_with_state()
+        dispatcher.dispatch.return_value = MagicMock(
+            success=False, error_code="STALE_APPROVAL"
+        )
+        hermes = MagicMock()
+        hermes._run_fast_programmatic.return_value = MagicMock(
+            success=True, response="PUBLISH"
+        )
+        telegram_out = MagicMock()
+        loop = TelegramReceiveLoop(
+            bot_token="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+            dispatcher=dispatcher,
+            telegram_out=telegram_out,
+            hermes=hermes,
+            transport=MagicMock(),
+        )
+        update = {
+            "update_id": 1,
+            "message": {"from": {"id": 1}, "chat": {"id": 555}, "text": "oke live", "date": 1},
+        }
+        loop._process_update(update)
+
+        calls = dispatcher.dispatch.call_args_list
+        actions = [c[0][2] for c in calls]
+        assert "publish" in actions
+        assert "approve" not in actions
+        telegram_out.send_text.assert_called_once_with(
+            "555", "The approval is stale. Please review the latest preview."
+        )
+
+    def test_intake_dispatches_intake_action(self):
+        """INTAKE intent dispatches intake action."""
+        dispatcher, state = self._loop_with_state(lifecycle="DISCOVERING")
+        hermes = MagicMock()
+        loop = TelegramReceiveLoop(
+            bot_token="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+            dispatcher=dispatcher,
+            telegram_out=MagicMock(),
+            hermes=hermes,
+            transport=MagicMock(),
+        )
+        update = {
+            "update_id": 1,
+            "message": {"from": {"id": 1}, "chat": {"id": 555}, "text": "hello", "date": 1},
+        }
+        loop._process_update(update)
+
+        calls = dispatcher.dispatch.call_args_list
+        actions = [c[0][2] for c in calls]
+        assert "intake" in actions
+
+    def test_unsupported_intent_cannot_become_arbitrary_action(self):
+        """FAST returning an unsupported intent string cannot become a dispatcher action."""
+        dispatcher, state = self._loop_with_state()
+        hermes = MagicMock()
+        hermes._run_fast_programmatic.return_value = MagicMock(
+            success=True, response="DELETE_EVERYTHING"
+        )
+        loop = TelegramReceiveLoop(
+            bot_token="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+            dispatcher=dispatcher,
+            telegram_out=MagicMock(),
+            hermes=hermes,
+            transport=MagicMock(),
+        )
+        update = {
+            "update_id": 1,
+            "message": {"from": {"id": 1}, "chat": {"id": 555}, "text": "delete everything", "date": 1},
+        }
+        loop._process_update(update)
+
+        calls = dispatcher.dispatch.call_args_list
+        actions = [c[0][2] for c in calls]
+        # Unsupported intent falls back to INTAKE
+        assert "intake" in actions
+        assert "delete" not in actions
+        assert "publish" not in actions
+
+
+# ---------------------------------------------------------------------------
+# 14. Duplicate update idempotency for revision and publication
+# ---------------------------------------------------------------------------
+
+
+class TestDuplicateRevisionAndPublication:
+    def test_duplicate_revise_update_idempotent(self, tmp_path):
+        """Duplicate Telegram update does not cause duplicate revision."""
+        store = ProjectStateStore(tmp_path / "state")
+        revise = MagicMock()
+        revise.reserve.return_value = MagicMock(success=True)
+        revise.apply.return_value = MagicMock(success=True)
+
+        dispatcher = TelegramDispatcher(store, None, revise=revise)
+
+        update = {
+            "update_id": 1,
+            "message": {"from": {"id": 1}, "chat": {"id": 555}, "text": "make hero smaller", "date": 1},
+        }
+        auth = AuthenticatedTelegramContext("1", "555")
+
+        # Create project first
+        dispatcher.dispatch(update, "tg-555", "create", authenticated=auth)
+
+        # Set lifecycle to PREVIEW_READY
+        with store.acquire_writer("tg-555") as state:
+            state.lifecycle = "PREVIEW_READY"
+            state.revisions.source_revision = 1
+            state.revisions.qa_revision = 1
+            state.revisions.preview_revision = 1
+            state.deployment["latest_shown_preview"] = {
+                "operation_id": "op-1",
+                "source_revision": 1,
+                "preview_url": "https://test.vercel.app",
+                "deployment_id": "dpl_1",
+                "source_sha256": "a" * 64,
+                "artifact_sha256": "b" * 64,
+            }
+            store.save(state)
+
+        # First revise dispatch
+        r1 = dispatcher.dispatch(update, "tg-555", "revise", authenticated=auth, seq=1)
+        assert r1.success
+
+        # Duplicate revise dispatch of SAME update
+        r2 = dispatcher.dispatch(update, "tg-555", "revise", authenticated=auth, seq=1)
+        assert r2.success
+        assert r2.data.get("duplicate") is True
+
+        # Reserve should only have been called once
+        assert revise.reserve.call_count == 1
+        assert revise.apply.call_count == 1
+
+    def test_duplicate_publish_update_idempotent(self, tmp_path):
+        """Duplicate Telegram update does not cause duplicate publication."""
+        store = ProjectStateStore(tmp_path / "state")
+        promote = MagicMock()
+        promote.approve.return_value = MagicMock(success=True)
+        promote.promote.return_value = MagicMock(success=True)
+
+        dispatcher = TelegramDispatcher(store, None, promote=promote, workspace_for=lambda pid: tmp_path / "ws")
+
+        update = {
+            "update_id": 1,
+            "message": {"from": {"id": 1}, "chat": {"id": 555}, "text": "oke live", "date": 1},
+        }
+        auth = AuthenticatedTelegramContext("1", "555")
+
+        # Create project first
+        dispatcher.dispatch(update, "tg-555", "create", authenticated=auth)
+
+        # Set lifecycle to PREVIEW_READY with shown preview
+        with store.acquire_writer("tg-555") as state:
+            state.lifecycle = "PREVIEW_READY"
+            state.revisions.source_revision = 1
+            state.revisions.qa_revision = 1
+            state.revisions.preview_revision = 1
+            state.deployment["latest_shown_preview"] = {
+                "operation_id": "op-1",
+                "source_revision": 1,
+                "preview_url": "https://test.vercel.app",
+                "deployment_id": "dpl_1",
+                "source_sha256": "a" * 64,
+                "artifact_sha256": "b" * 64,
+            }
+            store.save(state)
+
+        # First publish dispatch
+        r1 = dispatcher.dispatch(update, "tg-555", "publish", authenticated=auth)
+        assert r1.success
+
+        # Duplicate publish dispatch of SAME update
+        r2 = dispatcher.dispatch(update, "tg-555", "publish", authenticated=auth)
+        assert r2.success
+        assert r2.data.get("duplicate") is True
+
+        # Approve and promote should each have been called exactly once
+        assert promote.approve.call_count == 1
+        assert promote.promote.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# 15. Lifecycle guards remain authoritative
+# ---------------------------------------------------------------------------
+
+
+class TestLifecycleGuards:
+    def test_revise_blocked_in_wrong_lifecycle(self):
+        """REVISE intent in DISCOVERING lifecycle falls back to INTAKE."""
+        dispatcher = MagicMock()
+        state = MagicMock()
+        state.lifecycle = "DISCOVERING"
+        state.revisions.queued_revision_seq = 0
+        state.conversation_id = "555"
+        dispatcher.store.load.return_value = state
+        dispatcher.dispatch.return_value = MagicMock(success=True)
+
+        hermes = MagicMock()
+        loop = TelegramReceiveLoop(
+            bot_token="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+            dispatcher=dispatcher,
+            telegram_out=MagicMock(),
+            hermes=hermes,
+            transport=MagicMock(),
+        )
+        update = {
+            "update_id": 1,
+            "message": {"from": {"id": 1}, "chat": {"id": 555}, "text": "make hero smaller", "date": 1},
+        }
+        loop._process_update(update)
+
+        calls = dispatcher.dispatch.call_args_list
+        actions = [c[0][2] for c in calls]
+        # DISCOVERING only allows INTAKE, so revise is never dispatched
+        assert "revise" not in actions
+        assert "intake" in actions
+
+    def test_publish_blocked_in_wrong_lifecycle(self):
+        """PUBLISH intent in RUNNING lifecycle falls back to INTAKE."""
+        dispatcher = MagicMock()
+        state = MagicMock()
+        state.lifecycle = "RUNNING"
+        state.revisions.queued_revision_seq = 0
+        state.conversation_id = "555"
+        dispatcher.store.load.return_value = state
+        dispatcher.dispatch.return_value = MagicMock(success=True)
+
+        hermes = MagicMock()
+        loop = TelegramReceiveLoop(
+            bot_token="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+            dispatcher=dispatcher,
+            telegram_out=MagicMock(),
+            hermes=hermes,
+            transport=MagicMock(),
+        )
+        update = {
+            "update_id": 1,
+            "message": {"from": {"id": 1}, "chat": {"id": 555}, "text": "oke live", "date": 1},
+        }
+        loop._process_update(update)
+
+        calls = dispatcher.dispatch.call_args_list
+        actions = [c[0][2] for c in calls]
+        # RUNNING only allows INTAKE, so publish is never dispatched
+        assert "publish" not in actions
+        assert "intake" in actions
+
+
+# ---------------------------------------------------------------------------
+# 16. WhatsApp remains dormant
+# ---------------------------------------------------------------------------
+
+
+class TestWhatsAppDormant:
+    def test_whatsapp_not_instantiated_in_compose(self, tmp_path):
+        """WhatsApp adapter is not constructed by the runtime composition."""
+        config = _make_config(tmp_path)
+        comp = compose(config)
+        # No whatsapp attribute on composition
+        assert not hasattr(comp, "whatsapp")
+        assert not hasattr(comp, "whatsapp_out")

@@ -186,6 +186,12 @@ class TelegramDispatcher:
                         result = self.revise.apply(project_id, seq, message.text, principal_id=principal)
                 elif action == "approve":
                     result = self.promote.approve(project_id, principal_id=principal)
+                elif action == "publish":
+                    approval = self.promote.approve(project_id, principal_id=principal)
+                    if not approval.success:
+                        result = approval
+                    else:
+                        result = self.promote.promote(project_id, self.workspace_for(project_id), principal_id=principal)
                 else:
                     result = self.promote.promote(project_id, self.workspace_for(project_id), principal_id=principal)
             except Exception:
