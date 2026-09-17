@@ -52,8 +52,6 @@ def _default_capture_fn(url: str, width: int, height: int, out_path: Path) -> bo
         "--session", session_name,
         "--json",
         "open", url,
-        "--width", str(width),
-        "--height", str(height),
     ]
     browser_args = os.environ.get("AGENT_BROWSER_ARGS", "").strip()
     if browser_args:
@@ -72,6 +70,23 @@ def _default_capture_fn(url: str, width: int, height: int, out_path: Path) -> bo
         # missing sandbox flags, ...) could still produce a "successful"
         # screenshot of a blank/error page, silently corrupting QA evidence.
         if open_result.returncode != 0:
+            return False
+
+        # Viewport is a runtime command, not an `open` flag. Apply it to
+        # the same session before capturing either desktop or mobile evidence.
+        viewport_result = subprocess.run(
+            [
+                browser_cmd,
+                "--session", session_name,
+                "--json",
+                "set", "viewport", str(width), str(height),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if viewport_result.returncode != 0:
             return False
 
         result = subprocess.run(
@@ -112,6 +127,51 @@ class ScreenshotSet:
             and self.mobile is not None
             and self.mobile.exists()
         )
+
+
+def _png_dimensions(path: Path) -> tuple:
+    """Read (width, height) from a PNG's IHDR chunk — stdlib only.
+
+    Raises ScreenshotError if the file is not a decodable PNG header.
+    """
+    import struct
+
+    try:
+        with open(path, "rb") as f:
+            header = f.read(24)
+    except OSError as exc:
+        raise ScreenshotError(f"cannot read screenshot evidence {path}: {exc}") from exc
+    if len(header) < 24 or header[:8] != b"\x89PNG\r\n\x1a\n" or header[12:16] != b"IHDR":
+        raise ScreenshotError(f"screenshot evidence is not a valid PNG: {path}")
+    return struct.unpack(">II", header[16:24])
+
+
+def validate_screenshot_dimensions(screenshots: ScreenshotSet) -> None:
+    """Evidence-integrity guard: actual PNG pixels must match the viewports.
+
+    Verifies the ACTUAL pixel dimensions of captured screenshots against the
+    intended viewports (desktop 1440, mobile 390) by parsing each PNG's IHDR
+    chunk — not filenames or metadata. The tg-6329821361 incident produced
+    valid-looking PNGs at the browser's default 1280px width for BOTH
+    viewports because the viewport command was never applied; this guard
+    makes that class of broken evidence impossible to hand to VISION.
+
+    Raises ScreenshotError on any mismatch. Missing files are skipped here —
+    they are reported by the deterministic screenshot-presence checks.
+    """
+    for path, expected_width, label in (
+        (screenshots.desktop, DESKTOP_VIEWPORT[0], "desktop"),
+        (screenshots.mobile, MOBILE_VIEWPORT[0], "mobile"),
+    ):
+        if path is None or not path.exists():
+            continue
+        width, _height = _png_dimensions(path)
+        if width != expected_width:
+            raise ScreenshotError(
+                f"screenshot evidence integrity failure: {label} capture is "
+                f"{width}px wide, expected {expected_width}px ({path}) — "
+                f"viewport was not applied; evidence rejected before VISION"
+            )
 
 
 class ScreenshotCapture:

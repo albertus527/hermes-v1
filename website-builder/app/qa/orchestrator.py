@@ -19,7 +19,11 @@ from app.core.state import ProjectStateStore
 from app.qa.deterministic import run_deterministic_checks
 from app.qa.findings import DeterministicFindings, QAAttempt, QAResult, VisionFindings
 from app.qa.render import LocalRenderer, RenderError
-from app.qa.screenshot import ScreenshotCapture, ScreenshotSet
+from app.qa.screenshot import (
+    ScreenshotCapture,
+    ScreenshotSet,
+    validate_screenshot_dimensions,
+)
 from app.sandbox.runner import ProjectRunner
 
 # Bounded repair loop: attempt 0 (initial QA) + up to 2 repairs.
@@ -205,6 +209,14 @@ class QAOrchestrator:
         finally:
             if handle is not None:
                 self.renderer.stop(handle)
+
+        # Evidence-integrity guard: verify the actual PNG pixel dimensions
+        # match the intended viewports BEFORE VISION consumes the evidence.
+        # Wrong-dimension evidence (e.g. the browser's default 1280px width
+        # when the viewport command silently failed) is a capture
+        # infrastructure error, not a visual QA finding — it must never
+        # reach VISION or consume a FRONTEND repair attempt.
+        validate_screenshot_dimensions(screenshots)
 
         vision_findings: Optional[VisionFindings] = None
         if screenshots.complete and self.hermes_adapter is not None:

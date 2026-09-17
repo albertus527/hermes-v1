@@ -6,6 +6,7 @@ Tests do NOT require a live LLM, browser, or npm. All external boundaries
 
 from __future__ import annotations
 
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -33,6 +34,33 @@ def _make_workspace(tmpdir: Path, project_id: str) -> Path:
     (ws / "src" / "App.tsx").write_text("// real content, not starter", encoding="utf-8")
     (ws / "design-dna.json").write_text('{"version": 1}', encoding="utf-8")
     return ws
+
+
+def _png_bytes(width: int, height: int) -> bytes:
+    """Build a minimal valid PNG with the given pixel dimensions (stdlib only).
+
+    Used by orchestrator fixtures so the evidence-integrity guard exercises
+    real IHDR data: fixtures must be genuine PNGs at the intended viewport
+    sizes, proving the guard accepts valid evidence and only rejects actual
+    dimension mismatches.
+    """
+    import struct
+    import zlib
+
+    def _chunk(ctype: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data)) + ctype + data
+            + struct.pack(">I", zlib.crc32(ctype + data) & 0xFFFFFFFF)
+        )
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 0, 0, 0, 0)
+    raw = b"".join(b"\x00" + b"\x00" * width for _ in range(height))
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _chunk(b"IHDR", ihdr)
+        + _chunk(b"IDAT", zlib.compress(raw))
+        + _chunk(b"IEND", b"")
+    )
 
 
 class _FixtureBase(unittest.TestCase):
@@ -74,8 +102,8 @@ class _FixtureBase(unittest.TestCase):
         qa_dir.mkdir(parents=True, exist_ok=True)
         desktop = qa_dir / "desktop.png"
         mobile = qa_dir / "mobile.png"
-        desktop.write_bytes(b"fake-png")
-        mobile.write_bytes(b"fake-png")
+        desktop.write_bytes(_png_bytes(1440, 900))
+        mobile.write_bytes(_png_bytes(390, 844))
         return ScreenshotSet(desktop=desktop, mobile=mobile)
 
     def _passing_vision(self):
@@ -413,6 +441,158 @@ class TestScreenshotsRequired(_FixtureBase):
         self.assertEqual(state.lifecycle, ProjectLifecycle.FAILED.value)
 
 
+class TestEvidenceIntegrityGuard(unittest.TestCase):
+    """Evidence-integrity guard: actual PNG pixel dimensions must match the
+    intended viewports before evidence may be consumed downstream.
+
+    The tg-6329821361 incident produced valid-looking PNGs at the browser's
+    default 1280px width for BOTH viewports; these tests pin the guard that
+    rejects that class of broken evidence.
+    """
+
+    def test_valid_dimensions_pass(self):
+        from app.qa.screenshot import validate_screenshot_dimensions
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            desktop = Path(tmpdir) / "desktop.png"
+            mobile = Path(tmpdir) / "mobile.png"
+            desktop.write_bytes(_png_bytes(1440, 900))
+            mobile.write_bytes(_png_bytes(390, 844))
+            # Must not raise.
+            validate_screenshot_dimensions(ScreenshotSet(desktop=desktop, mobile=mobile))
+
+    def test_desktop_wrong_width_rejected(self):
+        from app.qa.screenshot import ScreenshotError, validate_screenshot_dimensions
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            desktop = Path(tmpdir) / "desktop.png"
+            mobile = Path(tmpdir) / "mobile.png"
+            desktop.write_bytes(_png_bytes(1280, 720))  # browser default width
+            mobile.write_bytes(_png_bytes(390, 844))
+            with self.assertRaises(ScreenshotError) as ctx:
+                validate_screenshot_dimensions(ScreenshotSet(desktop=desktop, mobile=mobile))
+        self.assertIn("desktop", str(ctx.exception))
+        self.assertIn("1440", str(ctx.exception))
+
+    def test_mobile_wrong_width_rejected(self):
+        from app.qa.screenshot import ScreenshotError, validate_screenshot_dimensions
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            desktop = Path(tmpdir) / "desktop.png"
+            mobile = Path(tmpdir) / "mobile.png"
+            desktop.write_bytes(_png_bytes(1440, 900))
+            mobile.write_bytes(_png_bytes(1280, 720))  # browser default width
+            with self.assertRaises(ScreenshotError) as ctx:
+                validate_screenshot_dimensions(ScreenshotSet(desktop=desktop, mobile=mobile))
+        self.assertIn("mobile", str(ctx.exception))
+        self.assertIn("390", str(ctx.exception))
+
+    def test_non_png_evidence_rejected(self):
+        from app.qa.screenshot import ScreenshotError, validate_screenshot_dimensions
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            desktop = Path(tmpdir) / "desktop.png"
+            mobile = Path(tmpdir) / "mobile.png"
+            desktop.write_bytes(b"fake-png")  # not a PNG at all
+            mobile.write_bytes(_png_bytes(390, 844))
+            with self.assertRaises(ScreenshotError):
+                validate_screenshot_dimensions(ScreenshotSet(desktop=desktop, mobile=mobile))
+
+    def test_missing_files_are_skipped_here(self):
+        """Missing files are the deterministic presence checks' job, not the
+        dimension guard's — the guard only validates files that exist."""
+        from app.qa.screenshot import validate_screenshot_dimensions
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing = Path(tmpdir) / "does-not-exist.png"
+            # Must not raise.
+            validate_screenshot_dimensions(ScreenshotSet(desktop=missing, mobile=missing))
+
+
+class TestEvidenceIntegrityBlocksBeforeVision(_FixtureBase):
+    """Wrong-dimension evidence is a capture-infrastructure failure: it must
+    never reach VISION and must never consume the FRONTEND repair budget."""
+
+    def _run_with_bad_evidence(self, width: int, height: int, target="desktop"):
+        _queue_and_run_project(self.store, "proj")
+        self._passing_render()
+
+        def _bad_capture(url, qa_dir, attempt):
+            s = self._passing_screenshots(attempt)
+            getattr(s, target).write_bytes(_png_bytes(width, height))
+            return s
+
+        self.mock_capture.capture.side_effect = _bad_capture
+        self.mock_adapter.vision_inspect.return_value = self._passing_vision()
+        self.mock_adapter.frontend_build.return_value = {"success": True, "design_dna": self.design_dna}
+
+        return self.orchestrator.run("proj", self.workspace, self.brief, self.design_dna)
+
+    def test_bad_desktop_dimensions_fail_as_capture_error(self):
+        result = self._run_with_bad_evidence(1280, 720)
+
+        self.assertFalse(result.success)
+        # VISION must never consume invalid evidence.
+        self.mock_adapter.vision_inspect.assert_not_called()
+        # Capture infrastructure failure must not consume the repair budget.
+        self.assertEqual(result.repair_attempts, 0)
+        self.mock_adapter.frontend_build.assert_not_called()
+        # Explicit capture/evidence failure, not a visual QA failure.
+        self.assertIn("screenshot evidence integrity", result.error)
+        state = self.store.load("proj")
+        self.assertEqual(state.lifecycle, ProjectLifecycle.FAILED.value)
+        self.assertEqual(state.failure["phase"], "qa")
+        self.assertIn("screenshot evidence integrity", state.failure["error"])
+
+    def test_bad_mobile_dimensions_fail_as_capture_error(self):
+        result = self._run_with_bad_evidence(1280, 720, target="mobile")
+
+        self.assertFalse(result.success)
+        self.mock_adapter.vision_inspect.assert_not_called()
+        self.assertEqual(result.repair_attempts, 0)
+        self.mock_adapter.frontend_build.assert_not_called()
+        self.assertIn("screenshot evidence integrity", result.error)
+        self.assertIn("mobile", result.error)
+        self.mock_renderer.stop.assert_called_once()
+        self.assertEqual(self.store.load("proj").failure["vision_findings"], [])
+
+    def test_bad_evidence_after_repair_stops_without_another_repair(self):
+        _queue_and_run_project(self.store, "proj")
+        self._passing_render()
+
+        def capture(url, qa_dir, attempt):
+            screenshots = self._passing_screenshots(attempt)
+            if attempt:
+                screenshots.mobile.write_bytes(_png_bytes(1280, 2501))
+            return screenshots
+
+        self.mock_capture.capture.side_effect = capture
+        self.mock_adapter.vision_inspect.return_value = self._blocking_vision()
+        self.mock_adapter.frontend_build.return_value = {
+            "success": True, "design_dna": self.design_dna,
+        }
+        with patch.object(self.orchestrator, "_run_rebuild_checks", return_value=(True, True)):
+            result = self.orchestrator.run("proj", self.workspace, self.brief, self.design_dna)
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.repair_attempts, 1)
+        self.mock_adapter.frontend_build.assert_called_once()
+        self.mock_adapter.vision_inspect.assert_called_once()
+        self.assertIn("mobile", result.error)
+        self.assertIn("screenshot evidence integrity", result.error)
+        self.assertEqual(self.mock_renderer.stop.call_count, 2)
+
+    def test_bad_evidence_does_not_consume_repair_budget(self):
+        """Even with a passing VISION stub ready, invalid evidence fails the
+        run with zero repairs — the budget is reserved for visual QA only."""
+        result = self._run_with_bad_evidence(1280, 720)
+
+        self.assertEqual(result.repair_attempts, 0)
+        self.assertEqual(self.mock_adapter.frontend_build.call_count, 0)
+        state = self.store.load("proj")
+        self.assertEqual(state.failure["repair_attempts"], 0)
+
+
 class TestBrokenBuildAfterRepairBlocks(_FixtureBase):
     """7. Broken build after repair blocks PREVIEW_READY."""
 
@@ -632,7 +812,7 @@ class TestAgentBrowserArgsEnv(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             ok, calls = self._run_capture(None, tmpdir)
         self.assertTrue(ok)
-        self.assertEqual(len(calls), 3)  # open, screenshot, close
+        self.assertEqual(len(calls), 4)  # open, set viewport, screenshot, close
         for argv in calls:
             self.assertNotIn("--args", argv)
 
@@ -676,8 +856,8 @@ class TestAgentBrowserArgsEnv(unittest.TestCase):
 
         self.assertTrue(ok_noenv)
         self.assertTrue(ok_env)
-        self.assertEqual(len(calls_noenv), 3)
-        self.assertEqual(len(calls_env), 3)
+        self.assertEqual(len(calls_noenv), 4)
+        self.assertEqual(len(calls_env), 4)
 
         # Strip the open call's optional --args tail, then the flows must match
         # command-for-command (same tmpdir + same inputs -> same session name
@@ -748,6 +928,175 @@ class TestBrowserOpenFailureCannotProceed(unittest.TestCase):
         self.assertTrue(any("close" in c for c in run_calls))
 
 
+class TestViewportAppliedBeforeScreenshot(unittest.TestCase):
+    """Regression: QA screenshots must be captured at the intended viewport.
+
+    Root cause of the tg-6329821361 production incident: `_default_capture_fn`
+    passed `--width/--height` to `agent-browser open`, but the CLI has no such
+    flags — they were silently ignored, so every capture ran at the daemon's
+    default viewport (1280x720) and desktop.png/mobile.png were identical in
+    width. The documented viewport mechanism is the separate runtime command
+    `agent-browser set viewport <w> <h>`, which must run between `open` and
+    `screenshot` on the same session.
+    """
+
+    def _run_capture(self, tmpdir, viewport_returncode=0, viewport=(1440, 900)):
+        import app.qa.screenshot as screenshot_mod
+
+        out_path = Path(tmpdir) / "shot.png"
+        run_calls = []
+
+        def _fake_run(argv, **kwargs):
+            run_calls.append(list(argv))
+            if "screenshot" in argv:
+                out_path.write_bytes(b"fake-png")
+            return MagicMock(returncode=viewport_returncode if "viewport" in argv else 0)
+
+        with patch.object(screenshot_mod.shutil, "which", return_value="/usr/bin/agent-browser"), \
+             patch.object(screenshot_mod.subprocess, "run", side_effect=_fake_run):
+            ok = screenshot_mod._default_capture_fn(
+                "https://example.com", *viewport, out_path
+            )
+
+        return ok, run_calls, out_path
+
+    def test_set_viewport_runs_between_open_and_screenshot(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ok, calls, _ = self._run_capture(tmpdir)
+
+        self.assertTrue(ok)
+        self.assertEqual(len(calls), 4)  # open, set viewport, screenshot, close
+
+        open_idx = next(i for i, c in enumerate(calls) if "open" in c)
+        viewport_idx = next(i for i, c in enumerate(calls) if "viewport" in c)
+        screenshot_idx = next(i for i, c in enumerate(calls) if "screenshot" in c)
+        self.assertLess(open_idx, viewport_idx)
+        self.assertLess(viewport_idx, screenshot_idx)
+
+        viewport_argv = calls[viewport_idx]
+        self.assertIn("set", viewport_argv)
+        self.assertIn("viewport", viewport_argv)
+        w_idx = viewport_argv.index("viewport")
+        self.assertEqual(viewport_argv[w_idx + 1 : w_idx + 3], ["1440", "900"])
+        # Same session as the open call — viewport applies to that session.
+        self.assertEqual(
+            viewport_argv[viewport_argv.index("--session") + 1],
+            calls[open_idx][calls[open_idx].index("--session") + 1],
+        )
+
+    def test_mobile_capture_uses_mobile_viewport(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ok, calls, _ = self._run_capture(tmpdir, viewport=(390, 844))
+
+        self.assertTrue(ok)
+        viewport_argv = next(c for c in calls if "viewport" in c)
+        w_idx = viewport_argv.index("viewport")
+        self.assertEqual(viewport_argv[w_idx + 1 : w_idx + 3], ["390", "844"])
+
+    def test_open_no_longer_passes_width_height_flags(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ok, calls, _ = self._run_capture(tmpdir)
+
+        self.assertTrue(ok)
+        open_argv = next(c for c in calls if "open" in c)
+        self.assertNotIn("--width", open_argv)
+        self.assertNotIn("--height", open_argv)
+
+    def test_failed_set_viewport_short_circuits_before_screenshot(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ok, calls, out_path = self._run_capture(tmpdir, viewport_returncode=1)
+
+        self.assertFalse(ok)
+        self.assertFalse(out_path.exists())
+        self.assertFalse(any("screenshot" in c for c in calls))
+        # close must still run for cleanup.
+        self.assertTrue(any("close" in c for c in calls))
+
+
+def _png_dimensions(path):
+    """Read (width, height) from a PNG's IHDR chunk — stdlib only."""
+    import struct
+
+    with open(path, "rb") as f:
+        header = f.read(24)
+    if header[:8] != b"\x89PNG\r\n\x1a\n" or header[12:16] != b"IHDR":
+        raise ValueError(f"not a PNG: {path}")
+    return struct.unpack(">II", header[16:24])
+
+
+class _ResponsivePageServer:
+    """Local HTTP server serving a viewport-responsive page (stdlib only).
+
+    The E2E test must not depend on public network reachability, so the
+    real-browser capture runs against this loopback page instead of an
+    external site.
+    """
+
+    def __init__(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        page = (
+            "<!doctype html><html><head><title>qa</title></head>"
+            "<body style='margin:0'>"
+            "<div id='vp' style='height:2000px'></div>"
+            "<script>document.title = window.innerWidth + 'x' + window.innerHeight;</script>"
+            "</body></html>"
+        ).encode("utf-8")
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(page)))
+                self.end_headers()
+                self.wfile.write(page)
+
+            def log_message(self, *args):
+                pass
+
+        self._httpd = HTTPServer(("127.0.0.1", 0), _Handler)
+        self.port = self._httpd.server_address[1]
+        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        self._thread.start()
+
+    def shutdown(self):
+        self._httpd.shutdown()
+        self._httpd.server_close()
+
+
+@unittest.skipIf(shutil.which("agent-browser") is None, "agent-browser CLI not installed")
+class TestRealViewportDimensions(unittest.TestCase):
+    """E2E: the real agent-browser capture path must produce PNGs at the
+    intended viewport widths (desktop 1440, mobile 390). This is the
+    pixel-level regression the mocked tests could never catch — the
+    tg-6329821361 incident produced valid PNGs at the wrong width.
+    """
+
+    def test_desktop_and_mobile_widths_match_viewport_constants(self):
+        from app.qa.screenshot import (
+            DESKTOP_VIEWPORT,
+            MOBILE_VIEWPORT,
+            ScreenshotCapture,
+        )
+
+        server = _ResponsivePageServer()
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                qa_dir = Path(tmpdir) / "qa"
+                screenshots = ScreenshotCapture().capture(
+                    f"http://127.0.0.1:{server.port}/", qa_dir, attempt=1
+                )
+                self.assertTrue(screenshots.complete, "both screenshots must be captured")
+                desktop_w, _ = _png_dimensions(screenshots.desktop)
+                mobile_w, _ = _png_dimensions(screenshots.mobile)
+        finally:
+            server.shutdown()
+
+        self.assertEqual(desktop_w, DESKTOP_VIEWPORT[0])
+        self.assertEqual(mobile_w, MOBILE_VIEWPORT[0])
+
+
 class TestRenderLocalhostBind(unittest.TestCase):
     """Audit #5: QA preview render must bind explicitly to 127.0.0.1, not
     the generated project's public `host: true` vite config."""
@@ -793,8 +1142,8 @@ class TestRepairAttemptNumbering(unittest.TestCase):
                 qa_dir.mkdir(parents=True, exist_ok=True)
                 desktop = qa_dir / "desktop.png"
                 mobile = qa_dir / "mobile.png"
-                desktop.write_bytes(b"fake-png")
-                mobile.write_bytes(b"fake-png")
+                desktop.write_bytes(_png_bytes(1440, 900))
+                mobile.write_bytes(_png_bytes(390, 844))
                 return ScreenshotSet(desktop=desktop, mobile=mobile)
 
             handle = RenderHandle(project_id="proj", port=5100, process=MagicMock(), url="http://127.0.0.1:5100/")
