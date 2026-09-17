@@ -716,6 +716,24 @@ User message:
             self._send_error_reply(message.conversation_id, result.error_code)
             return
 
+        # Last mile: the intake pipeline already derived the smallest blocking
+        # clarification question (from the existing FAST interpretation or the
+        # deterministic per-field fallback). Surface it to the user exactly
+        # once. Replay of the same Telegram update is short-circuited inside
+        # the dispatcher as {"duplicate": True} with NO clarification_question
+        # payload, so this send path never fires twice for the same event.
+        if result.data.get("duplicate"):
+            return
+        clarification = result.data.get("clarification_question")
+        if clarification:
+            try:
+                self.telegram_out.send_text(message.conversation_id, clarification)
+            except Exception:
+                logger.exception(
+                    "Failed to send clarification to chat %s", message.conversation_id
+                )
+            return
+
         if result.data.get("build_triggered") and not result.data.get("build_success"):
             logger.warning(
                 "Build dispatch failed for project %s: %s",
