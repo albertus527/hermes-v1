@@ -58,58 +58,70 @@ def _default_capture_fn(url: str, width: int, height: int, out_path: Path) -> bo
         open_argv.extend(["--args", " ".join(shlex.split(browser_args))])
 
     try:
-        open_result = subprocess.run(
-            open_argv,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-        # A failed `open` must never fall through to a screenshot: without
-        # this check a nonzero-exit open (bad URL, browser launch failure,
-        # missing sandbox flags, ...) could still produce a "successful"
-        # screenshot of a blank/error page, silently corrupting QA evidence.
-        if open_result.returncode != 0:
-            return False
+        try:
+            open_result = subprocess.run(
+                open_argv,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            # A failed `open` must never fall through to a screenshot: without
+            # this check a nonzero-exit open (bad URL, browser launch failure,
+            # missing sandbox flags, ...) could still produce a "successful"
+            # screenshot of a blank/error page, silently corrupting QA evidence.
+            if open_result.returncode != 0:
+                return False
 
-        # Viewport is a runtime command, not an `open` flag. Apply it to
-        # the same session before capturing either desktop or mobile evidence.
-        viewport_result = subprocess.run(
-            [
-                browser_cmd,
-                "--session", session_name,
-                "--json",
-                "set", "viewport", str(width), str(height),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-        if viewport_result.returncode != 0:
-            return False
+            # Viewport is a runtime command, not an `open` flag. Apply it to
+            # the same session before capturing either desktop or mobile evidence.
+            viewport_result = subprocess.run(
+                [
+                    browser_cmd,
+                    "--session", session_name,
+                    "--json",
+                    "set", "viewport", str(width), str(height),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if viewport_result.returncode != 0:
+                return False
 
-        result = subprocess.run(
-            [
-                browser_cmd,
-                "--session", session_name,
-                "--json",
-                "screenshot", "--full", str(out_path),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-        return result.returncode == 0 and out_path.exists()
+            result = subprocess.run(
+                [
+                    browser_cmd,
+                    "--session", session_name,
+                    "--json",
+                    "screenshot", "--full", str(out_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            return result.returncode == 0 and out_path.exists()
+        except subprocess.TimeoutExpired:
+            # Contract: this function never raises — a hung `open`/`set
+            # viewport`/`screenshot` call is a controlled capture failure,
+            # not an exception that should crash the QA run and bypass the
+            # bounded FRONTEND repair loop.
+            return False
     finally:
-        subprocess.run(
-            [browser_cmd, "--session", session_name, "--json", "close"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
+        # Cleanup must never itself raise past this function (a hung/failed
+        # `close` would otherwise mask the real capture result above).
+        try:
+            subprocess.run(
+                [browser_cmd, "--session", session_name, "--json", "close"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            pass
 
 
 @dataclass

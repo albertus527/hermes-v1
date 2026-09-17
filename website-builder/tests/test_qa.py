@@ -7,6 +7,7 @@ Tests do NOT require a live LLM, browser, or npm. All external boundaries
 from __future__ import annotations
 
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -875,6 +876,112 @@ class TestAgentBrowserArgsEnv(unittest.TestCase):
         self.assertIn("close", calls_noenv[-1])
         self.assertIn("close", calls_env[-1])
 
+
+class TestCaptureTimeoutHandling(unittest.TestCase):
+    """Regression: VPS mobile-capture hang (subprocess.TimeoutExpired) must
+    be converted to a controlled capture failure (False), never propagate
+    as an uncaught exception — per _default_capture_fn's documented
+    contract ("Returns False (never raises) on any failure")."""
+
+    def test_open_timeout_returns_false_not_raises(self):
+        import app.qa.screenshot as screenshot_mod
+
+        def _fake_run(argv, **kwargs):
+            if "open" in argv:
+                raise subprocess.TimeoutExpired(cmd=argv, timeout=30)
+            return MagicMock(returncode=0)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = Path(tmpdir) / "shot.png"
+            with patch.object(screenshot_mod.shutil, "which", return_value="/usr/bin/agent-browser"), \
+                 patch.object(screenshot_mod.subprocess, "run", side_effect=_fake_run):
+                result = screenshot_mod._default_capture_fn(
+                    "https://example.com", 1440, 900, out_path
+                )
+        self.assertFalse(result)
+
+    def test_screenshot_timeout_returns_false_not_raises(self):
+        import app.qa.screenshot as screenshot_mod
+
+        def _fake_run(argv, **kwargs):
+            if "screenshot" in argv:
+                raise subprocess.TimeoutExpired(cmd=argv, timeout=30)
+            return MagicMock(returncode=0)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = Path(tmpdir) / "shot.png"
+            with patch.object(screenshot_mod.shutil, "which", return_value="/usr/bin/agent-browser"), \
+                 patch.object(screenshot_mod.subprocess, "run", side_effect=_fake_run):
+                result = screenshot_mod._default_capture_fn(
+                    "https://example.com", 1440, 900, out_path
+                )
+        self.assertFalse(result)
+
+    def test_close_timeout_does_not_mask_successful_result(self):
+        """A hung cleanup `close` call must not raise past the function or
+        override an otherwise-successful capture result."""
+        import app.qa.screenshot as screenshot_mod
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = Path(tmpdir) / "shot.png"
+
+            def _fake_run(argv, **kwargs):
+                if "close" in argv:
+                    raise subprocess.TimeoutExpired(cmd=argv, timeout=10)
+                if "screenshot" in argv:
+                    out_path.write_bytes(b"fake-png")
+                return MagicMock(returncode=0)
+
+            with patch.object(screenshot_mod.shutil, "which", return_value="/usr/bin/agent-browser"), \
+                 patch.object(screenshot_mod.subprocess, "run", side_effect=_fake_run):
+                result = screenshot_mod._default_capture_fn(
+                    "https://example.com", 1440, 900, out_path
+                )
+        self.assertTrue(result)
+
+    def test_capture_timeout_does_not_consume_frontend_repair_budget(self):
+        """A capture-layer TimeoutExpired surfaces as a deterministic
+        capture failure (missing screenshot), not an uncaught exception
+        that corrupts the QAOrchestrator's repair-loop accounting."""
+        from app.core.state import ProjectStateStore
+        from app.sandbox.runner import ProjectRunner
+        from app.qa.orchestrator import QAOrchestrator
+        from app.qa.render import RenderHandle
+
+        with tempfile.TemporaryDirectory() as tmpdir_str:
+            tmpdir = Path(tmpdir_str)
+            store = ProjectStateStore(tmpdir / "state")
+            runner = ProjectRunner(tmpdir / "work", store)
+            workspace = _make_workspace(tmpdir, "proj-timeout")
+            _queue_and_run_project(store, "proj-timeout")
+
+            def _timeout_capture_fn(url, width, height, out_path):
+                raise subprocess.TimeoutExpired(cmd=["agent-browser"], timeout=30)
+
+            mock_renderer = MagicMock()
+            handle = RenderHandle(project_id="proj-timeout", port=5100, process=MagicMock(),
+                                   url="http://127.0.0.1:5100/")
+            mock_renderer.start.return_value = handle
+
+            # capture_fn raising is a bug in a *test double*; the real
+            # _default_capture_fn must never raise (see tests above). Here
+            # we assert the orchestrator's own boundary: if a capture_fn
+            # somehow raises, the run() outer exception boundary converts
+            # it to a failed QAResult rather than crashing the build path,
+            # and it does not silently report success.
+            from app.qa.screenshot import ScreenshotCapture
+            capture = ScreenshotCapture(capture_fn=_timeout_capture_fn)
+
+            orchestrator = QAOrchestrator(
+                runner, store, hermes_adapter=MagicMock(),
+                renderer=mock_renderer, screenshot_capture=capture,
+            )
+            result = orchestrator.run(
+                "proj-timeout", workspace, {"name": "N", "what": "W", "why": "Y"}, {"version": 1}
+            )
+        self.assertFalse(result.success)
+
+
 class TestPreviousPhasesStillPass(unittest.TestCase):
     """15 & 16. Existing Phase 2-7 tests and timeout recovery remain passing.
 
@@ -1034,7 +1141,7 @@ class _ResponsivePageServer:
 
     def __init__(self):
         import threading
-        from http.server import BaseHTTPRequestHandler, HTTPServer
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
         page = (
             "<!doctype html><html><head><title>qa</title></head>"
@@ -1055,7 +1162,7 @@ class _ResponsivePageServer:
             def log_message(self, *args):
                 pass
 
-        self._httpd = HTTPServer(("127.0.0.1", 0), _Handler)
+        self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
         self.port = self._httpd.server_address[1]
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
         self._thread.start()
