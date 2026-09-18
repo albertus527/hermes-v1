@@ -141,9 +141,16 @@ done
 # HERMES_RUN_SLOW_PET_TESTS / HERMES_E2E_BROWSER opt-ins already forwarded.
 # Keep this an explicit allowlist (no HERMES_TEST_* glob) so the "no
 # credential can leak" property stays auditable at a glance.
+#
+#   * AGENT_BROWSER_ARGS is a browser-runtime/test-infrastructure knob used
+#     by website-builder/app/qa/screenshot.py (e.g. "--no-sandbox" on
+#     sandbox-less VPS hosts). Without forwarding, the real-browser QA tests
+#     lose the flag under `env -i` and Chromium refuses to launch — the
+#     tests themselves must not hardcode host-specific browser flags.
 TEST_ENV=()
 for _test_var in HERMES_TEST_IMAGE HERMES_TEST_WORKERS HERMES_TEST_PATHS \
-  HERMES_TEST_FILE_TIMEOUT HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE; do
+  HERMES_TEST_FILE_TIMEOUT HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE \
+  AGENT_BROWSER_ARGS; do
   if [ -n "${!_test_var:-}" ]; then
     TEST_ENV+=("$_test_var=${!_test_var}")
   fi
