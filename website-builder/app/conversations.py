@@ -99,21 +99,6 @@ _LIST_PROJECTS_PHRASES = (
     "project ku apa aja",
 )
 
-_SELECT_VERBS = (
-    "buka",
-    "lanjut",
-    "lanjutkan",
-    "pilih",
-    "ganti ke",
-    "pindah ke",
-    "sekarang",
-    "open",
-    "switch to",
-    "go to",
-    "continue",
-    "select",
-)
-
 _REVISE_VERBS = (
     "revisi",
     "ubah",
@@ -134,21 +119,83 @@ _REVISE_VERBS = (
 
 # Prefixes stripped when deriving a display name from a NEW_PROJECT message.
 _NEW_PROJECT_PREFIX_RE = re.compile(
-    r"^(?:oke\s+|ok\s+|sekarang\s+|mau\s+|aku\s+|saya\s+|tolong\s+|please\s+)*"
+    r"^(?:oke\s+|ok\s+|sekarang\s+|mau\s+|aku\s+|saya\s+|tolong\s+|please\s+|i\s+want\s+to\s+|i'?d\s+like\s+to\s+)*"
     r"(?:bikin|buat|create|build|make|start|add|tambah)\s+"
+    r"(?:a\s+|an\s+)?"
     r"(?:website|web|situs|site|project|proyek|halaman|page)?\s*"
     r"(?:baru|new|lain|another|other)?\s*",
     re.IGNORECASE,
 )
 
-# "namanya X" / "nama X" / "named X" / "called X"
-_NAMED_RE = re.compile(
-    r"(?:namanya|nama|named|called|dengan nama)\s+(.+)$", re.IGNORECASE
+# Natural creation phrasing (no literal "baru"/"new" required), e.g.
+# "aku mau bikin website tentang cafe" / "buat web untuk portfolio" /
+# "create a website called Daily Bake". Both a create verb AND a
+# website-ish noun must be present, and no revision verb may be present
+# (so "ubah hero webjogja" never matches).
+_CREATE_VERB_RE = re.compile(
+    r"\b(?:bikin|bikinin|buat|buatin|create|creates|creating|build|builds|"
+    r"building|make|makes|making)\b",
+    re.IGNORECASE,
 )
+_WEBSITE_NOUN_RE = re.compile(
+    r"\b(?:website|web|situs|site|project|proyek|landing\s*page|homepage)\b",
+    re.IGNORECASE,
+)
+
+# "namanya X" / "nama web nya X" / "nama webnya X" / "named X" / "called X"
+_NAMED_RE = re.compile(
+    r"(?:namanya|dengan\s+nama|named|called|"
+    r"nama(?:\s+(?:web|website|situs|project|proyek)(?:nya)?)?(?:\s+nya)?)"
+    r"\s+([^\n,;!?]+)",
+    re.IGNORECASE,
+)
+
+# Bare business-topic words left over after the creation prefix is stripped
+# are NOT project names ("aku mau bikin website cafe" asks for a name
+# instead of silently naming the project "cafe"). Only single-word generic
+# topics belong here; anything specific enough to be an identity resolves
+# through the normal path.
+_GENERIC_TOPIC_STOPWORDS = frozenset({
+    "cafe", "kafe", "coffee", "kopi", "coffeeshop", "shop", "toko",
+    "store", "restoran", "resto", "restaurant", "bakery", "barbershop",
+    "barber", "salon", "laundry", "bengkel", "warung", "kuliner",
+    "sekolah", "portfolio", "portofolio", "bisnis", "usaha", "online",
+})
+
+# Words that mark the boundary between a human project NAME and trailing
+# instructions in a "namanya X …" clause. Hitting one of these ends the
+# name capture deterministically.
+_NAMED_TRAILING_STOPWORDS = frozenset({
+    "desainnya", "desain", "design", "disain", "di", "dan", "yang",
+    "dengan", "untuk", "buat", "bikin", "isinya", "tampilannya", "warna",
+    "warnanya", "fitur", "fiturnya", "pakai", "pake", "aja", "saja",
+    "dong", "ya", "yah", "please", "pls", "the", "a", "an", "itu",
+    "terserah",
+})
 
 
 def _contains_any(text_lower: str, phrases) -> bool:
     return any(p in text_lower for p in phrases)
+
+
+def _looks_like_natural_creation(text_lower: str) -> bool:
+    """True when the user clearly wants to CREATE a website without needing
+    the literal word "baru"/"new".
+
+    Requires a create verb + a website-ish noun, and is suppressed by any
+    revision verb (so "ubah hero webjogja" / "ganti web" stay REVISE).
+    Known-project mentions are handled by the caller (that branch runs
+    earlier), so a creation phrase that names an existing project still
+    resolves/clarifies through the duplicate-name path instead of
+    allocating a second project.
+    """
+    if not _CREATE_VERB_RE.search(text_lower or ""):
+        return False
+    if not _WEBSITE_NOUN_RE.search(text_lower or ""):
+        return False
+    if _contains_any(text_lower, _REVISE_VERBS):
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +251,29 @@ class ConversationRouter:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _truncate_named_candidate(candidate: str) -> str:
+        """Truncate a ``namanya/called`` capture to the human name itself.
+
+        The capture may carry trailing free-form instructions:
+        ``"thedailybake desainnya di sesuaiin aja"`` — only the leading name
+        span is the identity. Deterministic word-token rules:
+
+        * stop at the first word that is obvious instruction filler
+          (Indonesian/English), and
+        * when MORE than two words survive, keep at most two — a name
+        longer than two words is almost certainly a name plus instructions.
+        """
+        words = candidate.split()
+        kept: List[str] = []
+        for word in words:
+            if word.lower() in _NAMED_TRAILING_STOPWORDS:
+                break
+            kept.append(word)
+            if len(kept) == 2:
+                break
+        return " ".join(kept) if kept else candidate
+
+    @staticmethod
     def extract_new_project_name(text: str) -> Optional[str]:
         """Derive the human name of a newly requested project, if present.
 
@@ -214,8 +284,10 @@ class ConversationRouter:
         """
         named = _NAMED_RE.search(text or "")
         if named:
-            candidate = named.group(1).strip().strip("?.!\"'")
-            return candidate or None
+            candidate = named.group(1).strip().strip("?.!\"'") or None
+            if candidate:
+                return ConversationRouter._truncate_named_candidate(candidate)
+            return candidate
 
         stripped = _NEW_PROJECT_PREFIX_RE.sub("", (text or "").strip(), count=1).strip()
         # Drop a leading conjunction/possessive left over from the phrasing.
@@ -226,6 +298,11 @@ class ConversationRouter:
             return None
         # A bare phrase like "bikin website baru" leaves nothing meaningful.
         if normalize_project_name(stripped) in _NEW_PROJECT_PHRASES:
+            return None
+        # A bare topic word ("aku mau bikin website cafe") is not a name —
+        # ask for one instead of silently allocating an identity called
+        # "cafe".
+        if normalize_project_name(stripped) in _GENERIC_TOPIC_STOPWORDS:
             return None
         return stripped or None
 
@@ -257,50 +334,80 @@ class ConversationRouter:
         return mentioned
 
     # ------------------------------------------------------------------
-    # FAST (optional, bounded, name-as-string only)
+    # FAST — the primary conversation-level semantic authority.
+    #
+    # FAST interprets natural language into a BOUNDED intent
+    # (CREATE_PROJECT | PROJECT_TURN | LIST_PROJECTS | AMBIGUOUS) plus two
+    # STRINGS (target_project_name, proposed_new_project_name) and a
+    # confidence level. It never sees or chooses an internal project ID —
+    # target_project_name, when present, must exactly match a known
+    # registry display name or the whole result is discarded (never
+    # trusted partially). proposed_new_project_name is a free-form
+    # candidate the application still validates before allocating an
+    # identity. Deterministic application code (this class) remains the
+    # only writer of the active-project pointer and the only authority
+    # over whether a new identity is ever allocated.
+    #
+    # This call runs BEFORE any phrase/keyword heuristic — those heuristics
+    # are demoted to a fallback used ONLY when FAST is unavailable, raises,
+    # or returns something unparseable (see ``_route_deterministic_fallback``).
     # ------------------------------------------------------------------
 
-    _PROJECT_CUES = (
-        "web",
-        "website",
-        "situs",
-        "project",
-        "proyek",
-        "revisi",
-        "lanjut",
-        "buka",
-        "pilih",
-        "switch",
-        "open",
+    _TURN_INTENTS = frozenset(
+        {"CREATE_PROJECT", "PROJECT_TURN", "LIST_PROJECTS", "AMBIGUOUS"}
     )
+    _CONFIDENCE_LEVELS = frozenset({"high", "medium", "low"})
 
-    def _fast_target_name(self, text: str, known_names: List[str]) -> Optional[str]:
-        """Ask FAST for a target project NAME only.
+    def _fast_classify_turn(
+        self, text: str, known_names: List[str]
+    ) -> Optional[Dict[str, Any]]:
+        """Ask FAST for the conversation-level routing decision.
 
-        Returns a candidate name string, never an internal ID. Any failure,
-        malformed output, or unsupported value returns None so deterministic
-        routing owns the outcome.
+        Returns ``{"intent", "target_project_name", "proposed_new_project_name",
+        "confidence"}`` or ``None`` on ANY failure: exception, malformed
+        JSON, non-dict payload, or an unknown intent. An unresolvable
+        ``target_project_name`` discards the WHOLE result for
+        PROJECT_TURN/LIST_PROJECTS/AMBIGUOUS (the decision cannot be
+        trusted at all); CREATE_PROJECT is allowed to name an existing
+        project because the caller resolves that safely through the
+        duplicate-name path (clarify, never duplicate/mutate).
         """
-        if self.hermes is None or not known_names:
-            return None
-        lowered = (text or "").lower()
-        if not _contains_any(lowered, self._PROJECT_CUES):
+        if self.hermes is None:
             return None
         prompt = f"""You are FAST, routing one Website Builder conversation turn.
 
 The user already owns these website projects (human names only):
-{", ".join(known_names)}
+{", ".join(known_names) if known_names else "(none yet)"}
 
-Decide:
-1. intent: one of INTAKE, REVISE, SELECT_PROJECT, NEW_PROJECT.
-2. target_project_name: the project the user is referring to, copied exactly
-   from the list above, or null when no existing project is referenced.
+Classify the user's message into exactly one bounded intent:
+- CREATE_PROJECT: the user wants to start a brand-new, independent website
+  (a new business/topic/name), even if they never say "new" or "baru".
+- PROJECT_TURN: the user is continuing, switching to, revising, or asking
+  about a website they already own (an existing project).
+- LIST_PROJECTS: the user is asking what projects/websites they have.
+- AMBIGUOUS: you genuinely cannot tell whether this is a new website or a
+  continuation/change of an existing one.
 
-Rules:
-- Respond with ONLY a JSON object:
-  {{"intent": "...", "target_project_name": "..." | null}}
-- Never invent a project name that is not in the list.
-- If unsure which project is meant, return target_project_name null.
+Also extract:
+- target_project_name: the EXISTING project (copied exactly from the list
+  above) the user is referring to, or null if none is referenced.
+- proposed_new_project_name: the human name for a NEW website the user is
+  proposing (only meaningful for CREATE_PROJECT), or null if no name was
+  given.
+- confidence: "high", "medium", or "low" — how sure you are of `intent`.
+
+Critical safety rule: if you are not sure whether the user wants to CREATE a
+new, separate website versus MODIFY/continue an existing one, you MUST set
+confidence to "low" (or intent to AMBIGUOUS) rather than guessing. Silently
+mutating the wrong project is the single worst possible outcome.
+
+Respond with ONLY a JSON object:
+{{"intent": "...", "target_project_name": "..." | null,
+  "proposed_new_project_name": "..." | null, "confidence": "..."}}
+
+- Never invent a project name that is not in the list above for
+  target_project_name.
+- Never fabricate business facts.
 
 User message:
 {text}
@@ -326,15 +433,225 @@ User message:
             return None
         if not isinstance(payload, dict):
             return None
-        candidate = payload.get("target_project_name")
-        if not isinstance(candidate, str) or not candidate.strip():
+
+        intent = payload.get("intent")
+        if not isinstance(intent, str) or intent.strip().upper() not in self._TURN_INTENTS:
             return None
-        # Only a name we actually know may be returned to the caller.
-        normalized = normalize_project_name(candidate)
-        for known in known_names:
-            if normalize_project_name(known) == normalized:
-                return candidate
-        return None
+        intent = intent.strip().upper()
+
+        confidence = payload.get("confidence")
+        if not isinstance(confidence, str) or confidence.strip().lower() not in self._CONFIDENCE_LEVELS:
+            # Missing/malformed confidence is treated as the least trusted
+            # level rather than discarding the whole decision — the
+            # per-intent confidence gate in ``_route_via_fast`` then decides
+            # whether "low" is still safe to act on for this intent.
+            confidence = "low"
+        else:
+            confidence = confidence.strip().lower()
+
+        target_candidate = payload.get("target_project_name")
+        target_name: Optional[str] = None
+        if isinstance(target_candidate, str) and target_candidate.strip():
+            normalized = normalize_project_name(target_candidate)
+            for known in known_names:
+                if normalize_project_name(known) == normalized:
+                    target_name = known
+                    break
+            if target_name is None and intent not in ("CREATE_PROJECT", "AMBIGUOUS"):
+                # PROJECT_TURN/LIST_PROJECTS naming an unknown project means
+                # the decision cannot be trusted at all.
+                return None
+
+        proposed = payload.get("proposed_new_project_name")
+        proposed_name = (
+            proposed.strip() if isinstance(proposed, str) and proposed.strip() else None
+        )
+
+        return {
+            "intent": intent,
+            "target_project_name": target_name,
+            "proposed_new_project_name": proposed_name,
+            "confidence": confidence,
+        }
+
+    def _route_via_fast(
+        self,
+        conversation_id: str,
+        text: str,
+        event_id: Optional[str],
+        fast: Dict[str, Any],
+        registry,
+    ) -> RouteResult:
+        """Resolve a successfully-classified FAST turn into a RouteResult.
+
+        Confidence gating is risk-based, not a blanket threshold: read-only
+        LIST_PROJECTS tolerates medium confidence, while any turn that could
+        mutate/select a project requires the model to be sure. The single
+        most important invariant is enforced here — uncertainty between
+        CREATE and MODIFY always clarifies, never silently picks a side.
+        """
+        intent = fast["intent"]
+        confidence = fast["confidence"]
+        target_name = fast["target_project_name"]
+        proposed_name = fast["proposed_new_project_name"]
+
+        if intent == "LIST_PROJECTS":
+            if confidence == "low":
+                return RouteResult(
+                    route=ConversationRoute.CLARIFICATION,
+                    clarification=(
+                        "Project mana yang mau dibahas, atau mau lihat daftar "
+                        "semua project kamu?"
+                    ),
+                )
+            return RouteResult(
+                route=ConversationRoute.LIST_PROJECTS,
+                reply=self.render_projects(conversation_id),
+            )
+
+        if intent == "CREATE_PROJECT":
+            if confidence != "high":
+                # The core safety invariant: CREATE vs MODIFY ambiguity
+                # never silently proceeds in either direction.
+                return RouteResult(
+                    route=ConversationRoute.CLARIFICATION,
+                    clarification=(
+                        "Maksudnya bikin website baru, atau lanjut/ubah project "
+                        "yang sudah ada? Bisa dijelasin lagi?"
+                    ),
+                )
+            return self._resolve_create_project(
+                conversation_id, text, event_id, target_name, proposed_name
+            )
+
+        if intent == "PROJECT_TURN":
+            if confidence == "low":
+                return RouteResult(
+                    route=ConversationRoute.CLARIFICATION,
+                    clarification=(
+                        "Maksudnya lanjut/ubah project yang mana ya? Bisa "
+                        "disebutin nama projectnya?"
+                    ),
+                )
+            return self._resolve_project_turn(conversation_id, target_name, registry)
+
+        # AMBIGUOUS — never guess between CREATE and MODIFY.
+        return RouteResult(
+            route=ConversationRoute.CLARIFICATION,
+            clarification=(
+                "Aku belum yakin maksudnya bikin website baru atau lanjut/ubah "
+                "project yang sudah ada. Bisa dijelasin lagi?"
+            ),
+        )
+
+    def _resolve_create_project(
+        self,
+        conversation_id: str,
+        text: str,
+        event_id: Optional[str],
+        target_name: Optional[str],
+        proposed_name: Optional[str],
+    ) -> RouteResult:
+        """Resolve a high-confidence CREATE_PROJECT decision.
+
+        A ``target_name`` naming an EXISTING project is a duplicate-name
+        situation: never silently duplicate, navigate, or mutate — ask the
+        user whether to continue that project or pick a different name for
+        the new one (same contract as the deterministic duplicate-name path).
+        """
+        if target_name:
+            resolution = self.registry.resolve_name(conversation_id, target_name)
+            if resolution.status == "ok" and resolution.entry:
+                entry = resolution.entry
+                return RouteResult(
+                    route=ConversationRoute.CLARIFICATION,
+                    entry=entry,
+                    clarification=(
+                        f"Kamu sudah punya project {entry.display_name}. "
+                        "Lanjut ke project itu, atau kasih nama lain untuk "
+                        "website barunya?"
+                    ),
+                )
+            if resolution.status == "ambiguous":
+                names = ", ".join(e.display_name for e in resolution.candidates)
+                return RouteResult(
+                    route=ConversationRoute.CLARIFICATION,
+                    clarification=(
+                        f"Nama itu cocok dengan beberapa project: {names}. "
+                        "Mau yang mana, atau kasih nama lain?"
+                    ),
+                )
+
+        # FAST's proposed name is the semantic authority for the human name;
+        # deterministic extraction is only a derivation fallback when FAST
+        # did not propose one at all.
+        requested = proposed_name or self.extract_new_project_name(text)
+        return self._route_new_project(
+            conversation_id, text, event_id, requested_name=requested
+        )
+
+    def _resolve_project_turn(
+        self, conversation_id: str, target_name: Optional[str], registry
+    ) -> RouteResult:
+        """Resolve a PROJECT_TURN decision against the registry.
+
+        Never sets a project-level intent (REVISE/APPROVE/PUBLISH/INTAKE) —
+        that decision is deferred entirely to
+        ``TelegramReceiveLoop._classify_intent`` in ``app/runtime.py``, the
+        existing bounded-and-lifecycle-gated FAST classifier, so the router
+        and the runtime never make conflicting semantic decisions about the
+        same turn.
+        """
+        if target_name:
+            resolution = self.registry.resolve_name(conversation_id, target_name)
+            if resolution.status == "ok" and resolution.entry:
+                entry = resolution.entry
+                if not self._materialized(entry.project_id):
+                    return RouteResult(
+                        route=ConversationRoute.CLARIFICATION,
+                        entry=entry,
+                        clarification=(
+                            f"Project {entry.display_name} belum bisa dibuka. "
+                            "Mau bikin project baru atau pilih project lain?"
+                        ),
+                    )
+                switched = (
+                    self.registry.active_project_id(conversation_id)
+                    != entry.project_id
+                )
+                if switched:
+                    self.registry.set_active(conversation_id, entry.project_id)
+                return RouteResult(
+                    route=ConversationRoute.PROJECT,
+                    project_id=entry.project_id,
+                    entry=entry,
+                    switched=switched,
+                    mentioned=[entry.project_id],
+                )
+            if resolution.status == "ambiguous":
+                names = ", ".join(e.display_name for e in resolution.candidates)
+                return RouteResult(
+                    route=ConversationRoute.CLARIFICATION,
+                    clarification=(
+                        f"Ada beberapa project yang cocok: {names}. Mau yang mana?"
+                    ),
+                )
+            # status == "none" should not occur here: an unresolvable
+            # target_name already discards the whole FAST result in
+            # ``_fast_classify_turn``. Fail safe to the active project.
+
+        active_id = self.registry.active_project_id(conversation_id)
+        if not active_id or not self._materialized(active_id):
+            names = ", ".join(e.display_name for e in registry.projects)
+            return RouteResult(
+                route=ConversationRoute.CLARIFICATION,
+                clarification=f"Project mana yang mau dibahas? Pilihan: {names}",
+            )
+        return RouteResult(
+            route=ConversationRoute.PROJECT,
+            project_id=active_id,
+            entry=registry.find_by_id(active_id),
+        )
 
     # ------------------------------------------------------------------
     # Bootstrapping / repair
@@ -443,11 +760,54 @@ User message:
         event_id: Optional[str] = None,
         display_name_hint: Optional[str] = None,
     ) -> RouteResult:
-        """Route one conversation turn. Deterministic for every input."""
+        """Route one conversation turn.
+
+        FAST-first: natural-language semantics (CREATE vs continuing an
+        existing project vs listing vs ambiguous) are interpreted by FAST
+        on EVERY turn — there is no keyword pre-filter gating whether FAST
+        gets a chance to interpret. Application code remains authoritative:
+        it validates target_project_name against the registry, is the only
+        writer of the active-project pointer, and is the only allocator of
+        a new project identity.
+
+        The deterministic phrase/regex heuristics below are a FALLBACK used
+        ONLY when FAST is unavailable (no ``self.hermes``) or fails/returns
+        something unparseable. The fallback is deliberately conservative:
+        any genuine uncertainty between CREATE_PROJECT and continuing an
+        existing project asks for clarification rather than guessing.
+        """
         registry = self._ensure_registry(conversation_id)
+        known_names = [e.display_name for e in registry.projects]
+
+        fast = self._fast_classify_turn(text, known_names)
+        if fast is not None:
+            return self._route_via_fast(conversation_id, text, event_id, fast, registry)
+
+        return self._route_deterministic_fallback(
+            conversation_id, text, event_id, display_name_hint, registry
+        )
+
+    def _route_deterministic_fallback(
+        self,
+        conversation_id: str,
+        text: str,
+        event_id: Optional[str],
+        display_name_hint: Optional[str],
+        registry,
+    ) -> RouteResult:
+        """Degraded-mode routing used ONLY when FAST is unavailable/failed.
+
+        This path is intentionally LESS capable than FAST: it recognizes
+        only conservative, obvious, safe cases (explicit "website baru"
+        phrasing, an explicit create-verb + website-noun combination with no
+        revision verb present, and exact known-project-name mentions). Any
+        remaining uncertainty about whether the user wants to CREATE a new
+        website falls through to the active-project turn rather than
+        guessing — correctness over capability while FAST is degraded.
+        """
         lowered = (text or "").lower()
 
-        # ---- 1. LIST_PROJECTS (no LLM, deterministic) ----
+        # ---- 1. LIST_PROJECTS (deterministic phrase fallback) ----
         if _contains_any(lowered, _LIST_PROJECTS_PHRASES):
             return RouteResult(
                 route=ConversationRoute.LIST_PROJECTS,
@@ -518,13 +878,17 @@ User message:
             switched = self.registry.active_project_id(conversation_id) != entry.project_id
             if switched:
                 self.registry.set_active(conversation_id, entry.project_id)
-            revise_requested = _contains_any(lowered, _REVISE_VERBS)
+            # REVISE-vs-INTAKE for an already-resolved project is NOT decided
+            # here — that decision is deferred entirely to
+            # ``TelegramReceiveLoop._classify_intent`` in app/runtime.py, the
+            # existing bounded FAST classifier gated by project lifecycle.
+            # ``_REVISE_VERBS`` remains ONLY as that classifier's own
+            # fallback (see runtime.py) — it is not consulted twice.
             return RouteResult(
                 route=ConversationRoute.PROJECT,
                 project_id=entry.project_id,
                 entry=entry,
                 switched=switched,
-                forced_intent="REVISE" if revise_requested else None,
                 mentioned=[entry.project_id],
             )
         if len(mentioned) > 1:
@@ -537,58 +901,25 @@ User message:
                 mentioned=[e.project_id for e in mentioned],
             )
 
-        # ---- 3. NEW_PROJECT ----
+        # ---- 3. NEW_PROJECT (deterministic, conservative fallback) ----
+        # Explicit trigger phrases ("website baru", "project lain", ...).
         if _contains_any(lowered, _NEW_PROJECT_PHRASES):
             return self._route_new_project(conversation_id, text, event_id)
+        # Natural creation phrasing ("aku mau bikin website tentang cafe…")
+        # — only recognized when unambiguous (create verb + website noun,
+        # no revision verb). This is the fallback's ceiling of capability;
+        # anything less obvious falls through to the active-project turn
+        # below rather than guessing CREATE.
+        if _looks_like_natural_creation(lowered):
+            return self._route_new_project(conversation_id, text, event_id)
 
-        # ---- 4. Optional FAST name resolution (no exact known name found) ----
-        if registry.projects:
-            known_names = [e.display_name for e in registry.projects]
-            fast_name = self._fast_target_name(text, known_names)
-            if fast_name:
-                resolution = self.registry.resolve_name(conversation_id, fast_name)
-                if resolution.status == "ok" and resolution.entry:
-                    entry = resolution.entry
-                    if not self._materialized(entry.project_id):
-                        return RouteResult(
-                            route=ConversationRoute.CLARIFICATION,
-                            entry=entry,
-                            clarification=(
-                                f"Project {entry.display_name} belum bisa dibuka. "
-                                "Mau bikin project baru atau pilih project lain?"
-                            ),
-                        )
-                    switched = (
-                        self.registry.active_project_id(conversation_id)
-                        != entry.project_id
-                    )
-                    if switched:
-                        self.registry.set_active(conversation_id, entry.project_id)
-                    return RouteResult(
-                        route=ConversationRoute.PROJECT,
-                        project_id=entry.project_id,
-                        entry=entry,
-                        switched=switched,
-                        forced_intent=(
-                            "REVISE" if _contains_any(lowered, _REVISE_VERBS) else None
-                        ),
-                    )
-                if resolution.status == "ambiguous":
-                    names = ", ".join(e.display_name for e in resolution.candidates)
-                    return RouteResult(
-                        route=ConversationRoute.CLARIFICATION,
-                        clarification=(
-                            f"Ada beberapa project yang cocok: {names}. Mau yang mana?"
-                        ),
-                    )
-
-        # ---- 5. First contact in the conversation: bootstrap p1 ----
+        # ---- 4. First contact in the conversation: bootstrap p1 ----
         if not registry.projects:
             return self._bootstrap_first_project(
                 conversation_id, text, event_id, display_name_hint
             )
 
-        # ---- 6. Active project (or ask when there is none) ----
+        # ---- 5. Active project (or ask when there is none) ----
         active_id = self.registry.active_project_id(conversation_id)
         if not active_id or not self._materialized(active_id):
             names = ", ".join(e.display_name for e in registry.projects)
@@ -609,7 +940,11 @@ User message:
     # ------------------------------------------------------------------
 
     def _route_new_project(
-        self, conversation_id: str, text: str, event_id: Optional[str]
+        self,
+        conversation_id: str,
+        text: str,
+        event_id: Optional[str],
+        requested_name: Optional[str] = None,
     ) -> RouteResult:
         # Replay guard: a repeated Telegram event maps to the SAME project.
         if event_id:
@@ -649,7 +984,7 @@ User message:
                         ),
                     )
 
-        requested = self.extract_new_project_name(text)
+        requested = requested_name or self.extract_new_project_name(text)
         if not requested:
             return RouteResult(
                 route=ConversationRoute.CLARIFICATION,

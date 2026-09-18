@@ -289,7 +289,12 @@ class TestReviseResolvesNamedProject:
         route = router.route("555", "aku mau revisi webbandung", event_id="3")
         assert route.route == ConversationRoute.PROJECT
         assert route.project_id == p1.project_id
-        assert route.forced_intent == "REVISE"
+        # The router resolves WHICH project the turn targets; it no longer
+        # decides REVISE-vs-INTAKE itself — that decision is deferred
+        # entirely to runtime.py's TelegramReceiveLoop._classify_intent
+        # (project-lifecycle-gated FAST classifier), so router and runtime
+        # never make conflicting semantic decisions about the same turn.
+        assert route.forced_intent is None
         # Router focused the named project for subsequent turns.
         assert registry.active_project_id("555") == p1.project_id
 

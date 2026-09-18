@@ -141,15 +141,19 @@ class TestNewProjectThroughLoop:
 
 
 class TestListProjectsThroughLoop:
-    def test_list_returns_names_and_makes_no_llm_call(self, tmp_path):
+    def test_list_falls_back_to_deterministic_rendering_when_fast_unavailable(self, tmp_path):
+        """FAST is attempted on EVERY turn (no keyword pre-filter gates it —
+        see app/conversations.py's FAST-first architecture). This fixture's
+        FAST stub returns success=False, so the turn safely falls through to
+        the deterministic LIST_PROJECTS fallback, which still renders human
+        names (never internal IDs) with zero additional LLM calls of its
+        own — the fallback rendering itself is LLM-free."""
         loop, store, registry, adapter, builder, out, router = _loop(tmp_path)
         loop._process_update(_payload(1, text="bikin website baru namanya webbandung"))
         loop._process_update(_payload(2, text="bikin website baru namanya webjogja"))
-        fast_calls_before = adapter._run_fast_programmatic.call_count
 
         loop._process_update(_payload(3, text="project aku ada apa aja?"))
 
-        assert adapter._run_fast_programmatic.call_count == fast_calls_before
         last_message = out.sent[-1][1]
         assert "webbandung" in last_message
         assert "webjogja" in last_message
