@@ -81,6 +81,17 @@ class PreviewDeps:
     # post-delivery follow-up message. None (or returning None) disables the
     # follow-up so existing call sites behave exactly as before.
     display_name_for: Any = None
+    # Optional callable(project_id, state) -> Optional[str]. Returns the
+    # friendly Vercel slug to request for THIS project (already-bound slug
+    # if one exists, else the freshly-derived candidate). None disables
+    # slug-based project resolution entirely -- the orchestrator falls back
+    # to the existing opaque-name ensure_project/lookup_project path so
+    # every pre-existing call site behaves exactly as before.
+    slug_for: Any = None
+    # Optional callable(project_id, state, slug) -> None. Persists the
+    # slug binding EXACTLY ONCE after the first successful Vercel project
+    # creation/reconciliation under that slug. No-op when slug_for is None.
+    bind_slug: Any = None
 
 
 class PreviewOrchestrator:
@@ -187,11 +198,46 @@ class PreviewOrchestrator:
             locked.deployment['project_create_attempted'] = True
             self.store.save(locked)
         self._update_intent(project_id, operation_id, project_attempted=True)
-        project_result = (self.deps.vercel.lookup_project(app_id) if attempted
-                          else self.deps.vercel.ensure_project(app_id))
-        if not project_result.success:
-            return project_result
-        vercel_project = project_result.data["project"]
+
+        slug = None
+        if self.deps.slug_for is not None:
+            try:
+                slug = self.deps.slug_for(project_id, state)
+            except Exception:
+                slug = None
+
+        if slug:
+            # Friendly-slug resolution path. The SHA-based ownership marker
+            # (checked inside ensure_project_with_slug) remains the sole
+            # identity authority; the slug never proves ownership. A
+            # collision with a foreign/unowned project surfaces as a
+            # distinct, fail-closed result -- never adopted/overwritten.
+            project_result = self.deps.vercel.ensure_project_with_slug(app_id, slug)
+            if not project_result.success:
+                return project_result
+            vercel_project = project_result.data["project"]
+            if self.deps.bind_slug is not None:
+                try:
+                    self.deps.bind_slug(project_id, state, slug)
+                except Exception:
+                    logging.getLogger(__name__).exception(
+                        "Failed to persist vercel_slug binding for %s", project_id
+                    )
+        else:
+            project_result = (self.deps.vercel.lookup_project(app_id) if attempted
+                              else self.deps.vercel.ensure_project(app_id))
+            if not project_result.success:
+                return project_result
+            vercel_project = project_result.data["project"]
+
+        # ---- 2b. Consume Vercel's unavoidable first-deployment
+        # auto-promotion with content-free bytes BEFORE any real user
+        # artifact is ever deployed. Pure remote reconciliation -- no new
+        # local state, safe to call on every run (no-ops once production
+        # already exists, whether from a prior bootstrap or real content).
+        bootstrap_result = self.deps.vercel.ensure_bootstrap(app_id, vercel_project)
+        if not bootstrap_result.success:
+            return bootstrap_result
 
         # ---- 3. Deploy, reconciling any ambiguous prior attempt by lookup ----
         attempted = previous.get('deployment_attempted', False)

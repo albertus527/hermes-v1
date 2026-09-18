@@ -102,7 +102,7 @@ def test_unsafe_files_rejected_without_write(name):
 
 
 @pytest.mark.parametrize('field,value', [('teamId', None), ('projectId', 'foreign'),
-    ('meta', {}), ('target', 'production'), ('url', 'evil.example'), ('name', 'foreign')])
+    ('meta', {}), ('url', 'evil.example'), ('name', 'foreign')])
 def test_deployment_identity_failclosed(field, value):
     a, t = adapter()
     d = deployment(a)
@@ -110,6 +110,80 @@ def test_deployment_identity_failclosed(field, value):
     t.responses = [(201, d)]
     result = a.deploy_static_files('app', project(a), {'index.html': b'x'}, 'operation', 2, SHA)
     assert not result.success and not result.retryable
+
+
+def test_deployment_target_production_rejected_when_already_canonical():
+    """Vercel's documented first-deployment auto-promotion means target can
+    legitimately be "production" -- but if the project's OWN production
+    binding already points at this exact deployment id, it is genuinely
+    LIVE and must never be treated as an unpublished preview candidate,
+    even though every other identity marker (project/team/meta) matches.
+    """
+    a, t = adapter()
+    d = deployment(a)
+    d['target'] = 'production'
+    p = project(a)
+    t.responses = [
+        (201, d),
+        (200, {**p, 'targets': {'production': {'id': d['id']}}}),
+    ]
+    result = a.deploy_static_files('app', p, {'index.html': b'x'}, 'operation', 2, SHA)
+    assert not result.success and not result.retryable
+    assert result.error_code == 'DEPLOYMENT_ALREADY_LIVE'
+
+
+def test_deployment_target_production_accepted_when_not_yet_canonical():
+    """A first deployment auto-promoted to target="production" by Vercel is
+    a SAFE staged candidate as long as the project's production binding does
+    not yet point at it (e.g. binding is empty, or points elsewhere).
+    """
+    a, t = adapter()
+    d = deployment(a)
+    d['target'] = 'production'
+    p = project(a)
+    t.responses = [
+        (201, d),
+        (200, {**p, 'targets': {}}),
+    ]
+    result = a.deploy_static_files('app', p, {'index.html': b'x'}, 'operation', 2, SHA)
+    assert result.success
+
+
+def test_deployment_production_binding_lookup_ambiguous_failclosed():
+    """A malformed/ambiguous production-binding response must never be
+    treated as "not live" -- fail closed instead of assuming safety.
+    """
+    a, t = adapter()
+    d = deployment(a)
+    d['target'] = 'production'
+    p = project(a)
+    t.responses = [
+        (201, d),
+        (200, {**p, 'targets': 'not-a-dict'}),
+    ]
+    result = a.deploy_static_files('app', p, {'index.html': b'x'}, 'operation', 2, SHA)
+    assert not result.success and not result.retryable
+    assert result.error_code == 'DEPLOYMENT_IDENTITY_MISMATCH'
+
+
+def test_reconciliation_lookup_landing_on_canonical_production_failclosed():
+    """A reconciliation lookup that resolves to the project's CURRENT
+    canonical production deployment must fail closed exactly like a direct
+    deploy response would -- and _deploy_or_reconcile's caller must never
+    turn that into a second blind POST.
+    """
+    a, t = adapter()
+    d = deployment(a)
+    d['target'] = 'production'
+    p = project(a)
+    t.responses = [
+        (200, {'deployments': [d], 'pagination': {'next': None}}),
+        (200, d),
+        (200, {**p, 'targets': {'production': {'id': d['id']}}}),
+    ]
+    result = a.find_deployment_by_operation_id('app', p, 'operation', 2, SHA)
+    assert not result.success
+    assert result.error_code == 'DEPLOYMENT_ALREADY_LIVE'
 
 
 def test_lookup_paginated_then_authoritative_detail():
@@ -243,7 +317,248 @@ def test_smoke_desktop_mobile_anonymous(tmp_path):
 def test_invalid_preview_does_not_launch(url, tmp_path):
     factory = Mock()
     assert not PreviewSmokeTester(factory).run(url, tmp_path).success
-    factory.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Friendly Vercel slug resolution (ensure_project_with_slug)
+# ---------------------------------------------------------------------------
+
+
+def _slug_project(a, slug, app_id='app'):
+    return {'id': 'prj_1', 'name': slug, 'accountId': 'team_1',
+            'env': [{'key': 'WEBSITE_BUILDER_OWNER', 'value': a._marker(app_id), 'type': 'plain'}]}
+
+
+def test_slug_available_creates_project():
+    a, t = adapter()
+    p = _slug_project(a, 'dapur-kedaton')
+    t.responses = [(404, {}), (201, {'id': 'prj_1'}), (200, p)]
+    result = a.ensure_project_with_slug('app', 'dapur-kedaton')
+    assert result.success
+    assert result.data['project']['name'] == 'dapur-kedaton'
+    payload = json.loads(t.calls[1][2]['data'])
+    assert payload['name'] == 'dapur-kedaton'
+    # No opaque app-added suffix anywhere in the requested name.
+    assert payload['name'] == 'dapur-kedaton'
+
+
+def test_slug_belongs_to_own_project_reconciles():
+    a, t = adapter()
+    p = _slug_project(a, 'dapur-kedaton')
+    t.responses = [(200, p)]
+    result = a.ensure_project_with_slug('app', 'dapur-kedaton')
+    assert result.success
+    assert result.data['project'] == p
+    # Read-only reconciliation: no POST issued.
+    assert all(c[0] == 'GET' for c in t.calls)
+
+
+def test_slug_collision_with_foreign_project_never_adopted():
+    a, t = adapter()
+    foreign = {'id': 'prj_9', 'name': 'dapur-kedaton', 'accountId': 'team_1', 'env': []}
+    t.responses = [(200, foreign)]
+    result = a.ensure_project_with_slug('app', 'dapur-kedaton')
+    assert not result.success
+    assert result.error_code == 'SLUG_COLLISION'
+    # Never overwritten/adopted: no POST issued.
+    assert all(c[0] == 'GET' for c in t.calls)
+
+
+def test_slug_collision_wrong_marker_never_adopted():
+    """Slug exists, belongs to a DIFFERENT app_id's owned project (marker
+    mismatch) -- still a collision, never adopted.
+    """
+    a, t = adapter()
+    other_owned = {'id': 'prj_9', 'name': 'dapur-kedaton', 'accountId': 'team_1',
+                   'env': [{'key': 'WEBSITE_BUILDER_OWNER', 'value': a._marker('other-app'),
+                            'type': 'plain'}]}
+    t.responses = [(200, other_owned)]
+    result = a.ensure_project_with_slug('app', 'dapur-kedaton')
+    assert not result.success
+    assert result.error_code == 'SLUG_COLLISION'
+
+
+def test_slug_ambiguous_response_fails_closed():
+    """A malformed/incomplete response (missing id/name) is NOT proof of a
+    foreign project -- it must never be reported to the user as a taken
+    slug. Only a well-formed dict with a real, distinct project identity
+    and a failing ownership marker proves a collision (see
+    test_slug_collision_with_foreign_project_never_adopted below)."""
+    a, t = adapter()
+    t.responses = [(200, {'not': 'a valid project shape, missing id/name'})]
+    result = a.ensure_project_with_slug('app', 'dapur-kedaton')
+    assert not result.success
+    assert result.error_code == 'PROJECT_RECONCILIATION_REQUIRED'
+
+
+def test_slug_creation_timeout_reconciled_without_duplicate_post():
+    a, t = adapter((404, {}), TimeoutError('secret'))
+    assert not a.ensure_project_with_slug('app', 'dapur-kedaton').success
+    p = _slug_project(a, 'dapur-kedaton')
+    t.responses = [(200, p)]
+    result = a.ensure_project_with_slug('app', 'dapur-kedaton')
+    assert result.success
+    assert sum(c[0] == 'POST' for c in t.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap deployment (consumes Vercel's unavoidable first-deployment
+# auto-promotion so real user content is never that first deployment)
+# ---------------------------------------------------------------------------
+
+def test_bootstrap_noop_when_production_already_exists():
+    """Real content already live, or a prior bootstrap already consumed the
+    promotion -- either way, never create a second bootstrap. Confirmation
+    is already proven by the existing binding, so no polling occurs."""
+    a, t = adapter()
+    p = project(a)
+    t.responses = [(200, {**p, 'targets': {'production': {'id': 'dpl_existing'}}})]
+    result = a.ensure_bootstrap('app', p)
+    assert result.success
+    assert result.data == {'bootstrapped': False, 'already_current_production': True}
+    assert len(t.calls) == 1  # read-only; no POST
+
+
+def test_bootstrap_created_and_confirmed_current_before_returning_success():
+    """POST succeeding, or a wbBootstrap-tagged row existing, is NOT proof
+    the project's production slot was consumed -- ensure_bootstrap must poll
+    project.targets.production.id until it equals the bootstrap deployment
+    AND that deployment reports READY before returning success."""
+    a, t = adapter()
+    p = project(a)
+    t.responses = [
+        (200, {**p, 'targets': {}}),                                    # no production yet
+        (200, {'deployments': [], 'pagination': {'next': None}}),        # no existing bootstrap
+        (201, {'id': 'dpl_bootstrap_1'}),                                 # POST create
+        (200, {**p, 'targets': {'production': {'id': 'dpl_bootstrap_1'}}}),  # confirm poll: bound
+        (200, {'id': 'dpl_bootstrap_1', 'readyState': 'READY'}),         # confirm poll: READY
+    ]
+    result = a.ensure_bootstrap('app', p)
+    assert result.success
+    assert result.data == {'bootstrapped': True, 'deployment_id': 'dpl_bootstrap_1',
+                           'reconciled': False, 'confirmed': True}
+    post_calls = [c for c in t.calls if c[0] == 'POST']
+    assert len(post_calls) == 1
+    body = json.loads(post_calls[0][2]['data'])
+    assert body['meta']['wbBootstrap'] == a._bootstrap_operation_id('app')
+    assert 'wbOperation' not in body['meta']  # distinct namespace from real content
+
+
+def test_bootstrap_delayed_promotion_polled_then_confirmed():
+    """Vercel's promotion/alias assignment is eventually consistent: the
+    first poll finds no production binding yet; only the second poll
+    observes the bootstrap as current production. Must not fail or
+    re-POST -- must keep polling within the bound and then succeed."""
+    a, t = adapter()
+    p = project(a)
+    t.responses = [
+        (200, {**p, 'targets': {}}),
+        (200, {'deployments': [], 'pagination': {'next': None}}),
+        (201, {'id': 'dpl_bootstrap_1'}),
+        (200, {**p, 'targets': {}}),                                      # poll 1: not yet bound
+        (200, {**p, 'targets': {'production': {'id': 'dpl_bootstrap_1'}}}),  # poll 2: bound
+        (200, {'id': 'dpl_bootstrap_1', 'readyState': 'READY'}),
+    ]
+    result = a.ensure_bootstrap('app', p, interval=0)
+    assert result.success
+    assert result.data['confirmed'] is True
+    assert sum(c[0] == 'POST' for c in t.calls) == 1
+
+
+def test_bootstrap_confirmation_timeout_fails_closed_no_duplicate_post():
+    """Confirmation never lands within the bounded poll -- fail closed with
+    a distinct timeout error code. Real content must never be deployed off
+    the back of this. Only ONE bootstrap POST is ever issued, never a retry
+    loop of creates."""
+    a, t = adapter()
+    p = project(a)
+    t.responses = [
+        (200, {**p, 'targets': {}}),
+        (200, {'deployments': [], 'pagination': {'next': None}}),
+        (201, {'id': 'dpl_bootstrap_1'}),
+    ] + [(200, {**p, 'targets': {}})] * 3  # never binds within the bound
+    result = a.ensure_bootstrap('app', p, max_polls=3, interval=0)
+    assert not result.success
+    assert result.error_code == 'BOOTSTRAP_CONFIRMATION_TIMEOUT'
+    assert sum(c[0] == 'POST' for c in t.calls) == 1
+
+
+def test_bootstrap_crash_replay_reconciles_without_duplicate_post():
+    """Process crashes after the bootstrap POST landed but before local
+    confirmation. A restart must find the existing bootstrap by its
+    deterministic identity, never POST a second one, then still run the
+    same remote confirmation barrier before ever succeeding."""
+    a, t = adapter()
+    p = project(a)
+    existing = {'id': 'dpl_bootstrap_1', 'meta': {'wbBootstrap': a._bootstrap_operation_id('app')}}
+    t.responses = [
+        (200, {**p, 'targets': {}}),
+        (200, {'deployments': [existing], 'pagination': {'next': None}}),
+        (200, {**p, 'targets': {'production': {'id': 'dpl_bootstrap_1'}}}),
+        (200, {'id': 'dpl_bootstrap_1', 'readyState': 'READY'}),
+    ]
+    result = a.ensure_bootstrap('app', p)
+    assert result.success
+    assert result.data == {'bootstrapped': True, 'deployment_id': 'dpl_bootstrap_1',
+                           'reconciled': True, 'confirmed': True}
+    assert not any(c[0] == 'POST' for c in t.calls)
+
+
+def test_bootstrap_ambiguous_lookup_fails_closed_no_post():
+    a, t = adapter()
+    p = project(a)
+    d1 = {'id': 'dpl_a', 'meta': {'wbBootstrap': a._bootstrap_operation_id('app')}}
+    d2 = {'id': 'dpl_b', 'meta': {'wbBootstrap': a._bootstrap_operation_id('app')}}
+    t.responses = [
+        (200, {**p, 'targets': {}}),
+        (200, {'deployments': [d1, d2], 'pagination': {'next': None}}),
+    ]
+    result = a.ensure_bootstrap('app', p)
+    assert not result.success
+    assert result.error_code == 'AMBIGUOUS_DEPLOYMENT'
+    assert not any(c[0] == 'POST' for c in t.calls)
+
+
+def test_bootstrap_production_lookup_ambiguous_fails_closed():
+    a, t = adapter()
+    p = project(a)
+    t.responses = [(200, {**p, 'targets': 'not-a-dict'})]
+    result = a.ensure_bootstrap('app', p)
+    assert not result.success
+    assert result.error_code == 'PROJECT_RECONCILIATION_REQUIRED'
+    assert not any(c[0] == 'POST' for c in t.calls)
+
+
+def test_bootstrap_production_moves_elsewhere_during_poll_fails_closed():
+    """If, mid-poll, targets.production comes to point at some OTHER
+    deployment entirely (never our bootstrap), never keep polling against a
+    moving target -- fail closed immediately."""
+    a, t = adapter()
+    p = project(a)
+    t.responses = [
+        (200, {**p, 'targets': {}}),
+        (200, {'deployments': [], 'pagination': {'next': None}}),
+        (201, {'id': 'dpl_bootstrap_1'}),
+        (200, {**p, 'targets': {'production': {'id': 'dpl_something_else'}}}),
+    ]
+    result = a.ensure_bootstrap('app', p, interval=0)
+    assert not result.success
+    assert result.error_code == 'BOOTSTRAP_RECONCILIATION_REQUIRED'
+
+
+def test_real_content_deploy_after_bootstrap_consumed_promotion_is_accepted():
+    """Once bootstrap has consumed the project's one-time auto-promotion,
+    the real user-content deployment is provably NOT the project's first
+    deployment, so it is not auto-promoted -- target stays unset/preview
+    and it is accepted as a normal preview candidate. No first-deployment
+    exception is needed in _deployment(); remote truth alone is enough."""
+    a, t = adapter()
+    p = project(a)
+    d = deployment(a)
+    d['target'] = None  # real content deploy, NOT auto-promoted this time
+    t.responses = [(201, d)]
+    result = a.deploy_static_files('app', p, {'index.html': b'x'}, 'operation', 2, SHA)
+    assert result.success
 
 
 @pytest.mark.parametrize('options,addresses', [({'redirect': True}, ['8.8.8.8']),

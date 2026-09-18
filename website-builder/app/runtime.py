@@ -30,7 +30,7 @@ from app.channels.dispatch import AuthenticatedTelegramContext, TelegramDispatch
 from app.channels.telegram import NormalizedMessage, TelegramNormalizer
 from app.core.intake import IntakeProcessor
 from app.core.state import ProjectStateStore
-from app.core.registry import ConversationRegistryStore, DuplicateProjectName
+from app.core.registry import ConversationRegistryStore, DuplicateProjectName, slugify_display_name
 from app.conversations import ConversationRoute, ConversationRouter
 from app.deploy.adapters import TelegramAdapter, UrllibHttpTransport, VercelAdapter
 from app.deploy.git_output import OutputGitRepository
@@ -276,11 +276,6 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
     # Core state
     store = ProjectStateStore(config.state_root)
 
-    # Conversation-level project registry + router. Separate from per-project
-    # state so the registry survives any active-project switch.
-    registry_store = ConversationRegistryStore(config.state_root / "conversations")
-    conversations = ConversationRouter(store, registry_store)
-
     # Sandbox runner (MAX_WORKERS=1)
     runner = ProjectRunner(
         workspace_root=config.workspace_root,
@@ -288,11 +283,21 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
         hermes_home=config.hermes_home,
     )
 
-    # Hermes adapter (FAST/FRONTEND/VISION)
+    # Hermes adapter (FAST/FRONTEND/VISION) -- constructed BEFORE the
+    # conversation router so the SAME instance can be injected into it.
+    # Building a second HermesAdapter here would silently disable FAST-first
+    # conversation routing (conversations.hermes stays None) while still
+    # working for per-project intent classification.
     hermes = HermesAdapter(
         store=store,
         hermes_home=config.hermes_home,
     )
+
+    # Conversation-level project registry + router. Separate from per-project
+    # state so the registry survives any active-project switch. Shares the
+    # single HermesAdapter instance above for FAST-first routing.
+    registry_store = ConversationRegistryStore(config.state_root / "conversations")
+    conversations = ConversationRouter(store, registry_store, hermes=hermes)
 
     # Intake processor
     intake = IntakeProcessor(store, hermes_adapter=hermes)
@@ -326,6 +331,29 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
     # Preview orchestrator deps — display_name_for wires the natural
     # post-delivery follow-up ("Website webbandung udah siap...") and is allowed
     # to be absent in tests that do not construct a registry.
+    #
+    # slug_for / bind_slug wire the friendly Vercel project name feature:
+    # slug_for resolves (in order) an ALREADY-BOUND vercel_slug for this
+    # project, or else derives a fresh candidate from the registry's
+    # display_name -- never invented, never truncated. bind_slug persists
+    # that candidate EXACTLY ONCE on first successful Vercel resolution
+    # (idempotent — see ConversationRegistryStore.set_vercel_slug_once).
+    def _slug_for(pid, state):
+        if state is None or not state.conversation_id:
+            return None
+        registry = registry_store.load_or_create(state.conversation_id)
+        entry = registry.find_by_id(pid)
+        if entry is None:
+            return None
+        if entry.vercel_slug:
+            return entry.vercel_slug
+        return slugify_display_name(entry.display_name)
+
+    def _bind_slug(pid, state, slug):
+        if state is None or not state.conversation_id:
+            return
+        registry_store.set_vercel_slug_once(state.conversation_id, pid, slug)
+
     preview_deps = PreviewDeps(
         vercel=vercel,
         telegram=telegram_out,
@@ -337,6 +365,8 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
             if state is not None and state.conversation_id
             else None
         ),
+        slug_for=_slug_for,
+        bind_slug=_bind_slug,
     )
     preview = PreviewOrchestrator(store, preview_deps)
 
@@ -1049,6 +1079,11 @@ User message:
             "NOT_APPROVED": "The preview must be approved before publication.",
             "OUT_OF_ORDER_REVISION": "Revision is out of order. Please try again.",
             "REVISION_ALREADY_APPLIED": "This revision has already been applied.",
+            "SLUG_COLLISION": (
+                "Nama itu sudah dipakai untuk link preview. Mau pakai nama "
+                "lain, atau aku kasih beberapa pilihan?"
+            ),
+            "DEPLOYMENT_ALREADY_LIVE": "This deployment is already live in production.",
         }
         text = messages.get(error_code, "Something went wrong. Please try again.")
         try:

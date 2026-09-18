@@ -155,6 +155,51 @@ class TestComposition:
         assert config.workspace_root.exists()
         assert config.state_root.exists()
 
+    def test_conversations_shares_same_hermes_instance(self, tmp_path):
+        """Regression: FAST-first conversation routing must use the SAME
+        HermesAdapter instance as the rest of the runtime. A second,
+        independently-constructed HermesAdapter silently sets
+        conversations.hermes to a different object, or worse, leaves the
+        router unable to reach FAST at all in production.
+        """
+        config = _make_config(tmp_path)
+        comp = compose(config)
+        assert comp.conversations.hermes is not None
+        assert comp.conversations.hermes is comp.hermes
+
+    def test_compose_constructs_exactly_one_hermes_adapter(self, tmp_path):
+        """Regression: compose() must never construct a second HermesAdapter
+        merely to wire the conversation router.
+        """
+        config = _make_config(tmp_path)
+        with patch("app.runtime.HermesAdapter", wraps=__import__(
+            "app.hermes.adapter", fromlist=["HermesAdapter"]
+        ).HermesAdapter) as spy:
+            compose(config)
+            assert spy.call_count == 1
+
+    def test_fast_first_routing_reachable_through_real_composition(self, tmp_path):
+        """Regression: the conversation-level FAST routing prompt must be
+        reachable through the real `compose()` wiring, not just when a
+        ConversationRouter is hand-constructed in isolation (as prior
+        FAST-first routing tests did). This is the actual production bug:
+        `conversations.hermes` was None in the real runtime, so FAST was
+        never consulted for conversation-level routing.
+        """
+        config = _make_config(tmp_path)
+        comp = compose(config)
+
+        with patch.object(
+            comp.hermes, "_run_fast_programmatic"
+        ) as mock_fast:
+            mock_fast.return_value = MagicMock(
+                success=True,
+                response='{"intent": "LIST_PROJECTS", "target_project_name": null, '
+                         '"proposed_new_project_name": null, "confidence": "high"}',
+            )
+            comp.conversations.route("555", "project apa aja aku ada")
+            assert mock_fast.called
+
 
 # ---------------------------------------------------------------------------
 # 3. Telegram getUpdates success

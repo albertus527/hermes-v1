@@ -54,6 +54,13 @@ def normalize_project_name(name: Optional[str]) -> Optional[str]:
     return normalized or None
 
 
+# Public alias: the exact same conservative normalization doubles as the
+# friendly Vercel project slug derivation. No truncation, no word-count
+# limits, no invented business names — "Dapur Kedaton" -> "dapur-kedaton",
+# "The Daily Bake" -> "the-daily-bake", "Kopi & Roti" -> "kopi-roti".
+slugify_display_name = normalize_project_name
+
+
 def project_id_for(conversation_id: str, seq: int) -> str:
     """Derive the immutable internal project ID.
 
@@ -75,6 +82,12 @@ class ProjectEntry:
     display_name: str  # human name as the user typed/confirmed it
     aliases: List[str] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
+    # Stable, user-facing Vercel project slug. Set ONCE at first successful
+    # Vercel project creation/reconciliation and never changed afterward —
+    # a later display_name rename must never rename/recreate the bound
+    # remote Vercel project (R1: no migration complexity). None until a
+    # Vercel binding has actually been established.
+    vercel_slug: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -82,15 +95,18 @@ class ProjectEntry:
             "display_name": self.display_name,
             "aliases": list(self.aliases),
             "created_at": self.created_at,
+            "vercel_slug": self.vercel_slug,
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ProjectEntry":
+        vercel_slug = data.get("vercel_slug")
         return cls(
             project_id=str(data.get("project_id", "")),
             display_name=str(data.get("display_name", "")),
             aliases=[str(a) for a in (data.get("aliases") or [])],
             created_at=float(data.get("created_at", time.time())),
+            vercel_slug=str(vercel_slug) if vercel_slug else None,
         )
 
 
@@ -357,6 +373,28 @@ class ConversationRegistryStore:
                 raise ValueError(f"Unknown project for conversation: {project_id}")
             registry.active_project_id = project_id
             self.save(registry)
+
+    def set_vercel_slug_once(
+        self, conversation_id: str, project_id: str, slug: str
+    ) -> str:
+        """Bind the project's stable Vercel slug on FIRST successful Vercel
+        project creation/reconciliation only.
+
+        Idempotent: if a slug is already bound, that existing slug is
+        returned unchanged — a later call (e.g. after a display_name
+        rename) NEVER overwrites it. This is the persistence half of the
+        "no remote rename/recreation on local rename" R1 invariant.
+        """
+        with self._lock_for(conversation_id):
+            registry = self.load_or_create(conversation_id)
+            entry = registry.find_by_id(project_id)
+            if entry is None:
+                raise ValueError(f"Unknown project for conversation: {project_id}")
+            if entry.vercel_slug:
+                return entry.vercel_slug
+            entry.vercel_slug = slug
+            self.save(registry)
+            return slug
 
     def add_alias(self, conversation_id: str, project_id: str, alias: str) -> None:
         """Attach a rename alias so the OLD name still resolves to the project."""

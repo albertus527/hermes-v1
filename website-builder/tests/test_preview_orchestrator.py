@@ -44,6 +44,7 @@ class FakeVercel:
     def __init__(self):
         self.ensure_calls = 0
         self.deploy_calls = 0
+        self.bootstrap_calls = 0
         self._project = {'id': 'prj_1', 'name': 'wb', 'accountId': 'team'}
 
     def ensure_project(self, app_id):
@@ -52,6 +53,10 @@ class FakeVercel:
 
     def lookup_project(self, app_id):
         return OperationResult.ok({'project': self._project, 'app_id': app_id})
+
+    def ensure_bootstrap(self, app_id, project):
+        self.bootstrap_calls += 1
+        return OperationResult.ok({'bootstrapped': False, 'already_current_production': True})
 
     def deploy_static_files(self, app_id, project, files, operation_id, source_revision, artifact_sha256):
         self.deploy_calls += 1
@@ -192,3 +197,103 @@ def test_second_run_after_shown_reuses_deterministic_git_branch(tmp_path):
     assert first.success
     identity = deps.output_repo.commit('proj', snap)
     assert identity['branch'].endswith(snap.identity)
+
+
+def test_deployment_already_live_never_shown_as_preview(tmp_path):
+    """Regression: if the Vercel adapter proves a deployment is already the
+    project's CANONICAL production target (per app/deploy/adapters.py's
+    production-binding check), the orchestrator must never mark it as
+    latest_shown_preview, never send the Telegram preview, and never resend
+    on the reconciliation fallback.
+    """
+    store = ProjectStateStore(tmp_path / 'state')
+    ws = _make_workspace(tmp_path)
+    _preview_ready_state(store, 'proj', ws)
+
+    class AlreadyLiveVercel(FakeVercel):
+        def deploy_static_files(self, *a, **kw):
+            self.deploy_calls += 1
+            return OperationResult.fail('DEPLOYMENT_ALREADY_LIVE',
+                                        error_code='DEPLOYMENT_ALREADY_LIVE')
+
+        def find_deployment_by_operation_id(self, *a, **kw):
+            return OperationResult.fail('DEPLOYMENT_ALREADY_LIVE',
+                                        error_code='DEPLOYMENT_ALREADY_LIVE')
+
+    vercel = AlreadyLiveVercel()
+    deps = _deps(tmp_path, vercel=vercel)
+    result = PreviewOrchestrator(store, deps).run_owned('proj', ws)
+
+    assert not result.success
+    assert result.error_code == 'DEPLOYMENT_ALREADY_LIVE'
+    assert vercel.deploy_calls == 1  # never blindly resent
+    state = store.load('proj')
+    assert 'latest_shown_preview' not in state.deployment
+    assert not deps.telegram.sent
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap confirmation barrier: real-content deploy must never happen
+# before ensure_bootstrap proves (via remote provider truth) that the
+# bootstrap deployment actually became current production.
+# ---------------------------------------------------------------------------
+
+def test_real_content_deploy_never_called_before_bootstrap_confirms(tmp_path):
+    store = ProjectStateStore(tmp_path / 'state')
+    ws = _make_workspace(tmp_path)
+    _preview_ready_state(store, 'proj', ws)
+
+    class UnconfirmedBootstrapVercel(FakeVercel):
+        def ensure_bootstrap(self, app_id, project):
+            self.bootstrap_calls += 1
+            # Not yet confirmed -- must block the real content deploy.
+            return OperationResult.fail('BOOTSTRAP_RECONCILIATION_REQUIRED',
+                                        error_code='BOOTSTRAP_RECONCILIATION_REQUIRED')
+
+    vercel = UnconfirmedBootstrapVercel()
+    deps = _deps(tmp_path, vercel=vercel)
+    result = PreviewOrchestrator(store, deps).run_owned('proj', ws)
+
+    assert not result.success
+    assert result.error_code == 'BOOTSTRAP_RECONCILIATION_REQUIRED'
+    assert vercel.bootstrap_calls == 1
+    assert vercel.deploy_calls == 0  # real content POST never issued
+    assert not deps.telegram.sent
+
+
+def test_real_content_deploy_blocked_on_bootstrap_confirmation_timeout(tmp_path):
+    store = ProjectStateStore(tmp_path / 'state')
+    ws = _make_workspace(tmp_path)
+    _preview_ready_state(store, 'proj', ws)
+
+    class TimingOutBootstrapVercel(FakeVercel):
+        def ensure_bootstrap(self, app_id, project):
+            self.bootstrap_calls += 1
+            return OperationResult.fail('BOOTSTRAP_CONFIRMATION_TIMEOUT',
+                                        error_code='BOOTSTRAP_CONFIRMATION_TIMEOUT')
+
+    vercel = TimingOutBootstrapVercel()
+    deps = _deps(tmp_path, vercel=vercel)
+    result = PreviewOrchestrator(store, deps).run_owned('proj', ws)
+
+    assert not result.success
+    assert result.error_code == 'BOOTSTRAP_CONFIRMATION_TIMEOUT'
+    assert vercel.deploy_calls == 0
+    assert not deps.telegram.sent
+
+
+def test_real_content_deploy_proceeds_exactly_once_after_bootstrap_confirmed(tmp_path):
+    """Once ensure_bootstrap reports confirmed success, exactly one real
+    content deploy follows -- the normal happy path, made explicit as a
+    regression against ever double-deploying or skipping the deploy."""
+    store = ProjectStateStore(tmp_path / 'state')
+    ws = _make_workspace(tmp_path)
+    _preview_ready_state(store, 'proj', ws)
+
+    vercel = FakeVercel()  # ensure_bootstrap already returns confirmed-style ok
+    deps = _deps(tmp_path, vercel=vercel)
+    result = PreviewOrchestrator(store, deps).run_owned('proj', ws)
+
+    assert result.success
+    assert vercel.bootstrap_calls == 1
+    assert vercel.deploy_calls == 1

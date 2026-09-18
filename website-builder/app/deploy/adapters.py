@@ -24,6 +24,7 @@ import ipaddress
 import json
 import re
 import socket
+import time
 import uuid
 import urllib.error
 import urllib.request
@@ -67,6 +68,13 @@ class UrllibHttpTransport:
 def _fail(code):
     # Never expose provider responses/exceptions which can contain tokens.
     return OperationResult.fail(code, error_code=code, retryable=False)
+
+
+# Fixed, content-free bootstrap payload. Exists ONLY to consume Vercel's
+# unavoidable first-deployment auto-promotion behavior before any real user
+# artifact is ever deployed. Never shown to a user, never sent to Telegram,
+# never referenced by latest_shown_preview/approval/revision history.
+_BOOTSTRAP_HTML = b'<!doctype html><title>.</title>'
 
 
 def _json_call(transport, method, url, headers, payload=None):
@@ -141,9 +149,17 @@ class VercelAdapter:
                           {'Authorization': 'Bearer ' + self.token,
                            'Content-Type': 'application/json'}, payload)
 
-    def _project_valid(self, project, app_id):
+    def _project_valid(self, project, app_id, expected_name=None):
+        """Ownership/identity check. ``expected_name`` defaults to the
+        opaque hash-derived name; callers using a friendly Vercel slug pass
+        it explicitly. The WEBSITE_BUILDER_OWNER marker (derived only from
+        the immutable internal ``app_id``) remains the SOLE ownership
+        authority regardless of which name is being validated — the slug
+        itself never proves ownership.
+        """
+        expected_name = expected_name or self.project_name_for(app_id)
         return (isinstance(project, dict) and bool(project.get('id'))
-                and project.get('name') == self.project_name_for(app_id)
+                and project.get('name') == expected_name
                 and project.get('accountId') == self.team_id
                 and any(e.get('key') == 'WEBSITE_BUILDER_OWNER'
                         and e.get('value') == self._marker(app_id)
@@ -184,6 +200,62 @@ class VercelAdapter:
         except Exception:
             return _fail('PROJECT_RECONCILIATION_REQUIRED')
 
+    def ensure_project_with_slug(self, app_id, slug):
+        """Like ``ensure_project``, but requests the human-friendly ``slug``
+        as the Vercel project name instead of the opaque hash-derived name.
+
+        The WEBSITE_BUILDER_OWNER marker (derived only from the immutable
+        ``app_id``) remains the SOLE ownership/dedup authority — the slug
+        is never trusted for identity. Four possible outcomes, matching the
+        product's collision-handling contract:
+
+          A. slug available (404)            -> create, mark owned, return ok
+          B. slug names THIS owned project    -> reconcile, return ok
+          C. slug exists, marker mismatch/
+             missing (foreign/unowned project) -> SLUG_COLLISION, never
+             adopt/overwrite
+          D. ambiguous/malformed response      -> fail closed
+             (PROJECT_RECONCILIATION_REQUIRED), never assume availability
+
+        No retry/second POST on ambiguity — same no-duplicate-create
+        discipline as ``ensure_project``.
+        """
+        try:
+            status, project = self._call('GET', '/v9/projects/' + slug)
+            if status == 404:
+                status, project = self._call('POST', '/v11/projects', {
+                    'name': slug, 'framework': None,
+                    'environmentVariables': [{'key': 'WEBSITE_BUILDER_OWNER',
+                        'value': self._marker(app_id), 'type': 'plain', 'target': ['preview']}],
+                })
+                if status not in (200, 201):
+                    return _fail('AMBIGUOUS_PROJECT_CREATE')
+                status, project = self._call('GET', '/v9/projects/' + slug)
+                if status != 200 or not self._project_valid(project, app_id, expected_name=slug):
+                    return _fail('PROJECT_IDENTITY_MISMATCH')
+                return OperationResult.ok({'project': project, 'app_id': app_id, 'slug': slug})
+            if status != 200 or not isinstance(project, dict):
+                return _fail('PROJECT_RECONCILIATION_REQUIRED')
+            if self._project_valid(project, app_id, expected_name=slug):
+                # Outcome B: already our own project under this exact slug.
+                return OperationResult.ok({'project': project, 'app_id': app_id, 'slug': slug})
+            # A confirmed collision requires a WELL-FORMED foreign project
+            # record (real id + matching name) whose ownership marker simply
+            # doesn't match this app_id -- that is proof Vercel returned an
+            # actual, different project under this slug. Anything malformed
+            # or incomplete (missing id/name) is NOT proof of a foreign
+            # project -- it is an ambiguous provider response and must fail
+            # closed as reconciliation-required, never be reported to the
+            # user as "name already taken".
+            if not project.get('id') or project.get('name') != slug:
+                return _fail('PROJECT_RECONCILIATION_REQUIRED')
+            # Outcome C: slug belongs to a real, distinct project we do not
+            # own (ownership marker mismatch/missing) -- never adopt or
+            # overwrite; surface as a distinct proven collision.
+            return _fail('SLUG_COLLISION')
+        except Exception:
+            return _fail('PROJECT_RECONCILIATION_REQUIRED')
+
     def _meta(self, app_id, operation_id, source_revision, artifact_sha256):
         if (not operation_id or len(operation_id) > 128 or type(source_revision) is not int
                 or source_revision < 1 or not re.fullmatch('[a-f0-9]{64}', artifact_sha256)):
@@ -191,15 +263,60 @@ class VercelAdapter:
         return {'wbOwner': self._marker(app_id), 'wbOperation': operation_id,
                 'wbRevision': str(source_revision), 'wbArtifact': artifact_sha256}
 
+    def _current_production_id(self, project):
+        """Read-only fetch of the project's CURRENT canonical production
+        deployment id, straight from the provider (never from the
+        deployment response body itself, which is not authoritative for
+        "is this the live target").
+
+        Returns ``None`` when the project has no production deployment yet.
+        Any malformed/ambiguous shape raises -- callers must fail closed,
+        never assume "not live" from an unreadable response.
+        """
+        status, fresh = self._call('GET', '/v9/projects/' + project['name'])
+        if status != 200 or not isinstance(fresh, dict) or fresh.get('id') != project['id']:
+            raise ValueError('PRODUCTION_BINDING_LOOKUP_FAILED')
+        targets = fresh.get('targets')
+        if targets is None:
+            return None
+        if not isinstance(targets, dict):
+            raise ValueError('PRODUCTION_BINDING_LOOKUP_FAILED')
+        prod = targets.get('production')
+        if prod is None:
+            return None
+        if not isinstance(prod, dict) or not prod.get('id'):
+            raise ValueError('PRODUCTION_BINDING_LOOKUP_FAILED')
+        return prod['id']
+
     def _deployment(self, body, project, meta):
-        # Vercel preview target is null; "preview" is accepted in responses.
+        # Vercel's documented behavior: a brand-new project's FIRST
+        # deployment is automatically promoted to target="production" even
+        # when no production target was requested (there is no "preview"
+        # literal accepted/returned by this API -- omission is the only
+        # preview request shape). Because of that, `target` alone is
+        # NEITHER proof this deployment is live NOR safe to auto-accept as
+        # a preview candidate. The only authoritative proof of "currently
+        # serving as the project's canonical production target" is the
+        # project's own `targets.production` binding, fetched fresh here --
+        # never inferred from this deployment response body.
         team = body.get('teamId') or (body.get('team') or {}).get('id')
         project_id = body.get('projectId') or (body.get('project') or {}).get('id')
         if (not body.get('id') or project_id != project['id'] or team != self.team_id
                 or body.get('name') != project['name'] or 'target' not in body
-                or body['target'] not in (None, 'preview')
+                or body['target'] not in (None, 'production')
                 or any((body.get('meta') or {}).get(k) != v for k, v in meta.items())):
             return _fail('DEPLOYMENT_IDENTITY_MISMATCH')
+        if body['target'] == 'production':
+            try:
+                current_prod_id = self._current_production_id(project)
+            except Exception:
+                # Ambiguous/malformed binding lookup: never assume safe.
+                return _fail('DEPLOYMENT_IDENTITY_MISMATCH')
+            if current_prod_id == body['id']:
+                # This exact deployment IS the project's live production
+                # target -- never show it as an unpublished preview
+                # candidate, even though every other identity marker matches.
+                return _fail('DEPLOYMENT_ALREADY_LIVE')
         url = 'https://' + body.get('url', '')
         if not _safe_origin(url):
             return _fail('INVALID_PREVIEW_URL')
@@ -242,6 +359,147 @@ class VercelAdapter:
         except Exception:
             return _fail('DEPLOYMENT_RECONCILIATION_REQUIRED')
 
+    def _find_unique_deployment_by_meta_key(self, project, meta_key, meta_value, max_pages=100):
+        """Shared pagination core for "find the ONE deployment in this
+        project whose meta[meta_key] == meta_value". Used by both the real
+        operation-id lookup and the bootstrap-deployment lookup so both
+        share the exact same fail-closed pagination discipline (malformed
+        pagination, repeated cursors, missing meta all fail closed; NOT_FOUND
+        is not proof a resend/create is safe).
+
+        Returns (failure_result_or_None, identifier). On success, the first
+        element is ``None`` and ``identifier`` is set to the unique matching
+        deployment id. On failure (including NOT_FOUND/AMBIGUOUS), the first
+        element is the ``OperationResult`` to propagate and ``identifier`` is
+        ``None``.
+        """
+        matches, seen, query = {}, set(), {'projectId': project['id'], 'limit': 100}
+        for _ in range(max_pages):
+            status, body = self._call('GET', '/v6/deployments', **query)
+            if (status != 200 or not isinstance(body.get('deployments'), list)
+                    or not isinstance(body.get('pagination'), dict)
+                    or 'next' not in body['pagination']):
+                return _fail('INCOMPLETE_LOOKUP'), None
+            for item in body['deployments']:
+                if not isinstance(item.get('meta'), dict):
+                    return _fail('INCOMPLETE_LOOKUP'), None
+                if item['meta'].get(meta_key) == meta_value:
+                    identifier = item.get('uid') or item.get('id')
+                    if not identifier:
+                        return _fail('INCOMPLETE_LOOKUP'), None
+                    matches[identifier] = item
+            cursor = body['pagination']['next']
+            if cursor is None:
+                break
+            if type(cursor) is not int or cursor in seen:
+                return _fail('INCOMPLETE_LOOKUP'), None
+            seen.add(cursor)
+            query['until'] = cursor
+        else:
+            return _fail('INCOMPLETE_LOOKUP'), None
+        if len(matches) != 1:
+            return _fail('AMBIGUOUS_DEPLOYMENT' if matches else 'NOT_FOUND'), None
+        return None, next(iter(matches))
+
+    def _bootstrap_operation_id(self, app_id):
+        # Distinct namespace from real content operation ids -- can never
+        # collide with a genuine user-content operation_id (those are
+        # produced by the caller from project/source/snapshot identity, never
+        # from this fixed 'bootstrap' literal).
+        return hashlib.sha256((self.namespace + '\0bootstrap\0' + app_id).encode()).hexdigest()
+
+    def ensure_bootstrap(self, app_id, project, max_polls=20, interval=0.25):
+        """Consume Vercel's unavoidable first-deployment auto-promotion with
+        deterministic, content-free bytes -- BEFORE any real user artifact is
+        ever deployed. No new local state/lifecycle: this is a pure remote
+        reconciliation call, safe to repeat on every preview run.
+
+        Success is proven ONLY by remote confirmation: after creating or
+        reconciling the bootstrap deployment, this method polls (bounded)
+        until ``project.targets.production.id`` actually equals the
+        bootstrap deployment id AND that deployment is READY -- Vercel's
+        promotion/alias assignment is eventually consistent, so a bare
+        successful POST or a found ``wbBootstrap``-tagged row is NOT proof
+        the project's production slot has actually been consumed yet.
+        Callers (PreviewOrchestrator) must never deploy real user content
+        until this method returns success.
+
+        Outcomes:
+          * project already has a production binding (real content already
+            live, or a prior bootstrap already consumed it) -> no-op, no POST,
+            no polling needed -- confirmation already stands.
+          * no production binding yet, but a bootstrap deployment matching
+            this project's deterministic identity already exists (crash
+            after a prior POST) -> reconciled (no duplicate POST), then
+            polled for confirmation exactly like a fresh create.
+          * no production binding and no existing bootstrap -> POST the fixed
+            minimal static payload once, then polled for confirmation.
+          * confirmation not reached within the bounded poll -> fail closed;
+            real content must NOT be deployed.
+          * anything ambiguous/malformed -> fail closed, never guess.
+        """
+        try:
+            if not self._project_valid(project, app_id):
+                return _fail('PROJECT_IDENTITY_MISMATCH')
+            try:
+                current = self._current_production_id(project)
+            except Exception:
+                return _fail('PROJECT_RECONCILIATION_REQUIRED')
+            if current is not None:
+                # Production already exists -- real content (already live)
+                # or a previously-consumed bootstrap. Never create another;
+                # the binding is already proven, no polling needed.
+                return OperationResult.ok({'bootstrapped': False, 'already_current_production': True})
+
+            operation_id = self._bootstrap_operation_id(app_id)
+            marker = self._marker(app_id)
+            fail, identifier = self._find_unique_deployment_by_meta_key(
+                project, 'wbBootstrap', operation_id)
+            if fail is not None and fail.error_code != 'NOT_FOUND':
+                return fail
+            reconciled = fail is None
+            if not reconciled:
+                entries = [{'file': 'index.html',
+                           'data': base64.b64encode(_BOOTSTRAP_HTML).decode(), 'encoding': 'base64'}]
+                status, body = self._call('POST', '/v13/deployments', {
+                    'name': project['name'], 'project': project['id'], 'version': 2,
+                    'files': entries, 'builds': [{'src': '**', 'use': '@vercel/static'}],
+                    'meta': {'wbOwner': marker, 'wbBootstrap': operation_id},
+                    'projectSettings': {'framework': None},
+                })
+                if status not in (200, 201) or not body.get('id'):
+                    return _fail('BOOTSTRAP_RECONCILIATION_REQUIRED')
+                identifier = body['id']
+
+            # ---- Remote confirmation barrier: a POST/reconcile alone is
+            # never proof. Promotion/alias assignment is eventually
+            # consistent -- poll (bounded) until targets.production.id
+            # actually equals this bootstrap deployment AND it is READY.
+            for _ in range(max_polls):
+                try:
+                    prod_id = self._current_production_id(project)
+                except Exception:
+                    return _fail('BOOTSTRAP_RECONCILIATION_REQUIRED')
+                if prod_id == identifier:
+                    status, dep = self._call(
+                        'GET', '/v13/deployments/' + quote(identifier, safe=''))
+                    if (status == 200 and dep.get('id') == identifier
+                            and dep.get('readyState') == 'READY'):
+                        return OperationResult.ok({'bootstrapped': True,
+                                                   'deployment_id': identifier,
+                                                   'reconciled': reconciled,
+                                                   'confirmed': True})
+                    return _fail('BOOTSTRAP_RECONCILIATION_REQUIRED')
+                if prod_id is not None:
+                    # Production binding points somewhere else entirely --
+                    # never assume our bootstrap will still land; fail closed
+                    # rather than keep polling against a moving target.
+                    return _fail('BOOTSTRAP_RECONCILIATION_REQUIRED')
+                time.sleep(interval)
+            return _fail('BOOTSTRAP_CONFIRMATION_TIMEOUT')
+        except Exception:
+            return _fail('BOOTSTRAP_RECONCILIATION_REQUIRED')
+
     def find_deployment_by_operation_id(self, app_id, project, operation_id,
                                        source_revision, artifact_sha256, max_pages=100):
         """Paginate entire project scope, then GET unique match for identity.
@@ -253,33 +511,10 @@ class VercelAdapter:
             if not self._project_valid(project, app_id):
                 return _fail('PROJECT_IDENTITY_MISMATCH')
             meta = self._meta(app_id, operation_id, source_revision, artifact_sha256)
-            matches, seen, query = {}, set(), {'projectId': project['id'], 'limit': 100}
-            for _ in range(max_pages):
-                status, body = self._call('GET', '/v6/deployments', **query)
-                if (status != 200 or not isinstance(body.get('deployments'), list)
-                        or not isinstance(body.get('pagination'), dict)
-                        or 'next' not in body['pagination']):
-                    return _fail('INCOMPLETE_LOOKUP')
-                for item in body['deployments']:
-                    if not isinstance(item.get('meta'), dict):
-                        return _fail('INCOMPLETE_LOOKUP')
-                    if item['meta'].get('wbOperation') == operation_id:
-                        identifier = item.get('uid') or item.get('id')
-                        if not identifier:
-                            return _fail('INCOMPLETE_LOOKUP')
-                        matches[identifier] = item
-                cursor = body['pagination']['next']
-                if cursor is None:
-                    break
-                if type(cursor) is not int or cursor in seen:
-                    return _fail('INCOMPLETE_LOOKUP')
-                seen.add(cursor)
-                query['until'] = cursor
-            else:
-                return _fail('INCOMPLETE_LOOKUP')
-            if len(matches) != 1:
-                return _fail('AMBIGUOUS_DEPLOYMENT' if matches else 'NOT_FOUND')
-            identifier = next(iter(matches))
+            fail, identifier = self._find_unique_deployment_by_meta_key(
+                project, 'wbOperation', operation_id, max_pages=max_pages)
+            if fail is not None:
+                return fail
             status, body = self._call('GET', '/v13/deployments/' + quote(identifier, safe=''))
             if status != 200 or body.get('id') != identifier:
                 return _fail('DEPLOYMENT_IDENTITY_MISMATCH')
