@@ -30,6 +30,8 @@ from app.channels.dispatch import AuthenticatedTelegramContext, TelegramDispatch
 from app.channels.telegram import NormalizedMessage, TelegramNormalizer
 from app.core.intake import IntakeProcessor
 from app.core.state import ProjectStateStore
+from app.core.registry import ConversationRegistryStore, DuplicateProjectName
+from app.conversations import ConversationRoute, ConversationRouter
 from app.deploy.adapters import TelegramAdapter, UrllibHttpTransport, VercelAdapter
 from app.deploy.git_output import OutputGitRepository
 from app.deploy.preview import PreviewDeps, PreviewOrchestrator
@@ -246,6 +248,7 @@ class RuntimeComposition:
 
     config: RuntimeConfig
     store: ProjectStateStore
+    conversations: ConversationRouter
     runner: ProjectRunner
     hermes: HermesAdapter
     intake: IntakeProcessor
@@ -272,6 +275,11 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
 
     # Core state
     store = ProjectStateStore(config.state_root)
+
+    # Conversation-level project registry + router. Separate from per-project
+    # state so the registry survives any active-project switch.
+    registry_store = ConversationRegistryStore(config.state_root / "conversations")
+    conversations = ConversationRouter(store, registry_store)
 
     # Sandbox runner (MAX_WORKERS=1)
     runner = ProjectRunner(
@@ -315,13 +323,20 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
     def chat_id_for(project_id: str, state) -> Optional[str]:
         return state.conversation_id
 
-    # Preview orchestrator deps
+    # Preview orchestrator deps — display_name_for wires the natural
+    # post-delivery follow-up ("Website webbandung udah siap...") and is allowed
+    # to be absent in tests that do not construct a registry.
     preview_deps = PreviewDeps(
         vercel=vercel,
         telegram=telegram_out,
         smoke=config.smoke_browser_factory,
         output_repo=output_repo,
         chat_id_for=chat_id_for,
+        display_name_for=lambda pid, state: (
+            registry_store.display_name_for(state.conversation_id, pid)
+            if state is not None and state.conversation_id
+            else None
+        ),
     )
     preview = PreviewOrchestrator(store, preview_deps)
 
@@ -379,6 +394,7 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
     return RuntimeComposition(
         config=config,
         store=store,
+        conversations=conversations,
         runner=runner,
         hermes=hermes,
         intake=intake,
@@ -414,6 +430,9 @@ class ConversationIntent(str, Enum):
     REVISE = "REVISE"
     APPROVE = "APPROVE"
     PUBLISH = "PUBLISH"
+    NEW_PROJECT = "NEW_PROJECT"
+    SELECT_PROJECT = "SELECT_PROJECT"
+    LIST_PROJECTS = "LIST_PROJECTS"
 
 
 # Intents that are valid for each lifecycle state. FAST is only offered
@@ -458,11 +477,15 @@ class TelegramReceiveLoop:
         transport=None,
         poll_timeout: int = 30,
         error_backoff: float = 5.0,
+        conversations: Optional[ConversationRouter] = None,
+        display_name_for=None,
     ):
         self.bot_token = bot_token
         self.dispatcher = dispatcher
         self.telegram_out = telegram_out
         self.hermes = hermes
+        self.conversations = conversations
+        self.display_name_for = display_name_for
         self.transport = transport or UrllibHttpTransport()
         self.poll_timeout = poll_timeout
         self.error_backoff = error_backoff
@@ -515,6 +538,7 @@ class TelegramReceiveLoop:
         text: str,
         lifecycle: str,
         project_id: Optional[str] = None,
+        state=None,
     ) -> ConversationIntent:
         """Classify a natural-language turn into a bounded intent.
 
@@ -611,6 +635,14 @@ User message:
     def _process_update(self, update: dict) -> None:
         """Process a single Telegram Update through the existing dispatcher.
 
+        Routing is conversation-first when a ``ConversationRouter`` is wired
+        in: the conversation registry resolves the immutable internal project
+        (by active pointer or by human name) BEFORE any per-project gate runs,
+        so "revisi webbandung" and "sekarang bikin webjogja" land on the right
+        project deterministically. With no router wired (legacy direct
+        tests/embedding) the loop falls back to the R1 one-project-per-
+        conversation behavior exactly as before.
+
         Malformed/unsupported updates are logged and skipped — they never
         crash the process.
         """
@@ -635,50 +667,211 @@ User message:
 
             authenticated = AuthenticatedTelegramContext(user_id, conversation_id)
 
-            # Determine project_id: use conversation_id as the stable project
-            # identifier for R1 (one project per Telegram conversation).
-            project_id = f"tg-{conversation_id}"
-
-            # Check if project exists; if not, create it first
-            state = self.dispatcher.store.load(project_id)
-            if state is None:
-                create_result = self.dispatcher.dispatch(
-                    update,
-                    project_id,
-                    "create",
-                    authenticated=authenticated,
-                )
-                if not create_result.success:
-                    logger.error(
-                        "Failed to create project %s: %s",
-                        project_id,
-                        create_result.error_code,
-                    )
-                    return
-                state = self.dispatcher.store.load(project_id)
-
-            # Classify the natural-language intent using FAST, bounded by
-            # the current lifecycle state. AI interprets; code enforces.
-            lifecycle = state.lifecycle if state else "DISCOVERING"
-            intent = self._classify_intent(message.text, lifecycle, project_id)
-
-            # Route to the appropriate dispatcher action(s) based on the
-            # classified intent. The dispatcher's existing authz/lifecycle/
-            # dedup gates remain authoritative — FAST never bypasses them.
-            if intent == ConversationIntent.REVISE:
-                self._handle_revise(update, project_id, authenticated, message, state)
-            elif intent == ConversationIntent.APPROVE:
-                self._handle_approve(update, project_id, authenticated, state)
-            elif intent == ConversationIntent.PUBLISH:
-                self._handle_publish(update, project_id, authenticated, state)
-            else:
-                # INTAKE — default conversational flow
-                self._handle_intake(update, project_id, authenticated, message, state)
-
+            if self.conversations is not None:
+                self._process_update_routed(update, message, authenticated)
+                return
+            self._process_update_legacy(update, message, authenticated)
         except Exception:
             logger.exception(
                 "Unexpected error processing update %s", update.get("update_id")
             )
+
+    # ------------------------------------------------------------------
+    # Conversation-routed processing (multi-project per conversation)
+    # ------------------------------------------------------------------
+
+    def _process_update_routed(self, update, message, authenticated) -> None:
+        router = self.conversations
+        conversation_id = message.conversation_id
+
+        route = router.route(
+            conversation_id,
+            message.text,
+            event_id=message.event_id,
+        )
+
+        if route.route == ConversationRoute.LIST_PROJECTS:
+            self._safe_send(conversation_id, route.reply or "Belum ada project.")
+            return
+
+        if route.route == ConversationRoute.NEW_PROJECT:
+            self._handle_new_project(update, message, authenticated, route)
+            return
+
+        if route.route == ConversationRoute.CLARIFICATION:
+            text = route.clarification or "Aku belum yakin maksudnya. Bisa dijelasin lagi?"
+            self._safe_send(conversation_id, text)
+            return
+
+        # Ordinary turn against an existing (resolved + activated) project.
+        project_id = route.project_id
+        state = self.dispatcher.store.load(project_id)
+        if state is None:
+            # Registry pointed at a project that does not exist — repair the
+            # pointer instead of routing writes at a missing project.
+            logger.warning(
+                "Active project %s for conversation %s has no state; asking for clarification",
+                project_id, conversation_id,
+            )
+            self._safe_send(
+                conversation_id,
+                "Project itu tidak ditemukan. Mau buka yang mana?",
+            )
+            return
+        self._dispatch_project_turn(update, project_id, authenticated, message, state, route)
+
+    def _dispatch_project_turn(
+        self, update, project_id, authenticated, message, state, route=None
+    ) -> None:
+        """Per-project intent routing. All existing gates stay authoritative."""
+        lifecycle = state.lifecycle if state else "DISCOVERING"
+
+        forced = getattr(route, "forced_intent", None) if route is not None else None
+        if forced == "REVISE" and lifecycle in ("PREVIEW_READY", "LIVE"):
+            intent = ConversationIntent.REVISE
+        else:
+            intent = self._classify_intent(message.text, lifecycle, project_id)
+
+        if intent == ConversationIntent.REVISE:
+            self._handle_revise(update, project_id, authenticated, message, state)
+        elif intent == ConversationIntent.APPROVE:
+            self._handle_approve(update, project_id, authenticated, state)
+        elif intent == ConversationIntent.PUBLISH:
+            self._handle_publish(update, project_id, authenticated, state)
+        else:
+            self._handle_intake(update, project_id, authenticated, message, state)
+
+    def _handle_new_project(self, update, message, authenticated, route) -> None:
+        """Create (or recover) a project for the conversation's NEW_PROJECT intent.
+
+        Two allocation shapes arrive here:
+
+          * Pre-allocated entry (``route.project_id`` set): either the router
+            already allocated the id during routing, OR the replay guard
+            detected the registry persisted this event's allocation while
+            ProjectState creation never ran (crash window). Either way the
+            recovery path MUST reuse that exact id — never allocate a second
+            logical identity for the same Telegram event.
+          * Unallocated entry (``route.project_id`` empty): allocate now via
+            ``router.materialize_new_project``, which itself re-uses an
+            existing registry entry for the same normalized display name
+            (deterministic duplicate suppression).
+        """
+        router = self.conversations
+        conversation_id = message.conversation_id
+
+        entry = route.entry
+        pre_project_id = getattr(route, "project_id", None) or getattr(
+            entry, "project_id", None
+        )
+
+        if pre_project_id:
+            # Recover-or-confirm: the registry entry already exists for this id.
+            try:
+                router.registry.set_active(conversation_id, pre_project_id)
+            except Exception:
+                logger.exception("Failed to persist active project for recovery")
+            if message.event_id:
+                try:
+                    router.registry.record_event(
+                        conversation_id, message.event_id, pre_project_id
+                    )
+                except Exception:
+                    logger.exception("Failed to persist replay mapping during recovery")
+            project_id = pre_project_id
+        else:
+            display_name = entry.display_name if entry else None
+            if not display_name:
+                self._safe_send(
+                    conversation_id,
+                    "Oke, bikin website baru. Mau kasih nama apa untuk website barunya?",
+                )
+                return
+            try:
+                entry = router.materialize_new_project(
+                    conversation_id, display_name, event_id=message.event_id
+                )
+            except DuplicateProjectName:
+                self._safe_send(
+                    conversation_id,
+                    "Nama itu sudah dipakai. Mau lanjut ke project itu, atau kasih nama lain?",
+                )
+                return
+            project_id = entry.project_id
+
+        # If the project state ALREADY exists on disk (crash between
+        # ProjectAccess.create and a later crash, then Telegram retried the
+        # event), skip the create dispatch — there is nothing to redo.
+        state = self.dispatcher.store.load(project_id)
+        if state is None:
+            create_result = self.dispatcher.dispatch(
+                update,
+                project_id,
+                "create",
+                authenticated=authenticated,
+            )
+            if not create_result.success:
+                # Roll the registry entry back ONLY when we allocated it in
+                # this turn (fresh allocation path). For a pre-allocated
+                # recovery id, the registry mapping is the source of truth
+                # and must survive so a later retry can still recover.
+                if not pre_project_id:
+                    router.rollback_project(conversation_id, project_id)
+                logger.error(
+                    "Failed to create project %s: %s",
+                    project_id, create_result.error_code,
+                )
+                self._safe_send(conversation_id, "Sesuatu gagal. Coba lagi ya.")
+                return
+            state = self.dispatcher.store.load(project_id)
+
+        if state is None:
+            # Defensive: state must exist now; if not, surface a clarification
+            # instead of crashing the loop.
+            self._safe_send(
+                conversation_id,
+                "Project-nya belum bisa dibuka. Coba kirim ulang pesannya ya.",
+            )
+            return
+        self._handle_intake(update, project_id, authenticated, message, state)
+
+    def _handle_legacy_first_project(self, update, message, authenticated, project_id) -> None:
+        create_result = self.dispatcher.dispatch(
+            update, project_id, "create", authenticated=authenticated
+        )
+        if not create_result.success:
+            logger.error(
+                "Failed to create project %s: %s", project_id, create_result.error_code
+            )
+            return
+
+    # ------------------------------------------------------------------
+    # Legacy (no router) processing — R1 one-project-per-conversation
+    # ------------------------------------------------------------------
+
+    def _process_update_legacy(self, update, message, authenticated) -> None:
+        conversation_id = message.conversation_id
+        project_id = f"tg-{conversation_id}"
+        state = self.dispatcher.store.load(project_id)
+        if state is None:
+            self._handle_legacy_first_project(update, message, authenticated, project_id)
+            state = self.dispatcher.store.load(project_id)
+        lifecycle = state.lifecycle if state else "DISCOVERING"
+        intent = self._classify_intent(message.text, lifecycle, project_id, state=state)
+        if intent == ConversationIntent.REVISE:
+            self._handle_revise(update, project_id, authenticated, message, state)
+        elif intent == ConversationIntent.APPROVE:
+            self._handle_approve(update, project_id, authenticated, state)
+        elif intent == ConversationIntent.PUBLISH:
+            self._handle_publish(update, project_id, authenticated, state)
+        else:
+            self._handle_intake(update, project_id, authenticated, message, state)
+
+    def _safe_send(self, chat_id: str, text: str) -> None:
+        try:
+            self.telegram_out.send_text(chat_id, text)
+        except Exception:
+            logger.exception("Failed to send message to chat %s", chat_id)
 
     def _handle_intake(
         self,
@@ -930,6 +1123,7 @@ def main() -> int:
         dispatcher=composition.dispatcher,
         telegram_out=composition.telegram_out,
         hermes=composition.hermes,
+        conversations=composition.conversations,
     )
 
     # Graceful shutdown on SIGINT/SIGTERM

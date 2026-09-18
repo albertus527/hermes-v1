@@ -20,6 +20,7 @@ Vercel/Telegram credential resolution in this module.
 from __future__ import annotations
 
 import hashlib
+import logging
 import time
 import os
 from dataclasses import dataclass, field
@@ -32,6 +33,39 @@ from app.deploy.git_output import OutputGitRepository
 from app.deploy.snapshot import TestedSnapshot, source_fingerprint
 
 
+# ---------------------------------------------------------------------------
+# Post-delivery follow-up delivery-state machine
+# ---------------------------------------------------------------------------
+#
+# Durable on ``latest_shown_preview["follow_up_state"]``. This message is a
+# pure UX nudge ("mau revisi atau bikin baru?") — it carries NO product
+# state, and its delivery must never turn an already-delivered preview into
+# a failed preview.
+#
+#   ABSENT / None  -> definitely NOT attempted. Safe to (re)try: no bytes
+#                     have been sent for this operation, so a retry cannot
+#                     duplicate. This is where a definite local/pre-send
+#                     failure (no chat target, name resolution failure,
+#                     persist failure) leaves the state.
+#   PENDING        -> a Telegram send was ATTEMPTED but its outcome is
+#                      UNKNOWN (crash mid-send, transport error, adapter
+#                      reported failure). Ambiguous by construction: the
+#                      message may or may not have landed. FAIL CLOSED —
+#                      never blindly resend, because a resend can duplicate
+#                      and there is no idempotency key for a plain
+#                      ``send_text``.
+#   SENT           -> the adapter CONFIRMED delivery (success=True). Never
+#                      resend.
+#
+# This mirrors the existing fail-closed handling of ambiguous preview
+# Telegram sends in this module (``photo_attempted`` / ``text_attempted``
+# followed by ``DELIVERY_RECONCILIATION_REQUIRED``): persist the attempt
+# BEFORE the side effect, and treat an unconfirmed attempt as ambiguous
+# rather than retrying it.
+FOLLOW_UP_PENDING = "PENDING"
+FOLLOW_UP_SENT = "SENT"
+
+
 @dataclass
 class PreviewDeps:
     """All external boundary objects. None of these are constructed here."""
@@ -42,6 +76,11 @@ class PreviewDeps:
     output_repo: OutputGitRepository
     chat_id_for: Any  # callable(project_id, state) -> str, may return None
     app_id_for: Any = field(default=lambda project_id: project_id)
+    # Optional callable(project_id, state) -> Optional[str]. Returns the
+    # human project/display name (e.g. "webbandung") for the natural
+    # post-delivery follow-up message. None (or returning None) disables the
+    # follow-up so existing call sites behave exactly as before.
+    display_name_for: Any = None
 
 
 class PreviewOrchestrator:
@@ -106,6 +145,16 @@ class PreviewOrchestrator:
                                       + ':' + snapshot.identity).encode()).hexdigest()
         shown = state.deployment.get('latest_shown_preview', {})
         if shown.get('operation_id') == operation_id:
+            # Short-circuit: this exact preview was durably delivered. The
+            # follow-up is re-evaluated here so a crash between "preview
+            # marked shown" and "follow-up attempted" is recoverable — but
+            # ONLY when the durable state says the follow-up was definitely
+            # never attempted. An attempted-but-unconfirmed send (PENDING)
+            # is intentionally NOT retried (it may duplicate).
+            self._maybe_send_follow_up(
+                project_id, shown.get('preview_url', ''),
+                operation_id=operation_id, shown=shown,
+            )
             return OperationResult.ok(shown)
         source_revision = state.revisions.source_revision
 
@@ -234,8 +283,21 @@ class PreviewOrchestrator:
                 "source_sha256": snapshot.source_sha256,
                 "artifact_sha256": snapshot.artifact_sha256,
                 "shown_at": time.time(),
+                # Follow-up not yet attempted for this operation. Persisted
+                # as an explicit key (not merely absent) so a later reader
+                # can distinguish "definitely not attempted" from a
+                # partially-written row.
+                "follow_up_state": None,
             }
             self.store.save(locked)
+
+        # ---- 8. Natural follow-up AFTER durable delivery success ----------
+        # UX-only. Never fails the already-delivered preview: every failure
+        # path below is log-only and returns normally.
+        self._maybe_send_follow_up(
+            project_id, preview_url, operation_id=operation_id,
+            shown=locked.deployment["latest_shown_preview"],
+        )
 
         return OperationResult.ok({
             "preview_url": preview_url,
@@ -246,6 +308,143 @@ class PreviewOrchestrator:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _follow_up_state(shown: Dict[str, Any]) -> Optional[str]:
+        """Read the durable follow-up state from ``latest_shown_preview``.
+
+        Returns ``FOLLOW_UP_SENT`` / ``FOLLOW_UP_PENDING`` / ``None``
+        (definitely-not-attempted). Reads the legacy ``follow_up_sent``
+        boolean shape for compatibility with any row written by an earlier
+        build: ``True`` maps to SENT (so it is never resent); a missing or
+        ``False`` value maps to "not attempted" (retryable).
+        """
+        if shown.get("follow_up_sent") is True:
+            return FOLLOW_UP_SENT
+        state = shown.get("follow_up_state")
+        if state in (FOLLOW_UP_PENDING, FOLLOW_UP_SENT):
+            return state
+        return None
+
+    def _maybe_send_follow_up(
+        self,
+        project_id: str,
+        preview_url: str,
+        *,
+        operation_id: str,
+        shown: Dict[str, Any],
+    ) -> None:
+        """Attempt the post-delivery follow-up under fail-closed semantics.
+
+        Delivery contract (see the FOLLOW_UP_* state machine above):
+
+          * SENT or PENDING -> do nothing. PENDING means a prior send was
+            ATTEMPTED with an unknown outcome; resending could duplicate a
+            message that already arrived, and ``send_text`` has no
+            idempotency key to reconcile against. We accept a possible
+            lost UX nudge rather than risk a duplicate. An operator can see
+            the unresolved PENDING row in project state.
+          * not attempted -> resolve local prerequisites first. Any local
+            failure (no project state, no display name, no chat target,
+            marker persist failure) happens BEFORE any bytes are sent and
+            therefore leaves the state "not attempted" — safely retryable
+            on the next pass.
+          * Once local prerequisites are satisfied the state is durably
+            flipped to PENDING BEFORE the send, so a crash mid-send can
+            never cause a blind resend. A confirmed ``success=True`` result
+            flips it to SENT.
+
+        This method NEVER raises and never returns a failure — the preview
+        it belongs to has already been delivered.
+        """
+        existing = self._follow_up_state(shown)
+        if existing == FOLLOW_UP_SENT:
+            return
+        if existing == FOLLOW_UP_PENDING:
+            logging.getLogger(__name__).warning(
+                "Follow-up for project %s (operation %s) has an unconfirmed "
+                "prior attempt; not resending (ambiguous send, fail closed).",
+                project_id, operation_id,
+            )
+            return
+
+        state = self.store.load(project_id)
+        if state is None:
+            return
+        follow_up_name = None
+        if self.deps.display_name_for is not None:
+            try:
+                follow_up_name = self.deps.display_name_for(project_id, state)
+            except Exception:
+                follow_up_name = None
+        if not follow_up_name:
+            # Definite pre-send local failure — nothing was sent; retryable.
+            return
+        chat_id = None
+        try:
+            chat_id = self.deps.chat_id_for(project_id, state)
+        except Exception:
+            chat_id = None
+        if not chat_id:
+            # Definite pre-send local failure — nothing was sent; retryable.
+            return
+
+        # ---- Persist the ATTEMPT before any side effect (fail closed) ----
+        try:
+            with self.store.acquire_writer(project_id) as locked:
+                current = locked.deployment.get("latest_shown_preview") or {}
+                if current.get("operation_id") != operation_id:
+                    return  # operation superseded — nothing to follow up on
+                if self._follow_up_state(current) in (FOLLOW_UP_PENDING, FOLLOW_UP_SENT):
+                    return
+                current["follow_up_state"] = FOLLOW_UP_PENDING
+                self.store.save(locked)
+        except Exception:
+            # Local failure BEFORE any send — safe to retry on a later pass.
+            logging.getLogger(__name__).exception(
+                "Failed to persist follow-up attempt marker for %s", project_id
+            )
+            return
+
+        follow_up_text = (
+            f"Website {follow_up_name} udah siap \U0001F389\n"
+            f"{preview_url}\n\n"
+            "Mau revisi website ini, atau mau bikin website baru?"
+        )
+        # From here on the outcome is potentially ambiguous: the request may
+        # have reached Telegram even if we observe a failure. Never retry an
+        # unconfirmed attempt.
+        try:
+            result = self.deps.telegram.send_text(chat_id, follow_up_text)
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Ambiguous follow-up send for %s (operation %s); leaving "
+                "PENDING and NOT resending.",
+                project_id, operation_id,
+            )
+            return
+        if not getattr(result, "success", False):
+            logging.getLogger(__name__).warning(
+                "Follow-up send for %s (operation %s) reported failure; "
+                "outcome ambiguous, leaving PENDING and NOT resending.",
+                project_id, operation_id,
+            )
+            return
+
+        # Confirmed delivered — record it so no replay ever resends.
+        try:
+            with self.store.acquire_writer(project_id) as locked:
+                current = locked.deployment.get("latest_shown_preview") or {}
+                if (current.get("operation_id") == operation_id
+                        and self._follow_up_state(current) == FOLLOW_UP_PENDING):
+                    current["follow_up_state"] = FOLLOW_UP_SENT
+                    self.store.save(locked)
+        except Exception:
+            # Worst case: the row stays PENDING, which fails CLOSED (a later
+            # pass will not resend). At-most-once is preserved.
+            logging.getLogger(__name__).exception(
+                "Failed to persist confirmed follow-up for %s", project_id
+            )
 
     def _update_intent(self, project_id: str, operation_id: str, **fields) -> None:
         with self.store.acquire_writer(project_id) as state:

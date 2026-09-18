@@ -392,10 +392,23 @@ class IntakeProcessor:
                 # Resume to DISCOVERING — the canonical resume target
                 self.store.transition_lifecycle_locked(state, ProjectLifecycle.DISCOVERING)
 
-            # Update lifecycle based on readiness through lifecycle authority
+            # Update lifecycle based on readiness through lifecycle authority.
             if result.readiness == Readiness.DISCOVERY_READY:
+                # requirements_version counts every accepted completed brief,
+                # including legitimate post-READY corrections — preserve that
+                # semantics so corrections stay observable.
                 state.revisions.requirements_version += 1
-                self.store.transition_lifecycle_locked(state, ProjectLifecycle.READY)
+                # READY -> READY is intentionally invalid in lifecycle.py.
+                # When the project is already READY, a fresh semantically
+                # complete intake must SAFELY REMAIN READY rather than
+                # attempting a no-op transition through the authority (which
+                # would raise LifecycleError and strand the dispatch claim in
+                # CLAIMED, surfacing as EVENT_RECONCILIATION_REQUIRED on the
+                # next event). The lifecycle state machine itself is NOT
+                # weakened — the intake layer simply recognizes that READY is
+                # already correct.
+                if state.lifecycle != ProjectLifecycle.READY.value:
+                    self.store.transition_lifecycle_locked(state, ProjectLifecycle.READY)
             elif result.readiness == Readiness.NEEDS_CLARIFICATION:
                 if state.lifecycle == ProjectLifecycle.DISCOVERING.value:
                     self.store.transition_lifecycle_locked(state, ProjectLifecycle.WAITING_INPUT)
