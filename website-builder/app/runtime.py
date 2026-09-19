@@ -714,10 +714,18 @@ User message:
         router = self.conversations
         conversation_id = message.conversation_id
 
+        # Load bounded active-project context to enrich the FAST prompt so
+        # intake answers are not mistaken for new-project requests. This is a
+        # read-only operation; no mutation happens here. When there is no
+        # active project (first contact, all projects pending, etc.) the
+        # context is None and the router behaves exactly as before.
+        active_project_context = self._load_active_project_context(conversation_id)
+
         route = router.route(
             conversation_id,
             message.text,
             event_id=message.event_id,
+            active_project_context=active_project_context,
         )
 
         if route.route == ConversationRoute.LIST_PROJECTS:
@@ -874,6 +882,53 @@ User message:
                 "Failed to create project %s: %s", project_id, create_result.error_code
             )
             return
+
+    def _load_active_project_context(
+        self, conversation_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Load bounded active-project context for FAST prompt enrichment.
+
+        Returns a dict with:
+          active_project_name: str            — the human display name
+          active_project_lifecycle: str       — e.g. "WAITING_INPUT"
+          next_missing_intake_field: str|None — first of (name, what, why)
+                                               that is still None in the brief
+
+        Returns None when there is no active project, the state cannot be
+        loaded, or the conversations router is not wired in.
+        """
+        router = self.conversations
+        if router is None:
+            return None
+        registry = router.registry.load_or_create(conversation_id)
+        active_id = registry.active_project_id
+        if not active_id:
+            return None
+        entry = registry.find_by_id(active_id)
+        if entry is None:
+            return None
+        try:
+            state = self.dispatcher.store.load(active_id)
+        except Exception:
+            logger.exception(
+                "Failed to load active project state %s for context enrichment",
+                active_id,
+            )
+            return None
+        if state is None:
+            return None
+        # Determine the first missing intake field from the accumulated brief.
+        brief = state.brief or {}
+        next_missing: Optional[str] = None
+        for field_name in ("name", "what", "why"):
+            if not brief.get(field_name):
+                next_missing = field_name
+                break
+        return {
+            "active_project_name": entry.display_name,
+            "active_project_lifecycle": state.lifecycle,
+            "next_missing_intake_field": next_missing,
+        }
 
     # ------------------------------------------------------------------
     # Legacy (no router) processing — R1 one-project-per-conversation

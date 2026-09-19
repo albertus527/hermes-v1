@@ -359,7 +359,13 @@ class ConversationRouter:
     _CONFIDENCE_LEVELS = frozenset({"high", "medium", "low"})
 
     def _fast_classify_turn(
-        self, text: str, known_names: List[str]
+        self,
+        text: str,
+        known_names: List[str],
+        *,
+        active_project_name: Optional[str] = None,
+        active_project_lifecycle: Optional[str] = None,
+        next_missing_intake_field: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Ask FAST for the conversation-level routing decision.
 
@@ -371,14 +377,37 @@ class ConversationRouter:
         trusted at all); CREATE_PROJECT is allowed to name an existing
         project because the caller resolves that safely through the
         duplicate-name path (clarify, never duplicate/mutate).
+
+        When ``active_project_name`` is provided, a bounded context block is
+        injected into the prompt so FAST can distinguish an intake answer
+        for the active project from a genuine new-project request.
         """
         if self.hermes is None:
             return None
+
+        # Build the optional active-project context block.
+        active_context_block = ""
+        if active_project_name:
+            field_hint = (
+                f"\nIntake currently needs: {next_missing_intake_field}"
+                if next_missing_intake_field
+                else ""
+            )
+            active_context_block = f"""\nActive project: {active_project_name}
+Lifecycle: {active_project_lifecycle or 'unknown'}{field_hint}
+
+Important: The current message may simply be answering the active project's
+ongoing intake question. If it could plausibly be an answer to the missing
+field above, classify PROJECT_TURN (high confidence) rather than CREATE_PROJECT
+or AMBIGUOUS. Only classify CREATE_PROJECT when the user clearly wants a
+separate, independent website — not when the message could be an intake answer.
+"""
+
         prompt = f"""You are FAST, routing one Website Builder conversation turn.
 
 The user already owns these website projects (human names only):
 {", ".join(known_names) if known_names else "(none yet)"}
-
+{active_context_block}
 Classify the user's message into exactly one bounded intent:
 - CREATE_PROJECT: the user wants to start a brand-new, independent website
   (a new business/topic/name), even if they never say "new" or "baru".
@@ -481,6 +510,7 @@ User message:
         event_id: Optional[str],
         fast: Dict[str, Any],
         registry,
+        active_project_lifecycle: Optional[str] = None,
     ) -> RouteResult:
         """Resolve a successfully-classified FAST turn into a RouteResult.
 
@@ -489,11 +519,40 @@ User message:
         mutate/select a project requires the model to be sure. The single
         most important invariant is enforced here — uncertainty between
         CREATE and MODIFY always clarifies, never silently picks a side.
+
+        WAITING_INPUT bias: when the active project is in WAITING_INPUT (i.e.
+        an intake question was just asked and the bot is waiting for an
+        answer), a non-high-confidence CREATE_PROJECT or AMBIGUOUS is treated
+        as PROJECT_TURN against the active project. The user is almost
+        certainly answering the intake question. A high-confidence CREATE is
+        never overridden — an explicit new-project request still proceeds.
         """
         intent = fast["intent"]
         confidence = fast["confidence"]
         target_name = fast["target_project_name"]
         proposed_name = fast["proposed_new_project_name"]
+
+        # WAITING_INPUT safety bias: when an intake question is outstanding
+        # and FAST is uncertain, route to the active project rather than
+        # firing another CREATE-vs-MODIFY clarification.
+        #
+        # * AMBIGUOUS is always uncertain by definition — bias fires regardless
+        #   of the reported confidence value.
+        # * CREATE_PROJECT: bias fires only at non-high confidence. A
+        #   high-confidence CREATE is a deliberate new-project request and must
+        #   NOT be overridden even when another project is WAITING_INPUT.
+        if active_project_lifecycle == "WAITING_INPUT" and (
+            intent == "AMBIGUOUS"
+            or (intent == "CREATE_PROJECT" and confidence != "high")
+        ):
+            active_id = self.registry.active_project_id(conversation_id)
+            if active_id and self._materialized(active_id):
+                logger.debug(
+                    "WAITING_INPUT bias: overriding %s(%s) -> PROJECT_TURN "
+                    "for active project %s (conversation %s)",
+                    intent, confidence, active_id, conversation_id,
+                )
+                return self._resolve_project_turn(conversation_id, None, registry)
 
         if intent == "LIST_PROJECTS":
             if confidence == "low":
@@ -759,6 +818,7 @@ User message:
         text: str,
         event_id: Optional[str] = None,
         display_name_hint: Optional[str] = None,
+        active_project_context: Optional[Dict[str, Any]] = None,
     ) -> RouteResult:
         """Route one conversation turn.
 
@@ -770,6 +830,15 @@ User message:
         writer of the active-project pointer, and is the only allocator of
         a new project identity.
 
+        ``active_project_context`` is a bounded dict supplied by the caller:
+          {"active_project_name": str,
+           "active_project_lifecycle": str,
+           "next_missing_intake_field": str | None}
+        It enriches the FAST prompt so intake answers are not mistaken for
+        new-project requests. The caller (TelegramReceiveLoop) loads it
+        from the active project's persisted state; the router never loads
+        per-project state itself.
+
         The deterministic phrase/regex heuristics below are a FALLBACK used
         ONLY when FAST is unavailable (no ``self.hermes``) or fails/returns
         something unparseable. The fallback is deliberately conservative:
@@ -779,9 +848,95 @@ User message:
         registry = self._ensure_registry(conversation_id)
         known_names = [e.display_name for e in registry.projects]
 
-        fast = self._fast_classify_turn(text, known_names)
+        # ---- 0. Event replay guard (crash-window recovery) -----------
+        # If this Telegram event was already allocated to a project (e.g. crash
+        # between allocation and ProjectState materialization, or duplicate
+        # event delivery), deterministically recover that exact project
+        # identity without re-running FAST, re-opening pending actions, or
+        # allocating a second project.
+        if event_id:
+            replay = registry.event_projects.get(str(event_id))
+            if replay:
+                entry = registry.find_by_id(replay)
+                if entry is not None:
+                    if self._materialized(replay):
+                        return RouteResult(
+                            route=ConversationRoute.PROJECT,
+                            project_id=replay,
+                            entry=entry,
+                            switched=False,
+                        )
+                    logger.warning(
+                        "Recovering unmaterialized project %s for event %s "
+                        "(conversation %s)",
+                        replay, event_id, conversation_id,
+                    )
+                    return RouteResult(
+                        route=ConversationRoute.NEW_PROJECT,
+                        project_id=replay,
+                        entry=entry,
+                        clarification=(
+                            "Lagi beresin project kamu yang tadi sempet "
+                            "kepotong. Sebentar ya…"
+                        ),
+                    )
+
+        # ---- 1. Pending-action gate (deterministic, pre-FAST) ----------
+        # When the router previously asked a multi-turn clarifying question
+        # (e.g. "what name for the new project?"), the expected answer is
+        # consumed here before FAST is invoked.
+        #
+        # Crash-safe ordering:
+        #   1. Extract / validate the name candidate.
+        #   2. Call _route_new_project — allocates/recovers the identity and
+        #      persists the registry (allocation + event mapping) BEFORE
+        #      returning.
+        #   3. Clear pending_action ONLY after the project identity is safely
+        #      recorded (route is NEW_PROJECT or PROJECT).
+        #
+        # A crash between step 2 and step 3 leaves pending_action set but the
+        # project already allocated. The next retry fires the gate again,
+        # _route_new_project finds the project via resolve_name (duplicate
+        # guard), returns PROJECT, and clears pending. No orphaned state.
+        #
+        # A crash before step 2 leaves both pending and allocation untouched —
+        # the next retry re-asks for the name.
+        pending = registry.pending_action
+        if pending and pending.get("action") == "CREATE_PROJECT" and pending.get("awaiting") == "NAME":
+            # Use the full text as the name candidate; deterministic
+            # extraction/truncation applies as usual.
+            requested_name = self.extract_new_project_name(text) or text.strip() or None
+            logger.debug(
+                "Consuming pending CREATE_PROJECT/NAME for conversation %s: %r",
+                conversation_id, requested_name,
+            )
+            result = self._route_new_project(
+                conversation_id, text, event_id,
+                requested_name=requested_name,
+                clear_pending_on_success=True,
+            )
+            return result
+
+        # ---- FAST-first (active-project context enriched) ---------------
+        active_lifecycle = (
+            (active_project_context or {}).get("active_project_lifecycle")
+        )
+        fast = self._fast_classify_turn(
+            text,
+            known_names,
+            active_project_name=(
+                (active_project_context or {}).get("active_project_name")
+            ),
+            active_project_lifecycle=active_lifecycle,
+            next_missing_intake_field=(
+                (active_project_context or {}).get("next_missing_intake_field")
+            ),
+        )
         if fast is not None:
-            return self._route_via_fast(conversation_id, text, event_id, fast, registry)
+            return self._route_via_fast(
+                conversation_id, text, event_id, fast, registry,
+                active_project_lifecycle=active_lifecycle,
+            )
 
         return self._route_deterministic_fallback(
             conversation_id, text, event_id, display_name_hint, registry
@@ -945,8 +1100,15 @@ User message:
         text: str,
         event_id: Optional[str],
         requested_name: Optional[str] = None,
+        clear_pending_on_success: bool = False,
     ) -> RouteResult:
-        # Replay guard: a repeated Telegram event maps to the SAME project.
+        """Route a CREATE_PROJECT decision to a new or recovered project.
+
+        When ``clear_pending_on_success`` is True, the pending_action is
+        cleared in the SAME atomic write as the allocation (via
+        ``allocate_project(clear_pending=True)``), eliminating a separate
+        second save and its associated Windows file-handle window.
+        """
         if event_id:
             replay = self.registry.recorded_event(conversation_id, event_id)
             if replay:
@@ -986,6 +1148,14 @@ User message:
 
         requested = requested_name or self.extract_new_project_name(text)
         if not requested:
+            # Persist a pending action so the NEXT turn is consumed
+            # deterministically (before FAST runs) as the project name.
+            # This prevents the multi-turn loop where FAST re-classifies
+            # the name answer from scratch and goes AMBIGUOUS again.
+            self.registry.set_pending_action(
+                conversation_id,
+                {"action": "CREATE_PROJECT", "awaiting": "NAME"},
+            )
             return RouteResult(
                 route=ConversationRoute.CLARIFICATION,
                 clarification=(
@@ -1021,9 +1191,15 @@ User message:
                 ),
             )
 
-        entry = self.registry.allocate_project(conversation_id, requested)
+        entry = self.registry.allocate_project(
+            conversation_id,
+            requested,
+            clear_pending=clear_pending_on_success,
+            event_id=event_id,
+        )
         return RouteResult(
             route=ConversationRoute.NEW_PROJECT,
+            project_id=entry.project_id,
             entry=entry,
             reply=None,
         )
@@ -1066,9 +1242,12 @@ User message:
             or display_name_hint
             or self._derived_display_name(text)
         )
-        entry = self.registry.allocate_project(conversation_id, name)
+        entry = self.registry.allocate_project(
+            conversation_id, name, event_id=event_id
+        )
         return RouteResult(
             route=ConversationRoute.NEW_PROJECT,
+            project_id=entry.project_id,
             entry=entry,
         )
 
@@ -1110,7 +1289,9 @@ User message:
         if resolution.status == "ok" and resolution.entry is not None:
             entry = resolution.entry
         else:
-            entry = self.registry.allocate_project(conversation_id, display_name, aliases)
+            entry = self.registry.allocate_project(
+                conversation_id, display_name, aliases, event_id=event_id
+            )
         try:
             self.registry.set_active(conversation_id, entry.project_id)
         except Exception:

@@ -127,6 +127,13 @@ class ConversationRegistry:
     event_projects: Dict[str, str] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
+    # Minimal pending conversation state for multi-turn clarifications.
+    # Example: {"action": "CREATE_PROJECT", "awaiting": "NAME"}
+    # Set when the router asks a clarifying question that requires the next
+    # turn to be consumed deterministically (before FAST is invoked).
+    # Cleared immediately after the awaited value is consumed.
+    # None when no clarification is pending.
+    pending_action: Optional[Dict[str, str]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -137,11 +144,16 @@ class ConversationRegistry:
             "event_projects": dict(self.event_projects),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "pending_action": self.pending_action,
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ConversationRegistry":
         raw_events = data.get("event_projects") or {}
+        raw_pending = data.get("pending_action")
+        pending_action: Optional[Dict[str, str]] = None
+        if isinstance(raw_pending, dict):
+            pending_action = {str(k): str(v) for k, v in raw_pending.items()}
         return cls(
             conversation_id=str(data.get("conversation_id", "")),
             active_project_id=data.get("active_project_id"),
@@ -150,6 +162,7 @@ class ConversationRegistry:
             event_projects={str(k): str(v) for k, v in raw_events.items()},
             created_at=float(data.get("created_at", time.time())),
             updated_at=float(data.get("updated_at", time.time())),
+            pending_action=pending_action,
         )
 
     # ------------------------------------------------------------------
@@ -296,12 +309,27 @@ class ConversationRegistryStore:
     # ------------------------------------------------------------------
 
     def allocate_project(
-        self, conversation_id: str, display_name: str, aliases: Optional[List[str]] = None
+        self,
+        conversation_id: str,
+        display_name: str,
+        aliases: Optional[List[str]] = None,
+        clear_pending: bool = False,
+        event_id: Optional[str] = None,
     ) -> ProjectEntry:
         """Allocate exactly one immutable internal project ID and register it.
 
         Refuses a duplicate normalized display name/alias so a NEW_PROJECT
         with an already-taken name can never silently fork a second project.
+
+        When ``clear_pending`` is True, ``pending_action`` is cleared in the
+        SAME locked atomic write as the allocation.  This is used by the
+        pending-NAME gate so the clear happens crash-safely after the identity
+        is recorded, without requiring a second separate locked save.
+
+        When ``event_id`` is provided, the ``event_id -> project_id`` replay
+        mapping is recorded in the SAME locked atomic write. This ensures
+        there is zero crash window between project allocation, event replay
+        recording, and clearing pending_action.
         """
         with self._lock_for(conversation_id):
             registry = self.load_or_create(conversation_id)
@@ -327,6 +355,10 @@ class ConversationRegistryStore:
             registry.next_project_seq += 1
             registry.projects.append(entry)
             registry.active_project_id = entry.project_id
+            if event_id:
+                registry.event_projects[str(event_id)] = entry.project_id
+            if clear_pending:
+                registry.pending_action = None
             self.save(registry)
             return entry
 
@@ -449,6 +481,41 @@ class ConversationRegistryStore:
             if registry.find_by_id(project_id) is None:
                 raise ValueError(f"Unknown project for conversation: {project_id}")
             registry.event_projects[str(event_id)] = project_id
+            self.save(registry)
+
+    # ------------------------------------------------------------------
+    # Pending-action helpers (crash-safe multi-turn clarification state)
+    # ------------------------------------------------------------------
+
+    def set_pending_action(
+        self, conversation_id: str, action: Dict[str, str]
+    ) -> None:
+        """Persist a pending conversation-level clarification action.
+
+        Called atomically with the CLARIFICATION RouteResult so the next
+        turn can consume the expected answer deterministically, before FAST
+        is invoked. Only one pending action is tracked at a time (the most
+        recent one wins).
+        """
+        with self._lock_for(conversation_id):
+            registry = self.load_or_create(conversation_id)
+            registry.pending_action = {str(k): str(v) for k, v in action.items()}
+            self.save(registry)
+
+    def clear_pending_action(self, conversation_id: str) -> None:
+        """Clear a consumed pending action. Idempotent when already None.
+
+        NOTE: prefer passing ``clear_pending=True`` to ``allocate_project``
+        when the clear happens in the same logical operation as an allocation,
+        so both changes land in a single atomic write (especially important on
+        Windows where a second consecutive save to the same file can hit OS
+        file-handle contention under test).
+        """
+        with self._lock_for(conversation_id):
+            registry = self.load_or_create(conversation_id)
+            if registry.pending_action is None:
+                return
+            registry.pending_action = None
             self.save(registry)
 
     def remove_project(self, conversation_id: str, project_id: str) -> None:
