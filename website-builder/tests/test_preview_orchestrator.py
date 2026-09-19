@@ -11,6 +11,7 @@ from app.core.state import ProjectStateStore
 from app.deploy.git_output import OutputGitRepository
 from app.deploy.preview import PreviewDeps, PreviewOrchestrator
 from app.deploy.snapshot import TestedSnapshot, source_fingerprint
+from app.sandbox.runner import ProjectRunner
 
 
 def _make_workspace(tmp_path):
@@ -297,3 +298,54 @@ def test_real_content_deploy_proceeds_exactly_once_after_bootstrap_confirmed(tmp
     assert result.success
     assert vercel.bootstrap_calls == 1
     assert vercel.deploy_calls == 1
+
+
+# ---------------------------------------------------------------------------
+# HIGH-5: preview-worker lock removal must not allow parallel preview
+# execution — the ProjectRunner single worker slot (MAX_WORKERS=1) is the
+# serializer. Dispatch-side callers acquire it; build/revise callers hold it.
+# ---------------------------------------------------------------------------
+
+
+def _slot_guarded_orch(tmp_path, runner):
+    store = ProjectStateStore(tmp_path / 'state')
+    ws = _make_workspace(tmp_path)
+    _preview_ready_state(store, 'proj', ws)
+    deps = _deps(tmp_path)
+    return store, ws, PreviewOrchestrator(store, deps, runner=runner)
+
+
+def test_external_caller_blocked_when_worker_slot_held(tmp_path):
+    """A dispatch-side reconcile while a build/preview owns the slot fails busy."""
+    runner = ProjectRunner(tmp_path / 'workspaces', ProjectStateStore(tmp_path / 'rs'))
+    assert runner.acquire_project('other-build')
+    try:
+        _, ws, orch = _slot_guarded_orch(tmp_path, runner)
+        result = orch.run_owned('proj', ws)
+    finally:
+        runner.release_project('other-build')
+    assert not result.success
+    assert result.error_code == 'PREVIEW_BUSY'
+
+
+def test_external_caller_acquires_and_releases_slot(tmp_path):
+    """A dispatch-side reconcile acquires the slot and releases it afterwards."""
+    runner = ProjectRunner(tmp_path / 'workspaces', ProjectStateStore(tmp_path / 'rs'))
+    _, ws, orch = _slot_guarded_orch(tmp_path, runner)
+    result = orch.run_owned('proj', ws)
+    assert result.success
+    # Slot released after the run — a new mutation may proceed.
+    assert runner.acquire_project('next-op')
+    runner.release_project('next-op')
+
+
+def test_slot_held_caller_bypasses_acquisition(tmp_path):
+    """Build/revise already own the slot — nested preview must not reacquire."""
+    runner = ProjectRunner(tmp_path / 'workspaces', ProjectStateStore(tmp_path / 'rs'))
+    _, ws, orch = _slot_guarded_orch(tmp_path, runner)
+    assert runner.acquire_project('proj')
+    try:
+        result = orch.run_owned('proj', ws, slot_held=True)
+        assert result.success
+    finally:
+        runner.release_project('proj')

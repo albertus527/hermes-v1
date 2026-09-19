@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import os
+import shutil
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -207,6 +212,108 @@ class TestNestedWriterDeadlock(unittest.TestCase):
         self.store.transition_lifecycle("proj-unlocked", ProjectLifecycle.READY)
         loaded = self.store.load("proj-unlocked")
         self.assertEqual(loaded.lifecycle, ProjectLifecycle.READY.value)
+
+
+# ---------------------------------------------------------------------------
+# HIGH-5: Crash-recoverable writer locks
+# ---------------------------------------------------------------------------
+
+
+class TestCrashRecoverableWriterLocks(unittest.TestCase):
+    """Writer locks record pid+time so a crashed owner can be recovered,
+    without ever reaping a verified live owner."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.store = ProjectStateStore(Path(self.tmpdir) / "state")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _write_lock(self, project_id="proj", payload=None, raw=None):
+        lock = self.store._lock_path(project_id)
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        if raw is not None:
+            lock.write_text(raw)
+        else:
+            lock.write_text(json.dumps(payload))
+        return lock
+
+    @staticmethod
+    def _dead_pid() -> int:
+        """Spawn a process that exits immediately and return its (now-dead) pid."""
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "pass"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        proc.wait(timeout=10)
+        return proc.pid
+
+    def test_lock_payload_records_owner_pid_and_time(self):
+        """A freshly-acquired writer lock records the owning pid + timestamp."""
+        with self.store.acquire_writer("proj"):
+            payload = json.loads(self.store._lock_path("proj").read_text())
+        self.assertEqual(payload["pid"], os.getpid())
+        self.assertGreater(payload["time"], 0)
+
+    def test_dead_pid_lock_reaped_and_acquired(self):
+        """A lock whose owner pid is dead is reaped so the writer proceeds."""
+        self._write_lock(payload={"pid": self._dead_pid(), "time": time.time()})
+        with self.store.acquire_writer("proj", timeout=5.0) as state:
+            state.lifecycle = "READY"  # prove we hold the writer lock
+            self.store.save(state)
+        loaded = self.store.load("proj")
+        self.assertEqual(loaded.lifecycle, "READY")
+
+    def test_live_pid_lock_never_reaped(self):
+        """A lock whose owner pid is ALIVE must never be unlinked."""
+        sleeper = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            lock = self._write_lock(payload={"pid": sleeper.pid, "time": time.time()})
+            with self.assertRaises(TimeoutError):
+                with self.store.acquire_writer("proj", timeout=0.6):
+                    pass
+            self.assertTrue(lock.exists())  # not reaped
+        finally:
+            sleeper.kill()
+            sleeper.wait(timeout=10)
+
+    def test_own_pid_lock_not_reaped(self):
+        """A lock owned by THIS process pid is never reaped (no self-reap)."""
+        lock = self._write_lock(payload={"pid": os.getpid(), "time": time.time()})
+        with self.assertRaises(TimeoutError):
+            with self.store.acquire_writer("proj", timeout=0.6):
+                pass
+        self.assertTrue(lock.exists())
+
+    def test_garbage_lock_content_not_reaped(self):
+        """Unparseable lock content is never deleted (fail closed)."""
+        lock = self._write_lock(raw="{not json")
+        with self.assertRaises(TimeoutError):
+            with self.store.acquire_writer("proj", timeout=0.4):
+                pass
+        self.assertTrue(lock.exists())
+
+    def test_empty_stale_lock_reaped_by_mtime(self):
+        """An EMPTY lock file older than the stale timeout is reaped."""
+        lock = self._write_lock(raw="")
+        old = time.time() - 120
+        os.utime(lock, (old, old))
+        with self.store.acquire_writer("proj", timeout=2.0) as state:
+            state.lifecycle = "READY"
+            self.store.save(state)
+        self.assertEqual(self.store.load("proj").lifecycle, "READY")
+
+    def test_is_pid_alive_helper(self):
+        """_is_pid_alive is true for self, false for a verified-dead pid."""
+        self.assertTrue(self.store._is_pid_alive(os.getpid()))
+        self.assertFalse(self.store._is_pid_alive(self._dead_pid()))
+        self.assertFalse(self.store._is_pid_alive(-1))
 
 
 if __name__ == "__main__":

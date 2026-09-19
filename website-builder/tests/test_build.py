@@ -256,7 +256,6 @@ class TestFrontendBuilderWithHermes(unittest.TestCase):
 
 class TestFrontendBuilderTimeoutRecovery(unittest.TestCase):
     """Phase 7 timeout-recovery integration tests through FrontendBuilder."""
-
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
         self.workspace_root = Path(self.tmpdir) / "workspaces"
@@ -587,7 +586,11 @@ class TestPhase8Handoff(unittest.TestCase):
             self.store,
             hermes_adapter=self.mock_adapter,
             web3forms_access_key=None,
+            toolchain_verify=unittest.mock.ANY,
         )
+        # MEDIUM-5: the toolchain verifier closes over this build's hashes.
+        verify_fn = mock_qa_cls.call_args.kwargs["toolchain_verify"]
+        self.assertTrue(callable(verify_fn))
         mock_qa.run.assert_called_once()
 
     def test_phase7_failure_does_not_invoke_qa(self):
@@ -715,6 +718,173 @@ class TestPhase8Handoff(unittest.TestCase):
 
         self.assertTrue(result.success)
         mock_acquire.assert_called_once_with("proj-handoff-g")
+
+
+# ---------------------------------------------------------------------------
+# MEDIUM-3: build failure observability / stable error propagation
+# ---------------------------------------------------------------------------
+
+
+class TestBuildErrorPropagation(unittest.TestCase):
+    """Cheap-check failures return stable non-null application errors;
+    unexpected exceptions are logged operator-side while the returned error
+    stays sanitized."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.workspace_root = Path(self.tmpdir) / "workspaces"
+        self.state_root = Path(self.tmpdir) / "state"
+        self.store = ProjectStateStore(self.state_root)
+        self.runner = ProjectRunner(self.workspace_root, self.store)
+        self.starter_path = Path(self.tmpdir) / "starter"
+        (self.starter_path / "src").mkdir(parents=True)
+        (self.starter_path / "package.json").write_text(
+            json.dumps({"name": "starter", "scripts": {"build": "echo build"}})
+        )
+        (self.starter_path / "src" / "App.tsx").write_text(
+            "// starter placeholder\n", encoding="utf-8"
+        )
+        self.adapter = MagicMock()
+        self.builder = FrontendBuilder(
+            self.runner,
+            self.store,
+            hermes_adapter=self.adapter,
+            starter_path=self.starter_path,
+        )
+        self.brief = {"name": "Northcut", "what": "barbershop", "why": "booking WA"}
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_cheap_check_failure_returns_stable_error_code(self):
+        self.adapter.frontend_build.return_value = {
+            "success": True,
+            "design_dna": {"version": 1, "brand_personality": "premium"},
+        }
+        _queue_project(self.store, "proj-cheap")
+        with patch.object(self.builder, "_run_fixed_checks") as mock_checks:
+            mock_checks.return_value = {
+                "npm_ci": {"success": True},
+                "npm_build": {"success": False},
+                "npm_typecheck": {"success": True},
+            }
+            result = self.builder.build("proj-cheap", self.brief)
+
+        self.assertFalse(result.success)
+        self.assertIsNotNone(result.error)
+        self.assertTrue(result.error.startswith("CHEAP_CHECKS_FAILED:"))
+        self.assertIn("npm_build", result.error)
+        state = self.store.load("proj-cheap")
+        self.assertEqual(state.lifecycle, ProjectLifecycle.FAILED.value)
+        self.assertEqual(state.failure["phase"], "cheap_checks")
+
+    def test_unexpected_exception_returns_sanitized_error(self):
+        self.adapter.frontend_build.side_effect = RuntimeError("kaboom-internal-detail")
+        _queue_project(self.store, "proj-boom")
+        result = self.builder.build("proj-boom", self.brief)
+
+        self.assertFalse(result.success)
+        # User-facing error is a stable, sanitized code…
+        self.assertEqual(result.error, "UNEXPECTED_BUILD_ERROR")
+        # …while the full detail is preserved operator-side in state.
+        state = self.store.load("proj-boom")
+        self.assertEqual(state.lifecycle, ProjectLifecycle.FAILED.value)
+        self.assertIn("kaboom-internal-detail", state.failure["error"])
+
+
+# ---------------------------------------------------------------------------
+# MEDIUM-5: protected toolchain files verified after initial FRONTEND
+# ---------------------------------------------------------------------------
+
+
+class TestToolchainProtectionInitialBuild(unittest.TestCase):
+    """Mutation/removal of a protected starter/toolchain identity file during
+    initial FRONTEND generation deterministically fails with
+    TOOLCHAIN_MUTATION_REJECTED."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.workspace_root = Path(self.tmpdir) / "workspaces"
+        self.state_root = Path(self.tmpdir) / "state"
+        self.store = ProjectStateStore(self.state_root)
+        self.runner = ProjectRunner(self.workspace_root, self.store)
+        self.starter_path = Path(self.tmpdir) / "starter"
+        (self.starter_path / "src").mkdir(parents=True)
+        (self.starter_path / ".nvmrc").write_text("26.5.0\n", encoding="utf-8")
+        (self.starter_path / "package.json").write_text(
+            json.dumps({"name": "starter", "scripts": {"build": "echo build"}})
+        )
+        (self.starter_path / "src" / "App.tsx").write_text(
+            "// starter placeholder\n", encoding="utf-8"
+        )
+        self.adapter = MagicMock()
+        self.builder = FrontendBuilder(
+            self.runner,
+            self.store,
+            hermes_adapter=self.adapter,
+            starter_path=self.starter_path,
+        )
+        self.brief = {"name": "Northcut", "what": "barbershop", "why": "booking WA"}
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _dna(self):
+        return {"version": 1, "brand_personality": "premium"}
+
+    def test_toolchain_modification_fails_build(self):
+        def mutate(**kwargs):
+            (kwargs["workspace"] / "package.json").write_text(
+                json.dumps({"name": "evil"}), encoding="utf-8"
+            )
+            return {"success": True, "design_dna": self._dna()}
+
+        self.adapter.frontend_build.side_effect = mutate
+        _queue_project(self.store, "proj-mutate")
+        result = self.builder.build("proj-mutate", self.brief)
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error, "TOOLCHAIN_MUTATION_REJECTED")
+        state = self.store.load("proj-mutate")
+        self.assertEqual(state.lifecycle, ProjectLifecycle.FAILED.value)
+        self.assertIn("TOOLCHAIN_MUTATION_REJECTED", state.failure["error"])
+        self.assertIn("package.json", state.failure["error"])
+
+    def test_toolchain_removal_fails_build(self):
+        def remove(**kwargs):
+            (kwargs["workspace"] / ".nvmrc").unlink()
+            return {"success": True, "design_dna": self._dna()}
+
+        self.adapter.frontend_build.side_effect = remove
+        _queue_project(self.store, "proj-remove")
+        result = self.builder.build("proj-remove", self.brief)
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error, "TOOLCHAIN_MUTATION_REJECTED")
+        state = self.store.load("proj-remove")
+        self.assertEqual(state.lifecycle, ProjectLifecycle.FAILED.value)
+        self.assertIn("missing:.nvmrc", state.failure["error"])
+
+    def test_toolchain_mutation_rejected_even_when_frontend_fails(self):
+        """A failed FRONTEND that still mutated protected files fails with the
+        deterministic policy code, never a generic FRONTEND error."""
+
+        def mutate_and_fail(**kwargs):
+            (kwargs["workspace"] / "package.json").write_text("{}", encoding="utf-8")
+            return {"success": False, "error": "FRONTEND build failed"}
+
+        self.adapter.frontend_build.side_effect = mutate_and_fail
+        _queue_project(self.store, "proj-mutate-fail")
+        result = self.builder.build("proj-mutate-fail", self.brief)
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error, "TOOLCHAIN_MUTATION_REJECTED")
+        state = self.store.load("proj-mutate-fail")
+        self.assertIn("TOOLCHAIN_MUTATION_REJECTED", state.failure["error"])
 
 
 if __name__ == "__main__":

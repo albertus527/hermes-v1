@@ -7,12 +7,16 @@ On success, hands off to Phase 8 QA within the same worker ownership.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 from app.deploy.snapshot import source_fingerprint, record_checks
 from app.core.composition import compose_project_instructions, prebuild_error, validate_composed_dna
@@ -20,6 +24,45 @@ from app.core.lifecycle import ProjectLifecycle
 from app.core.state import ProjectStateStore
 from app.qa.orchestrator import QAOrchestrator
 from app.sandbox.runner import ProjectRunner, WorkspaceError
+
+# Protected toolchain identity files that must NEVER be mutated by FRONTEND or repairs
+PROTECTED_TOOLCHAIN_FILES = (
+    ".nvmrc",
+    ".npmrc",
+    "package.json",
+    "package-lock.json",
+    "tsconfig.json",
+    "tsconfig.app.json",
+    "tsconfig.node.json",
+    "vite.config.ts",
+)
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _capture_toolchain_hashes(workspace: Path) -> Dict[str, str]:
+    hashes = {}
+    for filename in PROTECTED_TOOLCHAIN_FILES:
+        target = workspace / filename
+        if target.is_file():
+            hashes[filename] = _file_sha256(target)
+    return hashes
+
+
+def _verify_toolchain_untouched(workspace: Path, expected_hashes: Dict[str, str]) -> Optional[str]:
+    """Verify that protected toolchain identity files have not been modified or deleted.
+
+    Returns the filename of the first modified/missing file, or None if all match.
+    """
+    for filename, expected in expected_hashes.items():
+        target = workspace / filename
+        if not target.is_file():
+            return f"missing:{filename}"
+        if _file_sha256(target) != expected:
+            return f"modified:{filename}"
+    return None
 
 
 # Canonical frontend starter location (relative to repo root)
@@ -166,6 +209,7 @@ class FrontendBuilder:
                 policy_state = state
                 workspace = self.runner.create_workspace(project_id)
                 self._copy_starter(workspace)
+                toolchain_hashes = _capture_toolchain_hashes(workspace)
                 self.store.transition_lifecycle_locked(state, ProjectLifecycle.RUNNING)
                 state.revisions.source_revision += 1
                 self.store.save(state)
@@ -179,6 +223,24 @@ class FrontendBuilder:
                     design_dna_instructions=combined_instructions,
                 )
 
+                # MEDIUM-5: verify the protected starter/toolchain identity
+                # files after EVERY initial FRONTEND generation — regardless
+                # of the FRONTEND result. Mutation or removal is a
+                # deterministic toolchain-policy rejection, never a fallback
+                # into generic FRONTEND error handling.
+                toolchain_violation = _verify_toolchain_untouched(workspace, toolchain_hashes)
+                if toolchain_violation:
+                    logger.warning(
+                        "Protected toolchain file mutated during initial FRONTEND "
+                        "generation for project %s: %s",
+                        project_id,
+                        toolchain_violation,
+                    )
+                    frontend_result = {
+                        "success": False,
+                        "error": f"TOOLCHAIN_MUTATION_REJECTED ({toolchain_violation})",
+                    }
+
                 if frontend_result.get("success"):
                     try:
                         validate_composed_dna(frontend_result.get("design_dna"), policy_state)
@@ -186,11 +248,13 @@ class FrontendBuilder:
                         frontend_result = {"success": False, "error": str(exc)}
 
                 if not frontend_result.get("success"):
+                    err_text = frontend_result.get("error", "Unknown FRONTEND error")
+                    err_code = "TOOLCHAIN_MUTATION_REJECTED" if "TOOLCHAIN_MUTATION_REJECTED" in err_text else err_text
                     with self.store.acquire_writer(project_id) as state:
                         self.store.transition_lifecycle_locked(state, ProjectLifecycle.FAILED)
                         state.failure = {
                             "phase": "frontend_build",
-                            "error": frontend_result.get("error", "Unknown FRONTEND error"),
+                            "error": err_text,
                             "failed_at": time.time(),
                         }
                         self.store.save(state)
@@ -199,7 +263,7 @@ class FrontendBuilder:
                         success=False,
                         project_id=project_id,
                         workspace=workspace,
-                        error=frontend_result.get("error"),
+                        error=err_code,
                         duration_seconds=time.time() - start_time,
                     )
 
@@ -248,12 +312,14 @@ class FrontendBuilder:
                 self.store.save(state)
 
             if not build_success:
+                failed_check = next((name for name, r in checks.items() if not r.get("success")), "unknown")
                 return BuildResult(
                     success=False,
                     project_id=project_id,
                     workspace=workspace,
                     design_dna=design_dna,
                     build_output=json.dumps(checks, indent=2),
+                    error=f"CHEAP_CHECKS_FAILED:{failed_check}",
                     duration_seconds=time.time() - start_time,
                 )
 
@@ -265,6 +331,9 @@ class FrontendBuilder:
                 self.store,
                 hermes_adapter=self.hermes_adapter,
                 web3forms_access_key=self.web3forms_access_key,
+                # MEDIUM-5: QA repair must verify the same protected toolchain
+                # files after every FRONTEND repair invocation.
+                toolchain_verify=lambda ws: _verify_toolchain_untouched(ws, toolchain_hashes),
             )
             qa_result = qa_orchestrator.run(
                 project_id=project_id,
@@ -274,7 +343,9 @@ class FrontendBuilder:
             )
 
             if qa_result.success and self.preview_orchestrator is not None:
-                preview = self.preview_orchestrator.run_owned(project_id, workspace)
+                preview = self.preview_orchestrator.run_owned(
+                    project_id, workspace, slot_held=True
+                )
                 if not preview.success:
                     return BuildResult(False, project_id, workspace=workspace,
                                        error=preview.error or preview.error_code,
@@ -293,6 +364,10 @@ class FrontendBuilder:
             )
 
         except Exception as exc:
+            # MEDIUM-3: unexpected exceptions are logged with full detail
+            # operator-side; the returned BuildResult stays a stable,
+            # sanitized application error code.
+            logger.exception("Unexpected error during Phase 7 build of %s", project_id)
             with self.store.acquire_writer(project_id) as state:
                 self.store.transition_lifecycle_locked(state, ProjectLifecycle.FAILED)
                 state.failure = {
@@ -305,7 +380,7 @@ class FrontendBuilder:
             return BuildResult(
                 success=False,
                 project_id=project_id,
-                error=str(exc),
+                error="UNEXPECTED_BUILD_ERROR",
                 duration_seconds=time.time() - start_time,
             )
 

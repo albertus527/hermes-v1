@@ -1300,6 +1300,194 @@ class TestVisionFailureBlocksQA(unittest.TestCase):
         self.assertFalse(findings.blocking)
 
 
+# ---------------------------------------------------------------------------
+# MEDIUM-1: QA infrastructure failure isolation
+# ---------------------------------------------------------------------------
+
+
+class TestInfrastructureFailureIsolation(_FixtureBase):
+    """Render/capture/VISION infrastructure failures must fail immediately
+    without FRONTEND repair, repair-budget consumption, or source mutation.
+    Genuine visual findings still use bounded repair normally."""
+
+    def test_render_failure_is_infrastructure_not_repairable(self):
+        _queue_and_run_project(self.store, "proj")
+        self.mock_renderer.start.side_effect = RenderError("pid did not become ready")
+
+        result = self.orchestrator.run("proj", self.workspace, self.brief, self.design_dna)
+
+        self.assertFalse(result.success)
+        self.assertTrue(result.error.startswith("INFRASTRUCTURE_ERROR:render_failed:"))
+        self.assertEqual(result.repair_attempts, 0)
+        self.mock_adapter.frontend_build.assert_not_called()
+        self.mock_adapter.vision_inspect.assert_not_called()
+        state = self.store.load("proj")
+        self.assertEqual(state.lifecycle, ProjectLifecycle.FAILED.value)
+        self.assertTrue(
+            state.failure["error"].startswith("INFRASTRUCTURE_ERROR:render_failed:")
+        )
+
+    def test_capture_failure_is_infrastructure_not_repairable(self):
+        _queue_and_run_project(self.store, "proj")
+        self._passing_render()
+        self.mock_adapter.vision_inspect.return_value = self._passing_vision()
+        self.mock_capture.capture.side_effect = RuntimeError("browser crashed")
+
+        result = self.orchestrator.run("proj", self.workspace, self.brief, self.design_dna)
+
+        self.assertFalse(result.success)
+        self.assertTrue(result.error.startswith("INFRASTRUCTURE_ERROR:capture_failed:"))
+        self.assertEqual(result.repair_attempts, 0)
+        self.mock_adapter.frontend_build.assert_not_called()
+        self.mock_adapter.vision_inspect.assert_not_called()
+        state = self.store.load("proj")
+        self.assertEqual(state.lifecycle, ProjectLifecycle.FAILED.value)
+
+    def test_vision_exception_is_infrastructure_not_repairable(self):
+        _queue_and_run_project(self.store, "proj")
+        self._passing_render()
+        self.mock_capture.capture.side_effect = (
+            lambda url, qa_dir, attempt: self._passing_screenshots(attempt)
+        )
+        self.mock_adapter.vision_inspect.side_effect = RuntimeError("provider exploded")
+
+        result = self.orchestrator.run("proj", self.workspace, self.brief, self.design_dna)
+
+        self.assertFalse(result.success)
+        self.assertTrue(result.error.startswith("INFRASTRUCTURE_ERROR:vision_failed:"))
+        self.assertEqual(result.repair_attempts, 0)
+        self.mock_adapter.frontend_build.assert_not_called()
+        state = self.store.load("proj")
+        self.assertEqual(state.lifecycle, ProjectLifecycle.FAILED.value)
+
+    def test_vision_error_field_is_infrastructure_not_repairable(self):
+        """VISION returning an error payload (quota/auth/timeout) short-
+        circuits as infrastructure, never consumed as a visual finding."""
+        _queue_and_run_project(self.store, "proj")
+        self._passing_render()
+        self.mock_capture.capture.side_effect = (
+            lambda url, qa_dir, attempt: self._passing_screenshots(attempt)
+        )
+        self.mock_adapter.vision_inspect.return_value = {
+            "pass": False,
+            "error": "provider 429: quota exhausted",
+        }
+
+        result = self.orchestrator.run("proj", self.workspace, self.brief, self.design_dna)
+
+        self.assertFalse(result.success)
+        self.assertTrue(result.error.startswith("INFRASTRUCTURE_ERROR:vision_failed:"))
+        self.assertIn("quota exhausted", result.error)
+        self.assertEqual(result.repair_attempts, 0)
+        self.mock_adapter.frontend_build.assert_not_called()
+        state = self.store.load("proj")
+        self.assertEqual(state.lifecycle, ProjectLifecycle.FAILED.value)
+
+    def test_genuine_visual_findings_still_use_bounded_repair(self):
+        """Control: real blocking visual findings (no infra error) still
+        consume the bounded FRONTEND repair budget exactly as before."""
+        _queue_and_run_project(self.store, "proj")
+        self._passing_render()
+        self.mock_capture.capture.side_effect = (
+            lambda url, qa_dir, attempt: self._passing_screenshots(attempt)
+        )
+        self.mock_adapter.vision_inspect.return_value = self._blocking_vision()
+        self.mock_adapter.frontend_build.return_value = {
+            "success": True,
+            "design_dna": self.design_dna,
+        }
+
+        with patch.object(self.orchestrator, "_run_rebuild_checks", return_value=(True, True)):
+            result = self.orchestrator.run("proj", self.workspace, self.brief, self.design_dna)
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.repair_attempts, MAX_REPAIR_ATTEMPTS)
+        self.assertEqual(
+            self.mock_adapter.frontend_build.call_count, MAX_REPAIR_ATTEMPTS
+        )
+        state = self.store.load("proj")
+        self.assertEqual(state.lifecycle, ProjectLifecycle.FAILED.value)
+
+
+# ---------------------------------------------------------------------------
+# MEDIUM-5: protected toolchain files verified after every QA repair
+# ---------------------------------------------------------------------------
+
+
+class TestToolchainProtectionRepair(_FixtureBase):
+    """After EVERY FRONTEND repair the protected toolchain files are
+    re-verified; mutation/removal deterministically fails with
+    TOOLCHAIN_MUTATION_REJECTED."""
+
+    def _orch_with_verify(self, verify):
+        return QAOrchestrator(
+            self.runner,
+            self.store,
+            hermes_adapter=self.mock_adapter,
+            renderer=self.mock_renderer,
+            screenshot_capture=self.mock_capture,
+            toolchain_verify=verify,
+        )
+
+    def test_toolchain_mutation_during_repair_fails_deterministically(self):
+        _queue_and_run_project(self.store, "proj")
+        verify = MagicMock(return_value="modified:package.json")
+        orchestrator = self._orch_with_verify(verify)
+
+        self._passing_render()
+        self.mock_capture.capture.side_effect = (
+            lambda url, qa_dir, attempt: self._passing_screenshots(attempt)
+        )
+        # Attempt 0 blocks visually -> repair runs and mutates the toolchain.
+        self.mock_adapter.vision_inspect.side_effect = [
+            self._blocking_vision(),
+            self._passing_vision(),
+        ]
+        self.mock_adapter.frontend_build.return_value = {
+            "success": True,
+            "design_dna": self.design_dna,
+        }
+
+        with patch.object(orchestrator, "_run_rebuild_checks", return_value=(True, True)):
+            result = orchestrator.run("proj", self.workspace, self.brief, self.design_dna)
+
+        self.assertFalse(result.success)
+        self.assertTrue(result.error.startswith("TOOLCHAIN_MUTATION_REJECTED"))
+        self.assertIn("modified:package.json", result.error)
+        self.assertEqual(result.repair_attempts, 1)
+        self.mock_adapter.frontend_build.assert_called_once()
+        verify.assert_called_once()
+        # No second repair, no budget burn beyond the violating repair.
+        state = self.store.load("proj")
+        self.assertEqual(state.lifecycle, ProjectLifecycle.FAILED.value)
+        self.assertIn("TOOLCHAIN_MUTATION_REJECTED", state.failure["error"])
+
+    def test_clean_repair_is_verified_and_continues(self):
+        _queue_and_run_project(self.store, "proj")
+        verify = MagicMock(return_value=None)
+        orchestrator = self._orch_with_verify(verify)
+
+        self._passing_render()
+        self.mock_capture.capture.side_effect = (
+            lambda url, qa_dir, attempt: self._passing_screenshots(attempt)
+        )
+        self.mock_adapter.vision_inspect.side_effect = [
+            self._blocking_vision(),
+            self._passing_vision(),
+        ]
+        self.mock_adapter.frontend_build.return_value = {
+            "success": True,
+            "design_dna": self.design_dna,
+        }
+
+        with patch.object(orchestrator, "_run_rebuild_checks", return_value=(True, True)):
+            result = orchestrator.run("proj", self.workspace, self.brief, self.design_dna)
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.repair_attempts, 1)
+        verify.assert_called_once()
+
+
 
 if __name__ == "__main__":
     unittest.main()

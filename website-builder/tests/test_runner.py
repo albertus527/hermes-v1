@@ -209,5 +209,105 @@ class TestProjectRunner(unittest.TestCase):
             self.assertFalse(self.runner.is_source_repo_clean(repo))
 
 
+# ---------------------------------------------------------------------------
+# MEDIUM-2: OS-level port occupancy
+# ---------------------------------------------------------------------------
+
+
+class TestOsLevelPortOccupancy(unittest.TestCase):
+    """PortAllocator must skip ports occupied at OS level while staying
+    within its bounded deterministic range."""
+
+    def test_occupied_port_skipped(self):
+        allocator = PortAllocator(base=6100, range_size=5, is_free_fn=lambda p: p != 6101)
+        self.assertEqual(allocator.allocate(), 6100)
+        self.assertEqual(allocator.allocate(), 6102)  # 6101 occupied at OS level
+
+    def test_all_occupied_exhausts_range(self):
+        allocator = PortAllocator(base=6200, range_size=3, is_free_fn=lambda p: False)
+        with self.assertRaises(RuntimeError):
+            allocator.allocate()
+
+    def test_os_level_probe_detects_real_listener(self):
+        from app.sandbox.runner import _port_is_free
+
+        import socket
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            port = listener.getsockname()[1]
+            self.assertFalse(_port_is_free(port))
+        # After the listener closes the probe reports free again.
+        self.assertTrue(_port_is_free(port))
+
+    def test_default_allocator_uses_os_probe(self):
+        """Constructed without an override, the allocator consults the OS probe."""
+        with patch("app.sandbox.runner._port_is_free", return_value=False):
+            allocator = PortAllocator(base=6300, range_size=3)
+            with self.assertRaises(RuntimeError):
+                allocator.allocate()
+
+
+# ---------------------------------------------------------------------------
+# MEDIUM-4: generated-project HERMES_HOME isolation
+# ---------------------------------------------------------------------------
+
+
+class TestProjectEnvIsolation(unittest.TestCase):
+    """Generated-project processes must get HERMES_HOME=<workspace>/.hermes
+    and must not inherit the platform Hermes profile or platform credentials.
+    Hermes FRONTEND execution keeps the platform profile."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.workspace_root = Path(self.tmpdir) / "workspaces"
+        self.state_root = Path(self.tmpdir) / "state"
+        self.platform_home = Path(self.tmpdir) / "platform-hermes"
+        self.store = ProjectStateStore(self.state_root)
+        self.runner = ProjectRunner(
+            self.workspace_root, self.store, hermes_home=self.platform_home
+        )
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_project_env_uses_workspace_hermes_home(self):
+        ws = self.runner.create_workspace("proj")
+        env = self.runner._build_project_env("proj", ws)
+        self.assertEqual(env["HERMES_HOME"], str(ws / ".hermes"))
+        self.assertNotEqual(env["HERMES_HOME"], str(self.runner.hermes_home))
+        self.assertEqual(env["PROJECT_ID"], "proj")
+        self.assertEqual(env["WORKSPACE_ROOT"], str(ws))
+
+    def test_platform_hermes_env_still_uses_platform_profile(self):
+        env = self.runner.build_hermes_env("proj")
+        self.assertEqual(env["HERMES_HOME"], str(self.platform_home))
+
+    def test_platform_credentials_stripped_from_project_env(self):
+        ws = self.runner.create_workspace("proj")
+        with patch.dict(
+            os.environ,
+            {
+                "TELEGRAM_BOT_TOKEN": "t",
+                "WHATSAPP_TOKEN": "w",
+                "VERCEL_TOKEN": "v",
+                "NINEROUTER_API_KEY": "n",
+                "OPENROUTER_API_KEY": "o",
+            },
+        ):
+            env = self.runner._build_project_env("proj", ws)
+        for key in (
+            "TELEGRAM_BOT_TOKEN",
+            "WHATSAPP_TOKEN",
+            "VERCEL_TOKEN",
+            "NINEROUTER_API_KEY",
+            "OPENROUTER_API_KEY",
+        ):
+            self.assertNotIn(key, env)
+
+
 if __name__ == "__main__":
     unittest.main()

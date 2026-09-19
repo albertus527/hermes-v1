@@ -12,7 +12,10 @@ picks the matching normalizer purely from the context type.
 """
 import hashlib
 import json
+import logging
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 from app.channels.telegram import NormalizedMessage, TelegramNormalizer
 from app.channels.whatsapp import WhatsAppNormalizer
@@ -80,13 +83,14 @@ def dispatch_normalized(dispatcher, message, project_id, action, *, authenticate
 
 class TelegramDispatcher:
     def __init__(self, store, intake, revise=None, promote=None, workspace_for=None,
-                 reference_intake=None, directions=None, domain=None, builder=None):
+                 reference_intake=None, directions=None, domain=None, builder=None, preview=None):
         self.store, self.intake = store, intake
         self.revise, self.promote = revise, promote
         self.workspace_for = workspace_for
         self.access = ProjectAccess(store)
         self.reference_intake, self.directions = reference_intake, directions
         self.domain, self.builder = domain, builder
+        self.preview = preview or getattr(builder, "preview_orchestrator", None)
 
     def dispatch(self, payload, project_id, action, *, authenticated=None, seq=None,
                  reference_token=None, data=None, role=None, url=None, brief=None,
@@ -123,11 +127,12 @@ class TelegramDispatcher:
                 "domain_prepare": self.domain, "domain_verify": self.domain,
                 "build": self.builder, "revise": self.revise,
                 "approve": self.promote, "publish": self.promote,
+                "reconcile_preview": self.preview,
             }
             if collaborators.get(action) is None:
                 return OperationResult.fail("UNSUPPORTED_ACTION", error_code="UNSUPPORTED_ACTION")
             domain_action = action in {"domain_connect", "domain_prepare", "domain_verify"}
-            if (domain_action or action in {"directions_propose", "publish"}) and self.workspace_for is None:
+            if (domain_action or action in {"directions_propose", "publish", "reconcile_preview"}) and self.workspace_for is None:
                 return OperationResult.fail("UNSUPPORTED_ACTION", error_code="UNSUPPORTED_ACTION")
             key = hashlib.sha256(json.dumps(
                 [principal, authenticated.conversation_id, message.event_id],
@@ -151,6 +156,11 @@ class TelegramDispatcher:
                         prefix = "DIRECTIONS" if action.startswith("directions_") else "REFERENCE"
                         code = prefix + "_NOT_ALLOWED_IN_LIFECYCLE"
                         return OperationResult.fail(code, error_code=code)
+                if action == "reconcile_preview":
+                    if (state.lifecycle != "PREVIEW_READY"
+                            or not state.deployment.get("tested_snapshot")
+                            or state.pause_state.get("paused")):
+                        return OperationResult.fail("PREVIEW_RECONCILIATION_NOT_ALLOWED", error_code="PREVIEW_RECONCILIATION_NOT_ALLOWED")
                 if action == "build":
                     if direction_choice_pending(state):
                         return OperationResult.fail("DIRECTION_CHOICE_PENDING", error_code="DIRECTION_CHOICE_PENDING")
@@ -246,9 +256,12 @@ class TelegramDispatcher:
                         result = approval
                     else:
                         result = self.promote.promote(project_id, self.workspace_for(project_id), principal_id=principal)
+                elif action == "reconcile_preview":
+                    result = self.preview.run_owned(project_id, self.workspace_for(project_id))
                 else:
                     result = self.promote.promote(project_id, self.workspace_for(project_id), principal_id=principal)
-            except Exception:
+            except Exception as exc:
+                logger.exception("Unexpected error during dispatch of action '%s' on project '%s': %s", action, project_id, exc)
                 return OperationResult.fail("EVENT_RECONCILIATION_REQUIRED", error_code="EVENT_RECONCILIATION_REQUIRED")
             with self.store.acquire_writer(project_id) as state:
                 state.dispatch_events[key]["status"] = "DONE" if result.success else "FAILED"

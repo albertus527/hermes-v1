@@ -14,7 +14,7 @@ from unittest.mock import MagicMock
 
 from app.channels.telegram import NormalizedMessage, TelegramNormalizer
 from app.core.buffer import MessageBuffer
-from app.core.intake import IntakeProcessor, Readiness, Scope
+from app.core.intake import IntakeProcessor, IntakeResult, Readiness, Scope
 from app.core.lifecycle import ProjectLifecycle
 from app.core.state import ProjectStateStore
 
@@ -351,6 +351,151 @@ class TestIntakeProcessorFallback(unittest.TestCase):
         self.assertFalse(self.store.is_event_processed("proj-dedup", "e13"))
         self.store.mark_event_processed("proj-dedup", "e13")
         self.assertTrue(self.store.is_event_processed("proj-dedup", "e13"))
+
+
+# ---------------------------------------------------------------------------
+# HIGH-3: Failed initial-build recovery
+# ---------------------------------------------------------------------------
+
+
+class TestInitialBuildFailureRecovery(unittest.TestCase):
+    """A FAILED initial build must reset source_revision to 0 and clear the
+    failure on the next complete intake so auto-build can trigger cleanly —
+    but ONLY for genuine never-successful initial builds. Projects that have
+    ever been QA'd, previewed, approved, or LIVE must never be reset."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.state_root = Path(self.tmpdir) / "state"
+        self.store = ProjectStateStore(self.state_root)
+        self.processor = IntakeProcessor(self.store, hermes_adapter=None)
+        from app.core.authz import ProjectAccess
+
+        self.access = ProjectAccess(self.store)
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _ready_result(self) -> IntakeResult:
+        return IntakeResult(
+            readiness=Readiness.DISCOVERY_READY,
+            scope=Scope.WEBSITE,
+            brief={"name": "Northcut", "what": "barbershop", "why": "booking WA"},
+        )
+
+    def _seed_failed(
+        self,
+        project_id: str,
+        source_revision: int = 1,
+        qa_revision: int = 0,
+        approved_revision: int = 0,
+        shown_preview=None,
+        live_url=None,
+    ) -> None:
+        """Put a project into FAILED lifecycle as a never-successful initial
+        build (or with whichever success markers the caller passes)."""
+        self.access.create(project_id, "owner")
+        with self.store.acquire_writer(project_id) as state:
+            state.lifecycle = ProjectLifecycle.FAILED.value
+            state.brief = {"name": "Northcut", "what": "barbershop", "why": "booking WA"}
+            state.revisions.source_revision = source_revision
+            state.revisions.qa_revision = qa_revision
+            state.revisions.approved_revision = approved_revision
+            state.revisions.requirements_version = 1
+            state.failure = {
+                "phase": "frontend_build",
+                "error": "boom",
+                "failed_at": time.time(),
+            }
+            if shown_preview is not None:
+                state.deployment["latest_shown_preview"] = shown_preview
+            if live_url is not None:
+                state.deployment["live_url"] = live_url
+            self.store.save(state)
+
+    def test_failed_initial_build_recovery_resets_source_revision(self):
+        """FAILED + qa_revision==0 + no preview + no live: recovery reset."""
+        self._seed_failed("proj-rec", source_revision=1)
+
+        self.processor.apply_to_project(
+            "proj-rec", self._ready_result(), principal_id="owner"
+        )
+
+        state = self.store.load("proj-rec")
+        self.assertEqual(state.lifecycle, ProjectLifecycle.READY.value)
+        # Reset so the canonical (READY and source_revision == 0) auto-build
+        # contract fires again on the next turn.
+        self.assertEqual(state.revisions.source_revision, 0)
+        self.assertIsNone(state.failure)
+        # Identity/brief/requirements preserved.
+        self.assertEqual(state.project_id, "proj-rec")
+        self.assertEqual(state.roles["owner"], "owner")
+        self.assertEqual(state.brief["name"], "Northcut")
+        self.assertEqual(state.brief["what"], "barbershop")
+        self.assertEqual(state.revisions.requirements_version, 2)  # seeded 1 + accepted intake
+
+    def test_failed_project_that_was_live_never_resets(self):
+        """A project that has EVER been live keeps its revision and failure."""
+        self._seed_failed(
+            "proj-live",
+            source_revision=3,
+            qa_revision=3,
+            approved_revision=3,
+            live_url="https://proj.vercel.app",
+        )
+
+        self.processor.apply_to_project(
+            "proj-live", self._ready_result(), principal_id="owner"
+        )
+
+        state = self.store.load("proj-live")
+        self.assertEqual(state.lifecycle, ProjectLifecycle.READY.value)
+        self.assertEqual(state.revisions.source_revision, 3)
+        self.assertIsNotNone(state.failure)
+        self.assertEqual(state.deployment["live_url"], "https://proj.vercel.app")
+
+    def test_failed_project_with_shown_preview_never_resets(self):
+        """A project that ever showed a preview keeps its revision."""
+        self._seed_failed(
+            "proj-preview",
+            source_revision=2,
+            qa_revision=2,
+            shown_preview={"operation_id": "op-1", "preview_url": "https://p.vercel.app"},
+        )
+
+        self.processor.apply_to_project(
+            "proj-preview", self._ready_result(), principal_id="owner"
+        )
+
+        state = self.store.load("proj-preview")
+        self.assertEqual(state.revisions.source_revision, 2)
+        self.assertIsNotNone(state.failure)
+
+    def test_failed_project_with_qa_success_never_resets(self):
+        """qa_revision > 0 means QA succeeded once — never reset."""
+        self._seed_failed("proj-qa", source_revision=2, qa_revision=2)
+
+        self.processor.apply_to_project(
+            "proj-qa", self._ready_result(), principal_id="owner"
+        )
+
+        state = self.store.load("proj-qa")
+        self.assertEqual(state.revisions.source_revision, 2)
+        self.assertIsNotNone(state.failure)
+
+    def test_failed_project_with_approval_never_resets(self):
+        """approved_revision > 0 means the project was once approved."""
+        self._seed_failed("proj-approved", source_revision=4, qa_revision=4, approved_revision=4)
+
+        self.processor.apply_to_project(
+            "proj-approved", self._ready_result(), principal_id="owner"
+        )
+
+        state = self.store.load("proj-approved")
+        self.assertEqual(state.revisions.source_revision, 4)
+        self.assertIsNotNone(state.failure)
 
 
 if __name__ == "__main__":

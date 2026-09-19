@@ -139,19 +139,33 @@ class ProcessTracker:
             return {p.port for p in self._processes.values() if p.port is not None}
 
 
+def _port_is_free(port: int, host: str = "127.0.0.1") -> bool:
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.25)
+        try:
+            s.connect((host, port))
+            return False  # something is listening
+        except OSError:
+            return True
+
+
 class PortAllocator:
     """Small deterministic port allocator. Not a service."""
 
-    def __init__(self, base: int = _PORT_BASE, range_size: int = _PORT_RANGE):
+    def __init__(self, base: int = _PORT_BASE, range_size: int = _PORT_RANGE, is_free_fn=None):
         self.base = base
         self.range_size = range_size
         self._allocated: Set[int] = set()
+        self.is_free_fn = is_free_fn or _port_is_free
 
     def allocate(self) -> int:
         """Allocate the next available port in the deterministic range."""
         for offset in range(self.range_size):
             port = self.base + offset
             if port not in self._allocated:
+                if self.is_free_fn is not None and not self.is_free_fn(port):
+                    continue
                 self._allocated.add(port)
                 return port
         raise RuntimeError("No available ports in deterministic range")
@@ -307,7 +321,7 @@ class ProjectRunner:
                 del env[key]
 
         # Set project-specific vars
-        env["HERMES_HOME"] = str(self.hermes_home)
+        env["HERMES_HOME"] = str(workspace / ".hermes")
         env["PROJECT_ID"] = project_id
         env["WORKSPACE_ROOT"] = str(workspace)
 

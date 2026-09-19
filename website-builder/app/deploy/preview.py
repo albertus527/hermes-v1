@@ -22,7 +22,6 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -97,31 +96,50 @@ class PreviewDeps:
 class PreviewOrchestrator:
     """Application-owned Phase 9 orchestration. Caller supplies all adapters."""
 
-    def __init__(self, store: ProjectStateStore, deps: PreviewDeps, smoke_dir_root: Optional[Path] = None):
+    def __init__(self, store: ProjectStateStore, deps: PreviewDeps,
+                 smoke_dir_root: Optional[Path] = None, runner=None):
         self.store = store
         self.deps = deps
         self.smoke_dir_root = smoke_dir_root
+        # Optional single-worker-slot guard (ProjectRunner, MAX_WORKERS=1).
+        # When set, run_owned acquires the slot for any caller that does not
+        # already own it, so a dispatch-side reconcile can never overlap a
+        # build/revise-triggered preview on the same process.
+        self.runner = runner
 
     # ------------------------------------------------------------------
     # Entry point — runs inside the same worker ownership as Phase 7/8.
     # ------------------------------------------------------------------
 
-    def run_owned(self, project_id: str, workspace: Path) -> OperationResult:
-        """Serialize preview orchestrators without nesting project writer locks."""
-        lock = self.store._locks_dir / 'preview-worker'
-        try:
-            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
-            return OperationResult.fail('PREVIEW_BUSY', error_code='PREVIEW_BUSY')
-        os.close(fd)
+    def run_owned(self, project_id: str, workspace: Path, *,
+                  slot_held: bool = False) -> OperationResult:
+        """Serialize preview orchestrators without nesting project writer locks.
+
+        ProjectRunner MAX_WORKERS=1 provides exclusive worker-slot ownership
+        across build, revise, promote, and preview executions. Callers that
+        already hold the slot (Phase 7 build, revision) pass
+        ``slot_held=True``; every other caller (e.g. dispatch-side preview
+        reconciliation) acquires the slot here, so two preview executions
+        can never run in parallel after the preview-worker lock removal.
+        """
+        acquired = False
+        if self.runner is not None and not slot_held:
+            if not self.runner.acquire_project(project_id):
+                return OperationResult.fail('PREVIEW_BUSY', error_code='PREVIEW_BUSY')
+            acquired = True
         try:
             return self._run(project_id, workspace)
         except Exception:
             # Persisted intents survive crashes/exceptions; retry only reconciles.
+            # Log operator-side: the failure text itself is a stable code.
+            logging.getLogger(__name__).exception(
+                "Preview execution for %s raised unexpectedly", project_id
+            )
             return OperationResult.fail('PREVIEW_RECONCILIATION_REQUIRED',
                                         error_code='PREVIEW_RECONCILIATION_REQUIRED')
         finally:
-            lock.unlink(missing_ok=True)
+            if acquired:
+                self.runner.release_project(project_id)
 
     def _run(self, project_id, workspace):
         state = self.store.load(project_id)

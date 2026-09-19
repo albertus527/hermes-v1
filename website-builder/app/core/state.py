@@ -7,7 +7,9 @@ No database, no Redis, no distributed lock service.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import sys
 import tempfile
 import re
 import time
@@ -183,14 +185,86 @@ class ProjectStateStore:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
 
+    @staticmethod
+    def _is_pid_alive(pid: int) -> bool:
+        """Check if process with given PID is currently alive."""
+        if pid <= 0:
+            return False
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                kernel32 = ctypes.windll.kernel32
+                SYNCHRONIZE = 0x00100000
+                PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+                handle = kernel32.OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+                if not handle:
+                    return False
+                exit_code = ctypes.c_ulong()
+                STILL_ACTIVE = 259
+                if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    kernel32.CloseHandle(handle)
+                    return exit_code.value == STILL_ACTIVE
+                kernel32.CloseHandle(handle)
+                return False
+            except Exception:
+                return False
+        else:
+            try:
+                os.kill(pid, 0)
+                return True
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True
+            except OSError:
+                return False
+
+    def _try_reap_stale_lock(self, lock_path: Path, stale_timeout: float = 60.0) -> bool:
+        """Inspect existing lock file. If owner PID is dead, unlink stale lock.
+
+        Returns True if a stale lock was unlinked so the caller can retry immediately.
+        """
+        try:
+            data = lock_path.read_text(encoding="utf-8").strip()
+            if not data:
+                mtime = lock_path.stat().st_mtime
+                if (time.time() - mtime) > stale_timeout:
+                    lock_path.unlink(missing_ok=True)
+                    return True
+                return False
+            payload = json.loads(data)
+            pid = payload.get("pid")
+            lock_time = payload.get("time", 0.0)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return False
+
+        if not isinstance(pid, int) or pid <= 0:
+            return False
+
+        if pid == os.getpid():
+            return False
+
+        if not self._is_pid_alive(pid):
+            logging.getLogger(__name__).warning(
+                "Reaping stale writer lock at %s (owner PID %d is dead)", lock_path, pid
+            )
+            try:
+                lock_path.unlink(missing_ok=True)
+                return True
+            except OSError:
+                return False
+
+        return False
+
     @contextmanager
     def acquire_writer(
         self, project_id: str, timeout: float = 30.0
     ) -> Generator[ProjectState, None, None]:
         """Acquire exclusive writer lock for a project.
 
-        Uses a lock file with O_CREAT|O_EXCL for atomic acquisition.
-        Yields the current state; caller must call save() to persist.
+        Uses a lock file with O_CREAT|O_EXCL for atomic acquisition, recording
+        PID and timestamp for crash recovery. Yields the current state; caller
+        must call save() to persist.
         """
         lock_path = self._lock_path(project_id)
         deadline = time.monotonic() + timeout
@@ -198,10 +272,16 @@ class ProjectStateStore:
         while True:
             try:
                 fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                os.close(fd)
+                try:
+                    payload = json.dumps({"pid": os.getpid(), "time": time.time()}).encode("utf-8")
+                    os.write(fd, payload)
+                finally:
+                    os.close(fd)
                 acquired = True
                 break
             except FileExistsError:
+                if self._try_reap_stale_lock(lock_path):
+                    continue
                 if time.monotonic() >= deadline:
                     break
                 time.sleep(min(0.05, max(0, deadline - time.monotonic())))

@@ -8,9 +8,12 @@ application code. Maximum 2 repair attempts, never a third.
 from __future__ import annotations
 
 import json
+import logging
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+logger = logging.getLogger(__name__)
 
 from app.deploy.snapshot import TestedSnapshot, source_fingerprint, record_checks
 from app.core.lifecycle import ProjectLifecycle
@@ -43,6 +46,7 @@ class QAOrchestrator:
         renderer: Optional[LocalRenderer] = None,
         screenshot_capture: Optional[ScreenshotCapture] = None,
         web3forms_access_key: Optional[str] = None,
+        toolchain_verify=None,
     ):
         self.runner = runner
         self.store = store
@@ -50,6 +54,10 @@ class QAOrchestrator:
         self.web3forms_access_key = web3forms_access_key
         self.renderer = renderer or LocalRenderer(runner)
         self.screenshot_capture = screenshot_capture or ScreenshotCapture()
+        # MEDIUM-5: optional callable(workspace) -> Optional[str] verifying
+        # protected starter/toolchain files after every FRONTEND repair.
+        self._toolchain_verify = toolchain_verify
+        self._toolchain_error: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -71,6 +79,7 @@ class QAOrchestrator:
         qa_dir = workspace / "qa"
         attempts: list = []
         repair_count = 0
+        self._toolchain_error = None
 
         # Monotonic attempt counter: every entry appended to ``attempts``
         # (whether a real QA pass or a synthetic failing entry recording a
@@ -92,6 +101,21 @@ class QAOrchestrator:
                 rebuild_failure = None
                 next_attempt_num += 1
                 attempts.append(qa_attempt)
+
+                if qa_attempt.infrastructure_error:
+                    # Infrastructure error (render start, browser capture, or VISION provider failure).
+                    # This is NOT a defect produced by FRONTEND — do NOT consume repair attempts
+                    # or mutate source code.
+                    self._finalize_failure(
+                        project_id, attempts, repair_count, error=qa_attempt.infrastructure_error
+                    )
+                    return QAResult(
+                        project_id=project_id,
+                        success=False,
+                        attempts=attempts,
+                        repair_attempts=repair_count,
+                        error=qa_attempt.infrastructure_error,
+                    )
 
                 if qa_attempt.final_pass:
                     state = self.store.load(project_id)
@@ -126,6 +150,22 @@ class QAOrchestrator:
                 if not repaired:
                     # Repair itself failed to execute; stop the loop and
                     # fail with what we have rather than silently retrying.
+                    if self._toolchain_error is not None:
+                        # MEDIUM-5: a protected toolchain mutation during a
+                        # repair is a deterministic policy rejection that must
+                        # surface as TOOLCHAIN_MUTATION_REJECTED — never as a
+                        # generic "budget exhausted" error.
+                        self._finalize_failure(
+                            project_id, attempts, repair_count,
+                            error=self._toolchain_error,
+                        )
+                        return QAResult(
+                            project_id=project_id,
+                            success=False,
+                            attempts=attempts,
+                            repair_attempts=repair_count,
+                            error=self._toolchain_error,
+                        )
                     break
 
                 design_dna = self.store.load(project_id).design_dna
@@ -170,13 +210,16 @@ class QAOrchestrator:
             )
 
         except Exception as exc:
-            self._finalize_failure(project_id, attempts, repair_count, error=str(exc))
+            # MEDIUM-3: log full detail operator-side; the QAResult and the
+            # persisted failure carry a stable, sanitized application code.
+            logger.exception("Unexpected error during Phase 8 QA for %s", project_id)
+            self._finalize_failure(project_id, attempts, repair_count, error="UNEXPECTED_QA_ERROR")
             return QAResult(
                 project_id=project_id,
                 success=False,
                 attempts=attempts,
                 repair_attempts=repair_count,
-                error=str(exc),
+                error="UNEXPECTED_QA_ERROR",
             )
 
     # ------------------------------------------------------------------
@@ -194,18 +237,22 @@ class QAOrchestrator:
     ) -> QAAttempt:
         render_ok = True
         handle = None
+        infra_error: Optional[str] = None
         screenshots = ScreenshotSet(desktop=None, mobile=None)
 
         try:
             handle = self.renderer.start(project_id, workspace)
-        except RenderError:
+        except RenderError as exc:
             render_ok = False
+            infra_error = f"INFRASTRUCTURE_ERROR:render_failed:{exc}"
 
         try:
             if render_ok and handle is not None:
                 screenshots = self.screenshot_capture.capture(
                     handle.url, qa_dir, attempt_num
                 )
+        except Exception as exc:
+            infra_error = f"INFRASTRUCTURE_ERROR:capture_failed:{exc}"
         finally:
             if handle is not None:
                 self.renderer.stop(handle)
@@ -216,21 +263,34 @@ class QAOrchestrator:
         # when the viewport command silently failed) is a capture
         # infrastructure error, not a visual QA finding — it must never
         # reach VISION or consume a FRONTEND repair attempt.
-        validate_screenshot_dimensions(screenshots)
+        if not infra_error and render_ok:
+            try:
+                validate_screenshot_dimensions(screenshots)
+            except Exception as exc:
+                infra_error = f"INFRASTRUCTURE_ERROR:capture_failed:{exc}"
 
         vision_findings: Optional[VisionFindings] = None
-        if screenshots.complete and self.hermes_adapter is not None:
-            vision_raw = self.hermes_adapter.vision_inspect(
-                screenshots.desktop, screenshots.mobile, brief, design_dna
-            )
-            vision_findings = VisionFindings(
-                pass_=bool(vision_raw.get("pass", False)),
-                critical=list(vision_raw.get("critical") or []),
-                major=list(vision_raw.get("major") or []),
-                minor=list(vision_raw.get("minor") or []),
-                summary=vision_raw.get("summary", ""),
-                raw_error=vision_raw.get("error"),
-            )
+        if not infra_error and screenshots.complete and self.hermes_adapter is not None:
+            try:
+                vision_raw = self.hermes_adapter.vision_inspect(
+                    screenshots.desktop, screenshots.mobile, brief, design_dna
+                )
+            except Exception as exc:
+                infra_error = f"INFRASTRUCTURE_ERROR:vision_failed:{exc}"
+                vision_raw = {"error": str(exc)}
+
+            if not infra_error:
+                raw_err = vision_raw.get("error")
+                if raw_err:
+                    infra_error = f"INFRASTRUCTURE_ERROR:vision_failed:{raw_err}"
+                vision_findings = VisionFindings(
+                    pass_=bool(vision_raw.get("pass", False)),
+                    critical=list(vision_raw.get("critical") or []),
+                    major=list(vision_raw.get("major") or []),
+                    minor=list(vision_raw.get("minor") or []),
+                    summary=vision_raw.get("summary", ""),
+                    raw_error=raw_err,
+                )
 
         # Build/typecheck are already known-good from Phase 7 on attempt 0;
         # subsequent attempts re-verify via _run_rebuild_checks before this
@@ -251,6 +311,7 @@ class QAOrchestrator:
             vision=vision_findings,
             desktop_screenshot=str(screenshots.desktop) if screenshots.desktop else None,
             mobile_screenshot=str(screenshots.mobile) if screenshots.mobile else None,
+            infrastructure_error=infra_error,
         )
 
     # ------------------------------------------------------------------
@@ -290,6 +351,20 @@ class QAOrchestrator:
             workspace=workspace,
             design_dna_instructions=instructions,
         )
+
+        # MEDIUM-5: verify protected starter/toolchain files after EVERY
+        # FRONTEND repair invocation — regardless of the repair's own result.
+        if self._toolchain_verify is not None:
+            violation = self._toolchain_verify(workspace)
+            if violation:
+                logger.warning(
+                    "Protected toolchain file mutated during QA repair of %s: %s",
+                    project_id,
+                    violation,
+                )
+                self._toolchain_error = f"TOOLCHAIN_MUTATION_REJECTED ({violation})"
+                return False
+
         if not result.get("success"):
             return False
         dna = result.get("design_dna")
@@ -377,7 +452,7 @@ Instructions:
                 "repair_attempts": repair_attempts,
                 "deterministic_findings": [a.deterministic.to_dict() for a in attempts],
                 "vision_findings": [
-                    a.vision.to_dict() if a.vision else None for a in attempts
+                    a.vision.to_dict() for a in attempts if a.vision is not None
                 ],
                 "error": error,
                 "failed_at": time.time(),

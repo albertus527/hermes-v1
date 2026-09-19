@@ -284,7 +284,9 @@ class RevisionOrchestrator:
                 )
 
             if self.preview_orchestrator is not None:
-                preview = self.preview_orchestrator.run_owned(project_id, workspace)
+                preview = self.preview_orchestrator.run_owned(
+                    project_id, workspace, slot_held=True
+                )
                 if not preview.success:
                     return self._fail(
                         project_id, seq, preview.error or preview.error_code,

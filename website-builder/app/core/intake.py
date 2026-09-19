@@ -408,6 +408,22 @@ class IntakeProcessor:
                 # weakened — the intake layer simply recognizes that READY is
                 # already correct.
                 if state.lifecycle != ProjectLifecycle.READY.value:
+                    if (
+                        state.lifecycle == ProjectLifecycle.FAILED.value
+                        and state.revisions.qa_revision == 0
+                        and not state.deployment.get("latest_shown_preview")
+                        and state.revisions.approved_revision == 0
+                        and not state.deployment.get("live_url")
+                    ):
+                        # Initial build failure recovery:
+                        # Reset source_revision to 0 and clear failure so auto-build
+                        # can trigger cleanly under the canonical
+                        # (lifecycle == READY and source_revision == 0) contract.
+                        # Preserves brief, project_id, conversation_id, requirements_version.
+                        # Never resets if the project has ever shown a preview, reached QA success,
+                        # or been live in production.
+                        state.revisions.source_revision = 0
+                        state.failure = None
                     self.store.transition_lifecycle_locked(state, ProjectLifecycle.READY)
             elif result.readiness == Readiness.NEEDS_CLARIFICATION:
                 if state.lifecycle == ProjectLifecycle.DISCOVERING.value:

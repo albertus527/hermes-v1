@@ -86,16 +86,19 @@ class QAAttempt:
     vision: Optional[VisionFindings]
     desktop_screenshot: Optional[str] = None
     mobile_screenshot: Optional[str] = None
+    infrastructure_error: Optional[str] = None
 
     @property
     def repair_required(self) -> bool:
+        if self.infrastructure_error:
+            return False
         det_blocking = self.deterministic.blocking
         vis_blocking = bool(self.vision and self.vision.blocking)
         return det_blocking or vis_blocking
 
     @property
     def final_pass(self) -> bool:
-        return not self.repair_required
+        return not self.infrastructure_error and not self.repair_required
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -104,6 +107,7 @@ class QAAttempt:
             "vision": self.vision.to_dict() if self.vision else None,
             "desktop_screenshot": self.desktop_screenshot,
             "mobile_screenshot": self.mobile_screenshot,
+            "infrastructure_error": self.infrastructure_error,
             "repair_required": self.repair_required,
             "final_pass": self.final_pass,
         }

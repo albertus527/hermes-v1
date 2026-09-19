@@ -32,7 +32,12 @@ from app.core.intake import IntakeProcessor
 from app.core.state import ProjectStateStore
 from app.core.registry import ConversationRegistryStore, DuplicateProjectName, slugify_display_name
 from app.conversations import ConversationRoute, ConversationRouter
-from app.deploy.adapters import TelegramAdapter, UrllibHttpTransport, VercelAdapter
+from app.deploy.adapters import (
+    PreviewSmokeTester,
+    TelegramAdapter,
+    UrllibHttpTransport,
+    VercelAdapter,
+)
 from app.deploy.git_output import OutputGitRepository
 from app.deploy.preview import PreviewDeps, PreviewOrchestrator
 from app.hermes.adapter import HermesAdapter
@@ -202,6 +207,161 @@ ROLE_CONFIG_SCHEMA_HINT = (
 )
 
 
+def preflight_node_toolchain(starter_dir: Optional[Path] = None) -> None:
+    """Validate that local node and npm satisfy the fixed starter toolchain contract.
+
+    Fail-closed contract:
+    - success returns normally (logs resolved versions and executable paths)
+    - any failure raises RuntimeError with an actionable, sanitized reason
+    - all subprocess invocations keep bounded timeouts (10s)
+    - no secrets are ever logged
+    """
+    import shutil
+    import subprocess
+
+    if starter_dir is None:
+        starter_dir = Path(__file__).resolve().parent.parent.parent / "templates" / "frontend-starter"
+
+    nvmrc_path = starter_dir / ".nvmrc"
+    expected_nvmrc = "26.5.0"
+    if nvmrc_path.is_file():
+        expected_nvmrc = nvmrc_path.read_text(encoding="utf-8").strip()
+
+    node_bin = shutil.which("node")
+    if not node_bin:
+        logger.error("Node toolchain preflight failed: 'node' executable not found in PATH")
+        raise RuntimeError(
+            "Node.js executable ('node') not found in PATH. "
+            f"Install Node {expected_nvmrc} (see starter .nvmrc) and ensure it is on PATH."
+        )
+
+    try:
+        res = subprocess.run(
+            [node_bin, "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+        node_version_str = res.stdout.strip()
+    except Exception as exc:
+        logger.error("Node toolchain preflight failed: unable to execute '%s --version': %s", node_bin, exc)
+        raise RuntimeError(
+            f"Unable to execute '{node_bin} --version'. Ensure Node {expected_nvmrc} is installed."
+        ) from exc
+
+    clean_ver = node_version_str.lstrip("v")
+    try:
+        parts = [int(p) for p in clean_ver.split(".")[:3]]
+        major = parts[0]
+    except (ValueError, IndexError) as exc:
+        logger.error("Node toolchain preflight failed: unparseable node version '%s'", node_version_str)
+        raise RuntimeError(
+            f"Unparseable Node version '{node_version_str}' reported by 'node --version'."
+        ) from exc
+
+    if major != 26:
+        logger.error(
+            "Node toolchain drift: starter requires node >=26 <27 (.nvmrc %s), "
+            "but resolved node is %s at %s.",
+            expected_nvmrc,
+            node_version_str,
+            node_bin,
+        )
+        raise RuntimeError(
+            f"Node version {node_version_str} does not satisfy starter requirement "
+            f"(>=26 <27, .nvmrc {expected_nvmrc}). Activate Node {expected_nvmrc} before "
+            "starting — npm ci/build would otherwise fail with EBADENGINE."
+        )
+
+    npm_bin = shutil.which("npm")
+    if not npm_bin:
+        logger.error("Node toolchain preflight failed: 'npm' executable not found in PATH")
+        raise RuntimeError(
+            "npm executable ('npm') not found in PATH. "
+            f"Install Node {expected_nvmrc} (bundles npm) and ensure it is on PATH."
+        )
+
+    try:
+        res_npm = subprocess.run(
+            [npm_bin, "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+        npm_version_str = res_npm.stdout.strip()
+    except Exception as exc:
+        logger.error("Node toolchain preflight failed: unable to execute '%s --version': %s", npm_bin, exc)
+        raise RuntimeError(
+            f"Unable to execute '{npm_bin} --version'. Reinstall Node {expected_nvmrc}."
+        ) from exc
+
+    logger.info(
+        "Node toolchain preflight OK: node=%s (%s), npm=%s (%s)",
+        node_version_str,
+        node_bin,
+        npm_version_str,
+        npm_bin,
+    )
+
+
+def preflight_smoke_support(browser_factory: Optional[Any]) -> None:
+    """Prove the configured preview-smoke browser factory actually works.
+
+    Preview smoke is mandatory in R1, so startup must fail closed BEFORE any
+    Telegram polling or deployment when the Chromium browser cannot launch.
+    This check invokes the factory through its real production contract
+    (``factory() -> Browser``, as used by ``PreviewSmokeTester``) and performs
+    the minimum operation that proves usability — opening and closing a page —
+    then closes every acquired resource deterministically. It never navigates
+    anywhere: no network access and no Vercel/deployment work happens here.
+
+    Raises RuntimeError with an actionable, sanitized reason on failure.
+    """
+    if browser_factory is None:
+        logger.error(
+            "Preview smoke preflight failed: Playwright browser factory is unavailable. "
+            "Preview smoke is mandatory in Website Builder R1 — install with: "
+            "pip install playwright && playwright install chromium"
+        )
+        raise RuntimeError(
+            "Playwright browser factory is unavailable. Preview smoke is mandatory in "
+            "Website Builder R1 — install with: pip install playwright && playwright install chromium"
+        )
+
+    browser = None
+    page = None
+    try:
+        browser = browser_factory()
+        page = browser.new_page()
+    except Exception as exc:
+        logger.error(
+            "Preview smoke preflight failed: browser factory did not produce a usable "
+            "browser/page: %s",
+            exc,
+        )
+        raise RuntimeError(
+            "Playwright browser is not usable in this environment (launch or page-open "
+            "failed). Verify Chromium is installed: playwright install chromium"
+        ) from exc
+    finally:
+        if page is not None:
+            try:
+                page.close()
+            except Exception:
+                logger.warning("Preview smoke preflight: page close failed", exc_info=True)
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                logger.warning("Preview smoke preflight: browser close failed", exc_info=True)
+
+    logger.info("Preview smoke preflight OK: browser factory produced a usable browser")
+
+
 def preflight_role_validation(config: RuntimeConfig) -> bool:
     """Fail-closed startup validation of all Website Builder model roles.
 
@@ -354,10 +514,12 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
             return
         registry_store.set_vercel_slug_once(state.conversation_id, pid, slug)
 
+    smoke_tester = PreviewSmokeTester(config.smoke_browser_factory)
+
     preview_deps = PreviewDeps(
         vercel=vercel,
         telegram=telegram_out,
-        smoke=config.smoke_browser_factory,
+        smoke=smoke_tester,
         output_repo=output_repo,
         chat_id_for=chat_id_for,
         display_name_for=lambda pid, state: (
@@ -368,7 +530,7 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
         slug_for=_slug_for,
         bind_slug=_bind_slug,
     )
-    preview = PreviewOrchestrator(store, preview_deps)
+    preview = PreviewOrchestrator(store, preview_deps, runner=runner)
 
     # Frontend builder
     builder = FrontendBuilder(
@@ -392,7 +554,7 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
     promote_deps = PromoteDeps(
         vercel=vercel,
         telegram=telegram_out,
-        smoke=config.smoke_browser_factory,
+        smoke=smoke_tester,
         chat_id_for=chat_id_for,
     )
     promote = PromotionOrchestrator(runner, store, promote_deps)
@@ -400,7 +562,7 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
     # Custom domain orchestrator deps
     domain_deps = DomainDeps(
         vercel=vercel,
-        smoke=config.smoke_browser_factory,
+        smoke=smoke_tester,
     )
     domain = CustomDomainOrchestrator(runner, store, domain_deps)
 
@@ -419,6 +581,7 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
         directions=directions,
         domain=domain,
         builder=builder,
+        preview=preview,
     )
 
     return RuntimeComposition(
@@ -762,6 +925,20 @@ User message:
         self, update, project_id, authenticated, message, state, route=None
     ) -> None:
         """Per-project intent routing. All existing gates stay authoritative."""
+        # Preview reconciliation check: if project is in PREVIEW_READY with a tested_snapshot
+        # but latest_shown_preview is missing, reconcile Phase 9 before dispatching the turn.
+        if (
+            state is not None
+            and state.lifecycle == "PREVIEW_READY"
+            and state.deployment.get("tested_snapshot")
+            and not state.deployment.get("latest_shown_preview")
+        ):
+            recon = self.dispatcher.dispatch(
+                update, project_id, "reconcile_preview", authenticated=authenticated
+            )
+            if recon.success:
+                state = self.dispatcher.store.load(project_id)
+
         lifecycle = state.lifecycle if state else "DISCOVERING"
 
         forced = getattr(route, "forced_intent", None) if route is not None else None
@@ -941,6 +1118,18 @@ User message:
         if state is None:
             self._handle_legacy_first_project(update, message, authenticated, project_id)
             state = self.dispatcher.store.load(project_id)
+        if (
+            state is not None
+            and state.lifecycle == "PREVIEW_READY"
+            and state.deployment.get("tested_snapshot")
+            and not state.deployment.get("latest_shown_preview")
+        ):
+            recon = self.dispatcher.dispatch(
+                update, project_id, "reconcile_preview", authenticated=authenticated
+            )
+            if recon.success:
+                state = self.dispatcher.store.load(project_id)
+
         lifecycle = state.lifecycle if state else "DISCOVERING"
         intent = self._classify_intent(message.text, lifecycle, project_id, state=state)
         if intent == ConversationIntent.REVISE:
@@ -1140,7 +1329,19 @@ User message:
             ),
             "DEPLOYMENT_ALREADY_LIVE": "This deployment is already live in production.",
         }
-        text = messages.get(error_code, "Something went wrong. Please try again.")
+        if error_code and error_code.startswith("CHEAP_CHECKS_FAILED:"):
+            check_name = error_code.split(":", 1)[1]
+            text = f"Build verification failed ({check_name}). Please try again."
+        elif error_code == "TOOLCHAIN_MUTATION_REJECTED":
+            text = "Build failed due to toolchain policy violation. Please try again."
+        elif error_code and error_code.startswith("INFRASTRUCTURE_ERROR:"):
+            text = "An infrastructure error occurred during verification. Please try again."
+        elif error_code == "PREVIEW_BUSY":
+            text = "The project is busy with another build/preview operation. Please try again shortly."
+        elif error_code in ("UNEXPECTED_BUILD_ERROR", "UNEXPECTED_QA_ERROR"):
+            text = "An unexpected error occurred. Please try again."
+        else:
+            text = messages.get(error_code, "Something went wrong. Please try again.")
         try:
             self.telegram_out.send_text(chat_id, text)
         except Exception:
@@ -1181,8 +1382,11 @@ User message:
 # ---------------------------------------------------------------------------
 
 
-def main() -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     """Canonical Website Builder runtime entrypoint."""
+    if argv is None:
+        argv = sys.argv[1:]
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
@@ -1195,10 +1399,24 @@ def main() -> int:
         logger.error("Configuration error: %s", exc)
         return 1
 
-    # Fail closed BEFORE any polling or composition: every model role must
-    # resolve against the real profile config (and VISION must be
-    # vision-capable). A partial role set previously started the loop and
-    # failed per-message at runtime.
+    # Fail closed BEFORE any polling or composition:
+    # 1. Local Node toolchain must satisfy the starter contract.
+    # 2. Preview smoke support (Playwright/Chromium) must actually work.
+    #    (Both raise RuntimeError with an actionable sanitized reason; the
+    #    detail was already logged by the preflight itself.)
+    try:
+        preflight_node_toolchain()
+        preflight_smoke_support(config.smoke_browser_factory)
+    except RuntimeError:
+        return 1
+
+    if "--preflight" in argv:
+        logger.info(
+            "Preflight checks passed: Node toolchain and preview smoke support verified."
+        )
+        return 0
+
+    # 3. Every model role must resolve against the real profile config
     if not preflight_role_validation(config):
         return 1
 

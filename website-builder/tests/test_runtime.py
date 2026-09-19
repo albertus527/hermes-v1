@@ -31,6 +31,8 @@ from app.runtime import (
     compose,
     load_runtime_config,
     main,
+    preflight_node_toolchain,
+    preflight_smoke_support,
 )
 
 
@@ -1090,3 +1092,116 @@ class TestWhatsAppDormant:
         # No whatsapp attribute on composition
         assert not hasattr(comp, "whatsapp")
         assert not hasattr(comp, "whatsapp_out")
+
+
+# ---------------------------------------------------------------------------
+# 17. Toolchain and Smoke Preflight Checks (HIGH-1, HIGH-2)
+# ---------------------------------------------------------------------------
+
+
+class TestPreflightChecks:
+    def test_preflight_node_toolchain_success_on_system(self):
+        """Current system node satisfies the requirement >=26 <27."""
+        preflight_node_toolchain()
+
+    def test_preflight_node_toolchain_fails_on_old_node(self):
+        """Node 22 (EBADENGINE on VPS) fails closed with descriptive error."""
+        with patch("subprocess.run") as mock_run:
+            def fake_run(cmd, *args, **kwargs):
+                name = Path(str(cmd[0])).stem.lower()
+                if name == "node":
+                    return MagicMock(returncode=0, stdout="v22.23.2\n")
+                if name == "npm":
+                    return MagicMock(returncode=0, stdout="10.9.8\n")
+                return MagicMock(returncode=0, stdout="")
+            mock_run.side_effect = fake_run
+            with pytest.raises(RuntimeError) as exc_info:
+                preflight_node_toolchain()
+            assert "EBADENGINE" in str(exc_info.value) or "Node version v22.23.2 does not satisfy" in str(exc_info.value)
+
+    def test_preflight_node_toolchain_fails_if_node_missing(self):
+        """Missing node executable fails closed."""
+        with patch("shutil.which", return_value=None):
+            with pytest.raises(RuntimeError) as exc_info:
+                preflight_node_toolchain()
+            assert "Node.js executable ('node') not found" in str(exc_info.value)
+
+    def test_preflight_smoke_support_success(self):
+        """Callable browser factory passes preflight."""
+        mock_factory = MagicMock()
+        mock_ctx = MagicMock()
+        mock_page = MagicMock()
+        mock_ctx.new_page.return_value = mock_page
+        mock_factory.return_value = mock_ctx
+        preflight_smoke_support(mock_factory)
+        mock_factory.assert_called_once()
+        mock_page.close.assert_called_once()
+        mock_ctx.close.assert_called_once()
+
+    def test_preflight_smoke_support_fails_closed_when_factory_none(self):
+        """None factory fails closed with descriptive RuntimeError."""
+        with pytest.raises(RuntimeError) as exc_info:
+            preflight_smoke_support(None)
+        assert "Playwright browser factory is unavailable" in str(exc_info.value)
+
+    def test_main_preflight_flag_exits_cleanly(self):
+        """python -m app --preflight runs preflight and exits 0."""
+        with patch("app.runtime.preflight_node_toolchain") as mock_node, \
+             patch("app.runtime.preflight_smoke_support") as mock_smoke, \
+             patch("app.runtime.load_runtime_config") as mock_cfg:
+            mock_cfg.return_value = MagicMock(smoke_browser_factory=MagicMock())
+            exit_code = main(["--preflight"])
+            assert exit_code == 0
+            mock_node.assert_called_once()
+            mock_smoke.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# 18. Smoke Tester Composition Wiring (HIGH-2)
+# ---------------------------------------------------------------------------
+
+
+class TestSmokeTesterWiring:
+    def test_smoke_tester_wired_into_deps(self, tmp_path):
+        """PreviewDeps and PromoteDeps receive a PreviewSmokeTester with a callable run."""
+        mock_factory = MagicMock()
+        config = _make_config(tmp_path)
+        object.__setattr__(config, "smoke_browser_factory", mock_factory)
+        comp = compose(config)
+        assert callable(comp.preview.deps.smoke.run)
+        assert callable(comp.promote.deps.smoke.run)
+
+
+# ---------------------------------------------------------------------------
+# 19. Preview Reconciliation in Telegram Receive Loop (HIGH-4)
+# ---------------------------------------------------------------------------
+
+
+class TestPreviewReconciliation:
+    def test_reconcile_preview_triggered_when_preview_ready_without_card(self):
+        """When PREVIEW_READY has tested_snapshot but no latest_shown_preview, reconcile."""
+        dispatcher = MagicMock()
+        state = MagicMock()
+        state.lifecycle = "PREVIEW_READY"
+        state.deployment = {"tested_snapshot": {"dist_hash": "abc"}}
+        state.latest_shown_preview = None
+        state.conversation_id = "555"
+        dispatcher.store.load.return_value = state
+        dispatcher.dispatch.return_value = MagicMock(success=True)
+
+        loop = TelegramReceiveLoop(
+            bot_token="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+            dispatcher=dispatcher,
+            telegram_out=MagicMock(),
+            hermes=MagicMock(),
+            transport=MagicMock(),
+        )
+        update = {
+            "update_id": 1,
+            "message": {"from": {"id": 1}, "chat": {"id": 555}, "text": "halo", "date": 1},
+        }
+        loop._process_update(update)
+
+        calls = dispatcher.dispatch.call_args_list
+        actions = [c[0][2] for c in calls]
+        assert "reconcile_preview" in actions
