@@ -887,5 +887,460 @@ class TestToolchainProtectionInitialBuild(unittest.TestCase):
         self.assertIn("TOOLCHAIN_MUTATION_REJECTED", state.failure["error"])
 
 
+# ---------------------------------------------------------------------------
+# Phase-7 bounded compile repair after initial FRONTEND generation
+# ---------------------------------------------------------------------------
+
+
+class TestCheapCheckClassification(unittest.TestCase):
+    """Eligibility rules for the single Phase-7 compile-repair attempt.
+
+    Only deterministic source/build failures may enter the repair path;
+    infrastructure/runtime failures and unprovable failures must not.
+    """
+
+    def test_ts_diagnostic_is_eligible_source_error(self):
+        from app.projects.build import classify_cheap_check_failure
+
+        decision = classify_cheap_check_failure({
+            "npm_ci": {"success": True},
+            "npm_build": {
+                "success": False,
+                "stderr": "src/components/BookingCta.tsx(1,1): error TS6133: "
+                          "'Icon' is declared but its value is never read.",
+            },
+            "npm_typecheck": {"success": True},
+        })
+        self.assertTrue(decision.eligible)
+        self.assertEqual(decision.failed_check, "npm_build")
+        self.assertEqual(decision.classification, "source_error")
+
+    def test_network_failure_is_not_eligible(self):
+        from app.projects.build import classify_cheap_check_failure
+
+        decision = classify_cheap_check_failure({
+            "npm_ci": {"success": True},
+            "npm_build": {
+                "success": False,
+                "stderr": "npm ERR! code EAI_AGAIN\nnetwork request to "
+                          "registry.npmjs.org failed",
+            },
+            "npm_typecheck": {"success": True},
+        })
+        self.assertFalse(decision.eligible)
+        self.assertEqual(decision.classification, "infrastructure_failure")
+
+    def test_infrastructure_signature_wins_over_source_signature(self):
+        from app.projects.build import classify_cheap_check_failure
+
+        decision = classify_cheap_check_failure({
+            "npm_ci": {"success": True},
+            "npm_build": {
+                "success": False,
+                "stderr": "error TS6133: unused\nENOSPC: no space left on device",
+            },
+            "npm_typecheck": {"success": True},
+        })
+        self.assertFalse(decision.eligible)
+        self.assertEqual(decision.classification, "infrastructure_failure")
+
+    def test_npm_ci_failure_is_never_eligible(self):
+        from app.projects.build import classify_cheap_check_failure
+
+        decision = classify_cheap_check_failure({
+            "npm_ci": {"success": False, "stderr": "npm ERR! code EBADENGINE"},
+        })
+        self.assertFalse(decision.eligible)
+        self.assertEqual(decision.failed_check, "npm_ci")
+
+    def test_empty_output_is_not_eligible(self):
+        from app.projects.build import classify_cheap_check_failure
+
+        decision = classify_cheap_check_failure({
+            "npm_ci": {"success": True},
+            "npm_build": {"success": False},
+            "npm_typecheck": {"success": True},
+        })
+        self.assertFalse(decision.eligible)
+        self.assertEqual(decision.classification, "unclassified")
+
+    def test_no_failure_is_not_eligible(self):
+        from app.projects.build import classify_cheap_check_failure
+
+        decision = classify_cheap_check_failure({
+            "npm_ci": {"success": True},
+            "npm_build": {"success": True},
+            "npm_typecheck": {"success": True},
+        })
+        self.assertFalse(decision.eligible)
+        self.assertIsNone(decision.failed_check)
+        self.assertEqual(decision.classification, "no_failure")
+
+
+class TestPhase7CompileRepair(unittest.TestCase):
+    """A–H: the single bounded Phase-7 compile-repair path.
+
+    Real E2E class: npm_build fails with TS6133 (unused import) and the
+    existing recovery regenerated the whole site (~7–9 min). One targeted
+    repair on the existing workspace must fix it instead.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.workspace_root = Path(self.tmpdir) / "workspaces"
+        self.state_root = Path(self.tmpdir) / "state"
+        self.store = ProjectStateStore(self.state_root)
+        self.runner = ProjectRunner(self.workspace_root, self.store)
+
+        # Fake starter with the protected toolchain identity files.
+        self.starter_path = Path(self.tmpdir) / "starter"
+        (self.starter_path / "src" / "components").mkdir(parents=True)
+        (self.starter_path / ".nvmrc").write_text("26.5.0\n", encoding="utf-8")
+        (self.starter_path / "package.json").write_text(
+            json.dumps({"name": "starter", "scripts": {"build": "echo build"}}),
+            encoding="utf-8",
+        )
+        (self.starter_path / "src" / "App.tsx").write_text(
+            "// starter placeholder\n", encoding="utf-8"
+        )
+
+        self.adapter = MagicMock()
+        self.builder = FrontendBuilder(
+            self.runner,
+            self.store,
+            hermes_adapter=self.adapter,
+            starter_path=self.starter_path,
+        )
+        self.brief = {"name": "Northcut", "what": "barbershop", "why": "booking WA"}
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    # -- fixtures / helpers -------------------------------------------------
+
+    def _all_passing(self):
+        return {
+            "npm_ci": {"success": True, "stdout": "", "stderr": ""},
+            "npm_build": {"success": True, "stdout": "", "stderr": ""},
+            "npm_typecheck": {"success": True, "stdout": "", "stderr": ""},
+        }
+
+    def _ts6133_npm_build_failure(self):
+        return {
+            "npm_ci": {"success": True, "stdout": "", "stderr": ""},
+            "npm_build": {
+                "success": False,
+                "stdout": "",
+                "stderr": (
+                    "src/components/BookingCta.tsx(1,1): error TS6133: "
+                    "'Icon' is declared but its value is never read."
+                ),
+            },
+            "npm_typecheck": {"success": True, "stdout": "", "stderr": ""},
+        }
+
+    def _passing_frontend(self):
+        self.adapter.frontend_build.return_value = {
+            "success": True,
+            "design_dna": {"version": 1, "brand_personality": "premium"},
+        }
+
+    def _run_build_with_checks(self, project_id, checks_effect):
+        """Run build() with a scripted `_run_fixed_checks` sequence.
+
+        Returns (result, checks_mock, qa_mock_or_None).
+        """
+        self._passing_frontend()
+        _queue_project(self.store, project_id)
+        with patch.object(self.builder, "_run_fixed_checks") as mock_checks:
+            mock_checks.side_effect = checks_effect
+            with patch("app.projects.build.QAOrchestrator") as mock_qa_cls:
+                mock_qa = MagicMock()
+                mock_qa.run.return_value = MagicMock(success=True, error=None)
+                mock_qa_cls.return_value = mock_qa
+                result = self.builder.build(project_id, self.brief)
+                return result, mock_checks, mock_qa
+
+    # -- A: exact real failure class ---------------------------------------
+
+    def test_a_ts6133_repairs_once_then_passes_toward_qa(self):
+        result, mock_checks, mock_qa = self._run_build_with_checks(
+            "proj-repair-a",
+            [self._ts6133_npm_build_failure(), self._all_passing()],
+        )
+
+        self.assertTrue(result.success)
+        # The ENTIRE fixed cheap-check sequence is rerun (not trusted).
+        self.assertEqual(mock_checks.call_count, 2)
+        # Exactly one initial generation + exactly ONE targeted repair.
+        self.assertEqual(self.adapter.frontend_build.call_count, 2)
+
+        repair_instructions = self.adapter.frontend_build.call_args_list[1].kwargs[
+            "design_dna_instructions"
+        ]
+        self.assertIn("COMPILE REPAIR", repair_instructions)
+        self.assertIn("npm_build", repair_instructions)
+        self.assertIn("error TS6133", repair_instructions)
+        self.assertIn("MINIMUM", repair_instructions)
+        self.assertIn("Do NOT rewrite, redesign, regenerate", repair_instructions)
+
+        # Proceeds toward QA (Phase 8 owns PREVIEW_READY, so it stays RUNNING
+        # under the mocked QA).
+        mock_qa.run.assert_called_once()
+        state = self.store.load("proj-repair-a")
+        self.assertEqual(state.lifecycle, ProjectLifecycle.RUNNING.value)
+        self.assertIsNone(state.failure)
+
+    # -- B: repair runs, build still fails, NO second repair ---------------
+
+    def test_b_repair_still_failing_has_no_second_repair(self):
+        result, mock_checks, _mock_qa = self._run_build_with_checks(
+            "proj-repair-b",
+            [self._ts6133_npm_build_failure(), self._ts6133_npm_build_failure()],
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error, "CHEAP_CHECKS_FAILED:npm_build")
+        # Initial generation + exactly one repair; never a third FRONTEND call.
+        self.assertEqual(self.adapter.frontend_build.call_count, 2)
+        self.assertEqual(mock_checks.call_count, 2)
+        state = self.store.load("proj-repair-b")
+        self.assertEqual(state.lifecycle, ProjectLifecycle.FAILED.value)
+        self.assertEqual(state.failure["phase"], "cheap_checks")
+        self.assertEqual(state.failure["compile_repair_attempts"], 1)
+
+    # -- C: typecheck source error is eligible -----------------------------
+
+    def test_c_typecheck_ts_error_is_repaired(self):
+        typecheck_failure = {
+            "npm_ci": {"success": True, "stdout": "", "stderr": ""},
+            "npm_build": {"success": True, "stdout": "", "stderr": ""},
+            "npm_typecheck": {
+                "success": False,
+                "stdout": "",
+                "stderr": "src/App.tsx(12,5): error TS2304: Cannot find name 'ctaUrl'.",
+            },
+        }
+        result, mock_checks, mock_qa = self._run_build_with_checks(
+            "proj-repair-c", [typecheck_failure, self._all_passing()]
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(self.adapter.frontend_build.call_count, 2)
+        self.assertEqual(mock_checks.call_count, 2)
+        repair_instructions = self.adapter.frontend_build.call_args_list[1].kwargs[
+            "design_dna_instructions"
+        ]
+        self.assertIn("npm_typecheck", repair_instructions)
+        self.assertIn("error TS2304", repair_instructions)
+        mock_qa.run.assert_called_once()
+
+    # -- D: infrastructure / runner failures never repair ------------------
+
+    def test_d_network_failure_never_repairs_or_consumes_attempt(self):
+        network_failure = {
+            "npm_ci": {"success": True, "stdout": "", "stderr": ""},
+            "npm_build": {
+                "success": False,
+                "stdout": "",
+                "stderr": (
+                    "npm ERR! code EAI_AGAIN\nnpm ERR! network request to "
+                    "registry.npmjs.org failed"
+                ),
+            },
+            "npm_typecheck": {"success": True, "stdout": "", "stderr": ""},
+        }
+        result, mock_checks, mock_qa = self._run_build_with_checks(
+            "proj-repair-d1", [network_failure]
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error, "CHEAP_CHECKS_FAILED:npm_build")
+        # Repair NOT invoked, rerun NOT attempted.
+        self.assertEqual(self.adapter.frontend_build.call_count, 1)
+        self.assertEqual(mock_checks.call_count, 1)
+        mock_qa.run.assert_not_called()
+        state = self.store.load("proj-repair-d1")
+        self.assertEqual(state.failure["compile_repair_attempts"], 0)
+        self.assertEqual(state.failure["final_stage"], "initial")
+
+    def test_d_npm_ci_failure_never_repairs(self):
+        ci_failure = {
+            "npm_ci": {
+                "success": False,
+                "stdout": "",
+                "stderr": "npm ERR! code EBADENGINE engine unsupported",
+            },
+        }
+        result, mock_checks, _qa = self._run_build_with_checks(
+            "proj-repair-d2", [ci_failure]
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error, "CHEAP_CHECKS_FAILED:npm_ci")
+        self.assertEqual(self.adapter.frontend_build.call_count, 1)
+        self.assertEqual(mock_checks.call_count, 1)
+        state = self.store.load("proj-repair-d2")
+        self.assertEqual(state.failure["compile_repair_attempts"], 0)
+
+    def test_d_unclassified_failure_never_repairs(self):
+        unclassified = {
+            "npm_ci": {"success": True, "stdout": "", "stderr": ""},
+            "npm_build": {"success": False, "stdout": "", "stderr": ""},
+            "npm_typecheck": {"success": True, "stdout": "", "stderr": ""},
+        }
+        result, _mock_checks, _qa = self._run_build_with_checks(
+            "proj-repair-d3", [unclassified]
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error, "CHEAP_CHECKS_FAILED:npm_build")
+        self.assertEqual(self.adapter.frontend_build.call_count, 1)
+
+    # -- E: protected toolchain mutation during repair ---------------------
+
+    def test_e_toolchain_mutation_during_repair_fails_closed(self):
+        frontend_calls = {"count": 0}
+
+        def frontend_dispatch(**kwargs):
+            frontend_calls["count"] += 1
+            if frontend_calls["count"] == 2:
+                # The compile repair mutates a protected toolchain identity file.
+                (kwargs["workspace"] / "package.json").write_text(
+                    json.dumps({"name": "evil"}), encoding="utf-8"
+                )
+            return {
+                "success": True,
+                "design_dna": {"version": 1, "brand_personality": "premium"},
+            }
+
+        self.adapter.frontend_build.side_effect = frontend_dispatch
+        _queue_project(self.store, "proj-repair-e")
+
+        with patch.object(self.builder, "_run_fixed_checks") as mock_checks:
+            mock_checks.return_value = self._ts6133_npm_build_failure()
+            with patch("app.projects.build.QAOrchestrator") as mock_qa_cls:
+                mock_qa = MagicMock()
+                mock_qa.run.return_value = MagicMock(success=True, error=None)
+                mock_qa_cls.return_value = mock_qa
+                result = self.builder.build("proj-repair-e", self.brief)
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error, "TOOLCHAIN_MUTATION_REJECTED")
+        self.assertEqual(self.adapter.frontend_build.call_count, 2)
+        # Policy rejection happens BEFORE any cheap-check rerun or QA handoff.
+        self.assertEqual(mock_checks.call_count, 1)
+        mock_qa.run.assert_not_called()
+        state = self.store.load("proj-repair-e")
+        self.assertEqual(state.lifecycle, ProjectLifecycle.FAILED.value)
+        self.assertIn("TOOLCHAIN_MUTATION_REJECTED", state.failure["error"])
+        self.assertIn("package.json", state.failure["error"])
+
+    # -- F: successful initial checks never repair -------------------------
+
+    def test_f_passing_initial_checks_never_invoke_repair(self):
+        result, mock_checks, mock_qa = self._run_build_with_checks(
+            "proj-repair-f", [self._all_passing()]
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(self.adapter.frontend_build.call_count, 1)
+        self.assertEqual(mock_checks.call_count, 1)
+        mock_qa.run.assert_called_once()
+
+    # -- G: Phase-7 repair budget is independent from Phase-8 QA -----------
+
+    def test_g_compile_repair_budget_independent_from_phase8_qa(self):
+        self._passing_frontend()
+        _queue_project(self.store, "proj-repair-g")
+
+        with patch.object(self.builder, "_run_fixed_checks") as mock_checks:
+            mock_checks.side_effect = [
+                self._ts6133_npm_build_failure(),
+                self._all_passing(),
+            ]
+            with patch("app.projects.build.QAOrchestrator") as mock_qa_cls:
+                mock_qa = MagicMock()
+                mock_qa.run.return_value = MagicMock(success=True, error=None)
+                mock_qa_cls.return_value = mock_qa
+                result = self.builder.build("proj-repair-g", self.brief)
+
+        self.assertTrue(result.success)
+        # Phase-7 consumed its one repair...
+        self.assertEqual(self.adapter.frontend_build.call_count, 2)
+        # ...and Phase-8 QA is then handed off with exactly the standard
+        # constructor/handoff surface — no compile-repair budget or state is
+        # threaded into it, so its own bounded repair budget is untouched.
+        self.assertEqual(
+            set(mock_qa_cls.call_args.kwargs.keys()),
+            {"hermes_adapter", "web3forms_access_key", "toolchain_verify"},
+        )
+        mock_qa.run.assert_called_once_with(
+            project_id="proj-repair-g",
+            workspace=result.workspace,
+            brief=self.brief,
+            design_dna={"version": 1, "brand_personality": "premium"},
+        )
+
+    # -- Repair execution failure fails closed on the initial checks -------
+
+    def test_repair_execution_failure_fails_closed_with_initial_error(self):
+        self.adapter.frontend_build.side_effect = [
+            {
+                "success": True,
+                "design_dna": {"version": 1, "brand_personality": "premium"},
+            },
+            {"success": False, "error": "FRONTEND repair failed"},
+        ]
+        _queue_project(self.store, "proj-repair-x")
+
+        with patch.object(self.builder, "_run_fixed_checks") as mock_checks:
+            mock_checks.return_value = self._ts6133_npm_build_failure()
+            result = self.builder.build("proj-repair-x", self.brief)
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error, "CHEAP_CHECKS_FAILED:npm_build")
+        self.assertEqual(self.adapter.frontend_build.call_count, 2)
+        # No rerun after a failed repair invocation; the attempt is consumed.
+        self.assertEqual(mock_checks.call_count, 1)
+        state = self.store.load("proj-repair-x")
+        self.assertEqual(state.failure["compile_repair_attempts"], 1)
+        self.assertEqual(state.failure["final_stage"], "repair_execution_failed")
+
+    # -- H: persisted diagnostics distinguish the two failures -------------
+
+    def test_h_persisted_diagnostics_distinguish_initial_and_post_repair(self):
+        initial = self._ts6133_npm_build_failure()
+        post_repair = {
+            "npm_ci": {"success": True, "stdout": "", "stderr": ""},
+            "npm_build": {
+                "success": False,
+                "stdout": "",
+                "stderr": (
+                    "src/pages/Home.tsx(5,3): error TS2322: Type 'string' is "
+                    "not assignable to type 'number'."
+                ),
+            },
+            "npm_typecheck": {"success": True, "stdout": "", "stderr": ""},
+        }
+        result, _mock_checks, _qa = self._run_build_with_checks(
+            "proj-repair-h", [initial, post_repair]
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error, "CHEAP_CHECKS_FAILED:npm_build")
+        state = self.store.load("proj-repair-h")
+        failure = state.failure
+        self.assertEqual(failure["phase"], "cheap_checks")
+        self.assertEqual(failure["compile_repair_attempts"], 1)
+        self.assertEqual(failure["final_stage"], "post_repair")
+        # Both failures are persisted and independently diagnosable.
+        self.assertIn("initial_checks", failure)
+        self.assertIn("TS6133", failure["initial_checks"]["npm_build"]["stderr"])
+        self.assertIn("TS2322", failure["checks"]["npm_build"]["stderr"])
+
+
 if __name__ == "__main__":
     unittest.main()
