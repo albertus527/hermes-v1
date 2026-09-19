@@ -47,25 +47,35 @@ class FakeVercel:
         self.deploy_calls = 0
         self.bootstrap_calls = 0
         self._project = {'id': 'prj_1', 'name': 'wb', 'accountId': 'team'}
+        # Records every expected_name threaded by the orchestrator so tests
+        # can assert the canonical slug/legacy-None contract end to end.
+        self.expected_names = []
 
     def ensure_project(self, app_id):
         self.ensure_calls += 1
         return OperationResult.ok({'project': self._project, 'app_id': app_id})
 
+    def ensure_project_with_slug(self, app_id, slug):
+        self.ensure_calls += 1
+        return OperationResult.ok({'project': self._project, 'app_id': app_id, 'slug': slug})
+
     def lookup_project(self, app_id):
         return OperationResult.ok({'project': self._project, 'app_id': app_id})
 
-    def ensure_bootstrap(self, app_id, project):
+    def ensure_bootstrap(self, app_id, project, expected_name=None):
         self.bootstrap_calls += 1
+        self.expected_names.append(expected_name)
         return OperationResult.ok({'bootstrapped': False, 'already_current_production': True})
 
-    def deploy_static_files(self, app_id, project, files, operation_id, source_revision, artifact_sha256):
+    def deploy_static_files(self, app_id, project, files, operation_id, source_revision, artifact_sha256, expected_name=None):
         self.deploy_calls += 1
+        self.expected_names.append(expected_name)
         return OperationResult.ok({'deployment_id': 'dpl_1',
                                    'preview_url': 'https://tested.vercel.app',
                                    'state': 'READY'})
 
-    def find_deployment_by_operation_id(self, app_id, project, operation_id, source_revision, artifact_sha256):
+    def find_deployment_by_operation_id(self, app_id, project, operation_id, source_revision, artifact_sha256, expected_name=None):
+        self.expected_names.append(expected_name)
         return OperationResult.ok({'deployment_id': 'dpl_1',
                                    'preview_url': 'https://tested.vercel.app',
                                    'state': 'READY'})
@@ -245,7 +255,7 @@ def test_real_content_deploy_never_called_before_bootstrap_confirms(tmp_path):
     _preview_ready_state(store, 'proj', ws)
 
     class UnconfirmedBootstrapVercel(FakeVercel):
-        def ensure_bootstrap(self, app_id, project):
+        def ensure_bootstrap(self, app_id, project, expected_name=None):
             self.bootstrap_calls += 1
             # Not yet confirmed -- must block the real content deploy.
             return OperationResult.fail('BOOTSTRAP_RECONCILIATION_REQUIRED',
@@ -268,7 +278,7 @@ def test_real_content_deploy_blocked_on_bootstrap_confirmation_timeout(tmp_path)
     _preview_ready_state(store, 'proj', ws)
 
     class TimingOutBootstrapVercel(FakeVercel):
-        def ensure_bootstrap(self, app_id, project):
+        def ensure_bootstrap(self, app_id, project, expected_name=None):
             self.bootstrap_calls += 1
             return OperationResult.fail('BOOTSTRAP_CONFIRMATION_TIMEOUT',
                                         error_code='BOOTSTRAP_CONFIRMATION_TIMEOUT')
@@ -349,3 +359,88 @@ def test_slot_held_caller_bypasses_acquisition(tmp_path):
         assert result.success
     finally:
         runner.release_project('proj')
+
+
+# ---------------------------------------------------------------------------
+# tg-6329821361-p4 regression: the canonical friendly slug resolved BEFORE
+# ensure_project_with_slug must be threaded as expected_name through every
+# downstream adapter call that revalidates the owned project -- never
+# re-deriving the opaque hash name (the unfixed failure class).
+# ---------------------------------------------------------------------------
+
+
+class _SlugEnforcingVercel(FakeVercel):
+    """Fake adapter mirroring _project_valid semantics for a slug-named
+    project: the owned project exists under 'dapur-kedaton'; any downstream
+    call whose expected_name is anything else (including None, which means
+    're-derive the opaque hash name' at the real adapter) fails closed with
+    PROJECT_IDENTITY_MISMATCH -- exactly what the real adapter did to p4
+    before the orchestrator threaded the canonical slug."""
+
+    def __init__(self):
+        super().__init__()
+        self._project = {'id': 'prj_1', 'name': 'dapur-kedaton', 'accountId': 'team'}
+
+    def _identity_gate(self, expected_name):
+        self.expected_names.append(expected_name)
+        if expected_name != 'dapur-kedaton':
+            return OperationResult.fail('PROJECT_IDENTITY_MISMATCH',
+                                        error_code='PROJECT_IDENTITY_MISMATCH')
+        return None
+
+    def ensure_bootstrap(self, app_id, project, expected_name=None):
+        self.bootstrap_calls += 1
+        bad = self._identity_gate(expected_name)
+        return bad or OperationResult.ok({'bootstrapped': False,
+                                          'already_current_production': True})
+
+    def deploy_static_files(self, app_id, project, files, operation_id,
+                            source_revision, artifact_sha256, expected_name=None):
+        self.deploy_calls += 1
+        bad = self._identity_gate(expected_name)
+        return bad or OperationResult.ok({'deployment_id': 'dpl_1',
+                                          'preview_url': 'https://tested.vercel.app',
+                                          'state': 'READY'})
+
+    def find_deployment_by_operation_id(self, app_id, project, operation_id,
+                                        source_revision, artifact_sha256, expected_name=None):
+        bad = self._identity_gate(expected_name)
+        return bad or OperationResult.ok({'deployment_id': 'dpl_1',
+                                          'preview_url': 'https://tested.vercel.app',
+                                          'state': 'READY'})
+
+
+def test_canonical_slug_threaded_through_all_downstream_identity_checks(tmp_path):
+    """Full p4 production sequence at orchestrator level: slug_for resolves
+    'dapur-kedaton' -> ensure_project_with_slug -> same returned project ->
+    ensure_bootstrap -> deploy_static_files -> readiness lookup. Every
+    downstream revalidation must receive the canonical slug."""
+    store = ProjectStateStore(tmp_path / 'state')
+    ws = _make_workspace(tmp_path)
+    _preview_ready_state(store, 'proj', ws)
+    vercel = _SlugEnforcingVercel()
+    deps = _deps(tmp_path, vercel=vercel)
+    deps.slug_for = lambda pid, state: 'dapur-kedaton'
+    deps.bind_slug = lambda pid, state, slug: None
+    result = PreviewOrchestrator(store, deps).run_owned('proj', ws)
+    assert result.success, result.error
+    assert vercel.bootstrap_calls == 1
+    assert vercel.deploy_calls == 1
+    # Bootstrap + deploy + readiness poll(s): every gate saw the canonical slug.
+    assert vercel.expected_names
+    assert all(name == 'dapur-kedaton' for name in vercel.expected_names)
+
+
+def test_no_slug_configured_threads_none_preserving_legacy_opaque_path(tmp_path):
+    """When no slug is bound/derivable the orchestrator threads None, so the
+    adapter validates against the legacy opaque hash-derived name exactly as
+    before -- no behavior change for pre-slug projects."""
+    store = ProjectStateStore(tmp_path / 'state')
+    ws = _make_workspace(tmp_path)
+    _preview_ready_state(store, 'proj', ws)
+    vercel = FakeVercel()
+    deps = _deps(tmp_path, vercel=vercel)  # slug_for defaults to None
+    result = PreviewOrchestrator(store, deps).run_owned('proj', ws)
+    assert result.success, result.error
+    assert vercel.expected_names
+    assert all(name is None for name in vercel.expected_names)

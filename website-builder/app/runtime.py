@@ -514,6 +514,22 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
             return
         registry_store.set_vercel_slug_once(state.conversation_id, pid, slug)
 
+    # Bound-slug resolver for POST-preview flows (promotion, custom domain).
+    # Unlike preview's slug_for -- which may derive a fresh candidate in
+    # order to CREATE the project -- post-preview flows only run after a
+    # successful preview, which has already created the Vercel project and
+    # bound its slug. They therefore resolve ONLY the persisted binding,
+    # never derive: an unbound entry means the project lives under the
+    # legacy opaque hash-derived name.
+    def _bound_slug_for(pid, state):
+        if state is None or not state.conversation_id:
+            return None
+        registry = registry_store.load_or_create(state.conversation_id)
+        entry = registry.find_by_id(pid)
+        if entry is None:
+            return None
+        return entry.vercel_slug
+
     smoke_tester = PreviewSmokeTester(config.smoke_browser_factory)
 
     preview_deps = PreviewDeps(
@@ -556,6 +572,7 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
         telegram=telegram_out,
         smoke=smoke_tester,
         chat_id_for=chat_id_for,
+        slug_for=_bound_slug_for,
     )
     promote = PromotionOrchestrator(runner, store, promote_deps)
 
@@ -563,6 +580,7 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
     domain_deps = DomainDeps(
         vercel=vercel,
         smoke=smoke_tester,
+        slug_for=_bound_slug_for,
     )
     domain = CustomDomainOrchestrator(runner, store, domain_deps)
 

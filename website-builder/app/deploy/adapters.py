@@ -166,11 +166,19 @@ class VercelAdapter:
                         and e.get('type') == 'plain'
                         for e in project.get('env', []) if isinstance(e, dict)))
 
-    def lookup_project(self, app_id):
-        """Read-only reconciliation; absence never authorizes another create."""
+    def lookup_project(self, app_id, *, expected_name=None):
+        """Read-only reconciliation; absence never authorizes another create.
+
+        ``expected_name`` is the canonical Vercel project name, determined
+        independently from trusted application state (the bound friendly
+        slug); None keeps the legacy opaque hash-derived lookup key. The
+        same value is BOTH the lookup key and the validated name -- never
+        project.get('name') from the response itself.
+        """
         try:
-            status, project = self._call('GET', '/v9/projects/' + self.project_name_for(app_id))
-            if status != 200 or not self._project_valid(project, app_id):
+            name = expected_name or self.project_name_for(app_id)
+            status, project = self._call('GET', '/v9/projects/' + name)
+            if status != 200 or not self._project_valid(project, app_id, expected_name=expected_name):
                 return _fail('PROJECT_RECONCILIATION_REQUIRED')
             return OperationResult.ok({'project': project, 'app_id': app_id})
         except Exception:
@@ -325,15 +333,19 @@ class VercelAdapter:
                                   'deployment': body})
 
     def deploy_static_files(self, app_id, project, files, operation_id,
-                            source_revision, artifact_sha256):
+                            source_revision, artifact_sha256, *, expected_name=None):
         """files maps canonical relative POSIX names to immutable bytes.
 
         Uses Vercel's static v2 builder with inline exact bytes. No package
         install/git build; no production target (omission means preview).
         Caller supplies its snapshot fingerprint as durable metadata.
+        ``expected_name`` is the caller-determined canonical Vercel project
+        name (the friendly slug resolved before ensure_project_with_slug, or
+        None for the legacy opaque name) -- never inferred from the project
+        response itself.
         """
         try:
-            if not self._project_valid(project, app_id):
+            if not self._project_valid(project, app_id, expected_name=expected_name):
                 return _fail('PROJECT_IDENTITY_MISMATCH')
             meta = self._meta(app_id, operation_id, source_revision, artifact_sha256)
             if not files or 'index.html' not in files:
@@ -408,7 +420,8 @@ class VercelAdapter:
         # from this fixed 'bootstrap' literal).
         return hashlib.sha256((self.namespace + '\0bootstrap\0' + app_id).encode()).hexdigest()
 
-    def ensure_bootstrap(self, app_id, project, max_polls=20, interval=0.25):
+    def ensure_bootstrap(self, app_id, project, max_polls=20, interval=0.25,
+                         *, expected_name=None):
         """Consume Vercel's unavoidable first-deployment auto-promotion with
         deterministic, content-free bytes -- BEFORE any real user artifact is
         ever deployed. No new local state/lifecycle: this is a pure remote
@@ -439,7 +452,7 @@ class VercelAdapter:
           * anything ambiguous/malformed -> fail closed, never guess.
         """
         try:
-            if not self._project_valid(project, app_id):
+            if not self._project_valid(project, app_id, expected_name=expected_name):
                 return _fail('PROJECT_IDENTITY_MISMATCH')
             try:
                 current = self._current_production_id(project)
@@ -501,14 +514,15 @@ class VercelAdapter:
             return _fail('BOOTSTRAP_RECONCILIATION_REQUIRED')
 
     def find_deployment_by_operation_id(self, app_id, project, operation_id,
-                                       source_revision, artifact_sha256, max_pages=100):
+                                       source_revision, artifact_sha256, max_pages=100,
+                                       *, expected_name=None):
         """Paginate entire project scope, then GET unique match for identity.
 
         Missing metadata, malformed pagination, repeated cursors and multiple
         matching IDs fail closed. NOT_FOUND is not permission to resend.
         """
         try:
-            if not self._project_valid(project, app_id):
+            if not self._project_valid(project, app_id, expected_name=expected_name):
                 return _fail('PROJECT_IDENTITY_MISMATCH')
             meta = self._meta(app_id, operation_id, source_revision, artifact_sha256)
             fail, identifier = self._find_unique_deployment_by_meta_key(
@@ -524,7 +538,7 @@ class VercelAdapter:
 
 
     def promote_deployment(self, app_id, project, deployment_id, operation_id,
-                           source_revision, artifact_sha256):
+                           source_revision, artifact_sha256, *, expected_name=None):
         """Promote an EXISTING deployment (already built/deployed as preview)
         to the project's production alias. No rebuild, no new files.
 
@@ -534,7 +548,7 @@ class VercelAdapter:
         bound to the original preview deploy_static_files call.
         """
         try:
-            if not self._project_valid(project, app_id):
+            if not self._project_valid(project, app_id, expected_name=expected_name):
                 return _fail('PROJECT_IDENTITY_MISMATCH')
             meta = self._meta(app_id, operation_id, source_revision, artifact_sha256)
             if not deployment_id or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', deployment_id):
@@ -572,7 +586,7 @@ class VercelAdapter:
     def _valid_hostname_for_api(self, hostname):
         return valid_custom_hostname(hostname)
 
-    def add_domain(self, app_id, project, hostname):
+    def add_domain(self, app_id, project, hostname, *, expected_name=None):
         """Attach an existing user-owned hostname to the owned project.
 
         This is the REAL remote binding call -- Vercel considers the domain
@@ -584,7 +598,7 @@ class VercelAdapter:
         no-duplicate-create convention.
         """
         try:
-            if not self._project_valid(project, app_id):
+            if not self._project_valid(project, app_id, expected_name=expected_name):
                 return _fail('PROJECT_IDENTITY_MISMATCH')
             if not self._valid_hostname_for_api(hostname):
                 return _fail('INVALID_HOSTNAME')
@@ -597,7 +611,7 @@ class VercelAdapter:
                 )
             if status not in (200, 201) or body.get('name') != hostname:
                 return _fail('DOMAIN_ATTACH_RECONCILIATION_REQUIRED')
-            return self.get_project_domain(app_id, project, hostname)
+            return self.get_project_domain(app_id, project, hostname, expected_name=expected_name)
         except Exception:
             return _fail('DOMAIN_ATTACH_RECONCILIATION_REQUIRED')
 
@@ -637,14 +651,14 @@ class VercelAdapter:
         except Exception:
             return _fail('DOMAIN_CONFIG_LOOKUP_FAILED')
 
-    def verify_domain(self, app_id, project, hostname):
+    def verify_domain(self, app_id, project, hostname, *, expected_name=None):
         """POST verify endpoint; re-GETs the project-scoped domain record
         afterward and never trusts the POST response body alone for the
         verified flag (mirrors promote_deployment's before/after-GET
         pattern). Verifies project identity before ever calling verify.
         """
         try:
-            if not self._project_valid(project, app_id):
+            if not self._project_valid(project, app_id, expected_name=expected_name):
                 return _fail('PROJECT_IDENTITY_MISMATCH')
             if not self._valid_hostname_for_api(hostname):
                 return _fail('INVALID_HOSTNAME')
@@ -654,18 +668,18 @@ class VercelAdapter:
             )
             if status not in (200, 201) or body.get('name') != hostname:
                 return _fail('DOMAIN_VERIFY_RECONCILIATION_REQUIRED')
-            return self.get_project_domain(app_id, project, hostname)
+            return self.get_project_domain(app_id, project, hostname, expected_name=expected_name)
         except Exception:
             return _fail('DOMAIN_VERIFY_RECONCILIATION_REQUIRED')
 
-    def get_project_domain(self, app_id, project, hostname):
+    def get_project_domain(self, app_id, project, hostname, *, expected_name=None):
         """Read-only reconciliation of a project-scoped domain binding.
 
         Never mutates anything -- used to re-check verified status without
         repeating a verify POST once one has already been attempted.
         """
         try:
-            if not self._project_valid(project, app_id):
+            if not self._project_valid(project, app_id, expected_name=expected_name):
                 return _fail('PROJECT_IDENTITY_MISMATCH')
             if not self._valid_hostname_for_api(hostname):
                 return _fail('INVALID_HOSTNAME')
@@ -687,10 +701,10 @@ class VercelAdapter:
         except Exception:
             return _fail('DOMAIN_LOOKUP_FAILED')
 
-    def check_domain_production(self, app_id, project, identity):
+    def check_domain_production(self, app_id, project, identity, *, expected_name=None):
         """Exact current project target, not newest historical production row."""
         try:
-            current = self.lookup_project(app_id)
+            current = self.lookup_project(app_id, expected_name=expected_name)
             if not current.success:
                 return current
             fresh = current.data['project']
@@ -711,14 +725,14 @@ class VercelAdapter:
         except Exception:
             return _fail('PRODUCTION_IDENTITY_MISMATCH')
 
-    def find_production_deployment(self, app_id, project):
+    def find_production_deployment(self, app_id, project, *, expected_name=None):
         """Read-only lookup of the CURRENT production deployment, if any.
 
         Used to capture last-known-good identity before promoting a new
         deployment, so a failed post-promotion smoke check can roll back.
         """
         try:
-            if not self._project_valid(project, app_id):
+            if not self._project_valid(project, app_id, expected_name=expected_name):
                 return _fail('PROJECT_IDENTITY_MISMATCH')
             status, body = self._call('GET', '/v6/deployments',
                                       projectId=project['id'], target='production', limit=1)

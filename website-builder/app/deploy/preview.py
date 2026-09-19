@@ -223,6 +223,13 @@ class PreviewOrchestrator:
                 slug = self.deps.slug_for(project_id, state)
             except Exception:
                 slug = None
+        # Canonical Vercel project name for downstream identity validation,
+        # determined BEFORE and independently of any provider response:
+        # the friendly slug when one is bound/derivable, else None (legacy
+        # opaque hash-derived name path). Threaded through every adapter call
+        # that revalidates the owned project so those checks assert the same
+        # canonical name instead of re-deriving the opaque default.
+        expected_name = slug if slug else None
 
         if slug:
             # Friendly-slug resolution path. The SHA-based ownership marker
@@ -253,7 +260,8 @@ class PreviewOrchestrator:
         # artifact is ever deployed. Pure remote reconciliation -- no new
         # local state, safe to call on every run (no-ops once production
         # already exists, whether from a prior bootstrap or real content).
-        bootstrap_result = self.deps.vercel.ensure_bootstrap(app_id, vercel_project)
+        bootstrap_result = self.deps.vercel.ensure_bootstrap(
+            app_id, vercel_project, expected_name=expected_name)
         if not bootstrap_result.success:
             return bootstrap_result
 
@@ -262,9 +270,11 @@ class PreviewOrchestrator:
         self._update_intent(project_id, operation_id, deployment_attempted=True,
                             project=vercel_project)
         deployment = (self.deps.vercel.find_deployment_by_operation_id(
-            app_id, vercel_project, operation_id, source_revision, snapshot.artifact_sha256
+            app_id, vercel_project, operation_id, source_revision, snapshot.artifact_sha256,
+            expected_name=expected_name
         ) if attempted else self._deploy_or_reconcile(
-            app_id, vercel_project, snapshot, operation_id, source_revision
+            app_id, vercel_project, snapshot, operation_id, source_revision,
+            expected_name=expected_name
         ))
         if not deployment.success:
             return deployment
@@ -274,7 +284,8 @@ class PreviewOrchestrator:
                             preview_url=preview_url)
 
         # ---- 4. Bounded readiness polling ----
-        ready = self._await_ready(app_id, vercel_project, operation_id, source_revision, snapshot)
+        ready = self._await_ready(app_id, vercel_project, operation_id, source_revision,
+                                  snapshot, expected_name=expected_name)
         if not ready.success:
             return ready
 
@@ -517,12 +528,14 @@ class PreviewOrchestrator:
                 intent.update(fields)
                 self.store.save(state)
 
-    def _deploy_or_reconcile(self, app_id, project, snapshot, operation_id, source_revision):
+    def _deploy_or_reconcile(self, app_id, project, snapshot, operation_id, source_revision,
+                             *, expected_name=None):
         """Deploy; on ambiguity/timeout, reconcile via lookup — never resend blindly."""
         try:
             result = self.deps.vercel.deploy_static_files(
                 app_id, project, dict(snapshot.dist),
                 operation_id, source_revision, snapshot.artifact_sha256,
+                expected_name=expected_name,
             )
         except Exception as exc:  # pragma: no cover - defensive
             result = OperationResult.fail(str(exc), error_code="DEPLOY_EXCEPTION")
@@ -534,17 +547,19 @@ class PreviewOrchestrator:
         # (adapters.py never marks retryable=True). Before giving up,
         # check whether the operation actually landed under a timeout.
         lookup = self.deps.vercel.find_deployment_by_operation_id(
-            app_id, project, operation_id, source_revision, snapshot.artifact_sha256
+            app_id, project, operation_id, source_revision, snapshot.artifact_sha256,
+            expected_name=expected_name
         )
         if lookup.success:
             return lookup
         return result
 
     def _await_ready(self, app_id, project, operation_id, source_revision, snapshot,
-                     max_polls: int = 20, interval: float = 1.5):
+                     max_polls: int = 20, interval: float = 1.5, *, expected_name=None):
         for _ in range(max_polls):
             lookup = self.deps.vercel.find_deployment_by_operation_id(
-                app_id, project, operation_id, source_revision, snapshot.artifact_sha256
+                app_id, project, operation_id, source_revision, snapshot.artifact_sha256,
+                expected_name=expected_name
             )
             if not lookup.success:
                 if lookup.error_code == "NOT_FOUND":

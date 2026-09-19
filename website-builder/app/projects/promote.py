@@ -47,6 +47,12 @@ class PromoteDeps:
     smoke: Any
     chat_id_for: Any  # callable(project_id, state) -> str, may return None
     app_id_for: Any = field(default=lambda project_id: project_id)
+    # Optional callable(project_id, state) -> Optional[str]. Returns the
+    # ALREADY-BOUND friendly Vercel slug from trusted registry state -- never
+    # derived fresh here (promotion only runs after a successful preview,
+    # which is what binds the slug). None disables slug resolution: the
+    # legacy opaque hash-derived project name governs, exactly as before.
+    slug_for: Any = None
 
 
 class PromotionOrchestrator:
@@ -250,14 +256,27 @@ class PromotionOrchestrator:
             )
 
         app_id = self.deps.app_id_for(project_id)
-        project_result = self.deps.vercel.lookup_project(app_id)
+        slug = None
+        if self.deps.slug_for is not None:
+            try:
+                slug = self.deps.slug_for(project_id, state)
+            except Exception:
+                slug = None
+        # Canonical Vercel project name, resolved from trusted bound registry
+        # state BEFORE and independently of any provider response. Threaded
+        # through every adapter call that revalidates the owned project so
+        # those checks assert the canonical name instead of re-deriving the
+        # opaque hash default (same threading contract as PreviewOrchestrator).
+        expected_name = slug if slug else None
+        project_result = self.deps.vercel.lookup_project(app_id, expected_name=expected_name)
         if not project_result.success:
             return project_result
         vercel_project = project_result.data["project"]
 
         # ---- Capture last-known-good production identity BEFORE
         # promoting, so a failed post-promotion smoke check can roll back.
-        previous_result = self.deps.vercel.find_production_deployment(app_id, vercel_project)
+        previous_result = self.deps.vercel.find_production_deployment(
+            app_id, vercel_project, expected_name=expected_name)
         if not previous_result.success:
             return previous_result
         previous_deployment_id = previous_result.data.get("deployment_id")
@@ -293,7 +312,7 @@ class PromotionOrchestrator:
             # Writer remains held through the first mutating adapter call.
             promote_result = self.deps.vercel.promote_deployment(
                 app_id, vercel_project, deployment_id, operation_id,
-                source_revision, artifact_sha256,
+                source_revision, artifact_sha256, expected_name=expected_name,
             )
         if not promote_result.success:
             self._fail(project_id, "PROMOTE_FAILED", promote_result.error_code or "PROMOTE_FAILED")
@@ -310,7 +329,7 @@ class PromotionOrchestrator:
             self._rollback_and_fail(
                 project_id, app_id, vercel_project, previous_deployment_id,
                 operation_id, source_revision, artifact_sha256,
-                error_code="SMOKE_FAILED",
+                error_code="SMOKE_FAILED", expected_name=expected_name,
             )
             return OperationResult(
                 success=False, error="SMOKE_FAILED", error_code="SMOKE_FAILED",
@@ -382,9 +401,10 @@ class PromotionOrchestrator:
             self.store.save(state)
 
     def _rollback_and_fail(
-        self, project_id: str, app_id: str, vercel_project, previous_deployment_id,
+        self, project_id, app_id, vercel_project, previous_deployment_id,
         operation_id: str, source_revision: int, artifact_sha256: str, error_code: str,
-    ) -> None:
+        expected_name=None,
+    ):
         """Roll the production alias back to the prior last-known-good
         deployment (if one existed) before failing the lifecycle closed.
 
@@ -399,6 +419,7 @@ class PromotionOrchestrator:
                 self.deps.vercel.promote_deployment(
                     app_id, vercel_project, previous_deployment_id,
                     "rollback:" + operation_id, source_revision, artifact_sha256,
+                    expected_name=expected_name,
                 )
             except Exception:
                 pass

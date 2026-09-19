@@ -22,6 +22,13 @@ class DomainDeps:
     vercel: Any
     smoke: Any  # injected run(url, out_dir); PreviewSmokeTester custom_hostname opt-in
     app_id_for: Any = field(default=lambda project_id: project_id)
+    # Optional callable(project_id, state) -> Optional[str]. Returns the
+    # ALREADY-BOUND friendly Vercel slug from trusted registry state -- never
+    # derived fresh here (this flow only runs after a live/approved
+    # production, which is downstream of the preview that binds the slug).
+    # None disables slug resolution: the legacy opaque hash-derived project
+    # name governs, exactly as before.
+    slug_for: Any = None
 
 
 class CustomDomainOrchestrator:
@@ -97,19 +104,30 @@ class CustomDomainOrchestrator:
     def _connect(self, state, hostname, workspace, principal, identity, mode):
         v = self.deps.vercel
         app_id = self.deps.app_id_for(state.project_id)
+        slug = None
+        if self.deps.slug_for is not None:
+            try:
+                slug = self.deps.slug_for(state.project_id, state)
+            except Exception:
+                slug = None
+        # Canonical Vercel project name from trusted bound registry state,
+        # resolved independently of any provider response and threaded
+        # through every owned-project revalidation below (same contract as
+        # PreviewOrchestrator/PromotionOrchestrator).
+        expected_name = slug if slug else None
         domain = state.domain
         binding = {'hostname': hostname, 'principal_id': principal, 'app_id': app_id,
                    'team_id': v.team_id, 'namespace': v.namespace, **identity}
         if domain.connection and any(domain.connection.get(k) != value for k, value in binding.items()):
             return _fail('DOMAIN_BINDING_MISMATCH')
-        result = v.lookup_project(app_id)
+        result = v.lookup_project(app_id, expected_name=expected_name)
         if not result.success:
             return self._error(state, result.error_code)
         project = result.data['project']
         binding['project_id'] = project['id']
         if domain.connection and domain.connection.get('project_id') != project['id']:
             return self._error(state, 'DOMAIN_BINDING_MISMATCH')
-        result = v.check_domain_production(app_id, project, identity)
+        result = v.check_domain_production(app_id, project, identity, expected_name=expected_name)
         if not result.success:
             return self._error(state, result.error_code)
         if not domain.connection:
@@ -119,12 +137,12 @@ class CustomDomainOrchestrator:
             self.store.save(state)
         intent = domain.connection
         if intent['add_attempted']:
-            added = v.get_project_domain(app_id, project, hostname)
+            added = v.get_project_domain(app_id, project, hostname, expected_name=expected_name)
         else:
             intent['add_attempted'] = True
             domain.connection_stage = 'ADDING'
             self.store.save(state)
-            added = v.add_domain(app_id, project, hostname)
+            added = v.add_domain(app_id, project, hostname, expected_name=expected_name)
         if not added.success:
             return self._error(state, added.error_code)
         intent['remote_bound'] = True
@@ -132,7 +150,7 @@ class CustomDomainOrchestrator:
         domain.attached_at = None
         domain.verified_at = None
         self.store.save(state)
-        checked = v.check_domain_production(app_id, project, identity)
+        checked = v.check_domain_production(app_id, project, identity, expected_name=expected_name)
         if not checked.success:
             return self._error(state, checked.error_code)
         config = v.get_domain_config(hostname)
@@ -166,12 +184,12 @@ class CustomDomainOrchestrator:
             intent['verify_attempted'] = True
             domain.connection_stage = 'VERIFYING'
             self.store.save(state)
-            verified = v.verify_domain(app_id, project, hostname)
+            verified = v.verify_domain(app_id, project, hostname, expected_name=expected_name)
             if not verified.success or verified.data.get('verified') is not True:
                 return self._error(state, 'DOMAIN_VERIFY_RECONCILIATION_REQUIRED')
         # Fresh project-domain/config reads even when verify POST reported success.
-        checked = v.check_domain_production(app_id, project, identity)
-        record = v.get_project_domain(app_id, project, hostname)
+        checked = v.check_domain_production(app_id, project, identity, expected_name=expected_name)
+        record = v.get_project_domain(app_id, project, hostname, expected_name=expected_name)
         config = v.get_domain_config(hostname)
         if not checked.success:
             return self._error(state, checked.error_code)
@@ -186,8 +204,8 @@ class CustomDomainOrchestrator:
         intent['smoke'] = smoke.data
         if not smoke.success:
             return self._error(state, 'SMOKE_FAILED')
-        checked = v.check_domain_production(app_id, project, identity)
-        record = v.get_project_domain(app_id, project, hostname)
+        checked = v.check_domain_production(app_id, project, identity, expected_name=expected_name)
+        record = v.get_project_domain(app_id, project, hostname, expected_name=expected_name)
         config = v.get_domain_config(hostname)
         if not checked.success:
             return self._error(state, checked.error_code)

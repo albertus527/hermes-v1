@@ -561,6 +561,177 @@ def test_real_content_deploy_after_bootstrap_consumed_promotion_is_accepted():
     assert result.success
 
 
+# ---------------------------------------------------------------------------
+# tg-6329821361-p4 regression: slug-named projects + canonical expected_name
+# threaded through every downstream revalidation.
+#
+# Before the fix, only ensure_project_with_slug passed expected_name (the
+# slug); every downstream method revalidated with the opaque hash-derived
+# default and failed a project it had just created itself with
+# PROJECT_IDENTITY_MISMATCH. These tests reproduce the real production
+# sequence (slug = "dapur-kedaton") and pin the ownership/name assertions
+# in BOTH directions: a correct slug project passes only when the canonical
+# name is threaded, and every mismatch still fails closed.
+# ---------------------------------------------------------------------------
+
+
+def _slug_deployment(a, slug, app_id='app'):
+    d = deployment(a)
+    d['name'] = slug
+    return d
+
+
+def test_slug_project_full_preview_sequence_passes_with_expected_name():
+    """REAL production sequence for tg-6329821361-p4, fixed: create/reconcile
+    the slug-named project, then bootstrap + real-content deploy + readiness
+    reconciliation lookup on the SAME returned project, threading the
+    canonical slug. All four steps succeed; the same sequence WITHOUT the
+    threaded name is pinned by the tripwire test below."""
+    a, t = adapter()
+    p = _slug_project(a, 'dapur-kedaton')
+    # 1. project create under the friendly slug (validated with expected_name=slug)
+    t.responses = [(404, {}), (201, {'id': 'prj_1'}), (200, p)]
+    created = a.ensure_project_with_slug('app', 'dapur-kedaton')
+    assert created.success
+    project = created.data['project']
+    # 2. bootstrap consumes the first-deployment auto-promotion (production already consumed)
+    t.responses = [(200, {**p, 'targets': {'production': {'id': 'dpl_boot'}}})]
+    assert a.ensure_bootstrap('app', project, expected_name='dapur-kedaton').success
+    # 3. real content deploy
+    d = _slug_deployment(a, 'dapur-kedaton')
+    t.responses = [(201, d)]
+    deployed = a.deploy_static_files('app', project, {'index.html': b'x'}, 'operation', 2, SHA,
+                                     expected_name='dapur-kedaton')
+    assert deployed.success
+    assert deployed.data['preview_url'] == 'https://tested.vercel.app'
+    # 4. subsequent readiness/reconciliation lookup on the same project object
+    t.responses = [(200, {'deployments': [d], 'pagination': {'next': None}}), (200, d)]
+    found = a.find_deployment_by_operation_id('app', project, 'operation', 2, SHA,
+                                              expected_name='dapur-kedaton')
+    assert found.success
+
+
+def test_opaque_project_downstream_passes_without_expected_name():
+    """Legacy/default path preserved: a project whose name IS the opaque
+    hash-derived name passes every downstream revalidation with no
+    expected_name threaded (adapter falls back to the opaque default)."""
+    a, t = adapter()
+    p = project(a)
+    t.responses = [(200, {**p, 'targets': {'production': {'id': 'dpl_existing'}}})]
+    assert a.ensure_bootstrap('app', p).success
+    t.responses = [(201, deployment(a))]
+    assert a.deploy_static_files('app', p, {'index.html': b'x'}, 'operation', 2, SHA).success
+    d = deployment(a)
+    t.responses = [(200, {'deployments': [d], 'pagination': {'next': None}}), (200, d)]
+    assert a.find_deployment_by_operation_id('app', p, 'operation', 2, SHA).success
+
+
+def test_downstream_foreign_marker_fails_despite_matching_expected_name():
+    """Ownership assertion stays independent: a project whose NAME matches
+    the canonical slug but whose WEBSITE_BUILDER_OWNER marker belongs to a
+    different app_id must still fail closed -- the threaded expected_name
+    never weakens the marker check."""
+    a, t = adapter()
+    foreign = _slug_project(a, 'dapur-kedaton')
+    foreign['env'] = [{'key': 'WEBSITE_BUILDER_OWNER',
+                       'value': a._marker('other-app'), 'type': 'plain'}]
+    for result in (
+        a.ensure_bootstrap('app', foreign, expected_name='dapur-kedaton'),
+        a.deploy_static_files('app', foreign, {'index.html': b'x'}, 'operation', 2, SHA,
+                              expected_name='dapur-kedaton'),
+        a.find_deployment_by_operation_id('app', foreign, 'operation', 2, SHA,
+                                          expected_name='dapur-kedaton'),
+    ):
+        assert not result.success and not result.retryable
+        assert result.error_code == 'PROJECT_IDENTITY_MISMATCH'
+    assert not t.calls  # identity rejected before any provider I/O
+
+
+def test_downstream_correct_marker_wrong_slug_fails():
+    """Name assertion stays independent: correct ownership marker for this
+    app_id but the project's name is NOT the canonical slug (e.g. a stale
+    project under a different slug) -> fail closed, never adopt."""
+    a, t = adapter()
+    wrong_slug = _slug_project(a, 'warung-maju')  # marker for 'app', name mismatch
+    for result in (
+        a.ensure_bootstrap('app', wrong_slug, expected_name='dapur-kedaton'),
+        a.deploy_static_files('app', wrong_slug, {'index.html': b'x'}, 'operation', 2, SHA,
+                              expected_name='dapur-kedaton'),
+        a.find_deployment_by_operation_id('app', wrong_slug, 'operation', 2, SHA,
+                                          expected_name='dapur-kedaton'),
+    ):
+        assert not result.success and not result.retryable
+        assert result.error_code == 'PROJECT_IDENTITY_MISMATCH'
+    assert not t.calls
+
+
+def test_downstream_without_threaded_name_still_requires_opaque_name():
+    """Tripwire pinning the unfixed failure class AND proving the check was
+    not weakened into self-reference: when the caller does NOT thread the
+    canonical slug, the adapter still validates against the opaque
+    hash-derived name -- so a slug-named project fails closed. `expected_name`
+    is never inferred from the project response itself."""
+    a, _ = adapter()
+    p = _slug_project(a, 'dapur-kedaton')
+    for result in (
+        a.ensure_bootstrap('app', p),
+        a.deploy_static_files('app', p, {'index.html': b'x'}, 'operation', 2, SHA),
+        a.find_deployment_by_operation_id('app', p, 'operation', 2, SHA),
+    ):
+        assert result.error_code == 'PROJECT_IDENTITY_MISMATCH'
+
+
+# ---------------------------------------------------------------------------
+# lookup_project(expected_name=...) -- canonical slug as BOTH the lookup key
+# and the validated name (promote/custom-domain reconciliation path).
+# ---------------------------------------------------------------------------
+
+
+def test_lookup_with_canonical_slug_uses_slug_key_and_validates():
+    """The canonical slug is the lookup KEY, not merely a post-hoc check --
+    never 'look up opaque, then trust the response name'."""
+    a, t = adapter()
+    p = _slug_project(a, 'dapur-kedaton')
+    t.responses = [(200, p)]
+    result = a.lookup_project('app', expected_name='dapur-kedaton')
+    assert result.success and result.data['project'] == p
+    assert t.calls[0][1].split('?')[0].endswith('/v9/projects/dapur-kedaton')
+
+
+def test_lookup_correct_owner_marker_wrong_slug_fails_closed():
+    """Correct WEBSITE_BUILDER_OWNER marker but the project returned is NOT
+    the canonical slug -> fail closed (ownership and name stay independent)."""
+    a, t = adapter()
+    t.responses = [(200, _slug_project(a, 'warung-maju'))]
+    result = a.lookup_project('app', expected_name='dapur-kedaton')
+    assert not result.success and not result.retryable
+    assert result.error_code == 'PROJECT_RECONCILIATION_REQUIRED'
+
+
+def test_lookup_correct_slug_foreign_owner_fails_closed():
+    """Right slug, wrong ownership marker -> fail closed; the threaded
+    expected_name never weakens the marker check."""
+    a, t = adapter()
+    foreign = _slug_project(a, 'dapur-kedaton')
+    foreign['env'] = [{'key': 'WEBSITE_BUILDER_OWNER',
+                       'value': a._marker('other-app'), 'type': 'plain'}]
+    t.responses = [(200, foreign)]
+    result = a.lookup_project('app', expected_name='dapur-kedaton')
+    assert not result.success and not result.retryable
+    assert result.error_code == 'PROJECT_RECONCILIATION_REQUIRED'
+
+
+def test_lookup_opaque_legacy_project_unchanged():
+    """No expected_name threaded -> lookup key is the legacy opaque
+    hash-derived name, validated exactly as before."""
+    a, t = adapter()
+    p = project(a)
+    t.responses = [(200, p)]
+    result = a.lookup_project('app')
+    assert result.success and result.data['project'] == p
+    assert ('/v9/projects/' + a.project_name_for('app')) in t.calls[0][1]
+
+
 @pytest.mark.parametrize('options,addresses', [({'redirect': True}, ['8.8.8.8']),
     ({'request_url': 'http://127.0.0.1/secret'}, ['8.8.8.8']), ({}, ['127.0.0.1']),
     ({}, ['8.8.8.8', '::1']), ({'bad_assets': True}, ['8.8.8.8'])])

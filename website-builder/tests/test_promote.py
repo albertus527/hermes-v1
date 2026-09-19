@@ -53,16 +53,22 @@ class FakeVercel:
         self._project = {'id': 'prj_1', 'name': 'wb', 'accountId': 'team'}
         self.previous_production = previous_production
         self.promote_calls = []
+        # Records every expected_name threaded by the orchestrator so tests
+        # can assert the canonical-slug / legacy-None contract end to end.
+        self.expected_names = []
 
-    def lookup_project(self, app_id):
+    def lookup_project(self, app_id, *, expected_name=None):
+        self.expected_names.append(expected_name)
         return OperationResult.ok({'project': self._project, 'app_id': app_id})
 
-    def find_production_deployment(self, app_id, project):
+    def find_production_deployment(self, app_id, project, *, expected_name=None):
+        self.expected_names.append(expected_name)
         return OperationResult.ok({'deployment_id': self.previous_production})
 
     def promote_deployment(self, app_id, project, deployment_id, operation_id,
-                           source_revision, artifact_sha256):
+                           source_revision, artifact_sha256, *, expected_name=None):
         self.promote_calls.append(deployment_id)
+        self.expected_names.append(expected_name)
         return OperationResult.ok({
             'deployment_id': deployment_id,
             'production_url': 'https://prod.vercel.app',
@@ -75,11 +81,14 @@ class FlakyPromoteVercel(FakeVercel):
         super().__init__(**kw)
         self.fail_on = fail_on
 
-    def promote_deployment(self, app_id, project, deployment_id, operation_id, source_revision, artifact_sha256):
+    def promote_deployment(self, app_id, project, deployment_id, operation_id,
+                           source_revision, artifact_sha256, *, expected_name=None):
         self.promote_calls.append(deployment_id)
         if deployment_id in self.fail_on:
             return OperationResult.fail('PROMOTE_FAILED', error_code='PROMOTE_FAILED')
-        return super().promote_deployment(app_id, project, deployment_id, operation_id, source_revision, artifact_sha256)
+        return super().promote_deployment(app_id, project, deployment_id, operation_id,
+                                          source_revision, artifact_sha256,
+                                          expected_name=expected_name)
 
 
 class FakeTelegram:
@@ -332,3 +341,109 @@ def test_unauthorized_promote_leaves_state_byte_identical(tmp_path):
     assert result.error_code == 'UNAUTHORIZED_ROLE'
     after = store._project_path('proj').read_bytes()
     assert before == after
+
+
+# ---------------------------------------------------------------------------
+# Slug-identity regression (same class as tg-6329821361-p4): promotion must
+# resolve the canonical Vercel project name from trusted bound state and
+# thread it through lookup/revalidation -- never fall back to the opaque
+# hash-derived name when a slug is bound.
+# ---------------------------------------------------------------------------
+
+
+class _SlugEnforcingVercel(FakeVercel):
+    """Owned project lives under the friendly slug 'dapur-kedaton'. Any
+    adapter call whose expected_name is anything else (None = 're-derive
+    the opaque hash name', which the real provider 404s, or a wrong slug)
+    fails closed -- exactly the unfixed promotion failure mode."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self._project = {'id': 'prj_1', 'name': 'dapur-kedaton', 'accountId': 'team'}
+
+    def _gate(self, expected_name):
+        self.expected_names.append(expected_name)
+        if expected_name != 'dapur-kedaton':
+            return OperationResult.fail('PROJECT_RECONCILIATION_REQUIRED',
+                                        error_code='PROJECT_RECONCILIATION_REQUIRED')
+        return None
+
+    def lookup_project(self, app_id, *, expected_name=None):
+        bad = self._gate(expected_name)
+        return bad or OperationResult.ok({'project': self._project, 'app_id': app_id})
+
+    def find_production_deployment(self, app_id, project, *, expected_name=None):
+        bad = self._gate(expected_name)
+        return bad or OperationResult.ok({'deployment_id': self.previous_production})
+
+    def promote_deployment(self, app_id, project, deployment_id, operation_id,
+                           source_revision, artifact_sha256, *, expected_name=None):
+        bad = self._gate(expected_name)
+        # super() records promote_calls only when the gate passes.
+        return bad or super().promote_deployment(
+            app_id, project, deployment_id, operation_id, source_revision,
+            artifact_sha256, expected_name=expected_name)
+
+
+def test_slug_project_approve_promote_uses_canonical_lookup(tmp_path):
+    """Preview-created slug project: approve -> promote must succeed via the
+    canonical slug lookup, with expected_name threaded through every
+    owned-project revalidation (lookup, production probe, promote)."""
+    runner, store = _runner(tmp_path)
+    ws = _make_workspace(tmp_path)
+    _approved_state(store, 'proj')
+    vercel = _SlugEnforcingVercel()
+    deps = _deps(vercel=vercel)
+    deps.slug_for = lambda pid, state: 'dapur-kedaton'
+    orch = PromotionOrchestrator(runner, store, deps)
+    assert orch.approve('proj', principal_id=OWNER).success
+
+    result = orch.promote('proj', ws, principal_id=OWNER)
+
+    assert result.success, result.error
+    state = store.load('proj')
+    assert state.lifecycle == ProjectLifecycle.LIVE.value
+    assert vercel.promote_calls == ['dpl_1']
+    # lookup + find_production + promote: every gate saw the canonical slug.
+    assert vercel.expected_names
+    assert all(name == 'dapur-kedaton' for name in vercel.expected_names)
+
+
+def test_slug_project_promote_never_falls_back_to_opaque_name(tmp_path):
+    """Fault injection the other way: if the orchestrator ever drops the
+    threaded slug (the unfixed behavior), the slug-only provider rejects the
+    opaque lookup -- proving the canonical name is what was used."""
+    runner, store = _runner(tmp_path)
+    ws = _make_workspace(tmp_path)
+    _approved_state(store, 'proj')
+    vercel = _SlugEnforcingVercel()
+    deps = _deps(vercel=vercel)
+    # slug_for present but returning None simulates the unfixed/no-binding
+    # path: expected_name None -> opaque lookup -> fail closed, not success.
+    deps.slug_for = lambda pid, state: None
+    orch = PromotionOrchestrator(runner, store, deps)
+    assert orch.approve('proj', principal_id=OWNER).success
+
+    result = orch.promote('proj', ws, principal_id=OWNER)
+
+    assert not result.success
+    assert result.error_code == 'PROJECT_RECONCILIATION_REQUIRED'
+    assert vercel.promote_calls == []
+
+
+def test_legacy_no_slug_project_promotes_with_none_expected_name(tmp_path):
+    """Opaque legacy project unchanged: no slug bound, adapter receives
+    expected_name=None on every call (the opaque default path)."""
+    runner, store = _runner(tmp_path)
+    ws = _make_workspace(tmp_path)
+    _approved_state(store, 'proj')
+    vercel = FakeVercel()
+    deps = _deps(vercel=vercel)  # slug_for defaults to None
+    orch = PromotionOrchestrator(runner, store, deps)
+    assert orch.approve('proj', principal_id=OWNER).success
+
+    result = orch.promote('proj', ws, principal_id=OWNER)
+
+    assert result.success, result.error
+    assert vercel.expected_names
+    assert all(name is None for name in vercel.expected_names)

@@ -62,23 +62,32 @@ class Provider:
                     'verification': [{'type': 'TXT', 'domain': '_vercel.' + HOST,
                                       'value': 'vc-domain-verify=challenge'}], **self.domain_override}
         else:
+            # Project-name lookup (GET /v9/projects/<name>). The provider only
+            # answers under the project's REAL name -- any other key 404s.
+            # This is what proves the canonical slug is used as the lookup
+            # KEY (an opaque-name fallback misses entirely).
+            if path.rsplit('/', 1)[-1] != self.project['name']:
+                return HttpResponse(404, b'{}')
             body = self.project
         return HttpResponse(200, json.dumps(body).encode())
 
 
-def setup(tmp_path, lifecycle='LIVE', browser_options=None):
+def setup(tmp_path, lifecycle='LIVE', browser_options=None, slug=None):
     store = ProjectStateStore(tmp_path / 'state')
     runner = ProjectRunner(tmp_path / 'workspaces', store)
     provider = Provider()
     adapter = VercelAdapter('secret', 'team', 'installation', provider)
     identity = {'operation_id': 'op', 'deployment_id': 'dpl', 'source_revision': 1,
                 'source_sha256': 'a' * 64, 'artifact_sha256': 'b' * 64}
-    provider.project = {'id': 'prj', 'accountId': 'team', 'name': adapter.project_name_for('app'),
+    # slug=None keeps the legacy opaque project; slug='...' models a
+    # preview-created project living under the canonical friendly slug.
+    name = slug or adapter.project_name_for('app')
+    provider.project = {'id': 'prj', 'accountId': 'team', 'name': name,
                         'env': [{'key': 'WEBSITE_BUILDER_OWNER', 'type': 'plain',
                                  'value': adapter._marker('app')}],
                         'targets': {'production': {'id': 'dpl'}}}
     provider.deployment = {'id': 'dpl', 'projectId': 'prj', 'teamId': 'team',
-                           'name': provider.project['name'], 'target': 'production',
+                           'name': name, 'target': 'production',
                            'readyState': 'READY', 'meta': adapter._meta('app', 'op', 1, 'b' * 64)}
     with store.acquire_writer('app') as state:
         state.roles = {'owner': 'owner', 'reviewers': ['reviewer'], 'viewers': ['viewer']}
@@ -93,7 +102,8 @@ def setup(tmp_path, lifecycle='LIVE', browser_options=None):
         browsers.append(browser)
         return browser
     smoke = PreviewSmokeTester(factory, lambda _: ['8.8.8.8'], custom_hostname=HOST)
-    deps = DomainDeps(adapter, smoke)
+    deps = DomainDeps(adapter, smoke,
+                      slug_for=(lambda pid, state: slug) if slug else None)
     def restart():
         return CustomDomainOrchestrator(runner, ProjectStateStore(store.root), deps)
     def connect(**kwargs):
@@ -324,3 +334,54 @@ def test_tls_exception_failclosed(tmp_path):
     deps.smoke = PreviewSmokeTester(TLSBrowser, lambda _: ['8.8.8.8'], custom_hostname=HOST)
     assert connect().error_code == 'SMOKE_FAILED'
     assert store.load('app').domain.attached_at is None
+
+
+# ---------------------------------------------------------------------------
+# Slug-identity regression (same class as tg-6329821361-p4): the custom
+# domain flow must resolve the owned project by its canonical friendly slug
+# (lookup key AND validated name), never via the opaque hash-derived name.
+# The provider only answers under the project's REAL name -- an opaque
+# fallback 404s, which surfaces as PROJECT_RECONCILIATION_REQUIRED.
+# ---------------------------------------------------------------------------
+
+
+def _project_name_lookup_keys(p):
+    return [urlsplit(c[1]).path for c in p.calls
+            if c[0] == 'GET' and '/v9/projects/' in urlsplit(c[1]).path
+            and '/domains' not in urlsplit(c[1]).path]
+
+
+def test_slug_project_custom_domain_full_flow_via_canonical_lookup(tmp_path):
+    """Preview-created slug project: claim -> add -> check -> verify -> smoke
+    -> ATTACHED, every owned-project lookup keyed by the canonical slug."""
+    store, p, browsers, connect, _ = setup(tmp_path, slug='dapur-kedaton')
+    pending = connect()
+    assert pending.error_code == 'DNS_PENDING'  # lookup + add + checks all passed
+    p.misconfigured = False
+    result = connect()
+    assert result.success, result.error
+    assert result.data['stage'] == 'ATTACHED'
+    keys = _project_name_lookup_keys(p)
+    assert keys and all(key.endswith('/dapur-kedaton') for key in keys)
+
+
+def test_slug_project_domain_flow_never_falls_back_to_opaque_lookup(tmp_path):
+    """Fault injection: slug configured in the provider but the orchestrator
+    is NOT given the bound slug (the unfixed behavior) -> the opaque-name
+    lookup 404s and the flow fails closed before any domain mutation."""
+    store, p, browsers, connect, deps = setup(tmp_path, slug='dapur-kedaton')
+    deps.slug_for = lambda pid, state: None
+    result = connect()
+    assert result.error_code == 'PROJECT_RECONCILIATION_REQUIRED'
+    assert not p.bound and not p.verified
+    assert store.load('app').domain.attached_at is None
+
+
+def test_opaque_legacy_domain_flow_lookup_key_unchanged(tmp_path):
+    """No slug bound (legacy opaque project): the lookup key IS the opaque
+    hash-derived name and the existing flow is untouched."""
+    store, p, browsers, connect, _ = setup(tmp_path)
+    pending = connect()
+    assert pending.error_code == 'DNS_PENDING'
+    keys = _project_name_lookup_keys(p)
+    assert keys and all(key.endswith('/' + p.project['name']) for key in keys)
