@@ -1147,9 +1147,8 @@ Respond with a JSON summary:
         except ImportError as exc:
             return {
                 "pass": False,
-                "critical": [],
-                "major": [],
-                "minor": [],
+                "blocking": [],
+                "observations": [],
                 "summary": "",
                 "error": f"Failed to import Hermes image routing: {exc}",
             }
@@ -1166,9 +1165,8 @@ Respond with a JSON summary:
         if skipped:
             return {
                 "pass": False,
-                "critical": [],
-                "major": [],
-                "minor": [],
+                "blocking": [],
+                "observations": [],
                 "summary": "",
                 "error": (
                     "VISION failed to attach required screenshot(s): "
@@ -1189,9 +1187,8 @@ Respond with a JSON summary:
         if not result.success:
             return {
                 "pass": False,
-                "critical": [],
-                "major": [],
-                "minor": [],
+                "blocking": [],
+                "observations": [],
                 "summary": "",
                 "error": result.error or "VISION inspection failed",
             }
@@ -1203,13 +1200,19 @@ Respond with a JSON summary:
         brief: Dict[str, Any],
         design_dna: Optional[Dict[str, Any]],
     ) -> str:
-        """Build the VISION inspection prompt. Evidence-only — no edit authority."""
+        """Build the VISION inspection prompt. Evidence-only — no edit authority.
+
+        VISION is a narrow visual acceptance reviewer: it answers only whether
+        the rendered result is visibly healthy and reasonably aligned with the
+        supplied intent. It is NOT a designer, NOT a requirements author, and
+        must never invent new product/design/implementation requirements.
+        """
         name = brief.get("name", "Website")
         what = brief.get("what", "")
         why = brief.get("why", "")
         dna_summary = json.dumps(design_dna, indent=2) if design_dna else "(none)"
 
-        return f"""You are VISION, the evidence-only visual QA inspector for Website Builder R1.
+        return f"""You are VISION, the evidence-only visual acceptance reviewer for Website Builder R1.
 
 Two screenshots are attached to this message:
 - Desktop viewport (1440x900)
@@ -1223,32 +1226,87 @@ Brief:
 Design DNA:
 {dna_summary}
 
-Your job is to inspect the attached screenshots and report findings. You must
-NOT edit files, run commands, or take any action — you have zero tool access.
-Report only what you observe:
-- missing hero/content
-- clipping or overflow
-- responsive failures
-- overlapping UI
-- unreadable text
-- severe contrast problems
-- broken visual hierarchy
-- obvious placeholder leakage
-- broken CTA presentation
-- major visible accessibility issues
-- major mismatch with Design DNA
+FRONTEND owns design, structure, copy, and implementation. You are NOT a
+second designer and NOT a requirements author. Do NOT invent new product,
+design, or implementation requirements. Absence of a specification is NOT a
+prohibition. Evaluate only what is visible in the attached screenshots.
 
-Do not invent business facts. Do not judge subjective taste beyond the
-categories above.
+Answer only these questions:
+1. Is the rendered website visually broken?
+2. Is there an obvious responsive/layout problem?
+3. Is visible wording obviously broken, leaked, placeholder/debug-like,
+   nonsensical, or inconsistent with the supplied user intent?
+4. Does the visible result substantially contradict an EXPLICIT visual
+   requirement supplied above (brief / Design DNA)?
+5. Is there an obvious visible UI/UX defect severe enough that a normal user
+   would consider the page broken or unusable?
+
+BLOCKING findings — report in "blocking" only concrete visible defects or
+explicit requirement violations, such as:
+- overlapping content
+- clipped/cut-off important content
+- horizontal overflow that visibly breaks mobile
+- unreadable text or severe contrast problems
+- clearly broken responsive layout
+- obviously missing required visible section
+- broken image/icon presentation
+- placeholder/debug/internal text visibly leaking to the end user
+- a required visible CTA/element is missing
+- visible output directly contradicts an explicit supplied requirement
+- visible state that makes an important control appear unusable
+
+OBSERVATIONS — report in "observations" any subjective feedback or
+improvement suggestions. Observations are NON-BLOCKING: they never make the
+site fail and never become repair requirements. Examples:
+- spacing could be tighter
+- this color might look better
+- another CTA may be unnecessary
+- icons could be more varied
+- hierarchy could be stronger
+- this section could feel more polished
+- aesthetic preference, stylistic alternative, or a reasonable inference not
+  explicitly required by the brief / Design DNA
+
+Do NOT require or infer implementation details that cannot be established
+from the screenshots. These are NOT valid findings:
+- aria-disabled or any DOM attribute
+- CSS class names
+- exact color hex requirements for a component unless that requirement is
+  explicitly quoted in the brief / Design DNA above
+- event handlers, routing internals, semantic HTML implementation
+- JavaScript behavior not demonstrated by the evidence
+- "there may only be one CTA" or similar restrictions that are not explicit
+
+Functionality: report functionality only when the failure is directly visible
+from the evidence.
+VALID: "The mobile navigation visibly covers the hero content."
+VALID: "The CTA text is clipped and unreadable."
+INVALID: "The hamburger button probably does not work."
+INVALID: "The CTA click handler is missing."
+
+Wording: review visible wording. Blocking wording problems are debug/internal
+text exposed to the user, obvious placeholder leakage presented as real
+content, malformed/truncated wording, visibly nonsensical text, or wording
+that directly contradicts an explicit user requirement. "A different headline
+might sound better" or "the CTA copy could be more persuasive" are
+observations, not blockers — FRONTEND remains the copywriter.
+
+When uncertain whether something is an explicit violation, classify it as an
+observation. Do not fail closed on subjective design interpretation.
+
+You must NOT edit files, run commands, or take any action — you have zero
+tool access.
 
 Respond in this exact JSON format:
 {{
   "pass": true|false,
-  "critical": ["..."],
-  "major": ["..."],
-  "minor": ["..."],
+  "blocking": ["concrete visible defect or explicit requirement violation"],
+  "observations": ["non-blocking subjective suggestion"],
   "summary": "one paragraph summary"
 }}
+
+"pass" must be true if and only if "blocking" is empty. A site with
+observations but no blocking findings PASSES.
 """
 
     def vision_extract_references(
@@ -1356,17 +1414,36 @@ Respond in this exact JSON format, one entry per attached role in order:
         }
 
     def _parse_vision_response(self, response: str) -> Dict[str, Any]:
-        """Parse VISION JSON response. Fails closed (pass=false) on parse failure."""
+        """Parse VISION JSON response into the application-owned blocking /
+        observation contract. Fails closed (pass=false) on parse failure.
+
+        ``pass`` is derived by the application from the blocking list, never
+        trusted from model prose: a response with any blocking finding fails;
+        a response with only observations passes.
+        """
         try:
             start = response.find("{")
             end = response.rfind("}") + 1
             if start >= 0 and end > start:
                 data = json.loads(response[start:end])
+                blocking = list(data.get("blocking") or [])
+                observations = list(data.get("observations") or [])
+                if "blocking" not in data and "observations" not in data:
+                    # Legacy-shape compatibility: under the retired
+                    # critical/major/minor contract, critical+major were
+                    # unconditionally blocking and minor was non-blocking.
+                    # Mapping them (instead of dropping them) guarantees a
+                    # model that ignores the new schema cannot silently pass
+                    # a page it flagged as defective.
+                    blocking = (
+                        list(data.get("critical") or [])
+                        + list(data.get("major") or [])
+                    )
+                    observations = list(data.get("minor") or [])
                 return {
-                    "pass": bool(data.get("pass", False)),
-                    "critical": list(data.get("critical") or []),
-                    "major": list(data.get("major") or []),
-                    "minor": list(data.get("minor") or []),
+                    "pass": not blocking,
+                    "blocking": blocking,
+                    "observations": observations,
                     "summary": data.get("summary", ""),
                 }
         except (json.JSONDecodeError, ValueError):
@@ -1374,9 +1451,8 @@ Respond in this exact JSON format, one entry per attached role in order:
 
         return {
             "pass": False,
-            "critical": [],
-            "major": [],
-            "minor": [],
+            "blocking": [],
+            "observations": [],
             "summary": "",
             "error": "Failed to parse VISION response",
         }

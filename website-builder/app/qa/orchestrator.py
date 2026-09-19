@@ -283,11 +283,15 @@ class QAOrchestrator:
                 raw_err = vision_raw.get("error")
                 if raw_err:
                     infra_error = f"INFRASTRUCTURE_ERROR:vision_failed:{raw_err}"
+                # Application-owned pass semantics: VISION passes iff it
+                # reported no blocking findings and VISION itself ran.
+                # Subjective observations never affect pass/fail and never
+                # consume the repair budget.
+                blocking_findings = list(vision_raw.get("blocking") or [])
                 vision_findings = VisionFindings(
-                    pass_=bool(vision_raw.get("pass", False)),
-                    critical=list(vision_raw.get("critical") or []),
-                    major=list(vision_raw.get("major") or []),
-                    minor=list(vision_raw.get("minor") or []),
+                    pass_=not blocking_findings and not raw_err,
+                    blocking_findings=blocking_findings,
+                    observations=list(vision_raw.get("observations") or []),
                     summary=vision_raw.get("summary", ""),
                     raw_error=raw_err,
                 )
@@ -383,16 +387,15 @@ class QAOrchestrator:
         self, design_dna: Optional[Dict[str, Any]], failed_attempt: QAAttempt
     ) -> str:
         det_failures = "\n".join(f"- {f}" for f in failed_attempt.deterministic.failures) or "(none)"
-        vision_findings = ""
+        vision_blockers = ""
         if failed_attempt.vision is not None:
-            crit = "\n".join(f"- {c}" for c in failed_attempt.vision.critical) or "(none)"
-            major = "\n".join(f"- {m}" for m in failed_attempt.vision.major) or "(none)"
-            vision_findings = f"""
-VISION critical findings:
-{crit}
-
-VISION major findings:
-{major}
+            # Only BLOCKING findings are repair requirements. Subjective
+            # VISION observations are deliberately excluded — they are not
+            # mandatory and must not drive changes.
+            blockers = "\n".join(f"- {b}" for b in failed_attempt.vision.blocking_findings) or "(none)"
+            vision_blockers = f"""
+VISION blocking findings (concrete visible defects / explicit requirement violations):
+{blockers}
 """
         dna_note = json.dumps(design_dna, indent=2) if design_dna else "(none)"
 
@@ -403,13 +406,16 @@ Existing Design DNA (do not redesign; make the smallest targeted fix):
 
 Deterministic QA failures:
 {det_failures}
-{vision_findings}
+{vision_blockers}
 
 Instructions:
 - Make the smallest targeted fix that resolves the blocking findings above.
 - Do NOT redesign unrelated areas of the site.
 - Do NOT invent business facts.
 - Preserve the existing Design DNA unless it directly caused a blocking finding.
+- Only the blocking findings above are mandatory. VISION also reviews the
+  site subjectively, but those observations are NOT part of this repair task
+  and must not drive changes.
 """
 
     def _run_rebuild_checks(self, project_id: str, workspace: Path) -> tuple:

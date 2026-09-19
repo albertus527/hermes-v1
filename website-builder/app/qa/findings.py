@@ -14,34 +14,44 @@ class VisionFindings:
     """Structured VISION evidence-only result.
 
     VISION never mutates lifecycle or files. This is pure evidence.
+
+    VISION is a narrow visual acceptance reviewer, not a second designer or
+    a requirements author. Its findings are split into two disjoint classes:
+
+    - ``blocking_findings``: concrete visible defects or violations of an
+      EXPLICIT requirement supplied to VISION (brief / Design DNA). Only
+      these may consume a FRONTEND repair attempt.
+    - ``observations``: subjective feedback, suggestions, or inferences not
+      explicitly required by the supplied intent. These never block, never
+      consume a repair attempt, and are never promoted into requirements.
     """
 
     pass_: bool
-    critical: List[str] = field(default_factory=list)
-    major: List[str] = field(default_factory=list)
-    minor: List[str] = field(default_factory=list)
+    blocking_findings: List[str] = field(default_factory=list)
+    observations: List[str] = field(default_factory=list)
     summary: str = ""
     raw_error: Optional[str] = None
 
     @property
     def blocking(self) -> bool:
-        """VISION findings are blocking when critical/major findings are
-        present, OR when VISION itself failed to run (raw_error set).
+        """VISION blocks only on concrete visible defects / explicit
+        requirement violations, OR when VISION itself failed to run
+        (raw_error set).
 
         A VISION runtime failure (image attach failure, unsupported vision
         model, provider error, malformed JSON, missing screenshot) must
         never be silently treated as "no findings" — that would let a QA
         attempt pass without VISION ever having actually inspected the
-        pixels. Fail closed.
+        pixels. Fail closed on infrastructure; fail open (non-blocking) on
+        subjective design interpretation.
         """
-        return bool(self.critical) or bool(self.major) or bool(self.raw_error)
+        return bool(self.blocking_findings) or bool(self.raw_error)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "pass": self.pass_,
-            "critical": self.critical,
-            "major": self.major,
-            "minor": self.minor,
+            "blocking": self.blocking_findings,
+            "observations": self.observations,
             "summary": self.summary,
             "raw_error": self.raw_error,
         }

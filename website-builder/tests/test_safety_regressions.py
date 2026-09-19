@@ -63,7 +63,7 @@ def test_failed_rebuild_never_renders_stale_output(tmp_path):
     adapter = Mock()
     adapter.frontend_build.return_value = {'success': True, 'design_dna': {'version': 1}}
     qa = QAOrchestrator(ProjectRunner(tmp_path / 'work', store), store, adapter)
-    blocked = QAAttempt(0, DeterministicFindings(failures=['broken']), VisionFindings(False, critical=['broken']))
+    blocked = QAAttempt(0, DeterministicFindings(failures=['broken']), VisionFindings(False, blocking_findings=['broken']))
     with patch.object(qa, '_run_one_attempt', return_value=blocked) as render, patch.object(
         qa, '_run_rebuild_checks', return_value=(False, False)
     ):

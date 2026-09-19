@@ -6,6 +6,7 @@ Tests do NOT require a live LLM, browser, or npm. All external boundaries
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import tempfile
@@ -108,19 +109,23 @@ class _FixtureBase(unittest.TestCase):
         return ScreenshotSet(desktop=desktop, mobile=mobile)
 
     def _passing_vision(self):
-        return {"pass": True, "critical": [], "major": [], "minor": [], "summary": "Looks good."}
+        return {"pass": True, "blocking": [], "observations": [], "summary": "Looks good."}
 
-    def _blocking_vision(self, critical=None, major=None):
+    def _blocking_vision(self, blocking=None):
         return {
             "pass": False,
-            "critical": critical or ["Hero image missing"],
-            "major": major or [],
-            "minor": [],
+            "blocking": blocking or ["Hero image missing"],
+            "observations": [],
             "summary": "Blocking issue found.",
         }
 
-    def _minor_only_vision(self):
-        return {"pass": True, "critical": [], "major": [], "minor": ["Slightly uneven spacing"], "summary": "Minor polish only."}
+    def _observations_only_vision(self, observations=None):
+        return {
+            "pass": True,
+            "blocking": [],
+            "observations": observations or ["Slightly uneven spacing"],
+            "summary": "Non-blocking polish only.",
+        }
 
 
 class TestQASuccess(_FixtureBase):
@@ -220,7 +225,7 @@ class TestVisionBoundary(unittest.TestCase):
             with patch.object(adapter, "_run_fast_programmatic") as mock_fast:
                 mock_fast.return_value = MagicMock(
                     success=True,
-                    response='{"pass": true, "critical": [], "major": [], "minor": [], "summary": "ok"}',
+                    response='{"pass": true, "blocking": [], "observations": [], "summary": "ok"}',
                 )
                 desktop = Path(tmpdir) / "desktop.png"
                 mobile = Path(tmpdir) / "mobile.png"
@@ -268,7 +273,7 @@ class TestVisionMultimodalRouting(unittest.TestCase):
         with patch.object(self.adapter, "_run_fast_programmatic") as mock_fast:
             mock_fast.return_value = MagicMock(
                 success=True,
-                response='{"pass": true, "critical": [], "major": [], "minor": [], "summary": "ok"}',
+                response='{"pass": true, "blocking": [], "observations": [], "summary": "ok"}',
             )
             self.adapter.vision_inspect(self.desktop, self.mobile, self.brief)
 
@@ -308,7 +313,7 @@ class TestVisionMultimodalRouting(unittest.TestCase):
 
             def _run_conversation(msg):
                 captured["message"] = msg
-                return {"final_response": '{"pass": true, "critical": [], "major": [], "minor": [], "summary": "ok"}'}
+                return {"final_response": '{"pass": true, "blocking": [], "observations": [], "summary": "ok"}'}
 
             agent_instance.run_conversation.side_effect = _run_conversation
             mock_agent_cls.return_value = agent_instance
@@ -341,7 +346,7 @@ class TestVisionMultimodalRouting(unittest.TestCase):
         ):
             agent_instance = MagicMock()
             agent_instance.run_conversation.return_value = {
-                "final_response": '{"pass": true, "critical": [], "major": [], "minor": [], "summary": "ok"}'
+                "final_response": '{"pass": true, "blocking": [], "observations": [], "summary": "ok"}'
             }
             mock_agent_cls.return_value = agent_instance
 
@@ -629,14 +634,14 @@ class TestDeterministicFunctionalFailureBlocks(_FixtureBase):
         self.assertEqual(state.lifecycle, ProjectLifecycle.FAILED.value)
 
 
-class TestMinorFindingsDoNotTriggerRepair(_FixtureBase):
-    """9. Minor-only VISION findings do NOT trigger repair."""
+class TestObservationsOnlyFindingsDoNotTriggerRepair(_FixtureBase):
+    """9. Non-blocking VISION observations do NOT trigger repair."""
 
-    def test_minor_only_passes_immediately(self):
+    def test_observations_only_passes_immediately(self):
         _queue_and_run_project(self.store, "proj")
         self._passing_render()
         self.mock_capture.capture.side_effect = lambda url, qa_dir, attempt: self._passing_screenshots(attempt)
-        self.mock_adapter.vision_inspect.return_value = self._minor_only_vision()
+        self.mock_adapter.vision_inspect.return_value = self._observations_only_vision()
 
         result = self.orchestrator.run("proj", self.workspace, self.brief, self.design_dna)
 
@@ -759,7 +764,7 @@ class TestRepairPromptNoFabrication(_FixtureBase):
         failed = QAAttempt(
             attempt=0,
             deterministic=DeterministicFindings(failures=["Desktop screenshot missing"]),
-            vision=VisionFindings(pass_=False, critical=["Hero missing"], summary="bad"),
+            vision=VisionFindings(pass_=False, blocking_findings=["Hero missing"], summary="bad"),
         )
         instructions = self.orchestrator._build_repair_instructions(self.design_dna, failed)
 
@@ -1257,7 +1262,7 @@ class TestRepairAttemptNumbering(unittest.TestCase):
             mock_renderer.start.return_value = handle
             mock_capture.capture.side_effect = lambda url, qa_dir, attempt: _passing_screenshots(attempt)
             mock_adapter.vision_inspect.return_value = {
-                "pass": False, "critical": ["bad"], "major": [], "minor": [], "summary": "x",
+                "pass": False, "blocking": ["bad"], "observations": [], "summary": "x",
             }
             mock_adapter.frontend_build.return_value = {"success": True, "design_dna": {"version": 1}}
 
@@ -1290,13 +1295,13 @@ class TestVisionFailureBlocksQA(unittest.TestCase):
     def test_vision_raw_error_is_blocking(self):
         from app.qa.findings import VisionFindings
 
-        findings = VisionFindings(pass_=False, critical=[], major=[], minor=[], raw_error="provider timeout")
+        findings = VisionFindings(pass_=False, blocking_findings=[], observations=[], raw_error="provider timeout")
         self.assertTrue(findings.blocking)
 
     def test_vision_no_error_no_findings_not_blocking(self):
         from app.qa.findings import VisionFindings
 
-        findings = VisionFindings(pass_=True, critical=[], major=[], minor=[])
+        findings = VisionFindings(pass_=True, blocking_findings=[], observations=[])
         self.assertFalse(findings.blocking)
 
 
@@ -1486,6 +1491,346 @@ class TestToolchainProtectionRepair(_FixtureBase):
         self.assertTrue(result.success)
         self.assertEqual(result.repair_attempts, 1)
         verify.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# p5 regression (tg-6329821361-p5): VISION blocking vs. observation contract
+# ---------------------------------------------------------------------------
+
+
+class TestVisionBlockingVsObservationContract(_FixtureBase):
+    """p5 regression: only concrete visible defects or explicit requirement
+    violations may block QA or consume a repair attempt. Subjective VISION
+    feedback is a non-blocking observation: it can never fail QA, never
+    consume the repair budget, and never become a repair requirement.
+    """
+
+    def _run_with_vision(self, vision_responses):
+        _queue_and_run_project(self.store, "proj")
+        self._passing_render()
+        self.mock_capture.capture.side_effect = (
+            lambda url, qa_dir, attempt: self._passing_screenshots(attempt)
+        )
+        self.mock_adapter.vision_inspect.side_effect = vision_responses
+        self.mock_adapter.frontend_build.return_value = {
+            "success": True,
+            "design_dna": self.design_dna,
+        }
+        with patch.object(self.orchestrator, "_run_rebuild_checks", return_value=(True, True)):
+            return self.orchestrator.run("proj", self.workspace, self.brief, self.design_dna)
+
+    def test_p5_case1_preferred_hex_color_is_non_blocking(self):
+        """VISION: "Hero CTA would look better using #C2410C."
+        -> NON-BLOCKING, PASS, no repair consumed."""
+        result = self._run_with_vision([
+            {"pass": True, "blocking": [],
+             "observations": ["Hero CTA would look better using #C2410C."],
+             "summary": "Healthy."},
+        ])
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.repair_attempts, 0)
+        self.mock_adapter.frontend_build.assert_not_called()
+        state = self.store.load("proj")
+        self.assertEqual(state.lifecycle, ProjectLifecycle.PREVIEW_READY.value)
+        # Recorded as observation, not acted on.
+        self.assertEqual(
+            state.deployment["qa"]["vision"]["observations"],
+            ["Hero CTA would look better using #C2410C."],
+        )
+
+    def test_p5_case2_second_cta_is_non_blocking_without_explicit_prohibition(self):
+        """VISION: "The page has a second CTA not explicitly described in
+        Design DNA." -> NON-BLOCKING (absence of a spec is not a prohibition),
+        PASS, no repair consumed."""
+        result = self._run_with_vision([
+            {"pass": True, "blocking": [],
+             "observations": ["The page has a second CTA not explicitly described in Design DNA."],
+             "summary": "Fine."},
+        ])
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.repair_attempts, 0)
+        self.mock_adapter.frontend_build.assert_not_called()
+        self.assertEqual(self.store.load("proj").lifecycle, ProjectLifecycle.PREVIEW_READY.value)
+
+    def test_p5_case3_aria_disabled_cannot_be_a_screenshot_blocker(self):
+        """VISION: "CTA should use aria-disabled." -> implementation detail
+        unobservable from screenshots; must not become a screenshot-based
+        blocking requirement. As an observation: PASS, no repair consumed."""
+        result = self._run_with_vision([
+            {"pass": True, "blocking": [],
+             "observations": ["CTA should use aria-disabled to look inert."],
+             "summary": "Placeholder CTA looks active."},
+        ])
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.repair_attempts, 0)
+        self.mock_adapter.frontend_build.assert_not_called()
+        self.assertEqual(self.store.load("proj").lifecycle, ProjectLifecycle.PREVIEW_READY.value)
+
+    def test_p5_case4_placeholder_leakage_blocks_and_repairs(self):
+        """VISION sees internal placeholder/debug text visibly exposed to the
+        user -> BLOCKING, repair consumed, then pass."""
+        result = self._run_with_vision([
+            {"pass": False, "blocking": ["Internal placeholder text is visibly exposed to the user."],
+             "observations": [], "summary": "Leak."},
+            self._passing_vision(),
+        ])
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.repair_attempts, 1)
+        self.mock_adapter.frontend_build.assert_called_once()
+        self.assertEqual(self.store.load("proj").lifecycle, ProjectLifecycle.PREVIEW_READY.value)
+
+    def test_p5_case5_mobile_overlap_blocks_and_repairs(self):
+        """VISION sees mobile content visibly overlapping / important content
+        clipped -> BLOCKING, repair consumed."""
+        result = self._run_with_vision([
+            {"pass": False,
+             "blocking": ["Mobile content visibly overlaps the hero; important content is clipped."],
+             "observations": [], "summary": "Broken layout."},
+            self._passing_vision(),
+        ])
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.repair_attempts, 1)
+        self.mock_adapter.frontend_build.assert_called_once()
+
+    def test_p5_case6_observations_only_pass_consumes_zero_repairs(self):
+        """blocking=[] + several subjective UI suggestions -> PASS, zero
+        repair attempts consumed."""
+        result = self._run_with_vision([
+            {"pass": True, "blocking": [],
+             "observations": [
+                 "Feature icons could have more visual variety.",
+                 "Spacing in the steps section could be slightly tighter.",
+                 "The hero could feel more polished.",
+             ],
+             "summary": "Healthy, with polish suggestions."},
+        ])
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.repair_attempts, 0)
+        self.mock_adapter.frontend_build.assert_not_called()
+        self.assertEqual(len(result.attempts), 1)
+
+    def test_p5_case7_real_blocker_still_uses_bounded_repair(self):
+        """A real blocking visual defect still drives the existing bounded
+        repair loop; the budget remains exactly 2."""
+        self.assertEqual(MAX_REPAIR_ATTEMPTS, 2)
+        still_broken = {"pass": False,
+                        "blocking": ["Mobile navigation visibly covers the hero content."],
+                        "observations": [], "summary": "Still broken."}
+        result = self._run_with_vision([still_broken, still_broken.copy(), still_broken.copy()])
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.repair_attempts, MAX_REPAIR_ATTEMPTS)
+        self.assertEqual(self.mock_adapter.frontend_build.call_count, MAX_REPAIR_ATTEMPTS)
+        self.assertEqual(self.store.load("proj").lifecycle, ProjectLifecycle.FAILED.value)
+
+    def test_p5_case8_observations_after_repair_still_pass(self):
+        """After repair removes all blockers, remaining observations -> PASS."""
+        result = self._run_with_vision([
+            {"pass": False, "blocking": ["Important content is clipped on mobile."],
+             "observations": ["Spacing could be tighter."], "summary": "Clipped."},
+            {"pass": True, "blocking": [],
+             "observations": ["These icons could be more varied.", "Hierarchy could be stronger."],
+             "summary": "Fixed; polish suggestions remain."},
+        ])
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.repair_attempts, 1)
+        self.mock_adapter.frontend_build.assert_called_once()
+        state = self.store.load("proj")
+        self.assertEqual(state.lifecycle, ProjectLifecycle.PREVIEW_READY.value)
+        self.assertEqual(state.deployment["qa"]["vision"]["blocking"], [])
+        self.assertEqual(
+            len(state.deployment["qa"]["vision"]["observations"]), 2
+        )
+
+
+class TestVisionFindingsBlockingSemantics(unittest.TestCase):
+    """Application-owned semantics on VisionFindings / QAAttempt: only
+    blocking findings (or a VISION runtime failure) block; observations
+    never do."""
+
+    def test_observations_are_never_blocking(self):
+        findings = VisionFindings(
+            pass_=True,
+            observations=["Spacing could be tighter", "Another CTA may be unnecessary"],
+        )
+        self.assertFalse(findings.blocking)
+        attempt = QAAttempt(0, DeterministicFindings(), findings)
+        self.assertFalse(attempt.repair_required)
+        self.assertTrue(attempt.final_pass)
+
+    def test_blocking_findings_block(self):
+        findings = VisionFindings(
+            pass_=False, blocking_findings=["Mobile content overlaps hero"]
+        )
+        self.assertTrue(findings.blocking)
+        attempt = QAAttempt(0, DeterministicFindings(), findings)
+        self.assertTrue(attempt.repair_required)
+        self.assertFalse(attempt.final_pass)
+
+    def test_raw_error_still_fails_closed(self):
+        findings = VisionFindings(pass_=False, raw_error="provider timeout")
+        self.assertTrue(findings.blocking)
+
+    def test_to_dict_serializes_blocking_and_observations(self):
+        findings = VisionFindings(
+            pass_=False,
+            blocking_findings=["b"],
+            observations=["o"],
+            summary="s",
+        )
+        d = findings.to_dict()
+        self.assertEqual(d["blocking"], ["b"])
+        self.assertEqual(d["observations"], ["o"])
+        self.assertFalse(d["pass"])
+        # Retired severity keys must not leak into the persisted contract.
+        self.assertNotIn("critical", d)
+        self.assertNotIn("major", d)
+        self.assertNotIn("minor", d)
+
+
+class TestRepairInstructionsUseBlockingOnly(_FixtureBase):
+    """Repair instructions must carry BLOCKING findings only. Subjective
+    observations must never reach FRONTEND as mandatory requirements."""
+
+    def test_blocking_findings_are_included(self):
+        failed = QAAttempt(
+            attempt=0,
+            deterministic=DeterministicFindings(failures=["npm run build failed"]),
+            vision=VisionFindings(
+                pass_=False,
+                blocking_findings=["Mobile navigation visibly covers the hero content."],
+                observations=[],
+                summary="s",
+            ),
+        )
+        instructions = self.orchestrator._build_repair_instructions(self.design_dna, failed)
+
+        self.assertIn("VISION blocking findings", instructions)
+        self.assertIn("Mobile navigation visibly covers the hero content.", instructions)
+
+    def test_observations_are_not_sent_to_frontend(self):
+        failed = QAAttempt(
+            attempt=0,
+            deterministic=DeterministicFindings(failures=[]),
+            vision=VisionFindings(
+                pass_=False,
+                blocking_findings=["Mobile navigation visibly covers the hero content."],
+                observations=["Spacing in the steps section could be tighter."],
+                summary="s",
+            ),
+        )
+        instructions = self.orchestrator._build_repair_instructions(self.design_dna, failed)
+
+        self.assertIn("Mobile navigation visibly covers the hero content.", instructions)
+        self.assertNotIn("Spacing in the steps section could be tighter.", instructions)
+        self.assertIn("smallest targeted fix", instructions)
+        self.assertIn("Do NOT invent business facts", instructions)
+        self.assertIn("Preserve the existing Design DNA", instructions)
+
+
+class TestVisionResponseContract(unittest.TestCase):
+    """VISION JSON contract at the adapter seam: application-owned
+    blocking/observation split, pass derived by the application, and a
+    prompt that constrains VISION to visible-acceptance reviewing."""
+
+    def setUp(self):
+        self.tmpdir_obj = tempfile.TemporaryDirectory()
+        self.tmpdir = Path(self.tmpdir_obj.name)
+        from app.hermes.adapter import HermesAdapter
+
+        self.store = ProjectStateStore(self.tmpdir / "state")
+        self.adapter = HermesAdapter(
+            self.store,
+            hermes_home=self.tmpdir / "home",
+            repo_root=self.tmpdir / "repo",
+        )
+        self.brief = {"name": "N", "what": "W", "why": "Y"}
+
+    def tearDown(self):
+        self.tmpdir_obj.cleanup()
+
+    def test_parser_maps_blocking_and_observations(self):
+        parsed = self.adapter._parse_vision_response(json.dumps({
+            "pass": False,
+            "blocking": ["CTA text is clipped and unreadable."],
+            "observations": ["Spacing could be tighter."],
+            "summary": "s",
+        }))
+
+        self.assertEqual(parsed["blocking"], ["CTA text is clipped and unreadable."])
+        self.assertEqual(parsed["observations"], ["Spacing could be tighter."])
+        self.assertFalse(parsed["pass"])
+
+    def test_parser_derives_pass_from_blocking_not_model_prose(self):
+        """The application owns pass semantics. VISION's own ``pass`` claim
+        cannot make a page with blocking findings pass, nor fail a page VISION
+        only had subjective observations about."""
+        parsed = self.adapter._parse_vision_response(json.dumps({
+            "pass": True, "blocking": ["Overlapping content on mobile."], "observations": [], "summary": "",
+        }))
+        self.assertFalse(parsed["pass"])
+
+        parsed = self.adapter._parse_vision_response(json.dumps({
+            "pass": False, "blocking": [], "observations": ["Hero CTA would look better using #C2410C."], "summary": "",
+        }))
+        self.assertTrue(parsed["pass"])
+
+    def test_parser_legacy_shape_maps_without_dropping_findings(self):
+        """If a model ignores the new schema and answers in the retired
+        critical/major/minor shape, its findings must not be silently dropped
+        (critical+major map to blocking; minor maps to observations)."""
+        parsed = self.adapter._parse_vision_response(json.dumps({
+            "pass": False, "critical": ["c"], "major": ["m"], "minor": ["n"], "summary": "s",
+        }))
+
+        self.assertEqual(parsed["blocking"], ["c", "m"])
+        self.assertEqual(parsed["observations"], ["n"])
+        self.assertFalse(parsed["pass"])
+
+    def test_parser_failure_fails_closed(self):
+        parsed = self.adapter._parse_vision_response("this is not json")
+
+        self.assertFalse(parsed["pass"])
+        self.assertIn("error", parsed)
+        self.assertEqual(parsed["blocking"], [])
+        self.assertEqual(parsed["observations"], [])
+
+    def test_prompt_declares_blocking_observations_contract(self):
+        prompt = self.adapter._build_vision_prompt(self.brief, {"version": 1})
+
+        self.assertIn('"blocking"', prompt)
+        self.assertIn('"observations"', prompt)
+        self.assertIn("if and only if", prompt)
+        # Retired contract must not be reintroduced in the schema section.
+        self.assertNotIn('"critical"', prompt)
+        self.assertNotIn('"major"', prompt)
+        self.assertNotIn('"minor"', prompt)
+
+    def test_prompt_constrains_vision_to_visible_acceptance_review(self):
+        prompt = self.adapter._build_vision_prompt(self.brief, None)
+
+        # VISION is a narrow acceptance reviewer, not a second designer.
+        self.assertIn("visual acceptance reviewer", prompt)
+        self.assertIn("NOT a\nsecond designer", prompt)
+        self.assertIn("requirements author", prompt)
+        # Absence of a specification is not a prohibition.
+        self.assertIn("Absence of a specification is NOT a\nprohibition", prompt)
+        # Implementation-detail findings are explicitly forbidden.
+        self.assertIn("aria-disabled", prompt)
+        self.assertIn("DOM attribute", prompt)
+        self.assertIn("CSS class names", prompt)
+        # Uncertainty resolves to observation, not failure.
+        self.assertIn("classify it as an\nobservation", prompt)
+        # Existing guard language is preserved.
+        self.assertIn("attached to this message", prompt)
+        self.assertNotIn("on disk", prompt)
 
 
 
