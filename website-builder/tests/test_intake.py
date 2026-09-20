@@ -245,8 +245,24 @@ class TestIntakeProcessorFallback(unittest.TestCase):
         self.assertEqual(result.readiness, Readiness.PAUSED)
 
     def test_resume_detection(self):
+        # A resume phrase on a NON-paused project must NOT force readiness=RESUMED
+        # (that would suppress the clarification the user still needs). Resume is
+        # only meaningful when the project is actually paused.
         msg = NormalizedMessage(event_id="e2", text="lanjut")
         result = self.processor.process(msg)
+        self.assertFalse(result.resume_detected)
+        self.assertNotEqual(result.readiness, Readiness.RESUMED)
+
+    def test_resume_detection_when_paused(self):
+        # When the project IS paused, a resume phrase must surface RESUMED.
+        with self.store.acquire_writer("proj-paused") as state:
+            state.lifecycle = "PAUSED"
+            state.roles = {"owner": "owner", "reviewers": [], "viewers": []}
+            state.pause_state = {"paused": True, "paused_at": 1.0,
+                                 "pre_pause_lifecycle": "DISCOVERING"}
+            self.store.save(state)
+        msg = NormalizedMessage(event_id="e2b", text="lanjut")
+        result = self.processor.process(msg, "proj-paused")
         self.assertTrue(result.resume_detected)
         self.assertEqual(result.readiness, Readiness.RESUMED)
 

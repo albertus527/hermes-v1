@@ -952,7 +952,8 @@ User message:
             and not state.deployment.get("latest_shown_preview")
         ):
             recon = self.dispatcher.dispatch(
-                update, project_id, "reconcile_preview", authenticated=authenticated
+                update, project_id, "reconcile_preview", authenticated=authenticated,
+                claim_suffix=":reconcile_preview",
             )
             if recon.success:
                 state = self.dispatcher.store.load(project_id)
@@ -1143,7 +1144,8 @@ User message:
             and not state.deployment.get("latest_shown_preview")
         ):
             recon = self.dispatcher.dispatch(
-                update, project_id, "reconcile_preview", authenticated=authenticated
+                update, project_id, "reconcile_preview", authenticated=authenticated,
+                claim_suffix=":reconcile_preview",
             )
             if recon.success:
                 state = self.dispatcher.store.load(project_id)
@@ -1161,9 +1163,16 @@ User message:
 
     def _safe_send(self, chat_id: str, text: str) -> None:
         try:
-            self.telegram_out.send_text(chat_id, text)
+            result = self.telegram_out.send_text(chat_id, text)
         except Exception:
             logger.exception("Failed to send message to chat %s", chat_id)
+            return
+        if not result.success:
+            logger.error(
+                "Failed to send message to chat %s: %s",
+                chat_id,
+                result.error_code,
+            )
 
     def _handle_intake(
         self,
@@ -1212,10 +1221,19 @@ User message:
         clarification = result.data.get("clarification_question")
         if clarification:
             try:
-                self.telegram_out.send_text(message.conversation_id, clarification)
+                send_result = self.telegram_out.send_text(
+                    message.conversation_id, clarification
+                )
             except Exception:
                 logger.exception(
                     "Failed to send clarification to chat %s", message.conversation_id
+                )
+                return
+            if not send_result.success:
+                logger.error(
+                    "Failed to send clarification to chat %s: %s",
+                    message.conversation_id,
+                    send_result.error_code,
                 )
             return
 
@@ -1361,9 +1379,16 @@ User message:
         else:
             text = messages.get(error_code, "Something went wrong. Please try again.")
         try:
-            self.telegram_out.send_text(chat_id, text)
+            send_result = self.telegram_out.send_text(chat_id, text)
         except Exception:
             logger.exception("Failed to send error reply to chat %s", chat_id)
+            return
+        if not send_result.success:
+            logger.error(
+                "Failed to send error reply to chat %s: %s",
+                chat_id,
+                send_result.error_code,
+            )
 
     def run(self) -> None:
         """Main polling loop. Runs until stop() is called or SIGINT/SIGTERM."""

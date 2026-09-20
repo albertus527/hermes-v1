@@ -94,7 +94,7 @@ class TelegramDispatcher:
 
     def dispatch(self, payload, project_id, action, *, authenticated=None, seq=None,
                  reference_token=None, data=None, role=None, url=None, brief=None,
-                 index=None, hostname=None, ownership_claim=False):
+                 index=None, hostname=None, ownership_claim=False, claim_suffix=None):
         try:
             if isinstance(authenticated, AuthenticatedTelegramContext):
                 normalizer = TelegramNormalizer
@@ -137,6 +137,16 @@ class TelegramDispatcher:
             key = hashlib.sha256(json.dumps(
                 [principal, authenticated.conversation_id, message.event_id],
                 separators=(",", ":")).encode()).hexdigest()
+            if claim_suffix:
+                # Internal, non-user-initiated dispatches that share a Telegram
+                # event with the user's own turn (e.g. the pre-turn
+                # reconcile_preview) MUST NOT consume the event-derived key —
+                # that key belongs to the user's action. Deriving a distinct
+                # sub-key (same pattern as the ":auto_build" sub-claim below)
+                # keeps "one Telegram event -> one user claim" while letting an
+                # internal reconcile run under its own claim without colliding
+                # with the turn's intake/revise/approve/publish dispatch.
+                key = hashlib.sha256((key + claim_suffix).encode()).hexdigest()
             with self.store.acquire_writer(project_id) as state:
                 guard = require_owner_role if domain_action or action == "publish" else require_mutating_role
                 guard(state, principal, reference_token)

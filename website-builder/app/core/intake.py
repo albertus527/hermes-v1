@@ -73,7 +73,11 @@ _RESUME_PHRASES = {
 def _contains_phrase(text: str, phrases: set) -> bool:
     lower = text.lower().strip()
     for phrase in phrases:
-        if phrase in lower:
+        # Word-boundary match so a pause/resume keyword does not fire on a
+        # larger word that merely contains it — e.g. "wait" inside "waiting",
+        # "gas" inside "gasifikasi", or "pause" inside "paused". Multi-word
+        # phrases ("hold on", "stop dulu") still match as a bounded unit.
+        if re.search(r"\b" + re.escape(phrase) + r"\b", lower):
             return True
     return False
 
@@ -112,6 +116,18 @@ class IntakeProcessor:
             return {}
         state = self.store.load(project_id)
         return dict(state.brief) if state is not None else {}
+
+    def _persisted_pause_state(self, project_id: Optional[str]) -> Dict[str, Any]:
+        """Return the persisted pause_state dict for this project ({} if none).
+
+        Same load-failure contract as _persisted_brief: a genuinely missing
+        project yields {}, but a real load failure propagates rather than
+        being silently treated as "not paused".
+        """
+        if not project_id:
+            return {}
+        state = self.store.load(project_id)
+        return dict(state.pause_state) if state is not None else {}
 
     def _context_messages(self, persisted: Dict[str, Any]) -> Optional[List[Dict[str, str]]]:
         """Prior accumulated brief, handed to FAST as conversation context.
@@ -197,6 +213,15 @@ class IntakeProcessor:
 
         persisted = self._persisted_brief(project_id)
 
+        # Resume is only meaningful when the project is actually paused. A
+        # resume phrase on a non-paused project (e.g. "gas" / "lanjut" typed
+        # while DISCOVERING) must NOT force readiness=RESUMED — that would
+        # suppress the clarification question the user still needs to answer.
+        # Read the persisted pause flag up-front so the readiness override
+        # below can gate on it.
+        paused_now = bool(self._persisted_pause_state(project_id).get("paused"))
+        effective_resume = resume_detected and paused_now
+
         # Use Hermes FAST for semantic interpretation when available, handing
         # it the accumulated brief as context. If FAST fails (raises), the
         # application executes the deterministic fallback — FAST owns
@@ -212,6 +237,13 @@ class IntakeProcessor:
                 fast_result = None
 
             if fast_result is not None:
+                # fast_interpret() does NOT raise on Hermes failure — it returns
+                # the deterministic fallback dict tagged source="fallback_heuristic".
+                # Treat that as a fallback turn too, so the merge below applies the
+                # shift-into-next-missing-field protection and a lone fallback token
+                # doesn't clobber an already-established NAME.
+                if fast_result.get("source") == "fallback_heuristic":
+                    used_fallback = True
                 scope = Scope(fast_result.get("scope", "UNCLEAR"))
                 extracted = {
                     "name": fast_result.get("name"),
@@ -252,11 +284,14 @@ class IntakeProcessor:
         else:
             clarification_question = self._fallback_clarification(brief)
 
-        # Application enforces pause/resume regardless of FAST result
+        # Application enforces pause/resume regardless of FAST result.
+        # Resume only overrides readiness when the project is actually paused
+        # (effective_resume); a bare resume phrase on a non-paused project
+        # leaves readiness/clarification intact.
         if pause_detected:
             readiness = Readiness.PAUSED
             clarification_question = None
-        elif resume_detected:
+        elif effective_resume:
             readiness = Readiness.RESUMED
             clarification_question = None
 
@@ -266,7 +301,7 @@ class IntakeProcessor:
             brief=brief,
             clarification_question=clarification_question,
             pause_detected=pause_detected,
-            resume_detected=resume_detected,
+            resume_detected=effective_resume,
         )
 
     def _fallback_scope(self, text: str) -> Scope:
@@ -279,8 +314,15 @@ class IntakeProcessor:
                        "erp", "crm", "database", "cms", "admin panel",
                        "shopping cart", "payment", "booking engine"}
 
-        has_website = any(kw in lower for kw in website_keywords)
-        has_out = any(kw in lower for kw in out_keywords)
+        # Word-boundary matching: a bare substring test makes "app" match inside
+        # "WhatsApp" (and "web" inside "website" is fine, but "app" inside
+        # "WhatsApp" flips a legitimate website-with-WhatsApp brief to MIXED /
+        # OUT_OF_SCOPE). Match keywords as whole words / phrases instead.
+        def _kw_present(kw: str) -> bool:
+            return re.search(r"\b" + re.escape(kw) + r"\b", lower) is not None
+
+        has_website = any(_kw_present(kw) for kw in website_keywords)
+        has_out = any(_kw_present(kw) for kw in out_keywords)
 
         if has_website and has_out:
             return Scope.MIXED
@@ -385,12 +427,37 @@ class IntakeProcessor:
             if result.pause_detected:
                 state.pause_state["paused"] = True
                 state.pause_state["paused_at"] = time.time()
+                # Record where we paused from so resume can return there.
+                state.pause_state["pre_pause_lifecycle"] = state.lifecycle
                 self.store.transition_lifecycle_locked(state, ProjectLifecycle.PAUSED)
             elif result.resume_detected:
                 state.pause_state["paused"] = False
                 state.pause_state["resumed_at"] = time.time()
-                # Resume to DISCOVERING — the canonical resume target
-                self.store.transition_lifecycle_locked(state, ProjectLifecycle.DISCOVERING)
+                # Resume to the lifecycle the project was in when paused
+                # (READY, PREVIEW_READY, etc.), falling back to DISCOVERING.
+                # Resuming a paused READY project to DISCOVERING would strand
+                # it: the auto-build gate requires lifecycle == READY, so the
+                # project would never build until re-driven through intake.
+                target_name = state.pause_state.get("pre_pause_lifecycle")
+                target = ProjectLifecycle.DISCOVERING
+                if target_name:
+                    try:
+                        candidate = ProjectLifecycle(target_name)
+                    except ValueError:
+                        candidate = None
+                    if candidate is not None and candidate in (
+                        ProjectLifecycle.DISCOVERING,
+                        ProjectLifecycle.WAITING_INPUT,
+                        ProjectLifecycle.READY,
+                        ProjectLifecycle.QUEUED,
+                        ProjectLifecycle.RUNNING,
+                        ProjectLifecycle.PREVIEW_READY,
+                        ProjectLifecycle.REVISION_REQUESTED,
+                        ProjectLifecycle.PUBLISHING,
+                        ProjectLifecycle.LIVE,
+                    ):
+                        target = candidate
+                self.store.transition_lifecycle_locked(state, target)
 
             # Update lifecycle based on readiness through lifecycle authority.
             if result.readiness == Readiness.DISCOVERY_READY:
@@ -425,6 +492,16 @@ class IntakeProcessor:
                         state.revisions.source_revision = 0
                         state.failure = None
                     self.store.transition_lifecycle_locked(state, ProjectLifecycle.READY)
+                # A semantically complete brief (DISCOVERY_READY) means the user
+                # has re-engaged with full requirements. If the pause flag is
+                # still set while the lifecycle is being driven to READY, the
+                # stale flag would silently suppress the auto-build gate (which
+                # requires not pause_state.paused) even though the lifecycle is
+                # READY — a brief/pause desync. Clear it so a READY project with
+                # a complete brief can actually build.
+                if state.pause_state.get("paused"):
+                    state.pause_state["paused"] = False
+                    state.pause_state["resumed_at"] = time.time()
             elif result.readiness == Readiness.NEEDS_CLARIFICATION:
                 if state.lifecycle == ProjectLifecycle.DISCOVERING.value:
                     self.store.transition_lifecycle_locked(state, ProjectLifecycle.WAITING_INPUT)
