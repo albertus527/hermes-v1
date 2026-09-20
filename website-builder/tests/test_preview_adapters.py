@@ -744,3 +744,31 @@ def test_smoke_blocks_redirect_private_and_asset_failures(options, addresses, tm
     result = PreviewSmokeTester(factory, lambda _: addresses).run('https://test.vercel.app/', tmp_path)
     assert not result.success
     assert all(b.closed for b in browsers)
+
+
+def test_smoke_exception_persists_type_only_and_is_logged(tmp_path, caplog):
+    """A raised browser/Playwright exception must still fail closed, keep the
+    SMOKE_FAILED code, persist ONLY the exception type (never the message,
+    which can carry URLs/query params), and be logged for operators."""
+    secret = 'https://user:pw@test.vercel.app/?token=sekret'
+
+    class BoomBrowser(Browser):
+        def goto(self, url, **kwargs):
+            raise RuntimeError(secret)
+
+    def factory():
+        return BoomBrowser()
+
+    with caplog.at_level('ERROR', logger='app.deploy.adapters'):
+        result = PreviewSmokeTester(factory, lambda _: ['8.8.8.8']).run('https://test.vercel.app/', tmp_path)
+
+    # fail-closed + unchanged public code
+    assert not result.success
+    assert result.error_code == 'SMOKE_FAILED'
+    # exception TYPE persisted, message is NOT
+    assert 'browser smoke failed: RuntimeError' in result.data['failures']
+    assert not any(secret in f for f in result.data['failures'])
+    # full exception logged for operators, but state stays message-free
+    assert any('Preview smoke browser failure' in r.getMessage() for r in caplog.records)
+    assert any(r.exc_info for r in caplog.records)
+    assert secret not in result.data['failures'][-1]

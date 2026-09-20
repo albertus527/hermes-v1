@@ -22,6 +22,7 @@ import base64
 import hashlib
 import ipaddress
 import json
+import logging
 import re
 import socket
 import time
@@ -33,6 +34,8 @@ from pathlib import Path, PurePosixPath
 from urllib.parse import quote, urlencode, urlsplit
 
 from app.core.contracts import OperationResult
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -907,8 +910,12 @@ class PreviewSmokeTester:
                             context.close()
                     finally:
                         browser.close()
-        except Exception:
-            failures.append('browser smoke failed')
+        except Exception as exc:
+            # Operator logs get the full exception + traceback. Persisted
+            # failures carry ONLY the exception TYPE -- never str(exc), which
+            # can embed URLs/query params or other sensitive runtime detail.
+            logger.exception("Preview smoke browser failure for %s", url)
+            failures.append(f'browser smoke failed: {type(exc).__name__}')
         return OperationResult(
             success=not failures,
             data={**shots, 'url': url, 'failures': failures},
