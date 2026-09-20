@@ -115,6 +115,23 @@ class TestSkills(unittest.TestCase):
         self.assertIn("palette", content)
         self.assertIn("typography", content)
 
+    def test_design_dna_skill_forbids_acceptance_contract(self):
+        """Design DNA skill must declare DNA is declarative intent, never an
+        acceptance-test contract (the authority boundary for the p5 fix)."""
+        content = (SKILLS_DIR / "website-builder-design-dna" / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("DECLARATIVE description of design intent", content)
+        self.assertIn("never an", content)
+        self.assertIn("acceptance-test contract", content)
+        self.assertIn("no DOM attributes", content)
+        self.assertIn("no CSS class names", content)
+        self.assertIn("file", content)
+        self.assertIn("paths", content)
+        self.assertIn("no event handlers", content)
+        self.assertIn("no component counts", content)
+        self.assertIn("not a test specification", content)
+
     def test_ui_ux_pro_max_not_vendored(self):
         """UI UX Pro Max is reused from the Hermes profile, not duplicated."""
         skill_dirs = [d.name for d in SKILLS_DIR.iterdir() if d.is_dir()]

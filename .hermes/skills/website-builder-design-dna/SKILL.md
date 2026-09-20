@@ -65,3 +65,11 @@ design_dna:
 2. `design_dna_version` increments on each update.
 3. Never invent business facts in Design DNA.
 4. Clearly label placeholders in preview; never silently in production.
+5. Design DNA is a DECLARATIVE description of design intent, never an
+   acceptance-test contract. Do NOT write implementation-level acceptance
+   criteria into Design DNA: no DOM attributes, no CSS class names, no file
+   paths, no event handlers, no component counts, no exclusivity rules
+   (e.g. "exactly one CTA"), and no per-element QA or acceptance contracts.
+   Design DNA records intent (palette, typography, personality, layout
+   character); it is not a test specification and is never an authoritative
+   source of blocking QA requirements.

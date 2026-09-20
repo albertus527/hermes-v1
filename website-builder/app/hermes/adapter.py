@@ -1100,6 +1100,12 @@ Rules:
 - Never invent business facts (services, pricing, addresses, contact details,
   testimonials, claims).
 - If a CTA destination is unresolved, use a placeholder and mark it clearly.
+- Design DNA is a DECLARATIVE description of design intent only. It must NOT
+  contain implementation-level acceptance criteria: no DOM attributes, no CSS
+  class names, no file paths, no event handlers, no component counts, no
+  exclusivity rules (e.g. "exactly one CTA"), and no per-element QA or
+  acceptance contracts. Design DNA describes intent (palette, typography,
+  personality, layout character); it is not a test specification.
 - Keep the build sequential.
 - Keep design discovery bounded. Choose a coherent direction quickly rather
   than exhaustively exploring alternatives. Once Design DNA is written,
@@ -1223,7 +1229,7 @@ Brief:
 - What: {what}
 - Why: {why}
 
-Design DNA:
+Design DNA (declarative design intent / context, NOT a requirements source):
 {dna_summary}
 
 FRONTEND owns design, structure, copy, and implementation. You are NOT a
@@ -1231,13 +1237,23 @@ second designer and NOT a requirements author. Do NOT invent new product,
 design, or implementation requirements. Absence of a specification is NOT a
 prohibition. Evaluate only what is visible in the attached screenshots.
 
+Authority boundary: the BRIEF is the only authoritative source of explicit
+requirements. Design DNA is declarative design intent (palette, typography,
+brand personality, layout character) that gives you context for judging
+visible alignment. Design DNA is NOT an acceptance-test contract: it cannot
+manufacture new implementation-level requirements, and any DOM/CSS/file-level
+rule, component count, or exclusivity constraint appearing inside Design DNA
+is NOT authoritative and must never block on its own.
+
 Answer only these questions:
 1. Is the rendered website visually broken?
 2. Is there an obvious responsive/layout problem?
 3. Is visible wording obviously broken, leaked, placeholder/debug-like,
    nonsensical, or inconsistent with the supplied user intent?
-4. Does the visible result substantially contradict an EXPLICIT visual
-   requirement supplied above (brief / Design DNA)?
+4. Does the visible result substantially contradict an EXPLICIT requirement
+   stated in the brief, or the declarative design intent recorded in Design
+   DNA (e.g. a completely different palette, typography, or personality than
+   the intent describes)?
 5. Is there an obvious visible UI/UX defect severe enough that a normal user
    would consider the page broken or unusable?
 
@@ -1252,7 +1268,8 @@ explicit requirement violations, such as:
 - broken image/icon presentation
 - placeholder/debug/internal text visibly leaking to the end user
 - a required visible CTA/element is missing
-- visible output directly contradicts an explicit supplied requirement
+- visible output directly contradicts an explicit requirement stated in the
+  brief, or the declarative design intent recorded in Design DNA
 - visible state that makes an important control appear unusable
 
 OBSERVATIONS — report in "observations" any subjective feedback or
@@ -1265,17 +1282,27 @@ site fail and never become repair requirements. Examples:
 - hierarchy could be stronger
 - this section could feel more polished
 - aesthetic preference, stylistic alternative, or a reasonable inference not
-  explicitly required by the brief / Design DNA
+  explicitly required by the brief
 
 Do NOT require or infer implementation details that cannot be established
-from the screenshots. These are NOT valid findings:
+from the screenshots. These are NOT valid findings — and they remain invalid
+EVEN WHEN they appear inside Design DNA, because Design DNA is declarative
+intent, not an acceptance-test contract:
 - aria-disabled or any DOM attribute
 - CSS class names
 - exact color hex requirements for a component unless that requirement is
-  explicitly quoted in the brief / Design DNA above
+  explicitly quoted in the brief above
 - event handlers, routing internals, semantic HTML implementation
 - JavaScript behavior not demonstrated by the evidence
-- "there may only be one CTA" or similar restrictions that are not explicit
+- component counts, per-component presence/absence contracts, or
+  file/DOM/CSS/architecture acceptance criteria
+- "there may only be one CTA" or similar numeric/exclusivity restrictions
+  that are not explicit in the brief
+
+A DOM/CSS/file-level rule, component count, or exclusivity constraint found
+in Design DNA is not an authoritative requirement. If the visible result
+conflicts with such a self-authored rule, that is at most an observation —
+never a blocking finding.
 
 Functionality: report functionality only when the failure is directly visible
 from the evidence.

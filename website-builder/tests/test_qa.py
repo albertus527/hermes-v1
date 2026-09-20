@@ -405,6 +405,148 @@ class TestVisionMultimodalRouting(unittest.TestCase):
         self.assertIn("does not support image input", result["error"])
 
 
+class TestVisionPromptDesignDnaAuthority(unittest.TestCase):
+    """Authority boundary: model-authored Design DNA must not manufacture new
+    implementation-level blocking QA contracts.
+
+    These tests exercise the real ``_build_vision_prompt`` output (the
+    contract text VISION is given), asserting the authority boundary itself
+    rather than matching only literal p5 strings. The boundary under test:
+    the BRIEF is the sole authoritative source of explicit requirements;
+    Design DNA is declarative design intent / context, never an
+    acceptance-test contract.
+    """
+
+    def setUp(self):
+        self.tmpdir_obj = tempfile.TemporaryDirectory()
+        self.tmpdir = Path(self.tmpdir_obj.name)
+        from app.hermes.adapter import HermesAdapter
+
+        self.store = ProjectStateStore(self.tmpdir / "state")
+        self.adapter = HermesAdapter(
+            self.store,
+            hermes_home=self.tmpdir / "home",
+            repo_root=self.tmpdir / "repo",
+        )
+        self.brief = {"name": "Northcut", "what": "barbershop", "why": "booking WA"}
+
+    def tearDown(self):
+        self.tmpdir_obj.cleanup()
+
+    def _prompt(self, design_dna):
+        return self.adapter._build_vision_prompt(self.brief, design_dna)
+
+    def test_a_dna_implementation_rules_not_authoritative(self):
+        """A. DNA containing DOM/CSS/file-level entries cannot become a
+        blocking contract: the prompt must state such entries are not
+        authoritative even when present in Design DNA."""
+        dna = {
+            "version": 1,
+            "brand_personality": "premium",
+            "implementation_contract": {
+                "cta_button_class": "btn-primary-lg",
+                "aria_disabled": "false",
+                "file": "src/components/CTA.tsx",
+            },
+        }
+        prompt = self._prompt(dna)
+
+        # The DNA content is still embedded (context), but the prompt must
+        # explicitly deny it implementation-level authority.
+        self.assertIn("NOT a requirements source", prompt)
+        self.assertIn("not an acceptance-test contract", prompt)
+        self.assertIn("EVEN WHEN they appear inside Design DNA", prompt)
+        self.assertIn("not an authoritative requirement", prompt)
+
+    def test_b_self_authored_requirements_not_blockers(self):
+        """B. p5-shaped self-authored rules (exclusivity / component counts /
+        per-component contracts) do not become authoritative blockers merely
+        because they appear in Design DNA."""
+        dna = {
+            "version": 1,
+            "rules": [
+                "there may only be one CTA",
+                "exactly 3 feature cards",
+                "hero must contain a <nav> element",
+            ],
+        }
+        prompt = self._prompt(dna)
+
+        # Numeric/exclusivity restrictions not explicit in the brief are
+        # classified invalid; self-authored DNA rules are at most observations.
+        self.assertIn("numeric/exclusivity restrictions", prompt)
+        self.assertIn("not explicit in the brief", prompt)
+        self.assertIn("at most an observation", prompt)
+        self.assertIn("never a blocking finding", prompt)
+
+    def test_c_declarative_dna_remains_available(self):
+        """C. Legitimate declarative Design DNA (palette, typography,
+        personality) remains available to VISION as intent/context."""
+        dna = {
+            "version": 1,
+            "brand_personality": "premium, minimalist",
+            "palette": {"primary": "#1a1a2e", "accent": "#c9a227"},
+            "typography": {"heading_font": "Fraunces", "body_font": "Inter"},
+        }
+        prompt = self._prompt(dna)
+
+        # Declarative intent is still embedded for VISION to judge alignment.
+        self.assertIn("premium, minimalist", prompt)
+        self.assertIn("#1a1a2e", prompt)
+        self.assertIn("Fraunces", prompt)
+        # And it is framed as declarative design intent.
+        self.assertIn("declarative design intent", prompt)
+
+    def test_d_brief_requirements_remain_authoritative(self):
+        """D. Explicit user-visible requirements (the brief) remain
+        authoritative: the prompt keeps the contradicts-explicit-requirement
+        blocking rule and names the brief as the requirement source."""
+        prompt = self._prompt({"version": 1, "brand_personality": "premium"})
+
+        self.assertIn("BRIEF is the only authoritative source", prompt)
+        self.assertIn("explicit requirement", prompt)
+        # The blocking rule for contradicting an explicit requirement survives.
+        self.assertIn("directly contradicts an explicit requirement", prompt)
+
+    def test_e_blocking_observation_split_intact(self):
+        """E. The blocking-vs-observation VISION contract remains intact."""
+        prompt = self._prompt(None)
+
+        self.assertIn("BLOCKING findings", prompt)
+        self.assertIn("OBSERVATIONS", prompt)
+        self.assertIn("NON-BLOCKING", prompt)
+        # pass is still derived from an empty blocking list.
+        self.assertIn('"pass" must be true if and only if "blocking" is empty', prompt)
+
+    def test_f_raw_error_remains_fail_closed(self):
+        """F. A VISION runtime failure (raw_error) remains fail-closed:
+        it blocks regardless of an empty blocking list."""
+        findings = VisionFindings(pass_=False, blocking_findings=[], raw_error="provider boom")
+        self.assertTrue(findings.blocking)
+
+        ok = VisionFindings(pass_=True, blocking_findings=[], observations=["nice"], raw_error=None)
+        self.assertFalse(ok.blocking)
+
+    def test_g_repair_budget_remains_exactly_two(self):
+        """G. The bounded repair budget remains exactly 2 (no third repair)."""
+        self.assertEqual(MAX_REPAIR_ATTEMPTS, 2)
+
+    def test_frontend_prompt_forbids_implementation_level_dna(self):
+        """The FRONTEND build prompt must forbid implementation-level
+        acceptance criteria in Design DNA at authoring time (the source of
+        the self-manufactured contract)."""
+        prompt = self.adapter._build_frontend_prompt(self.brief, self.tmpdir / "ws")
+
+        self.assertIn("DECLARATIVE description of design intent only", prompt)
+        self.assertIn("no DOM attributes", prompt)
+        self.assertIn("CSS", prompt)
+        self.assertIn("class names", prompt)
+        self.assertIn("no file paths", prompt)
+        self.assertIn("no event handlers", prompt)
+        self.assertIn("no component counts", prompt)
+        self.assertIn("not a test specification", prompt)
+
+
 class TestScreenshotsRequired(_FixtureBase):
     """5 & 6. Desktop + mobile screenshots both required; missing one blocks PREVIEW_READY."""
 
