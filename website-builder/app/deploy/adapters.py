@@ -733,6 +733,16 @@ class VercelAdapter:
 
         Used to capture last-known-good identity before promoting a new
         deployment, so a failed post-promotion smoke check can roll back.
+
+        Returns the FULL trusted identity of the current production
+        deployment -- deployment_id plus the ``wbOperation``/``wbRevision``/
+        ``wbArtifact`` metadata the deployment was created with. A rollback
+        must re-promote that deployment using ITS OWN identity (the same
+        meta the promote path validates); deriving identity from the current
+        promotion operation instead is a guaranteed meta mismatch. When the
+        current production deployment cannot be identified unambiguously, or
+        its stored identity is incomplete, this fails closed rather than
+        returning a partial identity a caller might guess around.
         """
         try:
             if not self._project_valid(project, app_id, expected_name=expected_name):
@@ -748,7 +758,28 @@ class VercelAdapter:
             identifier = item.get('uid') or item.get('id')
             if not identifier:
                 return _fail('INCOMPLETE_LOOKUP')
-            return OperationResult.ok({'deployment_id': identifier})
+            # The deployment metadata carries the exact repository identity
+            # the deployment was created with. Absent/incomplete metadata
+            # means we cannot safely re-promote this deployment as a
+            # rollback target -- fail closed instead of guessing.
+            meta = item.get('meta')
+            if not isinstance(meta, dict):
+                return _fail('INCOMPLETE_LOOKUP')
+            operation_id = meta.get('wbOperation')
+            revision_raw = meta.get('wbRevision')
+            artifact_sha256 = meta.get('wbArtifact')
+            if (not isinstance(operation_id, str) or not operation_id
+                    or not isinstance(artifact_sha256, str)
+                    or not re.fullmatch('[a-f0-9]{64}', artifact_sha256)
+                    or not isinstance(revision_raw, str) or not revision_raw.isdigit()
+                    or int(revision_raw) < 1):
+                return _fail('INCOMPLETE_LOOKUP')
+            return OperationResult.ok({
+                'deployment_id': identifier,
+                'operation_id': operation_id,
+                'source_revision': int(revision_raw),
+                'artifact_sha256': artifact_sha256,
+            })
         except Exception:
             return _fail('INCOMPLETE_LOOKUP')
 

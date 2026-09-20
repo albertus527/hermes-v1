@@ -17,6 +17,7 @@ from unittest.mock import MagicMock
 from app.channels.dispatch import AuthenticatedTelegramContext, TelegramDispatcher
 from app.core.authz import ProjectAccess
 from app.core.intake import IntakeProcessor
+from app.core.lifecycle import ProjectLifecycle
 from app.core.state import ProjectStateStore
 
 
@@ -199,6 +200,160 @@ class TestThreeTurnDiscoveryToBuild:
         # The build sub-claim recorded FAILED, not left CLAIMED forever.
         build_claims = [c for c in state.dispatch_events.values() if c["action"] == "build"]
         assert build_claims[0]["status"] == "FAILED"
+
+
+class TestAutoBuildSafeRetry:
+    """F4: a build that provably never reached a remote side effect is
+    retryable on a fresh intake event; a possibly-remote or ambiguous build
+    stays fail-closed. Missing evidence is UNKNOWN -> fail closed."""
+
+    def _complete_brief(self, store):
+        with store.acquire_writer("app") as state:
+            state.brief = {"name": "N", "what": "w", "why": "y"}
+            state.lifecycle = "READY"
+            store.save(state)
+
+    def _new_intake_event(self, dispatcher, event_id, adapter):
+        adapter.fast_interpret.return_value = _fast(
+            "WEBSITE", name="N", what="w", why="y", clarification_needed=False,
+        )
+        return _payload(event_id, text="N, w, y")
+
+    def test_pre_remote_failure_retries_on_fresh_event(self, tmp_path):
+        """(a/b/c) local build failure (npm/toolchain/pre-Vercel) stamps
+        reached_remote=False; a fresh intake event re-runs the build."""
+        store, adapter, builder, dispatcher = _make(tmp_path)
+        self._complete_brief(store)
+        # First build fails pre-remote: the boundary callback is NOT called;
+        # reached_remote stays False. Model the real build contract: a failed
+        # build drives the project QUEUED -> FAILED.
+        def fail_pre_remote(pid, brief, on_remote_boundary=None):
+            with store.acquire_writer("app") as s:
+                store.transition_lifecycle_locked(s, ProjectLifecycle.FAILED)
+                store.save(s)
+            return MagicMock(success=False, error="npm ci failed")
+
+        builder.build.side_effect = fail_pre_remote
+
+        p1 = self._new_intake_event(dispatcher, 10, adapter)
+        r1 = dispatcher.dispatch(p1, "app", "intake", authenticated=_auth())
+        assert r1.success
+        assert r1.data["build_triggered"] is True
+        assert r1.data["build_success"] is False
+        claim = [c for c in store.load("app").dispatch_events.values()
+                 if c["action"] == "build"][0]
+        assert claim["status"] == "FAILED"
+        assert claim["reached_remote"] is False
+        # A pre-remote build failure leaves the project FAILED.
+        assert store.load("app").lifecycle == "FAILED"
+
+        # The next intake turn is a fresh requirements-complete submission.
+        # Intake's FAILED-recovery drives FAILED -> READY (resetting
+        # source_revision), which makes the FAILED build claim admissible for
+        # a safe re-drive (reached_remote was False).
+        builder.build.side_effect = None
+        builder.build.return_value = MagicMock(success=True)
+        builder.build.reset_mock()
+        p2 = self._new_intake_event(dispatcher, 11, adapter)
+        r2 = dispatcher.dispatch(p2, "app", "intake", authenticated=_auth())
+        assert r2.success
+        assert builder.build.call_count == 1
+        assert r2.data.get("build_triggered") is True
+
+    def test_reached_remote_failure_stays_fail_closed(self, tmp_path):
+        """(d/e) a build that reached the remote boundary (or crashed after
+        the flag was persisted) must NOT be replayed."""
+        store, adapter, builder, dispatcher = _make(tmp_path)
+        self._complete_brief(store)
+
+        def remote_then_fail(pid, brief, on_remote_boundary=None):
+            if on_remote_boundary:
+                on_remote_boundary()  # marks reached_remote=True before effect
+            return MagicMock(success=False, error="preview deploy failed")
+
+        builder.build.side_effect = remote_then_fail
+        p1 = self._new_intake_event(dispatcher, 20, adapter)
+        r1 = dispatcher.dispatch(p1, "app", "intake", authenticated=_auth())
+        assert r1.success
+        claim = [c for c in store.load("app").dispatch_events.values()
+                 if c["action"] == "build"][0]
+        assert claim["status"] == "FAILED"
+        assert claim["reached_remote"] is True
+
+        # Retry must NOT re-run the build.
+        builder.build.reset_mock()
+        builder.build.side_effect = None
+        builder.build.return_value = MagicMock(success=True)
+        p2 = self._new_intake_event(dispatcher, 21, adapter)
+        r2 = dispatcher.dispatch(p2, "app", "intake", authenticated=_auth())
+        assert builder.build.call_count == 0
+        assert r2.data.get("build_triggered") is not True
+
+    def test_crash_after_flag_before_result_stays_closed(self, tmp_path):
+        """(d) reached_remote persisted, then a crash (exception) before the
+        result status write -> retry remains fail-closed."""
+        store, adapter, builder, dispatcher = _make(tmp_path)
+        self._complete_brief(store)
+
+        def crash_after_boundary(pid, brief, on_remote_boundary=None):
+            if on_remote_boundary:
+                on_remote_boundary()
+            raise RuntimeError("process died")
+
+        builder.build.side_effect = crash_after_boundary
+        p1 = self._new_intake_event(dispatcher, 30, adapter)
+        dispatcher.dispatch(p1, "app", "intake", authenticated=_auth())
+        claim = [c for c in store.load("app").dispatch_events.values()
+                 if c["action"] == "build"][0]
+        assert claim["reached_remote"] is True
+
+        builder.build.reset_mock()
+        builder.build.side_effect = None
+        builder.build.return_value = MagicMock(success=True)
+        p2 = self._new_intake_event(dispatcher, 31, adapter)
+        dispatcher.dispatch(p2, "app", "intake", authenticated=_auth())
+        assert builder.build.call_count == 0
+
+    def test_done_claim_never_reexecutes(self, tmp_path):
+        """(f) a DONE build claim is never re-run."""
+        store, adapter, builder, dispatcher = _make(tmp_path)
+        self._complete_brief(store)
+        builder.build.return_value = MagicMock(success=True)
+
+        p1 = self._new_intake_event(dispatcher, 40, adapter)
+        dispatcher.dispatch(p1, "app", "intake", authenticated=_auth())
+        assert builder.build.call_count == 1
+        claim = [c for c in store.load("app").dispatch_events.values()
+                 if c["action"] == "build"][0]
+        assert claim["status"] == "DONE"
+
+        builder.build.reset_mock()
+        p2 = self._new_intake_event(dispatcher, 41, adapter)
+        dispatcher.dispatch(p2, "app", "intake", authenticated=_auth())
+        assert builder.build.call_count == 0
+
+    def test_legacy_failed_claim_without_evidence_stays_closed(self, tmp_path):
+        """(g) a pre-hardening FAILED build claim (no reached_remote key) is
+        UNKNOWN -> fail closed, never replayed."""
+        store, adapter, builder, dispatcher = _make(tmp_path)
+        self._complete_brief(store)
+        builder.build.return_value = MagicMock(success=False, error="npm ci failed")
+
+        p1 = self._new_intake_event(dispatcher, 50, adapter)
+        dispatcher.dispatch(p1, "app", "intake", authenticated=_auth())
+        # Strip the evidence to model a legacy claim.
+        with store.acquire_writer("app") as state:
+            for k, c in state.dispatch_events.items():
+                if c.get("action") == "build":
+                    c.pop("reached_remote", None)
+            store.save(state)
+
+        builder.build.reset_mock()
+        builder.build.return_value = MagicMock(success=True)
+        p2 = self._new_intake_event(dispatcher, 51, adapter)
+        dispatcher.dispatch(p2, "app", "intake", authenticated=_auth())
+        assert builder.build.call_count == 0
+
 
     def test_persistence_failure_before_effects_blocks_effect(self, tmp_path):
         """If persisting the claim raises before any effect runs, no effect

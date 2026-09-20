@@ -38,6 +38,45 @@ from app.core.state import ProjectStateStore
 from app.sandbox.runner import ProjectRunner
 
 
+def _previous_identity_complete(identity) -> bool:
+    """A previous-production identity is complete only when it carries the
+    full deployment + repository identity needed to re-promote that exact
+    deployment as a rollback target. Anything less must be treated as
+    unknowable (never guess which deployment was previously production).
+    """
+    return (
+        isinstance(identity, dict)
+        and bool(identity.get("deployment_id"))
+        and isinstance(identity.get("operation_id"), str)
+        and bool(identity.get("operation_id"))
+        and isinstance(identity.get("source_revision"), int)
+        and identity.get("source_revision") >= 1
+        and isinstance(identity.get("artifact_sha256"), str)
+        and bool(identity.get("artifact_sha256"))
+    )
+
+
+def _previous_identity_from_result(result) -> Optional[dict]:
+    """Normalize ``find_production_deployment``'s result into a full identity
+    dict, or ``None`` when there is no previous production deployment.
+
+    ``find_production_deployment`` already fails closed when the deployment's
+    stored metadata is incomplete, so any non-empty ``deployment_id`` here is
+    guaranteed to carry the matching ``wbOperation``/``wbRevision``/
+    ``wbArtifact`` fields. A ``None`` deployment_id means no prior production.
+    """
+    data = result.data or {}
+    if not data.get("deployment_id"):
+        return None
+    identity = {
+        "deployment_id": data["deployment_id"],
+        "operation_id": data.get("operation_id"),
+        "source_revision": data.get("source_revision"),
+        "artifact_sha256": data.get("artifact_sha256"),
+    }
+    return identity if _previous_identity_complete(identity) else None
+
+
 @dataclass
 class PromoteDeps:
     """All external boundary objects. None of these are constructed here."""
@@ -206,10 +245,20 @@ class PromotionOrchestrator:
         if not approval or not approval.get("operation_id"):
             return OperationResult.fail("NOT_APPROVED", error_code="NOT_APPROVED")
 
+        # A crash mid-promotion leaves the project in PUBLISHING. Re-entering
+        # the SAME operation (approval's operation_id matches the persisted
+        # promotion_intent's) is the intended crash-recovery resume, NOT a new
+        # operation -- it reuses the durable previous-production identity so
+        # the rollback target is never recomputed against a drifted state.
+        _intent = state.deployment.get("promotion_intent") or {}
+        is_resume = (
+            state.lifecycle == ProjectLifecycle.PUBLISHING.value
+            and _intent.get("operation_id") == approval.get("operation_id")
+        )
         if state.lifecycle not in (
             ProjectLifecycle.PREVIEW_READY.value,
             ProjectLifecycle.LIVE.value,
-        ):
+        ) and not is_resume:
             return OperationResult.fail(
                 "PROMOTION_NOT_ALLOWED_IN_LIFECYCLE",
                 error_code="PROMOTION_NOT_ALLOWED_IN_LIFECYCLE",
@@ -279,7 +328,7 @@ class PromotionOrchestrator:
             app_id, vercel_project, expected_name=expected_name)
         if not previous_result.success:
             return previous_result
-        previous_deployment_id = previous_result.data.get("deployment_id")
+        fresh_previous = _previous_identity_from_result(previous_result)
 
         # ---- Transition PREVIEW_READY/LIVE -> PUBLISHING before any
         # external side effect, mirroring the durable-intent pattern used
@@ -300,13 +349,44 @@ class PromotionOrchestrator:
                     self.store.transition_lifecycle_locked(locked, ProjectLifecycle.PUBLISHING)
                 except LifecycleError as exc:
                     return OperationResult.fail(str(exc), error_code="INVALID_LIFECYCLE_TRANSITION")
-            locked.deployment["promotion_intent"] = {
-                "operation_id": operation_id,
-                "deployment_id": deployment_id,
-                "previous_production_deployment_id": previous_deployment_id,
-                "stage": "publishing",
-                "created_at": time.time(),
-            }
+            existing_intent = locked.deployment.get("promotion_intent") or {}
+            is_same_operation = existing_intent.get("operation_id") == operation_id
+            if is_same_operation and "previous_production" in existing_intent:
+                # Re-entry into the SAME promotion operation with a persisted
+                # previous-production identity: REUSE it. Never recompute --
+                # a crash after the remote promote but before the
+                # stage="promoted" write would otherwise cause the retry to
+                # capture the just-promoted (broken) deployment as its own
+                # rollback target.
+                previous_identity = existing_intent["previous_production"]
+                if previous_identity is not None and not _previous_identity_complete(
+                        previous_identity):
+                    return OperationResult.fail(
+                        "INCOMPLETE_LOOKUP", error_code="INCOMPLETE_LOOKUP")
+            elif is_same_operation and "previous_production" not in existing_intent:
+                # Legacy/partial intent written before previous_production was
+                # persisted: the durable record cannot prove the rollback
+                # target's identity. Fail closed rather than guessing.
+                return OperationResult.fail(
+                    "INCOMPLETE_LOOKUP", error_code="INCOMPLETE_LOOKUP")
+            else:
+                previous_identity = fresh_previous
+                locked.deployment["promotion_intent"] = {
+                    "operation_id": operation_id,
+                    "deployment_id": deployment_id,
+                    # Full trusted previous-production identity, persisted
+                    # BEFORE any remote side effect. None means "no prior
+                    # production deployment" -- distinct from an incomplete
+                    # identity (which find_production_deployment already
+                    # fails closed on).
+                    "previous_production": previous_identity,
+                    "previous_production_deployment_id": (
+                        previous_identity.get("deployment_id")
+                        if previous_identity else None
+                    ),
+                    "stage": "publishing",
+                    "created_at": time.time(),
+                }
             self.store.save(locked)
 
             # Writer remains held through the first mutating adapter call.
@@ -327,8 +407,7 @@ class PromotionOrchestrator:
         self._update_intent(project_id, stage="smoked", smoke=smoke_result.data)
         if not smoke_result.success:
             self._rollback_and_fail(
-                project_id, app_id, vercel_project, previous_deployment_id,
-                operation_id, source_revision, artifact_sha256,
+                project_id, app_id, vercel_project, previous_identity,
                 error_code="SMOKE_FAILED", expected_name=expected_name,
             )
             return OperationResult(
@@ -401,9 +480,8 @@ class PromotionOrchestrator:
             self.store.save(state)
 
     def _rollback_and_fail(
-        self, project_id, app_id, vercel_project, previous_deployment_id,
-        operation_id: str, source_revision: int, artifact_sha256: str, error_code: str,
-        expected_name=None,
+        self, project_id, app_id, vercel_project, previous_identity,
+        error_code: str, expected_name=None,
     ):
         """Roll the production alias back to the prior last-known-good
         deployment (if one existed) before failing the lifecycle closed.
@@ -413,12 +491,32 @@ class PromotionOrchestrator:
         is (the newly promoted, smoke-FAILED deployment), and the failure
         is recorded so a human can intervene. This mirrors Phase 9's
         fail-closed-on-ambiguity posture: we never guess a rollback target.
+
+        The rollback re-promotes the previous deployment using THE PREVIOUS
+        DEPLOYMENT'S OWN persisted identity (its wbOperation/wbRevision/
+        wbArtifact), which is exactly what ``promote_deployment`` validates
+        before promoting. Deriving that identity from the CURRENT promotion
+        operation instead is a guaranteed meta mismatch and silently leaves
+        the smoke-failed deployment live. If the persisted previous identity
+        is incomplete, we fail closed -- we never guess which deployment was
+        previously production.
         """
-        if previous_deployment_id:
+        if previous_identity is not None:
+            if not _previous_identity_complete(previous_identity):
+                # Incomplete identity: fail closed. Surface a distinct error
+                # so an operator knows the rollback could not run safely.
+                self._fail(
+                    project_id, "PRODUCTION_SMOKE_FAILED",
+                    "ROLLBACK_TARGET_IDENTITY_INCOMPLETE",
+                )
+                return
             try:
                 self.deps.vercel.promote_deployment(
-                    app_id, vercel_project, previous_deployment_id,
-                    "rollback:" + operation_id, source_revision, artifact_sha256,
+                    app_id, vercel_project,
+                    previous_identity["deployment_id"],
+                    previous_identity["operation_id"],
+                    previous_identity["source_revision"],
+                    previous_identity["artifact_sha256"],
                     expected_name=expected_name,
                 )
             except Exception:

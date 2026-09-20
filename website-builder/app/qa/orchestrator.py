@@ -33,6 +33,23 @@ from app.sandbox.runner import ProjectRunner
 MAX_REPAIR_ATTEMPTS = 2
 
 
+class _ReferenceSnapshot:
+    """Immutable view of ``state.design_references`` captured under the lock.
+
+    ``validate_composed_dna`` only reads ``.design_references`` from its state
+    argument. Passing the live ``ProjectState`` after the writer lock has been
+    released validates against whatever is current at call time rather than
+    the reference set the repair instructions were composed against.
+    """
+
+    __slots__ = ("design_references",)
+
+    def __init__(self, design_references):
+        # design_references is a role -> record mapping; shallow-copy it so
+        # later mutation of the live state cannot change the validated set.
+        self.design_references = dict(design_references or {})
+
+
 class QAOrchestrator:
     """Phase 8 orchestrator: render, screenshot, VISION, deterministic QA,
     bounded FRONTEND repair, final verification.
@@ -346,6 +363,13 @@ class QAOrchestrator:
                 task=self._build_repair_instructions(state.design_dna or design_dna, failed_attempt),
             )
             brief = dict(state.brief)
+            # Snapshot the reference set UNDER the lock. validate_composed_dna
+            # (below, after the FRONTEND call) must validate the new DNA
+            # against the SAME design_references that were current when the
+            # repair instructions were composed — validating against a
+            # post-lock-release, possibly-mutated `state` object would
+            # validate against stale references.
+            design_references = dict(state.design_references or {})
             state.revisions.source_revision += 1
             invalidate_artifact(state)
             self.store.save(state)
@@ -373,7 +397,7 @@ class QAOrchestrator:
             return False
         dna = result.get("design_dna")
         try:
-            validate_composed_dna(dna, state)
+            validate_composed_dna(dna, _ReferenceSnapshot(design_references))
         except ValueError:
             return False
         with self.store.acquire_writer(project_id) as locked:

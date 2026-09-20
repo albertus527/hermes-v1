@@ -209,9 +209,23 @@ class TelegramDispatcher:
                             (key + ":auto_build").encode()
                         ).hexdigest()
                         with self.store.acquire_writer(project_id) as bstate:
-                            already_claimed = build_key in bstate.dispatch_events
+                            existing_claim = bstate.dispatch_events.get(build_key)
+                            # F4: a FAILED build claim is retryable ONLY when
+                            # the build provably never reached a remote side
+                            # effect (reached_remote is explicitly False). A
+                            # claim that is DONE, reached remote
+                            # (reached_remote True), or lacks the evidence
+                            # entirely (legacy/missing -> UNKNOWN) stays
+                            # fail-closed -- a possibly-remote build must never
+                            # be replayed.
+                            retryable_pre_remote = (
+                                existing_claim is not None
+                                and existing_claim.get("action") == "build"
+                                and existing_claim.get("status") == "FAILED"
+                                and existing_claim.get("reached_remote") is False
+                            )
                             admissible = (
-                                not already_claimed
+                                (existing_claim is None or retryable_pre_remote)
                                 and bstate.lifecycle == "READY"
                                 and bstate.revisions.source_revision == 0
                                 and not bstate.pause_state.get("paused")
@@ -220,13 +234,30 @@ class TelegramDispatcher:
                             if admissible:
                                 self.store.transition_lifecycle_locked(bstate, ProjectLifecycle.QUEUED)
                                 auto_build_brief = dict(bstate.brief)
-                                bstate.dispatch_events[build_key] = {"action": "build", "status": "CLAIMED"}
+                                # Stamp reached_remote=False at claim time so
+                                # the flag exists before any side effect; the
+                                # builder flips it to True only just before the
+                                # first remote (Vercel) call.
+                                bstate.dispatch_events[build_key] = {
+                                    "action": "build",
+                                    "status": "CLAIMED",
+                                    "reached_remote": False,
+                                }
                                 self.store.save(bstate)
                             else:
                                 auto_build_brief = None
                         if auto_build_brief is not None:
+                            def _mark_build_reached_remote():
+                                with self.store.acquire_writer(project_id) as rs:
+                                    claim = rs.dispatch_events.get(build_key)
+                                    if claim is not None and claim.get("status") == "CLAIMED":
+                                        claim["reached_remote"] = True
+                                        self.store.save(rs)
                             try:
-                                build_result = self.builder.build(project_id, auto_build_brief)
+                                build_result = self.builder.build(
+                                    project_id, auto_build_brief,
+                                    on_remote_boundary=_mark_build_reached_remote,
+                                )
                             except Exception:
                                 build_result = OperationResult.fail(
                                     "EVENT_RECONCILIATION_REQUIRED",

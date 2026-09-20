@@ -53,6 +53,18 @@ class FakeVercel:
         self._project = {'id': 'prj_1', 'name': 'wb', 'accountId': 'team'}
         self.previous_production = previous_production
         self.promote_calls = []
+        # Full identity of the current production deployment, mirroring the
+        # real adapter's contract (find_production_deployment now returns the
+        # deployment's own operation_id/source_revision/artifact_sha256 so a
+        # rollback can re-promote it with ITS OWN identity).
+        self.previous_identity = None
+        if previous_production:
+            self.previous_identity = {
+                'deployment_id': previous_production,
+                'operation_id': 'op-0',
+                'source_revision': 1,
+                'artifact_sha256': 'c' * 64,
+            }
         # Records every expected_name threaded by the orchestrator so tests
         # can assert the canonical-slug / legacy-None contract end to end.
         self.expected_names = []
@@ -63,7 +75,9 @@ class FakeVercel:
 
     def find_production_deployment(self, app_id, project, *, expected_name=None):
         self.expected_names.append(expected_name)
-        return OperationResult.ok({'deployment_id': self.previous_production})
+        if self.previous_identity is None:
+            return OperationResult.ok({'deployment_id': None})
+        return OperationResult.ok(dict(self.previous_identity))
 
     def promote_deployment(self, app_id, project, deployment_id, operation_id,
                            source_revision, artifact_sha256, *, expected_name=None):
@@ -447,3 +461,191 @@ def test_legacy_no_slug_project_promotes_with_none_expected_name(tmp_path):
     assert result.success, result.error
     assert vercel.expected_names
     assert all(name is None for name in vercel.expected_names)
+
+
+# ---------------------------------------------------------------------------
+# B-2b / F5 — rollback identity + persisted previous-production target.
+# ---------------------------------------------------------------------------
+
+
+class _CrashingSmoke(FakeSmoke):
+    """Simulates a process crash at a chosen stage: raises inside run() when
+    the promotion_intent is at a given stage, after the remote promote."""
+
+    def __init__(self, crash_stage, store):
+        super().__init__(success=True)
+        self.crash_stage = crash_stage
+        self.store = store
+
+    def run(self, url, out_dir):
+        intent = self.store.load('proj').deployment.get('promotion_intent', {})
+        if intent.get('stage') == self.crash_stage:
+            raise RuntimeError('simulated crash')
+        return super().run(url, out_dir)
+
+
+def _publishing_state(store, prev_identity):
+    """Model a crashed promotion: PUBLISHING with a persisted intent that
+    already holds the true previous-production identity."""
+    _approved_state(store, 'proj')
+    with store.acquire_writer('proj') as state:
+        state.lifecycle = ProjectLifecycle.PUBLISHING.value
+        state.deployment['promotion_intent'] = {
+            'operation_id': 'op-1',
+            'deployment_id': 'dpl_1',
+            'previous_production': prev_identity,
+            'previous_production_deployment_id': (
+                prev_identity.get('deployment_id') if prev_identity else None),
+            'stage': 'publishing',
+            'created_at': 1.0,
+        }
+        store.save(state)
+
+
+def test_rollback_uses_previous_deployment_own_identity(tmp_path):
+    """(a) rollback re-promotes the previous production deployment using THE
+    PREVIOUS DEPLOYMENT'S OWN identity, not the current operation's."""
+    runner, store = _runner(tmp_path)
+    ws = _make_workspace(tmp_path)
+    _approved_state(store, 'proj')
+    vercel = FakeVercel(previous_production='dpl_old')
+    # previous identity: op-0/rev1/artifact 'c'*64
+    deps = _deps(vercel=vercel, smoke=FakeSmoke(success=False))
+    orch = PromotionOrchestrator(runner, store, deps)
+    assert orch.approve('proj', principal_id=OWNER).success
+
+    # Capture the exact identity args used for the rollback promote call.
+    calls = []
+    orig = vercel.promote_deployment
+
+    def spy(app_id, project, deployment_id, operation_id, source_revision,
+            artifact_sha256, *, expected_name=None):
+        calls.append((deployment_id, operation_id, source_revision, artifact_sha256))
+        return orig(app_id, project, deployment_id, operation_id, source_revision,
+                    artifact_sha256, expected_name=expected_name)
+
+    vercel.promote_deployment = spy
+    result = orch.promote('proj', ws, principal_id=OWNER)
+
+    assert not result.success
+    assert result.error_code == 'SMOKE_FAILED'
+    assert vercel.promote_calls == ['dpl_1', 'dpl_old']
+    # The rollback promote used the PREVIOUS deployment's own identity.
+    assert calls[-1] == ('dpl_old', 'op-0', 1, 'c' * 64)
+    assert state_failed(store) == 'SMOKE_FAILED'
+
+
+def test_no_previous_production_does_not_rollback(tmp_path):
+    """(b) no previous production -> no rollback attempt, fail closed."""
+    runner, store = _runner(tmp_path)
+    ws = _make_workspace(tmp_path)
+    _approved_state(store, 'proj')
+    vercel = FakeVercel(previous_production=None)
+    deps = _deps(vercel=vercel, smoke=FakeSmoke(success=False))
+    orch = PromotionOrchestrator(runner, store, deps)
+    assert orch.approve('proj', principal_id=OWNER).success
+
+    result = orch.promote('proj', ws, principal_id=OWNER)
+
+    assert not result.success
+    assert result.error_code == 'SMOKE_FAILED'
+    assert vercel.promote_calls == ['dpl_1']
+
+
+def test_incomplete_previous_identity_fails_closed_no_guess(tmp_path):
+    """(c)/(g) previous identity present but incomplete -> never guess; fail
+    closed with a distinct rollback error, and never promote the candidate's
+    identity as the rollback target."""
+    runner, store = _runner(tmp_path)
+    ws = _make_workspace(tmp_path)
+    _approved_state(store, 'proj')
+    vercel = FakeVercel(previous_production='dpl_old')
+    deps = _deps(vercel=vercel, smoke=FakeSmoke(success=False))
+    orch = PromotionOrchestrator(runner, store, deps)
+    assert orch.approve('proj', principal_id=OWNER).success
+
+    # Legacy/partial intent: id only, no 'previous_production' key.
+    _publishing_state(store, prev_identity={'deployment_id': 'dpl_old'})
+    with store.acquire_writer('proj') as state:
+        # Model the pre-hardening durable shape: only the deployment_id was
+        # recorded, never the full identity needed for a safe rollback.
+        intent = state.deployment['promotion_intent']
+        intent.pop('previous_production')
+        intent.pop('previous_production_deployment_id', None)
+        state.deployment['promotion_intent'] = {
+            'operation_id': intent['operation_id'],
+            'deployment_id': intent['deployment_id'],
+            'previous_production_deployment_id': 'dpl_old',
+            'stage': 'publishing',
+            'created_at': 1.0,
+        }
+        store.save(state)
+
+    result = orch.promote('proj', ws, principal_id=OWNER)
+
+    assert not result.success
+    # Legacy intent lacks provable rollback identity -> fail closed; the
+    # candidate was NOT promoted again and no rollback was guessed.
+    assert result.error_code == 'INCOMPLETE_LOOKUP'
+    assert vercel.promote_calls == []
+
+
+def test_retry_reuses_persisted_previous_identity(tmp_path):
+    """(d)/(e) a re-entry into the SAME operation reuses the persisted
+    previous-production identity instead of recomputing it. We simulate the
+    crash-retry by re-entering _promote_authorized with a PUBLISHING state
+    that already holds the persisted target, while the CURRENT production
+    reported by Vercel has drifted to the broken candidate."""
+    runner, store = _runner(tmp_path)
+    ws = _make_workspace(tmp_path)
+    _approved_state(store, 'proj')
+    vercel = FakeVercel(previous_production='dpl_old')
+    deps = _deps(vercel=vercel, smoke=FakeSmoke(success=True))
+    orch = PromotionOrchestrator(runner, store, deps)
+    assert orch.approve('proj', principal_id=OWNER).success
+
+    # True last-known-good persisted before the remote promote.
+    good = {'deployment_id': 'dpl_old', 'operation_id': 'op-0',
+            'source_revision': 1, 'artifact_sha256': 'c' * 64}
+    _publishing_state(store, prev_identity=good)
+    # After the crash, Vercel's current production is now the broken candidate.
+    vercel.previous_identity = {'deployment_id': 'dpl_1', 'operation_id': 'op-1',
+                                'source_revision': 1, 'artifact_sha256': 'b' * 64}
+
+    # Re-enter the same operation; the smoke passes so it should go LIVE.
+    result = orch._promote_authorized('proj', ws, principal_id=OWNER)
+
+    assert result.success, result.error
+    intent = store.load('proj').deployment['promotion_intent']
+    # The persisted target was reused, NOT recomputed to the drifted dpl_1.
+    assert intent['previous_production']['deployment_id'] == 'dpl_old'
+    assert intent['previous_production_deployment_id'] == 'dpl_old'
+
+
+def test_smoke_failure_after_retry_rolls_back_to_true_last_known_good(tmp_path):
+    """(f) smoke failure on the retry rolls back to the ACTUAL persisted
+    last-known-good, not the drifted broken deployment."""
+    runner, store = _runner(tmp_path)
+    ws = _make_workspace(tmp_path)
+    _approved_state(store, 'proj')
+    vercel = FakeVercel(previous_production='dpl_old')
+    deps = _deps(vercel=vercel, smoke=FakeSmoke(success=False))
+    orch = PromotionOrchestrator(runner, store, deps)
+    assert orch.approve('proj', principal_id=OWNER).success
+
+    good = {'deployment_id': 'dpl_old', 'operation_id': 'op-0',
+            'source_revision': 1, 'artifact_sha256': 'c' * 64}
+    _publishing_state(store, prev_identity=good)
+    vercel.previous_identity = {'deployment_id': 'dpl_1', 'operation_id': 'op-1',
+                                'source_revision': 1, 'artifact_sha256': 'b' * 64}
+
+    result = orch._promote_authorized('proj', ws, principal_id=OWNER)
+
+    assert not result.success
+    assert result.error_code == 'SMOKE_FAILED'
+    # Rollback re-promoted the TRUE last-known-good (dpl_old with op-0/c*64).
+    assert vercel.promote_calls == ['dpl_1', 'dpl_old']
+
+
+def state_failed(store):
+    return store.load('proj').failure['error_code']

@@ -408,7 +408,14 @@ class HermesAdapter:
             try:
                 if load_config is None:
                     raise ValueError("Hermes configuration unavailable")
-                model, provider = self._role_selection(self._load_role_config(), role)
+                # The role mapping lives in the WEBSITE profile's config.yaml,
+                # resolved via get_hermes_home(). Loading it WITHOUT the
+                # profile override would silently read the DEFAULT Hermes
+                # profile (cross-profile contamination): preflight could pass
+                # while the real FRONTEND build resolved a different/absent
+                # role. Scope the load exactly as _run_fast_programmatic does.
+                with self._hermes_home_scope():
+                    model, provider = self._role_selection(self._load_role_config(), role)
             except Exception as exc:
                 return HermesResult(False, error=str(exc), exit_code=1)
         # Ensure profile-local skills are up-to-date so they resolve
@@ -724,7 +731,7 @@ class HermesAdapter:
             # Fallback to deterministic heuristic if Hermes fails
             return self._fallback_fast_interpret(text)
 
-        return self._parse_fast_response(result.response)
+        return self._parse_fast_response(result.response, source_text=text)
 
     def _build_fast_prompt(
         self, text: str, context: Optional[List[Dict[str, str]]] = None
@@ -786,8 +793,14 @@ User text:{context_str}
 {text}
 """
 
-    def _parse_fast_response(self, response: str) -> Dict[str, Any]:
-        """Parse FAST JSON response. Falls back to heuristic on parse failure."""
+    def _parse_fast_response(self, response: str, source_text: Optional[str] = None) -> Dict[str, Any]:
+        """Parse FAST JSON response. Falls back to heuristic on parse failure.
+
+        On failure the deterministic fallback must re-derive the brief from
+        the ORIGINAL USER TEXT (``source_text``), never from FAST's own
+        response prose: feeding model prose into the extractor would let
+        fabricated/explanatory model text populate user-brief fields.
+        """
         try:
             # Extract JSON from response (may have markdown fences)
             start = response.find("{")
@@ -809,8 +822,8 @@ User text:{context_str}
         except (json.JSONDecodeError, ValueError):
             pass
 
-        # Fallback
-        return self._fallback_fast_interpret(response)
+        # Fallback derives from the user's text, not the model's prose.
+        return self._fallback_fast_interpret(source_text if source_text is not None else "")
 
     def _fallback_fast_interpret(self, text: str) -> Dict[str, Any]:
         """Deterministic fallback when Hermes FAST is unavailable or fails.
@@ -1453,9 +1466,28 @@ Respond in this exact JSON format, one entry per attached role in order:
             end = response.rfind("}") + 1
             if start >= 0 and end > start:
                 data = json.loads(response[start:end])
+                if not isinstance(data, dict):
+                    raise ValueError("VISION response is not a JSON object")
+                has_new = "blocking" in data or "observations" in data
+                has_legacy = any(k in data for k in ("critical", "major", "minor"))
+                if not (has_new or has_legacy):
+                    # A structurally valid JSON object that carries NONE of
+                    # the contract keys is NOT an inspection result — it is a
+                    # wrong-schema/null response (e.g. {}, {"error": "..."}).
+                    # Treat it as a VISION infrastructure failure (fail
+                    # closed) rather than a clean "no blocking findings" pass.
+                    # Otherwise a page VISION never actually evaluated could
+                    # reach PREVIEW_READY ("VISION is blind").
+                    return {
+                        "pass": False,
+                        "blocking": [],
+                        "observations": [],
+                        "summary": "",
+                        "error": "VISION response missing required findings schema",
+                    }
                 blocking = list(data.get("blocking") or [])
                 observations = list(data.get("observations") or [])
-                if "blocking" not in data and "observations" not in data:
+                if not has_new:
                     # Legacy-shape compatibility: under the retired
                     # critical/major/minor contract, critical+major were
                     # unconditionally blocking and minor was non-blocking.

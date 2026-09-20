@@ -360,6 +360,32 @@ class TestMalformedUpdateIsolation:
             "message": {"from": {"id": 1}, "chat": {"id": 555}, "text": "hello", "date": 1},
         })
 
+    def test_processing_failure_surfaces_error_reply(self):
+        """M-3: an unexpected error during update processing must NOT silently
+        drop the user's message after the offset advances — the user must be
+        told to retry. Regression lock: previously the catch-all logged and
+        continued, leaving the user with no reply and the message gone.
+        """
+        telegram_out = MagicMock()
+        telegram_out.send_text.return_value = MagicMock(success=True)
+        dispatcher = MagicMock()
+        dispatcher.store.load.side_effect = RuntimeError("state unreadable")
+        loop = TelegramReceiveLoop(
+            bot_token="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+            dispatcher=dispatcher,
+            telegram_out=telegram_out,
+            transport=MagicMock(),
+        )
+        loop._process_update({
+            "update_id": 1,
+            "message": {"from": {"id": 1}, "chat": {"id": 555}, "text": "hello", "date": 1},
+        })
+        # An error reply was attempted for the user who sent the message.
+        assert telegram_out.send_text.called
+        sent_chat, sent_text = telegram_out.send_text.call_args.args[0], telegram_out.send_text.call_args.args[1]
+        assert str(sent_chat) == "555"
+        assert "try again" in sent_text.lower()
+
 
 # ---------------------------------------------------------------------------
 # 6. Graceful stop behavior

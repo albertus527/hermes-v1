@@ -269,6 +269,54 @@ class TestHermesAdapter(unittest.TestCase):
         self.assertEqual(result["clarification_question"], "What is Northcut?")
         self.assertEqual(result["readiness"], "NEEDS_CLARIFICATION")
 
+    def test_fast_parse_failure_falls_back_to_user_text_not_model_prose(self):
+        """L-1: on FAST JSON parse failure the heuristic fallback derives the
+        brief from the ORIGINAL USER TEXT, never from FAST's own response prose.
+
+        Regression lock: previously _parse_fast_response passed the model's
+        response string into _fallback_fast_interpret, so model-explanatory
+        prose could populate user-brief fields (fabrication). Now the fallback
+        re-derives from the user's message.
+        """
+        # FAST returns non-JSON prose that *mentions* a name the user never said.
+        response = 'I think the user wants a site called MegaCorp Holdings Inc.'
+        result = self.adapter._parse_fast_response(
+            response, source_text="Northcut, barbershop, biar orang booking WA"
+        )
+        self.assertEqual(result["source"], "fallback_heuristic")
+        # The brief must reflect the user's text, not the model's prose.
+        self.assertEqual(result["name"], "Northcut")
+        self.assertEqual(result["what"], "barbershop")
+        self.assertNotIn("MegaCorp", json.dumps(result))
+
+    def test_vision_wrong_schema_json_fails_closed(self):
+        """H-1: a structurally valid JSON object with NONE of the contract keys
+        must be treated as a VISION infrastructure failure (error set), never a
+        clean 'no blocking findings' pass that would let an un-inspected page
+        reach PREVIEW_READY."""
+        for bad in ("{}", '{"summary":"looks ok"}', '{"error":"rate limited"}'):
+            parsed = self.adapter._parse_vision_response(bad)
+            self.assertFalse(parsed["pass"], bad)
+            self.assertTrue(parsed.get("error"), bad)
+            self.assertEqual(parsed["blocking"], [], bad)
+
+    def test_vision_valid_schemas_still_parse(self):
+        """Sanity: genuine new/legacy vision schemas still parse to a pass."""
+        ok_new = '{"blocking": [], "observations": ["nice palette"], "summary": "ok"}'
+        parsed = self.adapter._parse_vision_response(ok_new)
+        self.assertTrue(parsed["pass"])
+        self.assertIsNone(parsed.get("error"))
+        ok_legacy = '{"critical": [], "major": [], "minor": ["tweak spacing"]}'
+        parsed = self.adapter._parse_vision_response(ok_legacy)
+        self.assertTrue(parsed["pass"])
+        self.assertIsNone(parsed.get("error"))
+
+    def test_vision_legacy_blocking_findings_still_fail(self):
+        """Legacy critical/major findings remain blocking (not silently dropped)."""
+        parsed = self.adapter._parse_vision_response('{"critical": ["broken hero"]}')
+        self.assertFalse(parsed["pass"])
+        self.assertIn("broken hero", parsed["blocking"])
+
     def test_fast_never_fabricates_url(self):
         """FAST fallback never fabricates a WhatsApp URL from WHY text."""
         with patch.object(self.adapter, "_run_fast_programmatic") as mock_prog:

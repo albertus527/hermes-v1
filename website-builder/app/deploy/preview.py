@@ -64,6 +64,38 @@ from app.deploy.snapshot import TestedSnapshot, source_fingerprint
 FOLLOW_UP_PENDING = "PENDING"
 FOLLOW_UP_SENT = "SENT"
 
+# Per-message delivery outcome for the photo/text preview sends.
+# ``photo_outcome``/``text_outcome`` are persisted BEFORE the corresponding
+# remote send so a crash mid-delivery is reconcilable without inventing
+# certainty about an ambiguous send.
+#
+#   NOT_SENT  -> the adapter DEFINITELY did not send (input/validation failure
+#                or an explicit Telegram rejection). Safe to re-drive once.
+#   PENDING   -> the send outcome is UNKNOWN (ambiguous transport failure, or
+#                a crash after Telegram may have accepted but before the
+#                message_id was recorded). Never resend -- possible duplicate.
+#   SENT      -> the adapter CONFIRMED delivery (success=True, message_id
+#                recorded). Never resend.
+_DELIVERY_NOT_SENT = "NOT_SENT"
+_DELIVERY_PENDING = "PENDING"
+_DELIVERY_SENT = "SENT"
+
+
+def _delivery_outcome_of(result) -> str:
+    """Map an adapter OperationResult to a delivery outcome.
+
+    Only an explicit, well-formed rejection is "definitely not sent". Any
+    transport-level ambiguity (AMBIGUOUS_SEND, exceptions, malformed payloads)
+    is PENDING -- the message may already have been accepted by Telegram.
+    """
+    if result is None:
+        return _DELIVERY_PENDING
+    if getattr(result, "success", False):
+        return _DELIVERY_SENT
+    if getattr(result, "error_code", None) == "TELEGRAM_REJECTED":
+        return _DELIVERY_NOT_SENT
+    return _DELIVERY_PENDING
+
 
 @dataclass
 class PreviewDeps:
@@ -319,25 +351,70 @@ class PreviewOrchestrator:
         self._update_intent(project_id, operation_id, screenshots=shots)
         photo_path = shots['desktop_screenshot']['path']
 
-        if previous.get('photo_attempted') or previous.get('text_attempted'):
+        # ---- Outcome-aware delivery reconciliation --------------------------
+        # Legacy rows only carry photo_attempted/text_attempted booleans; the
+        # outcome fields may be absent on rows written before this change.
+        # Read the durable outcome for each message independently.
+        #
+        # BACKWARD COMPATIBILITY: a legacy row with ``*_attempted`` True but
+        # no ``*_outcome`` cannot prove whether the send happened -- that is
+        # UNKNOWN, and unknown means fail closed (never resend), NOT "safe".
+        photo_outcome = previous.get('photo_outcome')
+        if photo_outcome is None and previous.get('photo_attempted'):
+            photo_outcome = _DELIVERY_PENDING
+        text_outcome = previous.get('text_outcome')
+        if text_outcome is None and previous.get('text_attempted'):
+            text_outcome = _DELIVERY_PENDING
+
+        # Photo delivery: a CONFIRMED SENT message is skipped (never resent);
+        # a provably NOT_SENT message is re-driven once; a PENDING (ambiguous)
+        # message fails closed -- never resend a possibly-delivered photo.
+        if photo_outcome == _DELIVERY_PENDING:
             return OperationResult.fail('DELIVERY_RECONCILIATION_REQUIRED',
                                         error_code='DELIVERY_RECONCILIATION_REQUIRED')
-        snapshot.verify(workspace)
-        self._update_intent(project_id, operation_id, photo_attempted=True, chat_id=str(chat_id))
-        photo_result = self.deps.telegram.send_photo(
-            chat_id, photo_path, caption=f"Preview ready: {preview_url}"
-        )
-        if not photo_result.success:
-            return photo_result
-        self._update_intent(project_id, operation_id, stage="photo_sent",
-                            photo_message_id=photo_result.data.get("message_id"))
 
-        self._update_intent(project_id, operation_id, text_attempted=True)
-        text_result = self.deps.telegram.send_text(
-            chat_id, f"Preview: {preview_url}\nReply with what you'd like changed."
-        )
-        if not text_result.success:
-            return text_result
+        snapshot.verify(workspace)
+        if photo_outcome in (None, _DELIVERY_NOT_SENT):
+            photo_result = self.deps.telegram.send_photo(
+                chat_id, photo_path, caption=f"Preview ready: {preview_url}"
+            )
+            new_outcome = _delivery_outcome_of(photo_result)
+            self._update_intent(
+                project_id, operation_id,
+                photo_attempted=True, chat_id=str(chat_id),
+                photo_outcome=new_outcome,
+                photo_message_id=(
+                    photo_result.data.get("message_id")
+                    if new_outcome == _DELIVERY_SENT else None
+                ),
+            )
+            if not photo_result.success:
+                return photo_result
+            self._update_intent(project_id, operation_id, stage="photo_sent")
+            photo_outcome = _DELIVERY_SENT
+
+        # Text delivery: same outcome-aware gate.
+        if text_outcome == _DELIVERY_PENDING:
+            return OperationResult.fail('DELIVERY_RECONCILIATION_REQUIRED',
+                                        error_code='DELIVERY_RECONCILIATION_REQUIRED')
+
+        if text_outcome in (None, _DELIVERY_NOT_SENT):
+            text_result = self.deps.telegram.send_text(
+                chat_id, f"Preview: {preview_url}\nReply with what you'd like changed."
+            )
+            new_outcome = _delivery_outcome_of(text_result)
+            self._update_intent(
+                project_id, operation_id,
+                text_attempted=True,
+                text_outcome=new_outcome,
+                text_message_id=(
+                    text_result.data.get("message_id")
+                    if new_outcome == _DELIVERY_SENT else None
+                ),
+            )
+            if not text_result.success:
+                return text_result
+            text_outcome = _DELIVERY_SENT
 
         # ---- 7. Mark latest shown preview only after BOTH sends succeeded ----
         snapshot.verify(workspace)
@@ -347,9 +424,18 @@ class PreviewOrchestrator:
                     or locked.lifecycle != 'PREVIEW_READY'
                     or locked.deployment['preview_intent']['operation_id'] != operation_id):
                 return OperationResult.fail('STALE_QA_BINDING', error_code='STALE_QA_BINDING')
+            # Both messages must be CONFIRMED SENT before the preview is shown.
+            # On a re-drive that skipped one send (already SENT), the
+            # message_id already lives in the durable intent -- never read it
+            # from a skipped (un-bound) local result variable.
+            prior = locked.deployment["preview_intent"]
+            if (prior.get("photo_outcome") != _DELIVERY_SENT
+                    or prior.get("text_outcome") != _DELIVERY_SENT):
+                return OperationResult.fail('DELIVERY_RECONCILIATION_REQUIRED',
+                                            error_code='DELIVERY_RECONCILIATION_REQUIRED')
             locked.revisions.preview_revision = source_revision
             locked.deployment["preview_intent"]["stage"] = "shown"
-            locked.deployment["preview_intent"]["text_message_id"] = text_result.data.get("message_id")
+            locked.deployment["preview_intent"]["text_message_id"] = prior.get("text_message_id")
             locked.deployment["latest_shown_preview"] = {
                 "operation_id": operation_id,
                 "source_revision": source_revision,

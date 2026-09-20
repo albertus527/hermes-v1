@@ -134,6 +134,248 @@ def test_full_preview_flow_marks_latest_shown(tmp_path):
     assert len(deps.telegram.sent) == 2
 
 
+# ---------------------------------------------------------------------------
+# BLOCKER-1 — preview delivery reconciliation (at-most-once, fail-closed).
+# ---------------------------------------------------------------------------
+
+
+class _OutcomeTelegram(FakeTelegram):
+    """Telegram fake whose photo/text sends return a scripted outcome."""
+
+    def __init__(self, photo=None, text=None):
+        super().__init__()
+        self.photo = photo or OperationResult.ok({'message_id': 1})
+        self.text = text or OperationResult.ok({'message_id': 2})
+
+    def send_photo(self, chat_id, path, caption=''):
+        self.sent.append(('photo', chat_id, path))
+        return self.photo
+
+    def send_text(self, chat_id, text):
+        self.sent.append(('text', chat_id, text))
+        return self.text
+
+
+def _seed_intent(store, project_id, **fields):
+    with store.acquire_writer(project_id) as state:
+        intent = state.deployment.get('preview_intent') or {}
+        intent.update(fields)
+        state.deployment['preview_intent'] = intent
+        store.save(state)
+
+
+def _run_with_seeded_intent(tmp_path, fields, **deps_kw):
+    """Run the exact delivery block by seeding a matching preview_intent
+    (the orchestrator's own op-id is deterministic, so re-running reaches the
+    delivery stage with prior delivery evidence present)."""
+    store = ProjectStateStore(tmp_path / 'state')
+    ws = _make_workspace(tmp_path)
+    _preview_ready_state(store, 'proj', ws)
+    deps = _deps(tmp_path, **deps_kw)
+    orch = PreviewOrchestrator(store, deps)
+    # First run to mint the deterministic operation_id and intent row.
+    first = orch.run_owned('proj', ws)
+    assert first.success
+    # Reset to PREVIEW_READY without latest_shown_preview so a re-run
+    # re-enters delivery for the SAME operation_id, then seed the evidence.
+    with store.acquire_writer('proj') as state:
+        state.deployment.pop('latest_shown_preview', None)
+        state.revisions.preview_revision = 0
+        store.save(state)
+    _seed_intent(store, 'proj', **fields)
+    deps.telegram.sent.clear()
+    return orch, deps, store
+
+
+def test_delivery_provably_unsent_photo_redrives(tmp_path):
+    """(b)/(i) an explicit Telegram rejection on the photo is provably
+    NOT_SENT -> a re-drive may proceed and deliver."""
+    # Model the prior attempt as NOT_SENT.
+    store = ProjectStateStore(tmp_path / 'state')
+    ws = _make_workspace(tmp_path)
+    _preview_ready_state(store, 'proj', ws)
+    deps = _deps(tmp_path)
+    orch = PreviewOrchestrator(store, deps)
+    first = orch.run_owned('proj', ws)
+    assert first.success
+    with store.acquire_writer('proj') as state:
+        state.deployment.pop('latest_shown_preview', None)
+        state.revisions.preview_revision = 0
+        # Prior delivery provably did not send the photo.
+        state.deployment['preview_intent']['photo_attempted'] = True
+        state.deployment['preview_intent']['photo_outcome'] = 'NOT_SENT'
+        store.save(state)
+    deps.telegram.sent.clear()
+
+    result = orch.run_owned('proj', ws)
+
+    assert result.success, result.error
+    assert any(kind == 'photo' for kind, *_ in deps.telegram.sent)
+
+
+def test_delivery_ambiguous_photo_never_duplicates(tmp_path):
+    """(d)/(g) an ambiguous transport failure on the photo is PENDING ->
+    fail closed, never resend a possibly-delivered photo."""
+    store = ProjectStateStore(tmp_path / 'state')
+    ws = _make_workspace(tmp_path)
+    _preview_ready_state(store, 'proj', ws)
+    deps = _deps(tmp_path)
+    orch = PreviewOrchestrator(store, deps)
+    assert orch.run_owned('proj', ws).success
+    with store.acquire_writer('proj') as state:
+        state.deployment.pop('latest_shown_preview', None)
+        state.revisions.preview_revision = 0
+        state.deployment['preview_intent']['photo_attempted'] = True
+        state.deployment['preview_intent']['photo_outcome'] = 'PENDING'
+        store.save(state)
+    deps.telegram.sent.clear()
+
+    result = orch.run_owned('proj', ws)
+
+    assert not result.success
+    assert result.error_code == 'DELIVERY_RECONCILIATION_REQUIRED'
+    assert deps.telegram.sent == []  # no duplicate photo
+
+
+def test_delivery_ambiguous_text_never_duplicates(tmp_path):
+    """(h) ambiguous text PENDING -> fail closed, never resend text."""
+    store = ProjectStateStore(tmp_path / 'state')
+    ws = _make_workspace(tmp_path)
+    _preview_ready_state(store, 'proj', ws)
+    deps = _deps(tmp_path)
+    orch = PreviewOrchestrator(store, deps)
+    assert orch.run_owned('proj', ws).success
+    with store.acquire_writer('proj') as state:
+        state.deployment.pop('latest_shown_preview', None)
+        state.revisions.preview_revision = 0
+        # Photo already SENT (confirmed), text ambiguous.
+        state.deployment['preview_intent']['photo_attempted'] = True
+        state.deployment['preview_intent']['photo_outcome'] = 'SENT'
+        state.deployment['preview_intent']['photo_message_id'] = 1
+        state.deployment['preview_intent']['text_attempted'] = True
+        state.deployment['preview_intent']['text_outcome'] = 'PENDING'
+        store.save(state)
+    deps.telegram.sent.clear()
+
+    result = orch.run_owned('proj', ws)
+
+    assert not result.success
+    assert result.error_code == 'DELIVERY_RECONCILIATION_REQUIRED'
+    assert deps.telegram.sent == []
+
+
+def test_delivery_legacy_attempt_without_outcome_fails_closed(tmp_path):
+    """(f) BACKWARD COMPAT: a legacy row with *_attempted True but no
+    *_outcome is UNKNOWN -> fail closed, never resent (missing != safe)."""
+    store = ProjectStateStore(tmp_path / 'state')
+    ws = _make_workspace(tmp_path)
+    _preview_ready_state(store, 'proj', ws)
+    deps = _deps(tmp_path)
+    orch = PreviewOrchestrator(store, deps)
+    assert orch.run_owned('proj', ws).success
+    with store.acquire_writer('proj') as state:
+        state.deployment.pop('latest_shown_preview', None)
+        state.revisions.preview_revision = 0
+        intent = state.deployment['preview_intent']
+        intent['photo_attempted'] = True
+        intent.pop('photo_outcome', None)
+        intent.pop('text_outcome', None)
+        store.save(state)
+    deps.telegram.sent.clear()
+
+    result = orch.run_owned('proj', ws)
+
+    assert not result.success
+    assert result.error_code == 'DELIVERY_RECONCILIATION_REQUIRED'
+    assert deps.telegram.sent == []
+
+
+def test_delivery_crash_between_photo_and_text(tmp_path):
+    """(f) crash after photo SENT but before text: photo is confirmed SENT
+    (no duplicate) and the text is not yet attempted, so delivery completes
+    with exactly one new text message."""
+    store = ProjectStateStore(tmp_path / 'state')
+    ws = _make_workspace(tmp_path)
+    _preview_ready_state(store, 'proj', ws)
+    deps = _deps(tmp_path)
+    orch = PreviewOrchestrator(store, deps)
+    assert orch.run_owned('proj', ws).success
+    with store.acquire_writer('proj') as state:
+        state.deployment.pop('latest_shown_preview', None)
+        state.revisions.preview_revision = 0
+        intent = state.deployment['preview_intent']
+        # Model the crash window exactly: the photo was delivered and
+        # confirmed SENT; the process died BEFORE the text send, so the text
+        # was never attempted and carries no outcome yet.
+        intent['photo_attempted'] = True
+        intent['photo_outcome'] = 'SENT'
+        intent['photo_message_id'] = 1
+        intent.pop('text_attempted', None)
+        intent.pop('text_outcome', None)
+        intent.pop('text_message_id', None)
+        store.save(state)
+    deps.telegram.sent.clear()
+
+    result = orch.run_owned('proj', ws)
+
+    assert result.success, result.error
+    kinds = [k for k, *_ in deps.telegram.sent]
+    assert kinds == ['text']  # photo not resent; text delivered once
+    assert store.load('proj').deployment['latest_shown_preview']['operation_id']
+
+
+def test_delivery_before_remote_send_succeeds_normally(tmp_path):
+    """(a)/(c) no prior attempt -> both sends happen exactly once and the
+    outcomes are persisted as SENT."""
+    store = ProjectStateStore(tmp_path / 'state')
+    ws = _make_workspace(tmp_path)
+    _preview_ready_state(store, 'proj', ws)
+    deps = _deps(tmp_path)
+    orch = PreviewOrchestrator(store, deps)
+
+    result = orch.run_owned('proj', ws)
+
+    assert result.success, result.error
+    assert [k for k, *_ in deps.telegram.sent] == ['photo', 'text']
+    intent = store.load('proj').deployment['preview_intent']
+    assert intent['photo_outcome'] == 'SENT'
+    assert intent['text_outcome'] == 'SENT'
+
+
+def test_delivery_rejected_photo_marks_not_sent(tmp_path):
+    """(b) an explicit Telegram rejection is persisted as NOT_SENT (distinct
+    from ambiguous), so a later run may safely re-drive it."""
+    store = ProjectStateStore(tmp_path / 'state')
+    ws = _make_workspace(tmp_path)
+    _preview_ready_state(store, 'proj', ws)
+    rejected = OperationResult.fail('TELEGRAM_REJECTED', error_code='TELEGRAM_REJECTED')
+    deps = _deps(tmp_path, telegram=_OutcomeTelegram(photo=rejected))
+    orch = PreviewOrchestrator(store, deps)
+
+    result = orch.run_owned('proj', ws)
+
+    assert not result.success
+    intent = store.load('proj').deployment['preview_intent']
+    assert intent['photo_outcome'] == 'NOT_SENT'
+
+
+def test_delivery_ambiguous_photo_marks_pending(tmp_path):
+    """(d)/(e) an ambiguous transport failure is persisted as PENDING (not
+    NOT_SENT), so a later run fails closed rather than duplicating."""
+    store = ProjectStateStore(tmp_path / 'state')
+    ws = _make_workspace(tmp_path)
+    _preview_ready_state(store, 'proj', ws)
+    ambiguous = OperationResult.fail('AMBIGUOUS_SEND', error_code='AMBIGUOUS_SEND')
+    deps = _deps(tmp_path, telegram=_OutcomeTelegram(photo=ambiguous))
+    orch = PreviewOrchestrator(store, deps)
+
+    result = orch.run_owned('proj', ws)
+
+    assert not result.success
+    intent = store.load('proj').deployment['preview_intent']
+    assert intent['photo_outcome'] == 'PENDING'
+
+
 def test_requires_qa_bound_tested_snapshot(tmp_path):
     store = ProjectStateStore(tmp_path / 'state')
     ws = _make_workspace(tmp_path)

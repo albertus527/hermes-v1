@@ -308,6 +308,31 @@ class TestProjectEnvIsolation(unittest.TestCase):
         ):
             self.assertNotIn(key, env)
 
+    def test_unlisted_credentials_never_leak_into_project_env(self):
+        """M-4: a prefix denylist cannot enumerate every credential an
+        operator's Hermes profile may define. The project env must be an
+        ALLOWLIST, so provider keys outside the old denylist (GEMINI_,
+        DEEPSEEK_, MOONSHOT_, GMI_, STRIPE_, AWS_, DATABASE_URL, ...) never
+        flow into generated-project subprocesses.
+        """
+        ws = self.runner.create_workspace("proj")
+        leaked = [
+            "GEMINI_API_KEY", "GOOGLE_API_KEY", "DEEPSEEK_API_KEY",
+            "MOONSHOT_API_KEY", "GMI_API_KEY", "NVIDIA_API_KEY",
+            "XAI_API_KEY", "MISTRAL_API_KEY", "STRIPE_SECRET_KEY",
+            "AWS_SECRET_ACCESS_KEY", "DATABASE_URL", "NPM_TOKEN",
+            "SENTRY_DSN", "MY_SECRET_KEY", "WB_VERCEL_TOKEN",
+        ]
+        with patch.dict(os.environ, {k: "x" for k in leaked}):
+            env = self.runner._build_project_env("proj", ws)
+        for key in leaked:
+            self.assertNotIn(key, env, key)
+        # Benign toolchain vars still flow through.
+        self.assertIn("PATH", env)
+        self.assertIn("HERMES_HOME", env)
+        self.assertIn("PROJECT_ID", env)
+        self.assertIn("WORKSPACE_ROOT", env)
+
 
 if __name__ == "__main__":
     unittest.main()

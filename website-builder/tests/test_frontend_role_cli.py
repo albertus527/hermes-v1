@@ -61,3 +61,39 @@ def test_missing_frontend_role_never_falls_back_to_default(tmp_path, monkeypatch
     monkeypatch.setattr('app.hermes.adapter.subprocess.run', runner)
     assert not adapter.frontend_build('app', {}, tmp_path)['success']
     runner.assert_not_called()
+
+
+def test_frontend_role_config_resolved_under_website_profile_scope(tmp_path, monkeypatch):
+    """H-3: the FRONTEND role mapping must be read from the WEBSITE profile's
+    config.yaml, not the DEFAULT Hermes profile.
+
+    `load_config()` resolves the config path via `get_hermes_home()`, which is
+    only scoped by `set_hermes_home_override`. The CLI boundary previously
+    loaded the role config OUTSIDE `_hermes_home_scope()`, so a role configured
+    only in the website profile could pass preflight yet resolve against the
+    default profile (or fail) at real build time.
+    """
+    adapter = adapter_for(tmp_path)
+    observed = {}
+
+    def resolver():
+        from hermes_constants import get_hermes_home
+        observed['home'] = get_hermes_home()
+        return {
+            'model': {'default': 'wrong-default', 'provider': 'wrong-provider'},
+            'website_builder': {'models': {'FRONTEND': {'model': 'frontend-model', 'provider': 'router'}}},
+        }
+
+    runner = Mock(return_value=SimpleNamespace(
+        returncode=0, stdout=json.dumps({'design_dna': {'brand': 'Northcut'}}), stderr=''))
+    monkeypatch.setattr('app.hermes.adapter.load_config', resolver)
+    monkeypatch.setattr('app.hermes.adapter.subprocess.run', runner)
+
+    result = adapter.frontend_build('app', {'name': 'Northcut', 'what': 'shop', 'why': 'visit'}, tmp_path)
+
+    assert result['success'], result
+    # The override must have been installed while the role config was read.
+    assert observed['home'] == adapter.hermes_home
+    # And the profile override must be released afterwards.
+    from hermes_constants import get_hermes_home_override
+    assert get_hermes_home_override() is None

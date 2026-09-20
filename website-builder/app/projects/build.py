@@ -247,6 +247,12 @@ class BuildResult:
     build_output: Optional[str] = None
     error: Optional[str] = None
     duration_seconds: float = 0.0
+    # F4: True only once the pipeline has provably reached a REMOTE side
+    # effect (the Vercel preview/deploy boundary). Persisted on the dispatch
+    # claim so a crash/retry can distinguish a safe pre-remote re-run from an
+    # unsafe post-remote replay. Absent on legacy results == UNKNOWN ==
+    # fail-closed.
+    reached_remote: bool = False
 
 
 class FrontendBuilder:
@@ -499,12 +505,25 @@ Respond with a JSON summary:
 
         return {"executed": True, "toolchain_violation": None, "design_dna": dna}
 
-    def build(self, project_id: str, brief: Dict[str, Any]) -> BuildResult:
+    def build(
+        self,
+        project_id: str,
+        brief: Dict[str, Any],
+        *,
+        on_remote_boundary=None,
+    ) -> BuildResult:
         """Execute the Phase 7 -> Phase 8 build pipeline for a project.
 
         Acquires the single worker slot once, runs Phase 7, and on success
         invokes Phase 8 QA before releasing the slot. Phase 8 owns the
         RUNNING -> PREVIEW_READY transition.
+
+        ``on_remote_boundary`` (F4): invoked exactly once, IMMEDIATELY BEFORE
+        the first remote (Vercel) side effect of the pipeline. The caller uses
+        it to durably mark the operation as having reached remote state, so a
+        crash between the remote effect and result persistence can never be
+        mistaken for a safe pre-remote retry. It must be called before, never
+        after, the remote call.
         """
         start_time = time.time()
 
@@ -760,12 +779,19 @@ Respond with a JSON summary:
             )
 
             if qa_result.success and self.preview_orchestrator is not None:
+                # F4: the preview hand-off is the first REMOTE (Vercel) side
+                # effect of this pipeline. Invoke the caller's boundary
+                # callback BEFORE the remote call so the durable "reached
+                # remote" marker is persisted ahead of the side effect.
+                if on_remote_boundary is not None:
+                    on_remote_boundary()
                 preview = self.preview_orchestrator.run_owned(
                     project_id, workspace, slot_held=True
                 )
                 if not preview.success:
                     return BuildResult(False, project_id, workspace=workspace,
                                        error=preview.error or preview.error_code,
+                                       reached_remote=True,
                                        duration_seconds=time.time() - start_time)
 
             duration = time.time() - start_time
@@ -778,6 +804,9 @@ Respond with a JSON summary:
                 build_output=json.dumps(checks, indent=2),
                 error=qa_result.error,
                 duration_seconds=duration,
+                reached_remote=bool(
+                    qa_result.success and self.preview_orchestrator is not None
+                ),
             )
 
         except Exception as exc:

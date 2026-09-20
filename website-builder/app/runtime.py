@@ -886,6 +886,26 @@ User message:
             logger.exception(
                 "Unexpected error processing update %s", update.get("update_id")
             )
+            # Do NOT drop the update silently: the intake/brief pipeline
+            # deliberately propagates transient state-load failures rather
+            # than erase the accumulated brief, so this exception reaching
+            # the loop means the user's message would otherwise be swallowed
+            # (and the offset already advanced, so Telegram never retries).
+            # Surface a sanitized error reply so the user knows to retry.
+            # Sending failures are themselves swallowed — the loop must never
+            # crash on a delivery problem.
+            try:
+                msg = TelegramNormalizer.normalize(update)
+                if msg and msg.conversation_id:
+                    self._safe_send(
+                        msg.conversation_id,
+                        "Something went wrong processing your message. Please try again.",
+                    )
+            except Exception:
+                logger.debug(
+                    "Failed to send error surface for update %s",
+                    update.get("update_id"),
+                )
 
     # ------------------------------------------------------------------
     # Conversation-routed processing (multi-project per conversation)
@@ -1188,6 +1208,11 @@ User message:
         except Exception:
             logger.exception("Failed to send message to chat %s", chat_id)
             return
+        # Some outbound adapters / fakes return None for fire-and-forget
+        # sends. Treat a None result as "delivered attempt, no status" rather
+        # than crashing the loop with AttributeError.
+        if result is None:
+            return
         if not result.success:
             logger.error(
                 "Failed to send message to chat %s: %s",
@@ -1285,7 +1310,20 @@ User message:
 
         # Derive revision sequence from existing persisted state.
         # The RevisionOrchestrator contract requires seq = queued_revision_seq + 1.
+        # F6 re-drive: after a crash between reserve() and apply(), the project
+        # is parked in REVISION_REQUESTED with an un-applied reservation for the
+        # current queued seq. Re-drive THAT seq (not queued+1) so the wedged
+        # reservation can be adopted and applied instead of deadlocking.
         seq = state.revisions.queued_revision_seq + 1
+        if state.lifecycle == "REVISION_REQUESTED":
+            principal = authenticated.principal_id
+            for entry in state.pending_revisions or []:
+                if (isinstance(entry, dict)
+                        and entry.get("seq") == state.revisions.queued_revision_seq
+                        and entry.get("applied") is False
+                        and entry.get("principal_id") == principal):
+                    seq = state.revisions.queued_revision_seq
+                    break
 
         result = self.dispatcher.dispatch(
             update,

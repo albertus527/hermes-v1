@@ -610,7 +610,19 @@ class ManagedLlmStream(Iterator[Any]):
                     "preserving the provider result",
                     exc_info=True,
                 )
-                self._preserve_pending_provider_chunks()
+                # On any unexpected exit from the fallback path, the loop must
+                # still be closed and unreferenced — otherwise __del__ (which
+                # reads self._loop) cannot reach it and the loop leaks.
+                try:
+                    self._preserve_pending_provider_chunks()
+                finally:
+                    loop_obj = self._loop or loop
+                    if loop_obj is not None and not loop_obj.is_closed():
+                        try:
+                            loop_obj.close()
+                        except Exception:
+                            logger.debug("Relay loop close failed", exc_info=True)
+                    self._loop = None
                 return
             if not self._defer_logical_completion:
                 _complete_logical(

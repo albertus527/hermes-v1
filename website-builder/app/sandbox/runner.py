@@ -297,28 +297,48 @@ class ProjectRunner:
         - PROJECT_ID
         - WORKSPACE_ROOT
         - PATH, HOME, and other basic system vars
-        """
-        env = os.environ.copy()
 
-        # Strip platform credentials
-        credential_prefixes = (
-            "TELEGRAM_",
-            "WHATSAPP_",
-            "VERCEL_",
-            "GITHUB_",
-            "OPENROUTER_",
-            "OPENAI_",
-            "ANTHROPIC_",
-            "NINEROUTER_",
-            "9ROUTER_",
-            "DOMAIN_",
-            "NAMECHEAP_",
-            "GODADDY_",
-            "CLOUDFLARE_",
+        SECURITY: a prefix *denylist* cannot enumerate every credential an
+        operator's Hermes profile may define (GEMINI_/GOOGLE_/DEEPSEEK_/GMI_/
+        MOONSHOT_/NVIDIA_/XAI_/MISTRAL_/STRIPE_/AWS_/NPM_TOKEN/...). A
+        compromised or buggy build dependency (postinstall script) would then
+        exfiltrate any non-listed secret. Use a strict *allowlist* of benign
+        system variables instead, so credentials never flow into generated
+        project subprocesses by default.
+        """
+        # Minimal, benign system variables needed to run node/npm and resolve
+        # the toolchain on POSIX + Windows. Anything not in this allowlist is
+        # dropped, so no credential can leak through merely because its name
+        # was not anticipated.
+        _ALLOWED_EXACT = {
+            "PATH", "PATHEXT",
+            "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
+            "TEMP", "TMP", "TMPDIR",
+            "SYSTEMROOT", "WINDIR", "COMSPEC", "SYSTEMDRIVE",
+            "SHELL", "TERM", "COLORTERM",
+            "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+            "NUMBER_OF_PROCESSORS",
+            "OS", "PROCESSOR_ARCHITECTURE",
+            # nvm / node version managers sometimes need these to resolve the
+            # selected toolchain when invoked inside a subprocess.
+            "NVM_DIR", "NVM_BIN", "NVM_HOME", "NVM_SYMLINK",
+            "VOLTA_HOME", "FNM_DIR", "FNM_MULTISHELL_PATH",
+        }
+        # Explicitly allowed prefixes for toolchain/runtime resolution only.
+        # These prefixes do not carry application credentials.
+        _ALLOWED_PREFIXES = (
+            "XDG_",          # XDG_DATA_HOME etc. — cache/config dirs, not secrets
+            "PROGRAMFILES",  # Windows Program Files / Program Files (x86)
+            "PROGRAMDATA",   # Windows ProgramData
+            "LOCALAPPDATA",  # Windows per-user app data
+            "APPDATA",       # Windows roaming app data
         )
-        for key in list(env.keys()):
-            if key.startswith(credential_prefixes):
-                del env[key]
+        env: Dict[str, str] = {}
+        for key, value in os.environ.items():
+            if key in _ALLOWED_EXACT or key.upper() in _ALLOWED_EXACT:
+                env[key] = value
+            elif key.upper().startswith(tuple(p.upper() for p in _ALLOWED_PREFIXES)):
+                env[key] = value
 
         # Set project-specific vars
         env["HERMES_HOME"] = str(workspace / ".hermes")

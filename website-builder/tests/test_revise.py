@@ -77,11 +77,64 @@ class TestReservation(RevisionOrchestratorTestBase):
         self.assertEqual(result.error_code, "OUT_OF_ORDER_REVISION")
 
     def test_duplicate_reservation_rejected(self):
+        """A reservation for an ALREADY-APPLIED seq must still be rejected.
+
+        F6 note: re-reserving the *current, un-applied* queued seq is now a
+        safe idempotent re-drive (adoption), not a duplicate. A duplicate of
+        an *applied* reservation must remain rejected.
+        """
         self._preview_ready("proj-c")
         self.orchestrator.reserve("proj-c", 1, principal_id=OWNER)
+        # Mark the reservation applied so seq=1 is now behind queued_seq.
+        with self.store.acquire_writer("proj-c") as state:
+            for entry in state.pending_revisions:
+                if entry.get("seq") == 1:
+                    entry["applied"] = True
+            self.store.save(state)
         result = self.orchestrator.reserve("proj-c", 1, principal_id=OWNER)
         self.assertFalse(result.success)
         self.assertEqual(result.error_code, "OUT_OF_ORDER_REVISION")
+
+    def test_redrive_same_pending_reservation_is_idempotent(self):
+        """(F6-a/b) crash-after-reserve re-drive: re-reserving the SAME
+        pending seq with the SAME principal adopts the reservation instead of
+        appending a new one or bumping the sequence."""
+        self._preview_ready("proj-cx")
+        first = self.orchestrator.reserve("proj-cx", 1, principal_id=OWNER)
+        self.assertTrue(first.success)
+        # Simulate crash-between-reserve-and-apply: state is REVISION_REQUESTED
+        # with an un-applied reservation for seq=1.
+        second = self.orchestrator.reserve("proj-cx", 1, principal_id=OWNER)
+        self.assertTrue(second.success)
+        self.assertTrue(second.data.get("redriven"))
+        state = self.store.load("proj-cx")
+        self.assertEqual(state.revisions.queued_revision_seq, 1)
+        # Only ONE pending reservation exists -- no duplicate was appended.
+        self.assertEqual(
+            sum(1 for e in state.pending_revisions if e.get("seq") == 1), 1
+        )
+
+    def test_redrive_rejects_different_principal(self):
+        """(F6-f) a pending reservation cannot be adopted by a different
+        principal -- ownership is preserved."""
+        self._preview_ready("proj-cy")
+        self.orchestrator.reserve("proj-cy", 1, principal_id=OWNER)
+        result = self.orchestrator.reserve("proj-cy", 1, principal_id=STRANGER)
+        self.assertFalse(result.success)
+
+    def test_out_of_order_seq_still_rejected_after_redrive(self):
+        """(F6-e) skipping ahead to seq=2 while seq=1 is still pending is
+        rejected -- monotonic ordering is preserved. The project stays parked
+        in REVISION_REQUESTED until seq=1 is applied, so a skip-ahead is
+        rejected (fail-closed) and never bumps the sequence."""
+        self._preview_ready("proj-cz")
+        self.orchestrator.reserve("proj-cz", 1, principal_id=OWNER)
+        result = self.orchestrator.reserve("proj-cz", 2, principal_id=OWNER)
+        self.assertFalse(result.success)
+        self.assertIn(result.error_code, (
+            "OUT_OF_ORDER_REVISION", "REVISION_NOT_ALLOWED_IN_LIFECYCLE"))
+        state = self.store.load("proj-cz")
+        self.assertEqual(state.revisions.queued_revision_seq, 1)
 
     def test_reservation_rejected_outside_allowed_lifecycle(self):
         with self.store.acquire_writer("proj-d") as state:

@@ -169,6 +169,63 @@ class TestInitialBlockingThenRepairPasses(_FixtureBase):
         self.assertEqual(state.lifecycle, ProjectLifecycle.PREVIEW_READY.value)
 
 
+class TestRepairValidatesAgainstLockedReferenceSnapshot(_FixtureBase):
+    """H-2: the QA repair path must validate the freshly-composed Design DNA
+    against the design_references that were current when the repair
+    instructions were composed — NOT against a live state object whose
+    writer lock has already been released.
+
+    Regression lock: previously ``_repair`` called
+    ``validate_composed_dna(dna, state)`` using the ``state`` variable from
+    the (already-exited) ``acquire_writer`` block.
+    """
+
+    def test_repair_passes_reference_snapshot_not_live_state(self):
+        _queue_and_run_project(self.store, "proj")
+        # Seed a reference set on the project so the snapshot is non-empty.
+        # design_references is a role -> {"item": ReferenceItem(...).to_dict(),
+        # "evidence": str} mapping.
+        from app.core.references import ReferenceItem
+        refs = {
+            "UX": {
+                "item": ReferenceItem("UX", "upload", "a" * 64, "image/png", 100).to_dict(),
+                "evidence": "Clear hierarchy",
+            }
+        }
+        with self.store.acquire_writer("proj") as state:
+            state.design_references = dict(refs)
+            self.store.save(state)
+
+        self._passing_render()
+        self.mock_capture.capture.side_effect = lambda url, qa_dir, attempt: self._passing_screenshots(attempt)
+        self.mock_adapter.vision_inspect.side_effect = [
+            self._blocking_vision(),
+            self._passing_vision(),
+        ]
+        self.mock_adapter.frontend_build.return_value = {"success": True, "design_dna": self.design_dna}
+
+        seen = {}
+
+        def _capture(dna, state_arg):
+            seen["state"] = state_arg
+
+        with patch(
+            "app.qa.orchestrator.validate_composed_dna",
+            side_effect=_capture,
+        ) as mock_validate, patch.object(
+            self.orchestrator, "_run_rebuild_checks", return_value=(True, True)
+        ):
+            result = self.orchestrator.run("proj", self.workspace, self.brief, self.design_dna)
+
+        self.assertTrue(result.success, result)
+        mock_validate.assert_called_once()
+        # The object handed to validate_composed_dna must expose the SAME
+        # reference set captured under the lock; it must not be the live
+        # (lock-released) ProjectState instance.
+        self.assertEqual(seen["state"].design_references, refs)
+        self.assertNotIsInstance(seen["state"], type(self.store.load("proj")))
+
+
 class TestRepairBudgetExhaustion(_FixtureBase):
     """3. Repair budget exhaustion -> repair1 -> repair2 -> still blocking -> FAILED, no 3rd repair."""
 

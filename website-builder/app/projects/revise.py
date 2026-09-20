@@ -103,6 +103,31 @@ class RevisionOrchestrator:
             except AuthzError as exc:
                 return OperationResult.fail(exc.error_code, error_code=exc.error_code)
             expected = state.revisions.queued_revision_seq + 1
+            # F6 re-drive: a crash between reserve() and apply() leaves a
+            # pending reservation for the CURRENT queued seq with
+            # applied=False and the lifecycle parked in REVISION_REQUESTED.
+            # Re-submitting that EXACT reservation is a safe idempotent
+            # re-drive (apply() still guards revision_seq >= seq, so it can
+            # never apply twice). Checked BEFORE the out-of-order gate because
+            # the current queued seq is intentionally not queued+1 here.
+            # A reservation owned by a DIFFERENT principal is a genuine
+            # conflict -- never adopt another principal's slot.
+            if (seq == state.revisions.queued_revision_seq
+                    and state.lifecycle == ProjectLifecycle.REVISION_REQUESTED.value):
+                pending = next(
+                    (e for e in state.pending_revisions
+                     if isinstance(e, dict) and e.get("seq") == seq
+                     and e.get("applied") is False),
+                    None,
+                )
+                if pending is not None:
+                    if pending.get("principal_id") == principal_id:
+                        # Adopt the existing un-applied reservation unchanged;
+                        # do NOT bump the sequence or re-append.
+                        return OperationResult.ok({"seq": seq, "redriven": True})
+                    return OperationResult.fail(
+                        "OUT_OF_ORDER_REVISION", error_code="OUT_OF_ORDER_REVISION",
+                    )
             if seq != expected:
                 return OperationResult.fail(
                     "OUT_OF_ORDER_REVISION", error_code="OUT_OF_ORDER_REVISION",
