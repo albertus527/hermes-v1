@@ -976,6 +976,138 @@ class TestCheapCheckClassification(unittest.TestCase):
         self.assertIsNone(decision.failed_check)
         self.assertEqual(decision.classification, "no_failure")
 
+    def test_tailwind_theme_diagnostic_is_eligible_source_error(self):
+        """The exact real p5 Tailwind @theme failure is repairable."""
+        from app.projects.build import classify_cheap_check_failure
+
+        decision = classify_cheap_check_failure({
+            "npm_ci": {"success": True},
+            "npm_build": {
+                "success": False,
+                "stderr": "[plugin @tailwindcss/vite:generate:build] "
+                          "/workspace/src/index.css\n"
+                          "Error: `@theme` blocks must only contain custom "
+                          "properties or `@keyframes`.",
+            },
+            "npm_typecheck": {"success": True},
+        })
+        self.assertTrue(decision.eligible)
+        self.assertEqual(decision.failed_check, "npm_build")
+        self.assertEqual(decision.classification, "source_error")
+
+    def test_generic_error_prefix_remains_unclassified(self):
+        """A generic 'Error:' line is NOT a repairable source signature."""
+        from app.projects.build import classify_cheap_check_failure
+
+        decision = classify_cheap_check_failure({
+            "npm_ci": {"success": True},
+            "npm_build": {
+                "success": False,
+                "stderr": "Error: something unexpected happened in a plugin",
+            },
+            "npm_typecheck": {"success": True},
+        })
+        self.assertFalse(decision.eligible)
+        self.assertEqual(decision.classification, "unclassified")
+
+    def test_infrastructure_still_wins_over_tailwind_source_text(self):
+        """Infrastructure signatures win even when source-looking text is present."""
+        from app.projects.build import classify_cheap_check_failure
+
+        decision = classify_cheap_check_failure({
+            "npm_ci": {"success": True},
+            "npm_build": {
+                "success": False,
+                "stderr": "Error: `@theme` blocks must only contain custom "
+                          "properties or `@keyframes`.\n"
+                          "ENOSPC: no space left on device",
+            },
+            "npm_typecheck": {"success": True},
+        })
+        self.assertFalse(decision.eligible)
+        self.assertEqual(decision.classification, "infrastructure_failure")
+
+
+class TestBoundedDiagnosticCapture(unittest.TestCase):
+    """Bounded head+tail capture for cheap-check stdout/stderr.
+
+    Real p5 failure: the Tailwind @theme diagnostic sat at the BEGINNING of
+    a long stderr whose >2000-char stack trace pushed it out of the old
+    tail-only capture, so the failure classified as 'unclassified' and the
+    eligible compile repair was skipped.
+    """
+
+    _TAILWIND_DIAGNOSTIC = (
+        "[plugin @tailwindcss/vite:generate:build] /workspace/src/index.css\n"
+        "Error: `@theme` blocks must only contain custom properties or "
+        "`@keyframes`."
+    )
+
+    def test_bounded_output_short_text_unchanged(self):
+        from app.projects.build import _bounded_output
+
+        self.assertEqual(_bounded_output("short"), "short")
+        self.assertEqual(_bounded_output(""), "")
+        self.assertEqual(_bounded_output(None), "")
+
+    def test_bounded_output_preserves_head_and_tail(self):
+        from app.projects.build import _bounded_output
+
+        head = "HEAD-DIAGNOSTIC " + "h" * 100
+        tail = "t" * 100 + " TAIL-END"
+        middle = "m" * 5000
+        captured = _bounded_output(head + middle + tail)
+
+        self.assertIn("HEAD-DIAGNOSTIC", captured)
+        self.assertIn("TAIL-END", captured)
+        self.assertIn("...[truncated]...", captured)
+        # Bounded: well under the full input length.
+        self.assertLess(len(captured), 2200)
+
+    def test_run_fixed_checks_preserves_leading_diagnostic(self):
+        """A long stderr with the diagnostic at the START and a >2000-char
+        stack trace at the END still preserves the diagnostic."""
+        from app.projects.build import classify_cheap_check_failure
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            workspace_root = Path(tmpdir) / "workspaces"
+            state_root = Path(tmpdir) / "state"
+            store = ProjectStateStore(state_root)
+            runner = ProjectRunner(workspace_root, store)
+            builder = FrontendBuilder(runner, store, hermes_adapter=None)
+            workspace = runner.create_workspace("proj-bounded")
+
+            stack_trace = "\n" + "\n".join(
+                f"    at chunk{i} (node_modules/vite/dist/node/chunks/dep-{i}.js:{i}:13)"
+                for i in range(300)
+            )
+            long_stderr = self._TAILWIND_DIAGNOSTIC + stack_trace
+            self.assertGreater(len(long_stderr), 2000)
+
+            def fake_run(project_id, cmd, **kwargs):
+                if cmd == ["npm", "ci"]:
+                    return MagicMock(returncode=0, stdout="", stderr="")
+                if cmd == ["npm", "run", "build"]:
+                    return MagicMock(returncode=1, stdout="", stderr=long_stderr)
+                return MagicMock(returncode=0, stdout="", stderr="")
+
+            with patch.object(runner, "run_command", side_effect=fake_run):
+                results = builder._run_fixed_checks("proj-bounded", workspace)
+
+            captured = results["npm_build"]["stderr"]
+            self.assertIn("`@theme` blocks must only contain", captured)
+            self.assertLess(len(captured), 2200)
+
+            decision = classify_cheap_check_failure(results)
+            self.assertEqual(decision.classification, "source_error")
+            self.assertTrue(decision.eligible)
+            self.assertEqual(decision.failed_check, "npm_build")
+        finally:
+            import shutil
+
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
 
 class TestPhase7CompileRepair(unittest.TestCase):
     """A–H: the single bounded Phase-7 compile-repair path.

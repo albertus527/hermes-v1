@@ -59,6 +59,29 @@ MAX_COMPILE_REPAIR_ATTEMPTS = 1
 # Deterministic execution order of the fixed cheap checks.
 _CHEAP_CHECK_SEQUENCE = ("npm_ci", "npm_build", "npm_typecheck")
 
+# Bounded diagnostic capture for cheap-check output. Long command output
+# (e.g. a Tailwind/Vite stack trace) must not push the actual diagnostic
+# line out of the captured text, so we preserve BOTH the head and the tail
+# instead of a tail-only slice. Output stays bounded; unlimited command
+# output is never persisted.
+_DIAGNOSTIC_CAPTURE_LIMIT = 2000
+_DIAGNOSTIC_TRUNCATION_MARKER = "\n...[truncated]...\n"
+
+def _bounded_output(text: Optional[str], limit: int = _DIAGNOSTIC_CAPTURE_LIMIT) -> str:
+    """Bound captured command output, preserving head + tail.
+
+    Deterministic: short output passes through unchanged; long output keeps
+    the first and last portions with a fixed truncation marker between them.
+    The result never exceeds ``limit + len(marker)`` characters.
+    """
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return text
+    head = limit // 2
+    tail = limit - head
+    return text[:head] + _DIAGNOSTIC_TRUNCATION_MARKER + text[-tail:]
+
 # Deterministic source/code-level build failure signatures. Any match makes a
 # failing npm_build / npm_typecheck check eligible for one targeted repair.
 _REPAIRABLE_SOURCE_PATTERNS = tuple(
@@ -74,6 +97,9 @@ _REPAIRABLE_SOURCE_PATTERNS = tuple(
         r"Failed to resolve import\b",
         r"Rollup failed to resolve\b",
         r"Transform failed\b",
+        # Tailwind v4 generated-source diagnostic (real p5 failure). Narrow on
+        # purpose: this exact @theme contract violation, not generic "Error:".
+        r"@theme` blocks must only contain custom properties or `@keyframes`",
     )
 )
 
@@ -279,8 +305,8 @@ class FrontendBuilder:
         )
         results["npm_ci"] = {
             "success": proc.returncode == 0,
-            "stdout": proc.stdout[-2000:] if proc.stdout else "",
-            "stderr": proc.stderr[-2000:] if proc.stderr else "",
+            "stdout": _bounded_output(proc.stdout),
+            "stderr": _bounded_output(proc.stderr),
         }
         if proc.returncode != 0:
             return results
@@ -294,8 +320,8 @@ class FrontendBuilder:
         )
         results["npm_build"] = {
             "success": proc.returncode == 0,
-            "stdout": proc.stdout[-2000:] if proc.stdout else "",
-            "stderr": proc.stderr[-2000:] if proc.stderr else "",
+            "stdout": _bounded_output(proc.stdout),
+            "stderr": _bounded_output(proc.stderr),
         }
 
         # npm run typecheck
@@ -307,8 +333,8 @@ class FrontendBuilder:
         )
         results["npm_typecheck"] = {
             "success": proc.returncode == 0,
-            "stdout": proc.stdout[-2000:] if proc.stdout else "",
-            "stderr": proc.stderr[-2000:] if proc.stderr else "",
+            "stdout": _bounded_output(proc.stdout),
+            "stderr": _bounded_output(proc.stderr),
         }
 
         return results
