@@ -957,6 +957,17 @@ User message:
             )
             if recon.success:
                 state = self.dispatcher.store.load(project_id)
+            else:
+                # Fail-closed recovery gate: a failed reconciliation must STOP
+                # this turn. Falling through to FAST/intake would let intake
+                # attempt an invalid PREVIEW_READY -> READY transition and mask
+                # the real reconcile error behind EVENT_RECONCILIATION_REQUIRED.
+                logger.error(
+                    "Preview reconciliation failed for project %s: %s",
+                    project_id, recon.error_code,
+                )
+                self._send_error_reply(message.conversation_id, recon.error_code)
+                return
 
         lifecycle = state.lifecycle if state else "DISCOVERING"
 
@@ -1149,6 +1160,16 @@ User message:
             )
             if recon.success:
                 state = self.dispatcher.store.load(project_id)
+            else:
+                # Fail-closed recovery gate (legacy path): identical contract to
+                # _dispatch_project_turn — a failed reconciliation stops the turn
+                # before FAST/intake so the real reconcile error is not masked.
+                logger.error(
+                    "Preview reconciliation failed for project %s: %s",
+                    project_id, recon.error_code,
+                )
+                self._send_error_reply(message.conversation_id, recon.error_code)
+                return
 
         lifecycle = state.lifecycle if state else "DISCOVERING"
         intent = self._classify_intent(message.text, lifecycle, project_id, state=state)

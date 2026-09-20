@@ -183,6 +183,16 @@ class _StubPreview:
     def run_owned(self, project_id, workspace, slot_held=False):
         return OperationResult.fail("NO_DELIVERY_TARGET", error_code="NO_DELIVERY_TARGET")
 
+class _SucceedingPreview:
+    """Reconcile stub that succeeds so the turn continues past the gate.
+
+    F6 pins the distinct-claim invariant (reconcile vs intake sub-keys). Under
+    the fail-closed recovery gate a FAILED reconcile stops the turn before
+    intake, so this stub must SUCCEED for intake to be claimed at all.
+    """
+    def run_owned(self, project_id, workspace, slot_held=False):
+        return OperationResult.ok({"preview_url": "https://x.vercel.app"})
+
 
 class _RecordingOut:
     def __init__(self, fail=False):
@@ -218,7 +228,7 @@ class TestReconcileClaimSubkey(unittest.TestCase):
             dispatcher = TelegramDispatcher(
                 store, IntakeProcessor(store),
                 workspace_for=lambda pid: workdir,
-                preview=_StubPreview(),
+                preview=_SucceedingPreview(),
             )
             out = _RecordingOut()
             loop = TelegramReceiveLoop(
