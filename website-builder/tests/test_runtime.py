@@ -1428,3 +1428,132 @@ class TestPreviewReconciliation:
         # the orchestrator owns the ambiguity refusal. This is a guard test that
         # preview.py's contract is intact (no code change there).
         assert store.load("tg-555").deployment["preview_intent"]["photo_attempted"] is True
+
+# ---------------------------------------------------------------------------
+# Async-ownership boundary — preview smoke browser factory (VPS regression)
+# ---------------------------------------------------------------------------
+
+class TestSmokeFactoryAsyncioBoundary:
+    """Reproduce the REAL VPS failure: the production smoke browser factory
+    is invoked while the CALLING thread owns a running asyncio loop (the state
+    left by the in-process Hermes FAST turn's sync/async bridge). Playwright's
+    sync API raises ``Error: using Playwright Sync API inside the asyncio loop``
+    on exactly that condition. The factory must survive it.
+
+    A test that merely calls PreviewSmokeTester synchronously is insufficient —
+    this suite drives the factory through the same ownership boundary that
+    caused the VPS failure.
+    """
+
+    @staticmethod
+    def _install_guarded_playwright_stub(monkeypatch):
+        """Install a stub ``playwright.sync_api.sync_playwright`` replicating
+        the real guard: ``get_running_loop()`` + ``is_running()`` on the
+        calling thread -> raise the exact production error. Returns the list of
+        thread names on which the stub was invoked."""
+        import asyncio as _asyncio
+        import sys as _sys
+        import types as _types
+
+        call_threads = []
+
+        class _StubPlaywright:
+            def start(self):
+                try:
+                    loop = _asyncio.get_running_loop()
+                    running = loop.is_running()
+                except RuntimeError:
+                    running = False
+                call_threads.append(threading.current_thread().name)
+                if running:
+                    raise RuntimeError(
+                        "It looks like you are using Playwright Sync API inside "
+                        "the asyncio loop.\nPlease use the Async API instead."
+                    )
+                browser = MagicMock(name="stub-browser")
+                self.chromium = MagicMock()
+                self.chromium.launch = MagicMock(return_value=browser)
+                return self
+
+        sync_api_mod = _types.ModuleType("playwright.sync_api")
+        sync_api_mod.sync_playwright = lambda: _StubPlaywright()
+        pkg = _types.ModuleType("playwright")
+        pkg.sync_api = sync_api_mod
+        monkeypatch.setitem(_sys.modules, "playwright", pkg)
+        monkeypatch.setitem(_sys.modules, "playwright.sync_api", sync_api_mod)
+        return call_threads
+
+    def test_factory_succeeds_with_no_running_loop(self, monkeypatch):
+        """Baseline: no running loop on the calling thread — direct path."""
+        from app import runtime as app_runtime
+
+        self._install_guarded_playwright_stub(monkeypatch)
+        factory = app_runtime._load_smoke_browser_factory()
+        assert factory is not None
+        browser = factory()
+        assert browser is not None
+
+    def test_factory_survives_running_loop_on_calling_thread(self, monkeypatch):
+        """REAL VPS condition: calling thread owns a RUNNING asyncio loop.
+
+        Before the fix, ``sync_playwright().start()`` raised the production
+        error here. After the fix, the launch is bridged onto a dedicated
+        thread (no asyncio state) and succeeds. Playwright must never be
+        invoked on the loop-owning thread.
+        """
+        import asyncio as _asyncio
+
+        from app import runtime as app_runtime
+
+        call_threads = self._install_guarded_playwright_stub(monkeypatch)
+        factory = app_runtime._load_smoke_browser_factory()
+        assert factory is not None
+
+        result_holder = {}
+
+        async def _drive():
+            # We are inside a running loop on THIS (main/test) thread — the
+            # exact ownership state that produced SMOKE_FAILED on the VPS.
+            result_holder["browser"] = factory()
+
+        _asyncio.run(_drive())
+
+        assert "browser" in result_holder, (
+            "factory raised inside running loop — VPS regression reproduced"
+        )
+        assert result_holder["browser"] is not None
+        # The guarded stub must have executed on the bridge thread, never on
+        # this loop-owning thread.
+        assert call_threads, "stub sync_playwright was never invoked"
+        assert all(
+            name == "wb-smoke-browser" for name in call_threads
+        ), f"Playwright invoked on wrong thread(s): {call_threads}"
+
+    def test_factory_error_propagates_fail_closed(self, monkeypatch):
+        """Fail-closed preserved: a genuine launch error still propagates
+        through the bridge unchanged (no swallow, no retry)."""
+        import asyncio as _asyncio
+        import sys as _sys
+        import types as _types
+
+        from app import runtime as app_runtime
+
+        class _BoomPlaywright:
+            def start(self):
+                raise ValueError("chromium-missing")
+
+        sync_api_mod = _types.ModuleType("playwright.sync_api")
+        sync_api_mod.sync_playwright = lambda: _BoomPlaywright()
+        pkg = _types.ModuleType("playwright")
+        pkg.sync_api = sync_api_mod
+        monkeypatch.setitem(_sys.modules, "playwright", pkg)
+        monkeypatch.setitem(_sys.modules, "playwright.sync_api", sync_api_mod)
+
+        factory = app_runtime._load_smoke_browser_factory()
+        assert factory is not None
+
+        async def _drive():
+            factory()
+
+        with pytest.raises(ValueError, match="chromium-missing"):
+            _asyncio.run(_drive())

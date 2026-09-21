@@ -327,6 +327,8 @@ class PreviewOrchestrator:
                                         error_code='DEPLOYMENT_IDENTITY_MISMATCH')
 
         # ---- 5. Mandatory anonymous smoke test ----
+        from app.runtime import _diag_log  # deferred: avoids import cycle
+        _diag_log("5.before_PreviewSmokeTester_run")
         smoke_dir = (self.smoke_dir_root or workspace) / "qa" / "preview_smoke"
         smoke_result = self.deps.smoke.run(preview_url, smoke_dir)
         self._update_intent(project_id, operation_id, stage="smoked", smoke=smoke_result.data)

@@ -11,6 +11,7 @@ Canonical invocation:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -25,6 +26,44 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
 
 import yaml
+
+# ---------------------------------------------------------------------------
+# Diagnostic instrumentation — async-loop boundary detection
+# ---------------------------------------------------------------------------
+
+_DIAG_ENABLED = os.environ.get("WB_DIAG_ASYNCIO_LOOP", "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+
+def _asyncio_loop_diag(tag: str) -> Dict[str, Any]:
+    """Capture safe async-loop context for boundary diagnosis.
+
+    Returns only non-secret operational metadata:
+    thread name, thread id, whether asyncio.get_running_loop() succeeds,
+    loop class/type, loop.is_running().
+    """
+    info: Dict[str, Any] = {
+        "tag": tag,
+        "thread": threading.current_thread().name,
+        "thread_id": threading.get_ident(),
+    }
+    try:
+        loop = asyncio.get_running_loop()
+        info["running"] = True
+        info["loop_type"] = type(loop).__name__
+        info["loop_is_running"] = loop.is_running()
+    except RuntimeError:
+        info["running"] = False
+        info["loop_type"] = None
+        info["loop_is_running"] = False
+    return info
+
+
+def _diag_log(tag: str) -> None:
+    if _DIAG_ENABLED:
+        logger.info("[ASYNCIO_DIAG] %s", _asyncio_loop_diag(tag))
+
 
 from app.channels.dispatch import AuthenticatedTelegramContext, TelegramDispatcher
 from app.channels.telegram import NormalizedMessage, TelegramNormalizer
@@ -162,17 +201,62 @@ def load_runtime_config(config_path: Optional[Path] = None) -> RuntimeConfig:
     )
 
 
+def _run_on_fresh_thread(fn):
+    """Run *fn* on a short-lived dedicated thread and return its result.
+
+    The calling thread is blocked until the worker finishes. Exceptions
+    propagate unchanged. The worker thread owns no asyncio state, so
+    Playwright's sync API never observes a running loop there.
+    """
+    box: Dict[str, Any] = {}
+
+    def _target() -> None:
+        try:
+            box["value"] = fn()
+        except BaseException as exc:  # propagate verbatim
+            box["error"] = exc
+
+    worker = threading.Thread(
+        target=_target, name="wb-smoke-browser", daemon=True
+    )
+    worker.start()
+    worker.join()
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
+def _calling_thread_has_running_loop() -> bool:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return loop.is_running()
+
+
 def _load_smoke_browser_factory():
     """Load the Playwright browser factory for smoke tests.
 
     Returns None when Playwright is not installed — smoke tests will then
     fail closed at runtime, which is the correct behavior for an optional
     dependency.
+
+    Async-ownership guard: Playwright's sync API refuses to start on a thread
+    that currently owns a RUNNING asyncio loop (``sync_playwright().start()``
+    raises "using Playwright Sync API inside the asyncio loop"). The Website
+    Builder pipeline is fully synchronous, but the in-process Hermes FAST turn
+    executes its LLM call through ``relay_llm``'s sync/async bridge, and a
+    loop left running on the calling thread at smoke time trips that guard
+    (VPS repro: preflight OK, runtime smoke SMOKE_FAILED). When — and only
+    when — the calling thread has a running loop, the browser launch is
+    bridged onto a dedicated short-lived thread that owns no asyncio state.
+    Orchestration stays synchronous and sequential; the bridge is inert in
+    the normal (no-running-loop) path, including startup preflight.
     """
     try:
         from playwright.sync_api import sync_playwright
 
-        def factory():
+        def _launch():
             pw = sync_playwright().start()
             return pw.chromium.launch(
                 headless=True,
@@ -183,6 +267,17 @@ def _load_smoke_browser_factory():
                     "--disable-gpu",
                 ],
             )
+
+        def factory():
+            _diag_log("6.browser_factory.before_sync_playwright_start")
+            if _calling_thread_has_running_loop():
+                logger.warning(
+                    "Preview smoke browser factory: running asyncio loop detected "
+                    "on the calling thread — bridging Playwright launch to a "
+                    "dedicated thread"
+                )
+                return _run_on_fresh_thread(_launch)
+            return _launch()
 
         return factory
     except ImportError:
@@ -776,12 +871,15 @@ class TelegramReceiveLoop:
         prompt = self._build_intent_prompt(text, lifecycle, intent_names)
 
         try:
+            _diag_log("2.before_FAST")
             result = self.hermes._run_fast_programmatic(
                 prompt=prompt,
                 role="FAST",
                 skills=["website-builder-environment", "website-builder-product-scope"],
             )
+            _diag_log("3.after_FAST")
         except Exception:
+            _diag_log("3.after_FAST_exception")
             return ConversationIntent.INTAKE
 
         if not result.success:
@@ -857,6 +955,7 @@ User message:
         Malformed/unsupported updates are logged and skipped — they never
         crash the process.
         """
+        _diag_log("1.update_dispatch_entry")
         try:
             # Normalize through the existing TelegramNormalizer
             message = TelegramNormalizer.normalize(update)
@@ -971,6 +1070,7 @@ User message:
             and state.deployment.get("tested_snapshot")
             and not state.deployment.get("latest_shown_preview")
         ):
+            _diag_log("4.before_reconcile_preview_dispatch")
             recon = self.dispatcher.dispatch(
                 update, project_id, "reconcile_preview", authenticated=authenticated,
                 claim_suffix=":reconcile_preview",
