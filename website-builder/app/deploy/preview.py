@@ -375,13 +375,27 @@ class PreviewOrchestrator:
 
         snapshot.verify(workspace)
         if photo_outcome in (None, _DELIVERY_NOT_SENT):
+            # CRITICAL ORDERING: durably persist the ATTEMPT (PENDING) BEFORE
+            # the first possible Telegram side effect. If this write fails we
+            # must NOT send -- a send without durable evidence is exactly the
+            # unmarked-send crash window that produces duplicate deliveries.
+            try:
+                self._update_intent(
+                    project_id, operation_id,
+                    photo_attempted=True, chat_id=str(chat_id),
+                    photo_outcome=_DELIVERY_PENDING,
+                )
+            except Exception:
+                return OperationResult.fail(
+                    'DELIVERY_STATE_PERSIST_FAILED',
+                    error_code='DELIVERY_STATE_PERSIST_FAILED',
+                )
             photo_result = self.deps.telegram.send_photo(
                 chat_id, photo_path, caption=f"Preview ready: {preview_url}"
             )
             new_outcome = _delivery_outcome_of(photo_result)
             self._update_intent(
                 project_id, operation_id,
-                photo_attempted=True, chat_id=str(chat_id),
                 photo_outcome=new_outcome,
                 photo_message_id=(
                     photo_result.data.get("message_id")
@@ -399,13 +413,25 @@ class PreviewOrchestrator:
                                         error_code='DELIVERY_RECONCILIATION_REQUIRED')
 
         if text_outcome in (None, _DELIVERY_NOT_SENT):
+            # Same pre-send durable PENDING write as the photo path: the
+            # remote send may only happen after the attempt is on disk.
+            try:
+                self._update_intent(
+                    project_id, operation_id,
+                    text_attempted=True,
+                    text_outcome=_DELIVERY_PENDING,
+                )
+            except Exception:
+                return OperationResult.fail(
+                    'DELIVERY_STATE_PERSIST_FAILED',
+                    error_code='DELIVERY_STATE_PERSIST_FAILED',
+                )
             text_result = self.deps.telegram.send_text(
                 chat_id, f"Preview: {preview_url}\nReply with what you'd like changed."
             )
             new_outcome = _delivery_outcome_of(text_result)
             self._update_intent(
                 project_id, operation_id,
-                text_attempted=True,
                 text_outcome=new_outcome,
                 text_message_id=(
                     text_result.data.get("message_id")

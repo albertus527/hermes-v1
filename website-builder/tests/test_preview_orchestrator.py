@@ -376,6 +376,261 @@ def test_delivery_ambiguous_photo_marks_pending(tmp_path):
     assert intent['photo_outcome'] == 'PENDING'
 
 
+# ---------------------------------------------------------------------------
+# B-NEW-1 — pre-send durable PENDING ordering (crash window regression tests)
+# ---------------------------------------------------------------------------
+
+class _SentWriteFailTelegram(FakeTelegram):
+    """Telegram fake that CONFIRMS each send with a message_id (like real
+    Telegram accepting the message). The post-acceptance durable-write
+    failure is injected separately via _inject_post_send_sent_write_failure;
+    this fake never raises inside send_photo/send_text."""
+
+
+def _inject_post_send_sent_write_failure(orch, fail_outcome):
+    """Wrap orch._update_intent so the first write carrying
+    ``<fail_outcome>_outcome`` AFTER the wrapper is armed raises -- models
+    the crash AFTER remote acceptance but BEFORE the SENT outcome is on
+    disk. The pre-send PENDING write passes through because arming happens
+    only once the corresponding fake send has returned success."""
+    real_update = orch._update_intent
+    state = {'armed': False, 'failed': False}
+
+    def wrapped(project_id, operation_id, **fields):
+        if state['armed'] and not state['failed'] and f'{fail_outcome}_outcome' in fields:
+            state['failed'] = True
+            raise OSError(f'simulated crash persisting {fail_outcome} SENT')
+        return real_update(project_id, operation_id, **fields)
+
+    orch._update_intent = wrapped
+    return state
+
+
+def _arm_on_send(telegram, kind, inject):
+    """Re-wrap telegram.send_<kind> so the SENT-write failure is armed only
+    AFTER the fake returns confirmed success (message_id present)."""
+    real = getattr(telegram, kind)
+
+    def arm(*args, **kwargs):
+        result = real(*args, **kwargs)
+        assert result.success and result.data.get('message_id')
+        inject['armed'] = True  # remote accepted FIRST; now fail the SENT write
+        return result
+
+    setattr(telegram, kind, arm)
+
+
+def _reset_for_redrive(store):
+    with store.acquire_writer('proj') as state:
+        state.deployment.pop('latest_shown_preview', None)
+        state.revisions.preview_revision = 0
+        store.save(state)
+
+
+def test_crash_after_photo_send_fails_closed_no_duplicate(tmp_path):
+    """B-NEW-1 photo: pre-send PENDING write succeeds, send_photo RETURNS
+    confirmed success (message_id), then the SENT persistence write is
+    forced to fail. Durable state stays PENDING; restart/reconcile fails
+    closed and NEVER resends the photo."""
+    store = ProjectStateStore(tmp_path / 'state')
+    ws = _make_workspace(tmp_path)
+    _preview_ready_state(store, 'proj', ws)
+    telegram = _SentWriteFailTelegram()
+    deps = _deps(tmp_path, telegram=telegram)
+    orch = PreviewOrchestrator(store, deps)
+    inject = _inject_post_send_sent_write_failure(orch, 'photo')
+    _arm_on_send(telegram, 'send_photo', inject)
+
+    first = orch.run_owned('proj', ws)
+    assert not first.success  # SENT persistence failure surfaces fail-closed
+    # send_photo returned success BEFORE the SENT write was forced to fail.
+    assert inject['failed'] is True
+    assert [k for k, *_ in telegram.sent] == ['photo']  # accepted exactly once
+
+    # Durable state must remain PENDING (the SENT write never landed).
+    intent = store.load('proj').deployment['preview_intent']
+    assert intent['photo_attempted'] is True
+    assert intent['photo_outcome'] == 'PENDING'
+
+    _reset_for_redrive(store)
+    telegram.sent.clear()
+    second = orch.run_owned('proj', ws)
+
+    assert not second.success
+    assert second.error_code == 'DELIVERY_RECONCILIATION_REQUIRED'
+    assert telegram.sent == []  # no automatic resend, no duplicate photo
+
+
+def test_crash_after_text_send_fails_closed_no_duplicate(tmp_path):
+    """B-NEW-1 text: photo already SENT normally; text pre-send PENDING
+    write succeeds, send_text RETURNS confirmed success (message_id), then
+    the text SENT persistence write fails. Text stays PENDING; restart/
+    reconcile fails closed; neither photo nor text is resent."""
+    store = ProjectStateStore(tmp_path / 'state')
+    ws = _make_workspace(tmp_path)
+    _preview_ready_state(store, 'proj', ws)
+    telegram = _SentWriteFailTelegram()
+    deps = _deps(tmp_path, telegram=telegram)
+    orch = PreviewOrchestrator(store, deps)
+    inject = _inject_post_send_sent_write_failure(orch, 'text')
+    _arm_on_send(telegram, 'send_text', inject)
+
+    first = orch.run_owned('proj', ws)
+    assert not first.success
+    # send_text returned success BEFORE the SENT write was forced to fail.
+    assert inject['failed'] is True
+    assert [k for k, *_ in telegram.sent] == ['photo', 'text']
+
+    intent = store.load('proj').deployment['preview_intent']
+    assert intent['photo_outcome'] == 'SENT'  # photo unaffected
+    assert intent['text_attempted'] is True
+    assert intent['text_outcome'] == 'PENDING'
+
+    photo_calls = sum(1 for k, *_ in telegram.sent if k == 'photo')
+    text_calls = sum(1 for k, *_ in telegram.sent if k == 'text')
+    _reset_for_redrive(store)
+    telegram.sent.clear()
+    second = orch.run_owned('proj', ws)
+
+    assert not second.success
+    assert second.error_code == 'DELIVERY_RECONCILIATION_REQUIRED'
+    assert telegram.sent == []  # neither photo nor text resent
+    assert photo_calls == 1 and text_calls == 1  # total send counts unchanged
+
+
+def test_text_pre_send_persist_failure_means_no_text_send(tmp_path, monkeypatch):
+    """B-NEW-1 text pre-send ordering (symmetrical to photo): with the photo
+    already confirmed SENT, if the text pre-send durable PENDING write fails
+    the text remote send MUST NOT happen -> fail-closed
+    DELIVERY_STATE_PERSIST_FAILED and send_text never called."""
+    store = ProjectStateStore(tmp_path / 'state')
+    ws = _make_workspace(tmp_path)
+    _preview_ready_state(store, 'proj', ws)
+    deps = _deps(tmp_path)
+    orch = PreviewOrchestrator(store, deps)
+    # First run delivers both normally so the photo is SENT.
+    assert orch.run_owned('proj', ws).success
+
+    # Re-enter delivery for the SAME operation with the photo SENT and the
+    # text never attempted, then fail the text PENDING write specifically.
+    with store.acquire_writer('proj') as state:
+        state.deployment.pop('latest_shown_preview', None)
+        state.revisions.preview_revision = 0
+        intent = state.deployment['preview_intent']
+        intent.pop('text_attempted', None)
+        intent.pop('text_outcome', None)
+        intent.pop('text_message_id', None)
+        store.save(state)
+
+    real_update = orch._update_intent
+
+    def failing_update(project_id, operation_id, **fields):
+        if 'text_attempted' in fields and fields.get('text_outcome') == 'PENDING':
+            raise OSError('simulated text pre-send durable-write failure')
+        return real_update(project_id, operation_id, **fields)
+
+    monkeypatch.setattr(orch, '_update_intent', failing_update)
+    deps.telegram.sent.clear()
+
+    result = orch.run_owned('proj', ws)
+
+    assert not result.success
+    assert result.error_code == 'DELIVERY_STATE_PERSIST_FAILED'
+    assert not any(k == 'text' for k, *_ in deps.telegram.sent)  # never sent
+
+def test_pre_send_persist_failure_means_no_telegram_send(tmp_path, monkeypatch):
+    """If the pre-send durable PENDING write itself fails, the remote send
+    MUST NOT happen (send count == 0 for both photo and text)."""
+    store = ProjectStateStore(tmp_path / 'state')
+    ws = _make_workspace(tmp_path)
+    _preview_ready_state(store, 'proj', ws)
+    deps = _deps(tmp_path)
+    orch = PreviewOrchestrator(store, deps)
+
+    real_update = orch._update_intent
+
+    def failing_update(project_id, operation_id, **fields):
+        if 'photo_outcome' in fields or 'text_outcome' in fields:
+            raise OSError('simulated durable-write failure')
+        return real_update(project_id, operation_id, **fields)
+
+    monkeypatch.setattr(orch, '_update_intent', failing_update)
+
+    result = orch.run_owned('proj', ws)
+
+    assert not result.success
+    assert result.error_code == 'DELIVERY_STATE_PERSIST_FAILED'
+    assert deps.telegram.sent == []  # no Telegram side effect at all
+
+
+def test_explicit_rejection_after_pending_allows_controlled_retry(tmp_path):
+    """Pre-send PENDING -> explicit TELEGRAM_REJECTED -> final NOT_SENT, and
+    a later re-drive remains possible (controlled retry)."""
+    store = ProjectStateStore(tmp_path / 'state')
+    ws = _make_workspace(tmp_path)
+    _preview_ready_state(store, 'proj', ws)
+    rejected = OperationResult.fail('TELEGRAM_REJECTED', error_code='TELEGRAM_REJECTED')
+    telegram = _OutcomeTelegram(photo=rejected)
+    deps = _deps(tmp_path, telegram=telegram)
+    orch = PreviewOrchestrator(store, deps)
+
+    first = orch.run_owned('proj', ws)
+    assert not first.success
+    intent = store.load('proj').deployment['preview_intent']
+    assert intent['photo_attempted'] is True
+    assert intent['photo_outcome'] == 'NOT_SENT'
+
+    # Controlled retry: swap in a healthy adapter and re-drive.
+    telegram.photo = OperationResult.ok({'message_id': 9})
+    _reset_for_redrive(store)
+    telegram.sent.clear()
+    second = orch.run_owned('proj', ws)
+
+    assert second.success, second.error
+    assert [k for k, *_ in telegram.sent] == ['photo', 'text']
+    intent = store.load('proj').deployment['preview_intent']
+    assert intent['photo_outcome'] == 'SENT'
+    assert intent['photo_message_id'] == 9
+
+
+def test_normal_success_pending_to_sent_with_message_ids(tmp_path):
+    """No regression: normal flow persists PENDING before send, then SENT
+    with message_id for both messages."""
+    store = ProjectStateStore(tmp_path / 'state')
+    ws = _make_workspace(tmp_path)
+    _preview_ready_state(store, 'proj', ws)
+    deps = _deps(tmp_path)
+    orch = PreviewOrchestrator(store, deps)
+
+    # Observe the durable state at the moment each send occurs: it must
+    # already be PENDING (pre-send write completed before the side effect).
+    observed = {}
+    real_photo = deps.telegram.send_photo
+    real_text = deps.telegram.send_text
+
+    def photo_probe(chat_id, path, caption=''):
+        observed['photo'] = store.load('proj').deployment['preview_intent'].get('photo_outcome')
+        return real_photo(chat_id, path, caption=caption)
+
+    def text_probe(chat_id, text):
+        observed['text'] = store.load('proj').deployment['preview_intent'].get('text_outcome')
+        return real_text(chat_id, text)
+
+    deps.telegram.send_photo = photo_probe
+    deps.telegram.send_text = text_probe
+
+    result = orch.run_owned('proj', ws)
+
+    assert result.success, result.error
+    assert observed['photo'] == 'PENDING'
+    assert observed['text'] == 'PENDING'
+    intent = store.load('proj').deployment['preview_intent']
+    assert intent['photo_outcome'] == 'SENT'
+    assert intent['photo_message_id'] == 1
+    assert intent['text_outcome'] == 'SENT'
+    assert intent['text_message_id'] == 2
+
+
 def test_requires_qa_bound_tested_snapshot(tmp_path):
     store = ProjectStateStore(tmp_path / 'state')
     ws = _make_workspace(tmp_path)
