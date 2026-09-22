@@ -950,6 +950,64 @@ class TelegramReceiveLoop:
 
         return self._parse_intent_response(result.response, valid_intents)
 
+    def _revision_redrive_intent(
+        self, project_id: str, lifecycle: str, text: str, state
+    ) -> ConversationIntent:
+        """Decide whether a REVISION_REQUESTED turn is an F6 re-drive.
+
+        H-7: the reserve() re-drive is only reachable when the runtime routes
+        the turn into REVISE. REVISION_REQUESTED offers only INTAKE, so
+        _classify_intent short-circuits and the re-drive never runs. Here we
+        classify the turn against the revision intents as though the project
+        were in its pre-revision state and -- ONLY when it is a revision
+        request AND an unapplied same-principal reservation exists for the
+        current queued seq -- return REVISE. Every other case falls back to
+        the normal INTAKE path so a non-revision message cannot trigger
+        adoption and a different principal is never routed into the slot.
+
+        The decision stays tied to the SAME principal as the request
+        (authenticated identity is enforced later by reserve()/apply()); the
+        pending-reservation check here is only a routing gate, not an
+        authorization authority.
+        """
+        # A redrive is only possible while an unapplied reservation for the
+        # CURRENT queued seq exists. Without one this is not a redrive.
+        queued = state.revisions.queued_revision_seq
+        pending = [
+            entry for entry in (state.pending_revisions or [])
+            if isinstance(entry, dict)
+            and entry.get("seq") == queued
+            and entry.get("applied") is False
+        ]
+        if not pending:
+            return ConversationIntent.INTAKE
+
+        # Classify against a bounded revision-intent vocabulary so a genuine
+        # revision request is recognized even though REVISION_REQUESTED only
+        # lists INTAKE. reserve()/apply() remain the authorization and
+        # same-principal authorities: a different principal's attempt is
+        # rejected (OUT_OF_ORDER_REVISION / UNAUTHORIZED_ROLE) and the turn
+        # falls back to INTAKE without double-dispatching or adopting the slot.
+        revision_intents = [ConversationIntent.REVISE]
+        if self.hermes is None:
+            return ConversationIntent.INTAKE
+        prompt = self._build_intent_prompt(text, "REVISION_REQUESTED", [
+            i.value for i in revision_intents
+        ])
+        try:
+            _diag_log("2.before_FAST_redrive")
+            result = self.hermes._run_fast_programmatic(
+                prompt=prompt,
+                role="FAST",
+                skills=["website-builder-environment", "website-builder-product-scope"],
+            )
+            _diag_log("3.after_FAST_redrive")
+        except Exception:
+            return ConversationIntent.INTAKE
+        if not result.success:
+            return ConversationIntent.INTAKE
+        return self._parse_intent_response(result.response, revision_intents)
+
     def _build_intent_prompt(
         self, text: str, lifecycle: str, valid_intents: List[str]
     ) -> str:
@@ -1157,6 +1215,21 @@ User message:
         forced = getattr(route, "forced_intent", None) if route is not None else None
         if forced == "REVISE" and lifecycle in ("PREVIEW_READY", "LIVE"):
             intent = ConversationIntent.REVISE
+        elif lifecycle == "REVISION_REQUESTED":
+            # H-7: a crash between reserve() and apply() parks the project in
+            # REVISION_REQUESTED with an unapplied reservation. That lifecycle
+            # is not in _LIFECYCLE_INTENTS for REVISE, so _classify_intent
+            # short-circuits to INTAKE and the existing reserve() re-drive is
+            # never reached (H-7). Route the next valid revision message from
+            # the SAME principal straight into REVISE so the dispatcher can
+            # adopt the EXISTING reservation. This is ADOPTION ONLY: reserve()
+            # still re-validates the principal/queued-seq/pending reservation,
+            # and a message that is not a revision request fails the redrive
+            # and falls back to INTAKE (nothing is auto-applied, and a
+            # different principal can never adopt the slot).
+            intent = self._revision_redrive_intent(
+                project_id, lifecycle, message.text, state
+            )
         else:
             intent = self._classify_intent(message.text, lifecycle, project_id)
 
@@ -1355,7 +1428,17 @@ User message:
                 return
 
         lifecycle = state.lifecycle if state else "DISCOVERING"
-        intent = self._classify_intent(message.text, lifecycle, project_id, state=state)
+        if lifecycle == "REVISION_REQUESTED":
+            # H-7 (legacy path): same F6 re-drive reachability rule as the
+            # routed path -- a REVISION_REQUESTED project with an unapplied
+            # reservation must route a genuine revision message into REVISE
+            # so reserve() can adopt the existing slot instead of parking
+            # forever. Non-revision messages fall back to INTAKE.
+            intent = self._revision_redrive_intent(
+                project_id, lifecycle, message.text, state
+            )
+        else:
+            intent = self._classify_intent(message.text, lifecycle, project_id, state=state)
         if intent == ConversationIntent.REVISE:
             self._handle_revise(update, project_id, authenticated, message, state)
         elif intent == ConversationIntent.APPROVE:

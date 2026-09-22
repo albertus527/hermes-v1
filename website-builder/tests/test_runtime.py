@@ -107,7 +107,7 @@ class TestConfigurationValidation:
         assert "vercel-token-test" not in text
 
     def test_whatsapp_credentials_not_required(self, tmp_path):
-        """WhatsApp remains IMPLEMENTED_DORMANT — no WhatsApp env vars needed."""
+        """WhatsApp remains IMPLEMENTED_DORMANT â€” no WhatsApp env vars needed."""
         env = _env()
         # Explicitly remove any WhatsApp vars that might leak from the test env
         for key in list(os.environ):
@@ -363,7 +363,7 @@ class TestMalformedUpdateIsolation:
 
     def test_processing_failure_surfaces_error_reply(self):
         """M-3: an unexpected error during update processing must NOT silently
-        drop the user's message after the offset advances — the user must be
+        drop the user's message after the offset advances â€” the user must be
         told to retry. Regression lock: previously the catch-all logged and
         continued, leaving the user with no reply and the message gone.
         """
@@ -675,7 +675,7 @@ class TestIntentClassification:
         )
 
     def test_pre_build_lifecycle_always_intake(self):
-        """Pre-build states only offer INTAKE — no FAST call needed."""
+        """Pre-build states only offer INTAKE â€” no FAST call needed."""
         hermes = MagicMock()
         loop = self._loop(hermes=hermes, lifecycle="DISCOVERING")
         intent = loop._classify_intent("make the hero smaller", "DISCOVERING")
@@ -1282,7 +1282,7 @@ class TestPreviewReconciliation:
         )
         telegram_out = MagicMock()
         telegram_out.send_text.return_value = MagicMock(success=True)
-        hermes = MagicMock()  # FAST boundary — must NOT be invoked
+        hermes = MagicMock()  # FAST boundary â€” must NOT be invoked
         loop = TelegramReceiveLoop(
             bot_token="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
             dispatcher=dispatcher, telegram_out=telegram_out, hermes=hermes,
@@ -1431,7 +1431,7 @@ class TestPreviewReconciliation:
         assert store.load("tg-555").deployment["preview_intent"]["photo_attempted"] is True
 
 # ---------------------------------------------------------------------------
-# Async-ownership boundary — preview smoke browser factory (VPS regression)
+# Async-ownership boundary â€” preview smoke browser factory (VPS regression)
 # ---------------------------------------------------------------------------
 
 class TestSmokeFactoryAsyncioBoundary:
@@ -1441,7 +1441,7 @@ class TestSmokeFactoryAsyncioBoundary:
     sync API raises ``Error: using Playwright Sync API inside the asyncio loop``
     on exactly that condition. The factory must survive it.
 
-    A test that merely calls PreviewSmokeTester synchronously is insufficient —
+    A test that merely calls PreviewSmokeTester synchronously is insufficient â€”
     this suite drives the factory through the same ownership boundary that
     caused the VPS failure.
     """
@@ -1485,7 +1485,7 @@ class TestSmokeFactoryAsyncioBoundary:
         return call_threads
 
     def test_factory_succeeds_with_no_running_loop(self, monkeypatch):
-        """Baseline: no running loop on the calling thread — direct path."""
+        """Baseline: no running loop on the calling thread â€” direct path."""
         from app import runtime as app_runtime
 
         self._install_guarded_playwright_stub(monkeypatch)
@@ -1513,14 +1513,14 @@ class TestSmokeFactoryAsyncioBoundary:
         result_holder = {}
 
         async def _drive():
-            # We are inside a running loop on THIS (main/test) thread — the
+            # We are inside a running loop on THIS (main/test) thread â€” the
             # exact ownership state that produced SMOKE_FAILED on the VPS.
             result_holder["browser"] = factory()
 
         _asyncio.run(_drive())
 
         assert "browser" in result_holder, (
-            "factory raised inside running loop — VPS regression reproduced"
+            "factory raised inside running loop â€” VPS regression reproduced"
         )
         assert result_holder["browser"] is not None
         # The guarded stub must have executed on the bridge thread, never on
@@ -1650,3 +1650,326 @@ class TestSmokeBrowserPlaywrightCleanup:
             # already decided by the time this runs.
             app_runtime._stop_browser_playwright(browser)
         assert any("Playwright stop (cleanup) failed" in r.getMessage() for r in caplog.records)
+
+# ---------------------------------------------------------------------------
+# H-7: F6 revision re-drive is reachable from the real Telegram runtime path
+# ---------------------------------------------------------------------------
+
+def _h7_revision_ready_store(tmp_path, project_id, lifecycle="REVISION_REQUESTED",
+                             queued_seq=1, pending_applied=False,
+                             pending_principal="telegram:1"):
+    """Build a REAL store with the crash-after-reserve durable state."""
+    store = ProjectStateStore(tmp_path / "state")
+    with store.acquire_writer(project_id) as state:
+        state.lifecycle = "PREVIEW_READY"
+        state.roles = {"owner": "telegram:1", "reviewers": [], "viewers": []}
+        state.conversation_id = "555"
+        state.brief = {"name": "Northcut", "what": "barbershop", "why": "booking WA"}
+        state.design_dna = {"version": 1, "typography": {"heading_font": "Inter", "body_font": "Inter"}}
+        state.revisions.source_revision = 1
+        state.revisions.qa_revision = 1
+        state.revisions.preview_revision = 1
+        if lifecycle == "REVISION_REQUESTED":
+            state.lifecycle = "REVISION_REQUESTED"
+            state.revisions.queued_revision_seq = queued_seq
+            state.pending_revisions.append({
+                "seq": queued_seq,
+                "principal_id": pending_principal,
+                "reserved_at": 1.0,
+                "applied": pending_applied,
+            })
+        store.save(state)
+    return store
+
+
+def _h7_loop(store, revise, hermes_response="REVISE", conversations=None):
+    from app.core.intake import IntakeProcessor
+    from unittest.mock import MagicMock as _MM
+
+    telegram_out = _MM()
+    telegram_out.send_text.return_value = _MM(success=True)
+    hermes = _MM()
+    # Router FAST (if conversations wired) + per-project FAST both answer.
+    hermes._run_fast_programmatic.return_value = _MM(
+        success=True, response=hermes_response
+    )
+    dispatcher = TelegramDispatcher(
+        store, IntakeProcessor(store, hermes_adapter=None), revise=revise,
+        workspace_for=lambda pid: store.root / "ws" / pid,
+    )
+    return TelegramReceiveLoop(
+        bot_token="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+        dispatcher=dispatcher,
+        telegram_out=telegram_out,
+        hermes=hermes,
+        transport=MagicMock(),
+        conversations=conversations,
+    )
+
+
+def _h7_update(event_id=1, user_id=1, text="make the hero smaller"):
+    return {
+        "update_id": event_id,
+        "message": {
+            "from": {"id": user_id}, "chat": {"id": 555},
+            "text": text, "date": event_id,
+        },
+    }
+
+def _routed_qa(store):
+    """QA stub mirroring the REAL QA lifecycle contract for the routed test."""
+    def _run(project_id=None, workspace=None, brief=None, design_dna=None, **kw):
+        with store.acquire_writer(project_id) as state:
+            state.lifecycle = "PREVIEW_READY"
+            state.revisions.qa_revision = state.revisions.source_revision
+            state.deployment["tested_snapshot"] = {"dist_hash": "h"}
+            state.deployment["checked"] = {
+                "source_sha256": "s", "artifact_sha256": "a",
+                "source_revision": state.revisions.source_revision,
+            }
+            store.save(state)
+        return MagicMock(success=True, error=None)
+    return _run
+
+
+class TestRevisionRedriveReachability:
+    """H-7: exercise the REAL runtime + dispatcher + RevisionOrchestrator path,
+    not reserve()/apply() in isolation. Uses the legacy (no-router) loop so the
+    runtime's per-project dispatch is the real production path; the routed path
+    is covered by TestRevisionRedriveRoutedPath."""
+
+    def _real_revise(self, store, tmp_path, frontend_result=None):
+        from app.projects.revise import RevisionOrchestrator
+        from app.sandbox.runner import ProjectRunner
+
+        ws_root = tmp_path / "workspaces"
+        runner = ProjectRunner(ws_root, store)
+        ws = ws_root / "tg-555"
+        (ws / "src").mkdir(parents=True, exist_ok=True)
+        adapter = MagicMock()
+        if frontend_result is not None:
+            adapter.frontend_build.return_value = frontend_result
+        preview = MagicMock()
+        preview.run_owned.return_value = OperationResult.ok({"preview_url": "https://x.vercel.app"})
+        revise = RevisionOrchestrator(
+            runner, store, hermes_adapter=adapter, preview_orchestrator=preview
+        )
+        return revise, adapter, preview
+
+    def _qa_patch(self, store):
+        """Patch QAOrchestrator with a stub that mirrors the REAL QA lifecycle
+        contract (RUNNING -> PREVIEW_READY, qa_revision bound, tested snapshot
+        recorded) so the revision's post-QA lifecycle is exercised end-to-end
+        without any browser/npm/live-LLM dependency."""
+        def _run(project_id=None, workspace=None, brief=None, design_dna=None, **kw):
+            with store.acquire_writer(project_id) as state:
+                state.lifecycle = "PREVIEW_READY"
+                state.revisions.qa_revision = state.revisions.source_revision
+                state.deployment["tested_snapshot"] = {"dist_hash": "h"}
+                state.deployment["checked"] = {
+                    "source_sha256": "s", "artifact_sha256": "a",
+                    "source_revision": state.revisions.source_revision,
+                }
+                store.save(state)
+            return MagicMock(success=True, error=None)
+        return patch(
+            "app.projects.revise.QAOrchestrator",
+            return_value=MagicMock(run=MagicMock(side_effect=_run)),
+        )
+
+    def test_redrive_same_principal_adopts_existing_seq(self, tmp_path):
+        """(H-7 Test A) A crash-after-reserve (REVISION_REQUESTED + unapplied
+        reservation) is re-driven by the next legitimate Telegram revision
+        message from the SAME principal: runtime routes into REVISE, the
+        EXISTING reservation is adopted, no new seq is allocated, and the
+        revision applies exactly once to the expected post-revision state."""
+        store = _h7_revision_ready_store(tmp_path, "tg-555")
+        revise, adapter, preview = self._real_revise(store, tmp_path, {
+            "success": True,
+            "design_dna": {"version": 2, "typography": {"heading_font": "Inter", "body_font": "Inter"}},
+        })
+        loop = _h7_loop(store, revise)
+
+        with self._qa_patch(store):
+            loop._process_update(_h7_update())
+
+        state = store.load("tg-555")
+        # Applied exactly once.
+        assert state.revisions.revision_seq == 1
+        # Queued sequence did NOT increment (no new pending revision allocated).
+        assert state.revisions.queued_revision_seq == 1
+        pending = [e for e in state.pending_revisions if e.get("seq") == 1]
+        assert len(pending) == 1
+        assert pending[0]["applied"] is True
+        # Exactly one frontend_build call -> applied once, not twice.
+        assert adapter.frontend_build.call_count == 1
+        # Lifecycle reached the expected post-revision state.
+        assert state.lifecycle == "PREVIEW_READY"
+
+    def test_redrive_different_principal_not_adopted(self, tmp_path):
+        """(H-7 Test B) The SAME stranded reservation is NOT adopted by a
+        different principal: no apply occurs and no new sequence is allocated
+        (fail closed)."""
+        store = _h7_revision_ready_store(tmp_path, "tg-555", pending_principal="telegram:1")
+        revise, adapter, preview = self._real_revise(store, tmp_path, {
+            "success": True,
+            "design_dna": {"version": 2, "typography": {"heading_font": "Inter", "body_font": "Inter"}},
+        })
+        loop = _h7_loop(store, revise)
+        telegram_out = loop.telegram_out
+
+        # Different Telegram user (principal_id telegram:2) in the SAME chat.
+        loop._process_update(_h7_update(user_id=2))
+
+        state = store.load("tg-555")
+        # Reservation intact and unapplied.
+        pending = [e for e in state.pending_revisions if e.get("seq") == 1]
+        assert len(pending) == 1
+        assert pending[0]["applied"] is False
+        # No apply, no new sequence.
+        adapter.frontend_build.assert_not_called()
+        assert state.revisions.queued_revision_seq == 1
+        assert state.revisions.revision_seq == 0
+        # Lifecycle parked (not advanced by the foreign principal).
+        assert state.lifecycle == "REVISION_REQUESTED"
+        # An error reply was surfaced (fail closed) rather than silent success.
+        telegram_out.send_text.assert_called()
+
+    def test_already_applied_reservation_not_redriven(self, tmp_path):
+        """(H-7 Test C) An already-APPLIED reservation is never adopted by the
+        redrive gate: the project stays parked and no second apply happens."""
+        store = _h7_revision_ready_store(
+            tmp_path, "tg-555", lifecycle="REVISION_REQUESTED",
+            queued_seq=1, pending_applied=True,
+        )
+        # revision_seq already advanced to 1 -> seq 1 is applied.
+        with store.acquire_writer("tg-555") as state:
+            state.revisions.revision_seq = 1
+            store.save(state)
+        revise, adapter, preview = self._real_revise(store, tmp_path, {
+            "success": True,
+            "design_dna": {"version": 2, "typography": {"heading_font": "Inter", "body_font": "Inter"}},
+        })
+        loop = _h7_loop(store, revise)
+        loop._process_update(_h7_update())
+
+        # The redrive gate must not route the applied reservation into REVISE
+        # (no unapplied reservation exists) -> no duplicate apply.
+        adapter.frontend_build.assert_not_called()
+        state = store.load("tg-555")
+        assert state.revisions.revision_seq == 1
+        assert state.revisions.queued_revision_seq == 1
+
+    def test_skip_ahead_still_rejected(self, tmp_path):
+        """(H-7 Test D) The redrive gate only fires from REVISION_REQUESTED
+        with an unapplied reservation for the CURRENT queued seq. A genuinely
+        parked project whose queued seq is already applied does NOT get routed
+        into a fresh (skip-ahead) revision by the gate."""
+        from app.projects.revise import RevisionOrchestrator
+        from app.sandbox.runner import ProjectRunner
+
+        # REVISION_REQUESTED, queued_seq=2, revision_seq=2 (applied), and NO
+        # unapplied pending reservation -> gate must not fire.
+        store = ProjectStateStore(tmp_path / "state")
+        with store.acquire_writer("tg-555") as state:
+            state.lifecycle = "REVISION_REQUESTED"
+            state.roles = {"owner": "telegram:1", "reviewers": [], "viewers": []}
+            state.conversation_id = "555"
+            state.brief = {"name": "N", "what": "w", "why": "y"}
+            state.design_dna = {"version": 1}
+            state.revisions.source_revision = 2
+            state.revisions.revision_seq = 2
+            state.revisions.queued_revision_seq = 2
+            state.pending_revisions.append({
+                "seq": 2, "principal_id": "telegram:1",
+                "reserved_at": 1.0, "applied": True,
+            })
+            store.save(state)
+
+        ws_root = tmp_path / "workspaces"
+        runner = ProjectRunner(ws_root, store)
+        adapter = MagicMock()
+        revise = RevisionOrchestrator(runner, store, hermes_adapter=adapter)
+        loop = _h7_loop(store, revise)
+
+        loop._process_update(_h7_update())
+
+        # Not routed into a revision; nothing applied or allocated.
+        adapter.frontend_build.assert_not_called()
+        state = store.load("tg-555")
+        assert state.revisions.queued_revision_seq == 2
+        assert state.revisions.revision_seq == 2
+
+
+class TestRevisionRedriveRoutedPath:
+    """H-7: the ROUTED (production, conversations-wired) path must route a
+    REVISION_REQUESTED turn from the same principal into revision re-drive."""
+
+    def test_routed_redrive_adopts_existing_seq(self, tmp_path):
+        from app.core.intake import IntakeProcessor
+        from app.projects.revise import RevisionOrchestrator
+        from app.sandbox.runner import ProjectRunner
+
+        store = _h7_revision_ready_store(tmp_path, "tg-555-p1")
+        registry = ConversationRegistryStore(tmp_path / "state" / "conversations")
+        registry.adopt_project("555", "tg-555-p1", "webbandung")
+        registry.set_active("555", "tg-555-p1")
+
+        ws_root = tmp_path / "workspaces"
+        runner = ProjectRunner(ws_root, store)
+        ws = ws_root / "tg-555-p1"
+        (ws / "src").mkdir(parents=True, exist_ok=True)
+        adapter = MagicMock()
+        adapter.frontend_build.return_value = {
+            "success": True,
+            "design_dna": {"version": 2, "typography": {"heading_font": "Inter", "body_font": "Inter"}},
+        }
+        preview = MagicMock()
+        preview.run_owned.return_value = OperationResult.ok({"preview_url": "https://x.vercel.app"})
+        revise = RevisionOrchestrator(
+            runner, store, hermes_adapter=adapter, preview_orchestrator=preview
+        )
+
+        telegram_out = MagicMock()
+        telegram_out.send_text.return_value = MagicMock(success=True)
+        hermes = MagicMock()
+
+        # Router FAST returns a PROJECT_TURN targeting the project; per-project
+        # FAST then sees the H-7 redrive prompt and answers REVISE.
+        def _fast(prompt=None, role=None, skills=None, **kwargs):
+            if "routing one Website Builder conversation turn" in (prompt or ""):
+                return MagicMock(
+                    success=True,
+                    response='{"intent":"PROJECT_TURN","target_project_name":"webbandung",'
+                             '"proposed_new_project_name":null,"confidence":"high"}',
+                )
+            return MagicMock(success=True, response="REVISE")
+
+        hermes._run_fast_programmatic.side_effect = _fast
+
+        router = ConversationRouter(store, registry, telegram_out=telegram_out, hermes=hermes)
+        dispatcher = TelegramDispatcher(
+            store, IntakeProcessor(store, hermes_adapter=None), revise=revise,
+            workspace_for=lambda pid: ws,
+        )
+        loop = TelegramReceiveLoop(
+            bot_token="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+            dispatcher=dispatcher,
+            telegram_out=telegram_out,
+            hermes=hermes,
+            transport=MagicMock(),
+            conversations=router,
+        )
+
+        _qa_run = _routed_qa(store)
+        with patch(
+            "app.projects.revise.QAOrchestrator",
+            return_value=MagicMock(run=MagicMock(side_effect=_qa_run)),
+        ):
+            loop._process_update(_h7_update())
+
+        state = store.load("tg-555-p1")
+        assert state.revisions.revision_seq == 1
+        assert state.revisions.queued_revision_seq == 1
+        assert adapter.frontend_build.call_count == 1
+        assert state.lifecycle == "PREVIEW_READY"

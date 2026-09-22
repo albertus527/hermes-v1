@@ -25,6 +25,7 @@ so any prior tested/shown state must never be trusted afterward.
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,6 +39,8 @@ from app.core.lifecycle import LifecycleError, ProjectLifecycle
 from app.core.state import ProjectStateStore
 from app.qa.orchestrator import QAOrchestrator
 from app.sandbox.runner import ProjectRunner
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -250,18 +253,43 @@ class RevisionOrchestrator:
 
                 # Authorization and first external mutation share the writer.
                 # A revoke that wins this lock prevents all workspace effects.
-                frontend_result = (
-                    self.hermes_adapter.frontend_build(
-                        project_id=project_id, brief=brief, workspace=workspace,
-                        design_dna_instructions=instructions,
-                    ) if self.hermes_adapter is not None else
-                    {"success": False, "error": "Hermes adapter not configured"}
-                )
+                #
+                # H-2: a collaborator that RAISES (instead of returning a
+                # falsy result) must take the SAME durable failure path as a
+                # returned failure. Before this fix an exception here escaped
+                # apply() while the project was already RUNNING with a bumped
+                # source_revision and its QA/preview evidence cleared -- the
+                # normal falsy-result failure handling was skipped and the
+                # project was stranded RUNNING with no recovery path.
+                # Classify the exception into a safe, bounded failure, record
+                # it durably (same shape as the returned-failure path), and
+                # fall through to the existing _fail() terminal transition.
+                # The exception detail is preserved (never double-static) but
+                # captured here so the writer lock is released before the
+                # terminal failure state is committed.
+                try:
+                    frontend_result = (
+                        self.hermes_adapter.frontend_build(
+                            project_id=project_id, brief=brief, workspace=workspace,
+                            design_dna_instructions=instructions,
+                        ) if self.hermes_adapter is not None else
+                        {"success": False, "error": "Hermes adapter not configured"}
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        "frontend_build raised during revision apply for project %s seq %s",
+                        project_id, seq,
+                    )
+                    frontend_result = {
+                        "success": False,
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "error_code": "FRONTEND_REVISION_EXCEPTION",
+                    }
             if not frontend_result.get("success"):
                 return self._fail(
                     project_id, seq,
                     frontend_result.get("error", "FRONTEND revision failed"),
-                    "FRONTEND_REVISION_FAILED",
+                    frontend_result.get("error_code") or "FRONTEND_REVISION_FAILED",
                 )
 
             try:

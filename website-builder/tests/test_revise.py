@@ -346,6 +346,136 @@ class TestApply(RevisionOrchestratorTestBase):
         self.assertFalse(result.success)
         self.assertEqual(result.error_code, "WORKER_BUSY")
 
+# ---------------------------------------------------------------------------
+# H-2: revision exception must not strand the project in RUNNING
+# ---------------------------------------------------------------------------
+
+class TestRevisionExceptionRecovery(RevisionOrchestratorTestBase):
+    def _passing_qa(self):
+        return patch(
+            "app.projects.revise.QAOrchestrator",
+            return_value=MagicMock(run=MagicMock(return_value=MagicMock(success=True, error=None))),
+        )
+
+    def test_frontend_raises_does_not_strand_running(self):
+        """(H-2 Test A) A raising frontend_build takes the SAME durable
+        failure path as a returned falsy result.
+
+        Before the fix the exception escaped apply() while the project was
+        already RUNNING with a bumped source_revision and cleared QA/preview
+        evidence. Assert: the exception does NOT escape; a durable failure is
+        persisted; lifecycle is recoverable (FAILED, never RUNNING); the
+        reserved seq was NOT applied (no double-apply / no skip-ahead)."""
+        ws = self._preview_ready("h2-a")
+        self.orchestrator.reserve("h2-a", 1, principal_id=OWNER)
+        with self.store.acquire_writer("h2-a") as state:
+            state.deployment["checked"] = {"source_revision": 5}
+            state.deployment["tested_snapshot"] = {"x": 1}
+            self.store.save(state)
+
+        self.mock_adapter.frontend_build.side_effect = RuntimeError("boom")
+
+        # The exception must NOT escape as an unhandled runtime crash.
+        result = self.orchestrator.apply(
+            "h2-a", 1, "req", workspace=ws, principal_id=OWNER
+        )
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, "FRONTEND_REVISION_EXCEPTION")
+
+        state = self.store.load("h2-a")
+        # Lifecycle is recoverable, never left RUNNING.
+        self.assertNotEqual(state.lifecycle, ProjectLifecycle.RUNNING.value)
+        self.assertEqual(state.lifecycle, ProjectLifecycle.FAILED.value)
+        # Durable failure exists with a safe classification.
+        self.assertIsNotNone(state.failure)
+        self.assertEqual(state.failure["phase"], "revision")
+        self.assertEqual(state.failure["seq"], 1)
+        self.assertIn("RuntimeError", state.failure["error"])
+        # Counters internally consistent: nothing applied.
+        self.assertEqual(state.revisions.revision_seq, 0)
+        self.assertEqual(state.revisions.queued_revision_seq, 1)
+        # No duplicate revision apply; preview never reached.
+        self.assertEqual(self.mock_adapter.frontend_build.call_count, 1)
+        self.mock_preview.run_owned.assert_not_called()
+
+    def test_retry_after_raised_exception_succeeds(self):
+        """(H-2 Test B) After the raised-exception failure the reservation is
+        intact and the SAME seq applies exactly once on retry -- no skipped
+        seq, no double-apply."""
+        ws = self._preview_ready("h2-b")
+        self.orchestrator.reserve("h2-b", 1, principal_id=OWNER)
+
+        # First attempt raises.
+        self.mock_adapter.frontend_build.side_effect = TypeError("nope")
+        first = self.orchestrator.apply("h2-b", 1, "req", workspace=ws, principal_id=OWNER)
+        self.assertFalse(first.success)
+        state = self.store.load("h2-b")
+        self.assertEqual(state.lifecycle, ProjectLifecycle.FAILED.value)
+        self.assertEqual(state.revisions.revision_seq, 0)
+        self.assertEqual(state.revisions.queued_revision_seq, 1)
+        # The durable reservation survived the exception -- recovery evidence.
+        pending = [e for e in state.pending_revisions if e.get("seq") == 1]
+        self.assertEqual(len(pending), 1)
+        self.assertFalse(pending[0]["applied"])
+
+        # Recovery through the supported path: the durable reservation is
+        # intact, so once the recoverable lifecycle is restored the same seq
+        # re-applies (exactly once). FAILED is recoverable -- the documented
+        # lifecycle path FAILED -> READY -> QUEUED -> RUNNING -> PREVIEW_READY
+        # -> REVISION_REQUESTED exists and needs no new state; the reservation
+        # and counters are untouched by this recovery walk.
+        with self.store.acquire_writer("h2-b") as s:
+            for target in (
+                ProjectLifecycle.READY,
+                ProjectLifecycle.QUEUED,
+                ProjectLifecycle.RUNNING,
+                ProjectLifecycle.PREVIEW_READY,
+                ProjectLifecycle.REVISION_REQUESTED,
+            ):
+                self.store.transition_lifecycle_locked(s, target)
+            self.store.save(s)
+
+        self.mock_adapter.frontend_build.side_effect = None
+        self.mock_adapter.frontend_build.return_value = {
+            "success": True,
+            "design_dna": {"version": 2, "typography": {"heading_font": "Inter", "body_font": "Inter"}},
+        }
+        with self._passing_qa():
+            second = self.orchestrator.apply("h2-b", 1, "req", workspace=ws, principal_id=OWNER)
+        self.assertTrue(second.success, second.error)
+
+        state = self.store.load("h2-b")
+        # Applied exactly once; no revision number skipped.
+        self.assertEqual(state.revisions.revision_seq, 1)
+        self.assertEqual(state.revisions.queued_revision_seq, 1)
+        applied = [e for e in state.pending_revisions if e.get("seq") == 1 and e.get("applied")]
+        self.assertEqual(len(applied), 1)
+        self.assertEqual(self.mock_adapter.frontend_build.call_count, 2)
+
+    def test_success_path_reserves_once_applies_once(self):
+        """(H-2 Test C) The normal success path is unchanged: reserved once,
+        applied once, expected revision advances once."""
+        ws = self._preview_ready("h2-c")
+        first = self.orchestrator.reserve("h2-c", 1, principal_id=OWNER)
+        self.assertTrue(first.success)
+        self.mock_adapter.frontend_build.return_value = {
+            "success": True,
+            "design_dna": {"version": 2, "typography": {"heading_font": "Inter", "body_font": "Inter"}},
+        }
+        with self._passing_qa():
+            result = self.orchestrator.apply("h2-c", 1, "req", workspace=ws, principal_id=OWNER)
+        self.assertTrue(result.success, result.error)
+
+        state = self.store.load("h2-c")
+        self.assertEqual(state.revisions.revision_seq, 1)
+        self.assertEqual(state.revisions.queued_revision_seq, 1)
+        self.assertEqual(state.revisions.source_revision, 1)
+        self.assertEqual(self.mock_adapter.frontend_build.call_count, 1)
+        self.mock_preview.run_owned.assert_called_once()
+        pending = [e for e in state.pending_revisions if e.get("seq") == 1]
+        self.assertEqual(len(pending), 1)
+        self.assertTrue(pending[0]["applied"])
+
 
 if __name__ == "__main__":
     unittest.main()
