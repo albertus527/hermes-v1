@@ -551,7 +551,14 @@ def test_build_dispatch_blocks_pending_then_builds_selected_once(tmp_path):
     assert store.load("proj").lifecycle == "READY"
     assert dispatcher.dispatch(_dispatch_payload(51), "proj", "directions_choose", authenticated=ctx, index=1).success
     assert dispatcher.dispatch(_dispatch_payload(), "proj", "build", authenticated=ctx, brief={"name": "forged"}).success
-    builder.build.assert_called_once_with("proj", {"name": "Persisted"})
+    # H-6: the explicit build path now receives the SAME remote-boundary
+    # callback the auto-build path uses (durable reached_remote=True before
+    # the first possible Vercel effect); the persisted brief is authoritative.
+    builder.build.assert_called_once()
+    call_args = builder.build.call_args
+    assert call_args.args == ("proj", {"name": "Persisted"})
+    assert "on_remote_boundary" in call_args.kwargs
+    assert callable(call_args.kwargs["on_remote_boundary"])
     assert store.load("proj").lifecycle == "QUEUED"
     assert dispatcher.dispatch(_dispatch_payload(), "proj", "build", authenticated=ctx).data["duplicate"]
 

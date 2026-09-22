@@ -11,6 +11,7 @@ mirrors ``AuthenticatedTelegramContext`` exactly, and ``TelegramDispatcher``
 picks the matching normalizer purely from the context type.
 """
 import hashlib
+import inspect
 import json
 import logging
 from dataclasses import dataclass
@@ -179,8 +180,38 @@ class TelegramDispatcher:
                         return OperationResult.fail("BUILD_NOT_ALLOWED_IN_LIFECYCLE", error_code="BUILD_NOT_ALLOWED_IN_LIFECYCLE")
                     self.store.transition_lifecycle_locked(state, ProjectLifecycle.QUEUED)
                 persisted_brief = dict(state.brief)
-                state.dispatch_events[key] = {"action": action, "status": "CLAIMED"}
+                # H-6: ALL build entry paths must use the same remote-boundary
+                # semantics. The build claim starts with reached_remote=False
+                # so a purely local/pre-remote failure (e.g.
+                # CHEAP_CHECKS_FAILED before any Vercel call) is provably
+                # retryable. Legacy claims with a missing flag stay UNKNOWN.
+                if action == "build":
+                    state.dispatch_events[key] = {
+                        "action": action,
+                        "status": "CLAIMED",
+                        "reached_remote": False,
+                    }
+                else:
+                    state.dispatch_events[key] = {"action": action, "status": "CLAIMED"}
                 self.store.save(state)
+            # H-6: ONE shared remote-boundary helper used by BOTH build entry
+            # paths (explicit "build" and the intake auto-build sub-claim). It
+            # durably flips the named claim's reached_remote=True IMMEDIATELY
+            # BEFORE the first possible remote (Vercel) side effect. If that
+            # persistence fails the callback raises, build() aborts before the
+            # remote call, and no duplicate external side effect can occur.
+            # Defined unconditionally so both branches close over the SAME
+            # function object.
+            def _mark_build_reached_remote(build_claim_key):
+                with self.store.acquire_writer(project_id) as rs:
+                    claim = rs.dispatch_events.get(build_claim_key)
+                    if claim is None or claim.get("status") != "CLAIMED":
+                        raise RuntimeError(
+                            "build claim is no longer claimed; refusing remote boundary"
+                        )
+                    claim["reached_remote"] = True
+                    self.store.save(rs)
+
             auth = {"principal_id": principal, "reference_token": reference_token}
             try:
                 if action == "intake":
@@ -247,16 +278,40 @@ class TelegramDispatcher:
                             else:
                                 auto_build_brief = None
                         if auto_build_brief is not None:
-                            def _mark_build_reached_remote():
-                                with self.store.acquire_writer(project_id) as rs:
-                                    claim = rs.dispatch_events.get(build_key)
-                                    if claim is not None and claim.get("status") == "CLAIMED":
-                                        claim["reached_remote"] = True
-                                        self.store.save(rs)
+                            # H-6: reuse the SAME remote-boundary helper as the
+                            # explicit build path (defined above, keyed by the
+                            # claim key) so both entry paths durably flip
+                            # reached_remote=True before the first Vercel call.
+                            _auto_boundary = (
+                                lambda bk=build_key: _mark_build_reached_remote(bk)
+                            )
+                            builder = self.builder
+                            build_attr = getattr(builder, "build", None)
+                            build_sig = (
+                                inspect.signature(build_attr)
+                                if callable(build_attr) else None
+                            )
+
+                            def _invoke_build(pid, brf, boundary):
+                                # Only pass on_remote_boundary when the
+                                # collaborator can accept it; test doubles and
+                                # legacy builders with the pre-boundary
+                                # 2-argument signature stay supported.
+                                if build_sig is not None and (
+                                    "on_remote_boundary" in build_sig.parameters
+                                    or any(
+                                        p.kind == inspect.Parameter.VAR_KEYWORD
+                                        for p in build_sig.parameters.values()
+                                    )
+                                ):
+                                    return builder.build(
+                                        pid, brf, on_remote_boundary=boundary
+                                    )
+                                return builder.build(pid, brf)
+
                             try:
-                                build_result = self.builder.build(
-                                    project_id, auto_build_brief,
-                                    on_remote_boundary=_mark_build_reached_remote,
+                                build_result = _invoke_build(
+                                    project_id, auto_build_brief, _auto_boundary,
                                 )
                             except Exception:
                                 build_result = OperationResult.fail(
@@ -284,7 +339,40 @@ class TelegramDispatcher:
                     method = {"domain_connect": "connect", "domain_prepare": "prepare", "domain_verify": "verify"}[action]
                     result = getattr(self.domain, method)(project_id, hostname, self.workspace_for(project_id), ownership_claim=True, **auth)
                 elif action == "build":
-                    result = self.builder.build(project_id, persisted_brief)
+                    builder = self.builder
+                    build_attr = getattr(builder, "build", None)
+                    if build_attr is not None and not callable(build_attr):
+                        build_attr = None
+                    build_sig = (
+                        inspect.signature(build_attr)
+                        if build_attr is not None else None
+                    )
+                    # Zero-arg closure over THIS claim's key -- the same
+                    # durable-before-remote semantics as the auto-build path.
+                    _explicit_boundary = (
+                        lambda bk=key: _mark_build_reached_remote(bk)
+                    )
+                    try:
+                        if build_sig is not None and (
+                            "on_remote_boundary" in build_sig.parameters
+                            or any(
+                                p.kind == inspect.Parameter.VAR_KEYWORD
+                                for p in build_sig.parameters.values()
+                            )
+                        ):
+                            result = builder.build(
+                                project_id, persisted_brief,
+                                on_remote_boundary=_explicit_boundary,
+                            )
+                        else:
+                            result = builder.build(project_id, persisted_brief)
+                    except TypeError as exc:
+                        # A builder that cannot accept the keyword (pre-boundary
+                        # collaborator / test double) must be retried with the
+                        # legacy signature so no dispatch path regresses.
+                        if "on_remote_boundary" not in str(exc):
+                            raise
+                        result = builder.build(project_id, persisted_brief)
                 elif action == "revise":
                     result = self.revise.reserve(project_id, seq, principal_id=principal)
                     if result.success:
@@ -302,11 +390,57 @@ class TelegramDispatcher:
                 else:
                     result = self.promote.promote(project_id, self.workspace_for(project_id), principal_id=principal)
             except Exception as exc:
-                logger.exception("Unexpected error during dispatch of action '%s' on project '%s': %s", action, project_id, exc)
-                return OperationResult.fail("EVENT_RECONCILIATION_REQUIRED", error_code="EVENT_RECONCILIATION_REQUIRED")
-            with self.store.acquire_writer(project_id) as state:
-                state.dispatch_events[key]["status"] = "DONE" if result.success else "FAILED"
-                self.store.save(state)
+                # H-5: EVERY dispatch attempt must leave its durable claim in a
+                # meaningful terminal or recoverable state. A collaborator
+                # raising must NOT leave the claim stuck at CLAIMED (which
+                # would make every later replay fail closed forever and wedge
+                # the project). Classification depends on remote-boundary
+                # evidence, never on the exception type:
+                #   reached_remote is False  -> proven pre-remote failure ->
+                #       the existing retryable FAILED state
+                #   True / missing / unknown -> fail closed, reconciliation
+                #       required, no replay
+                logger.exception(
+                    "Unexpected error during dispatch of action '%s' on project '%s': %s",
+                    action, project_id, exc,
+                )
+                try:
+                    with self.store.acquire_writer(project_id) as state:
+                        claim = state.dispatch_events.get(key)
+                        if claim is not None and claim.get("status") == "CLAIMED":
+                            claim["status"] = "FAILED"
+                        self.store.save(state)
+                except Exception:
+                    # Finalization persistence itself failed. Do not crash out
+                    # of dispatch and do not fabricate a terminal status we
+                    # could not persist: the durable claim (CLAIMED) already
+                    # fails closed on replay. Report reconciliation-required.
+                    logger.exception(
+                        "Failed to finalize dispatch claim for action '%s' on "
+                        "project '%s'; retaining fail-closed semantics",
+                        action, project_id,
+                    )
+                return OperationResult.fail(
+                    "EVENT_RECONCILIATION_REQUIRED",
+                    error_code="EVENT_RECONCILIATION_REQUIRED",
+                )
+            try:
+                with self.store.acquire_writer(project_id) as state:
+                    claim = state.dispatch_events.get(key)
+                    if claim is not None:
+                        claim["status"] = "DONE" if result.success else "FAILED"
+                        self.store.save(state)
+            except Exception:
+                # The action already completed (result in hand). A persistence
+                # failure here must never escape as an unhandled crash and must
+                # never mutate the durable claim into a state that could allow
+                # a blind replay: the claim is left as-is (CLAIMED / prior
+                # status) and the real result is still returned.
+                logger.exception(
+                    "Failed to persist final status for dispatch of action '%s' "
+                    "on project '%s'; durable claim left unchanged",
+                    action, project_id,
+                )
             return result
         except AuthzError as exc:
             return OperationResult.fail(exc.error_code, error_code=exc.error_code)
