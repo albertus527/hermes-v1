@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1557,3 +1558,95 @@ class TestSmokeFactoryAsyncioBoundary:
 
         with pytest.raises(ValueError, match="chromium-missing"):
             _asyncio.run(_drive())
+
+# ---------------------------------------------------------------------------
+# H-8: deterministic Playwright stop / no orphaned drivers
+# ---------------------------------------------------------------------------
+
+class TestSmokeBrowserPlaywrightCleanup:
+    """The runtime browser factory must retain the Playwright owner on the
+    returned Browser so the SAME thread can stop the driver deterministically
+    after ``browser.close()``; a launch failure must not orphan the driver."""
+
+    @staticmethod
+    def _install_recording_stub(monkeypatch, *, launch_error=None):
+        import sys as _sys
+        import types as _types
+
+        events = []
+
+        class _StubPlaywright:
+            def start(self):
+                events.append(("start", threading.current_thread().name))
+                return self
+
+            @property
+            def chromium(self):
+                return self
+
+            def launch(self, **kwargs):
+                events.append(("launch", threading.current_thread().name))
+                if launch_error is not None:
+                    raise launch_error
+                return SimpleNamespace()
+
+            def stop(self):
+                events.append(("stop", threading.current_thread().name))
+
+        sync_api_mod = _types.ModuleType("playwright.sync_api")
+        sync_api_mod.sync_playwright = lambda: _StubPlaywright()
+        pkg = _types.ModuleType("playwright")
+        pkg.sync_api = sync_api_mod
+        monkeypatch.setitem(_sys.modules, "playwright", pkg)
+        monkeypatch.setitem(_sys.modules, "playwright.sync_api", sync_api_mod)
+        return events
+
+    def test_launch_retains_playwright_owner_for_deterministic_stop(self, monkeypatch):
+        from app import runtime as app_runtime
+
+        events = self._install_recording_stub(monkeypatch)
+        factory = app_runtime._load_smoke_browser_factory()
+        assert factory is not None
+
+        browser = factory()
+        # Owner is attached so cleanup can stop the driver on the same thread.
+        assert getattr(browser, "_wb_playwright_owner", None) is not None
+
+        app_runtime._stop_browser_playwright(browser)
+        ops = [op for op, _ in events]
+        assert ops == ["start", "launch", "stop"]
+        # start/launch/stop all ran on the same (caller) thread.
+        assert len({thread for _, thread in events}) == 1
+
+    def test_launch_failure_stops_driver_and_propagates(self, monkeypatch):
+        from app import runtime as app_runtime
+
+        events = self._install_recording_stub(monkeypatch, launch_error=RuntimeError("no-chromium"))
+        factory = app_runtime._load_smoke_browser_factory()
+        assert factory is not None
+
+        with pytest.raises(RuntimeError, match="no-chromium"):
+            factory()
+        # The driver started before the failed launch must be stopped, not orphaned.
+        ops = [op for op, _ in events]
+        assert ops == ["start", "launch", "stop"]
+
+    def test_stop_is_noop_for_ownerless_browser(self):
+        from app import runtime as app_runtime
+
+        # No owner attribute -> cleanup must not raise.
+        app_runtime._stop_browser_playwright(SimpleNamespace())
+
+    def test_stop_failure_is_swallowed_not_raised(self, monkeypatch, caplog):
+        from app import runtime as app_runtime
+
+        class _BoomStop:
+            def stop(self):
+                raise RuntimeError("stop-boom")
+
+        browser = SimpleNamespace(_wb_playwright_owner=_BoomStop())
+        with caplog.at_level("WARNING", logger="app.runtime"):
+            # Cleanup-stop failures must never propagate: the smoke result is
+            # already decided by the time this runs.
+            app_runtime._stop_browser_playwright(browser)
+        assert any("Playwright stop (cleanup) failed" in r.getMessage() for r in caplog.records)

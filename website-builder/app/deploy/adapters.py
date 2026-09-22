@@ -18,6 +18,7 @@ block private egress at the browser sandbox/network boundary.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import ipaddress
@@ -25,6 +26,7 @@ import json
 import logging
 import re
 import socket
+import threading
 import time
 import uuid
 import urllib.error
@@ -851,6 +853,73 @@ def _safe_origin(url):
         return False
 
 
+def _stop_browser_playwright(browser):
+    """Deterministically stop the Playwright driver that owns *browser*.
+
+    MUST be called on the same thread that created the browser (Playwright
+    sync objects are thread-affine). Best-effort by design: it runs during
+    cleanup, after ``browser.close()``, so a failure (or an owner-less
+    injected/test Browser) must never convert an already-classified smoke
+    result into a different one. A Browser without a
+    ``_wb_playwright_owner`` attribute (e.g. test doubles) is a no-op.
+    """
+    owner = getattr(browser, '_wb_playwright_owner', None)
+    if owner is None:
+        return
+    stop = getattr(owner, 'stop', None)
+    if stop is None:
+        return
+    try:
+        stop()
+    except BaseException:
+        # Cleanup-only failure; the browser/context are already closed. Log
+        # with traceback for operators, never replace the primary result.
+        logger.warning(
+            'Preview smoke: Playwright stop (cleanup) failed', exc_info=True)
+
+
+def _calling_thread_has_running_loop():
+    """True when THIS thread currently owns a RUNNING asyncio loop.
+
+    Playwright's synchronous API refuses to start on such a thread
+    (``sync_playwright().start()`` raises "using Playwright Sync API inside
+    the asyncio loop"); it also cannot be driven from a different thread once
+    started (greenlet: "cannot switch to a different thread"). This mirrors
+    the guard installed by playwright's own sync context manager.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return loop.is_running()
+
+
+def _run_on_dedicated_thread(fn):
+    """Run *fn* to completion on a dedicated short-lived worker thread.
+
+    The calling thread blocks until the worker finishes, so project
+    orchestration stays synchronous and sequential. The worker owns no
+    asyncio state, so Playwright's sync API never observes a running loop
+    there, and every Playwright object it creates lives and dies on this one
+    thread. Returned values (and raised exceptions) cross the thread boundary
+    verbatim; only thread-neutral results are propagated.
+    """
+    box = {}
+
+    def _target():
+        try:
+            box["value"] = fn()
+        except BaseException as exc:  # propagate verbatim, never swallow
+            box["error"] = exc
+
+    worker = threading.Thread(target=_target, name="wb-smoke-browser", daemon=True)
+    worker.start()
+    worker.join()
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
 class PreviewSmokeTester:
     """Fresh anonymous browser contexts; same-origin GET/HEAD requests only.
 
@@ -858,6 +927,17 @@ class PreviewSmokeTester:
     private DNS requests. Strict policy intentionally fails externally hosted
     assets; caller must self-host assets. Factory returns a Playwright-style
     Browser. Requires route_web_socket support, otherwise fails closed.
+
+    Thread affinity: when the calling thread owns a RUNNING asyncio loop
+    (the state left by the in-process Hermes FAST turn on the runtime path),
+    the ENTIRE synchronous smoke lifecycle -- factory(), new_context, route,
+    new_page, goto, evaluate, screenshot and every close -- runs on one
+    dedicated worker thread that stays alive for the whole lifecycle. This is
+    mandatory because Playwright Sync API objects are thread-affine: bridging
+    only the launch and then using the returned Browser on the caller fails
+    with greenlet "cannot switch to a different thread". In the normal
+    no-loop path (startup preflight, non-async callers) the direct
+    synchronous path is preserved unchanged.
     """
     def __init__(self, browser_factory, resolver=None, *, custom_hostname=None):
         if custom_hostname is not None and not valid_custom_hostname(custom_hostname):
@@ -880,6 +960,21 @@ class PreviewSmokeTester:
     def run(self, url, out_dir):
         if not self._allowed_origin(url):
             return _fail('INVALID_PREVIEW_URL')
+        # Thread-affinity dispatch: Playwright Sync objects (Browser,
+        # BrowserContext, Page, greenlets) are bound to the thread that
+        # created them. If the caller owns a running asyncio loop, run the
+        # WHOLE synchronous lifecycle on one dedicated worker thread so that
+        # no Playwright object ever crosses a thread boundary.
+        if _calling_thread_has_running_loop():
+            logger.warning(
+                "Preview smoke: running asyncio loop detected on the calling "
+                "thread — executing the full Playwright lifecycle on a "
+                "dedicated worker thread"
+            )
+            return _run_on_dedicated_thread(lambda: self._run_sync(url, out_dir))
+        return self._run_sync(url, out_dir)
+
+    def _run_sync(self, url, out_dir):
         failures, shots = [], {}
         origin = urlsplit(url).netloc
         try:
@@ -941,6 +1036,12 @@ class PreviewSmokeTester:
                             context.close()
                     finally:
                         browser.close()
+                        # Deterministic Playwright driver cleanup (H-8): runs on
+                        # the SAME thread that launched the browser (this frame),
+                        # after the browser has closed, and is best-effort so it
+                        # never masks a smoke failure. No-op for injected/test
+                        # factories whose Browser carries no Playwright owner.
+                        _stop_browser_playwright(browser)
         except Exception as exc:
             # Operator logs get the full exception + traceback. Persisted
             # failures carry ONLY the exception TYPE -- never str(exc), which

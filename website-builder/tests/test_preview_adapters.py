@@ -1,7 +1,9 @@
 """Local behavioral adapter tests. No provider/browser/network calls."""
+import asyncio
 import base64
 import json
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -10,7 +12,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.deploy.adapters import (HttpResponse, PreviewSmokeTester, TelegramAdapter,
-                                 UrllibHttpTransport, VercelAdapter, _NoRedirect)
+                                 UrllibHttpTransport, VercelAdapter, _NoRedirect,
+                                 _calling_thread_has_running_loop)
 
 PNG = b'\x89PNG\r\n\x1a\nlocal-fake-image'
 SHA = 'a' * 64
@@ -317,6 +320,250 @@ def test_smoke_desktop_mobile_anonymous(tmp_path):
 def test_invalid_preview_does_not_launch(url, tmp_path):
     factory = Mock()
     assert not PreviewSmokeTester(factory).run(url, tmp_path).success
+
+# ---------------------------------------------------------------------------
+# Smoke lifecycle thread-affinity + deterministic cleanup (BL-1 / H-8)
+# ---------------------------------------------------------------------------
+#
+# Playwright's synchronous API is thread-affine: (a) ``sync_playwright().start()``
+# refuses to start on a thread that owns a RUNNING asyncio loop (raises "using
+# Playwright Sync API inside the asyncio loop"), and (b) a Browser created on one
+# thread cannot then be driven from another (greenlet: "cannot switch to a
+# different thread"). The runtime reaches PreviewSmokeTester from the Telegram
+# dispatch chain while an asyncio loop is running on the calling thread, so the
+# ENTIRE synchronous smoke lifecycle must execute on one dedicated worker thread.
+
+class _LifecyclePlaywrightStack:
+    """Stub Playwright sync stack that records the (op, thread) of every call.
+
+    ``start()`` mimics playwright's real guard, so this stub is only usable
+    from a thread that owns no running asyncio loop (the dedicated worker),
+    exactly like production.
+    """
+
+    def __init__(self, record, *, goto_raises=None):
+        self._rec = record
+        self._goto_raises = goto_raises
+
+    def _note(self, op):
+        self._rec.append((op, threading.current_thread().name))
+
+    def start(self):
+        try:
+            running = asyncio.get_running_loop().is_running()
+        except RuntimeError:
+            running = False
+        if running:
+            raise RuntimeError(
+                'It looks like you are using Playwright Sync API inside the '
+                'asyncio loop.'
+            )
+        self._note('pw.start')
+        return self
+
+    @property
+    def chromium(self):
+        return self
+
+    def launch(self, **kwargs):
+        self._note('chromium.launch')
+        return _LifecycleBrowser(self._rec, self._goto_raises)
+
+    def stop(self):
+        self._note('pw.stop')
+
+
+class _LifecycleBrowser:
+    def __init__(self, record, goto_raises):
+        self._rec = record
+        self._goto_raises = goto_raises
+
+    def new_context(self, **kwargs):
+        self._rec.append(('browser.new_context', threading.current_thread().name))
+        return _LifecycleContext(self._rec, self._goto_raises)
+
+    def close(self):
+        self._rec.append(('browser.close', threading.current_thread().name))
+
+
+class _LifecycleContext:
+    def __init__(self, record, goto_raises):
+        self._rec = record
+        self._goto_raises = goto_raises
+
+    def route(self, pattern, callback):
+        self._rec.append(('context.route', threading.current_thread().name))
+
+    def route_web_socket(self, pattern, callback):
+        self._rec.append(('context.route_web_socket', threading.current_thread().name))
+
+    def new_page(self):
+        self._rec.append(('context.new_page', threading.current_thread().name))
+        return _LifecyclePage(self._rec, self._goto_raises)
+
+    def close(self):
+        self._rec.append(('context.close', threading.current_thread().name))
+
+
+class _LifecyclePage:
+    def __init__(self, record, goto_raises):
+        self._rec = record
+        self._goto_raises = goto_raises
+        self.url = 'https://test.vercel.app/'
+
+    def on(self, event, callback):
+        pass
+
+    def goto(self, url, **kwargs):
+        self._rec.append(('page.goto', threading.current_thread().name))
+        if self._goto_raises is not None:
+            raise self._goto_raises
+        return SimpleNamespace(status=200)
+
+    def evaluate(self, script):
+        self._rec.append(('page.evaluate', threading.current_thread().name))
+        return True
+
+    def screenshot(self, **kwargs):
+        self._rec.append(('page.screenshot', threading.current_thread().name))
+        return PNG
+
+
+def _factory_using_stack(record, holder, **kwargs):
+    def factory():
+        record.append(('factory', threading.current_thread().name))
+        pw = _LifecyclePlaywrightStack(record, **kwargs)
+        browser = pw.start().chromium.launch(headless=True)
+        browser._wb_playwright_owner = pw  # mirrors runtime._launch_smoke_browser
+        holder.append(pw)
+        return browser
+    return factory
+
+
+def test_smoke_full_lifecycle_on_one_thread_inside_running_loop(tmp_path):
+    """BL-1: inside a running asyncio loop, EVERY Playwright operation runs on
+    exactly one dedicated worker thread (never the loop-owning caller), the
+    worker stays alive for the whole lifecycle, the result propagates, and the
+    Playwright driver is stopped."""
+    record = []
+    holder = []
+    main_thread = threading.current_thread().name
+    factory = _factory_using_stack(record, holder)
+    result_holder = {}
+
+    async def _drive():
+        # Running loop on THIS thread -> the exact runtime ownership state that
+        # broke production (the launch was bridged, then the Browser crossed back).
+        result_holder['result'] = PreviewSmokeTester(factory, lambda _: ['8.8.8.8']).run(
+            'https://test.vercel.app/', tmp_path)
+
+    asyncio.run(_drive())
+
+    result = result_holder['result']
+    assert result.success, result.data.get('failures')
+
+    ops = [op for op, _ in record]
+    threads = {thread for op, thread in record if op != 'factory'}
+    assert threads, 'no Playwright operations recorded'
+    # Every lifecycle operation executed on one and the same worker thread.
+    assert len(threads) == 1, f'operations spread across threads: {sorted(threads)}'
+    worker_thread = threads.pop()
+    assert worker_thread != main_thread, 'Playwright ran on the loop-owning caller thread'
+
+    for required in ('pw.start', 'chromium.launch', 'browser.new_context',
+                     'context.new_page', 'page.goto', 'page.evaluate',
+                     'page.screenshot', 'context.close', 'browser.close', 'pw.stop'):
+        assert required in ops, f'missing lifecycle op: {required}'
+    # Two anonymous contexts (desktop + mobile) -> close/stop run twice.
+    assert ops.count('browser.close') == 2 and ops.count('pw.stop') == 2
+    assert 'desktop_screenshot' in result.data and 'mobile_screenshot' in result.data
+
+
+def test_smoke_failure_mid_lifecycle_propagates_fail_closed(tmp_path):
+    """BL-1 + H-8: a Playwright failure mid-smoke fails closed, the worker exits,
+    cleanup is still attempted, pw.stop() still runs, and nothing is swallowed."""
+    record = []
+    holder = []
+    factory = _factory_using_stack(record, holder, goto_raises=RuntimeError('boom-mid-smoke'))
+    result_holder = {}
+
+    async def _drive():
+        result_holder['result'] = PreviewSmokeTester(factory, lambda _: ['8.8.8.8']).run(
+            'https://test.vercel.app/', tmp_path)
+
+    asyncio.run(_drive())
+
+    result = result_holder['result']
+    assert not result.success and result.error_code == 'SMOKE_FAILED'
+    # Exception TYPE is classified; the raw message is never persisted.
+    assert 'browser smoke failed: RuntimeError' in result.data['failures']
+    assert not any('boom-mid-smoke' in f for f in result.data['failures'])
+
+    ops = [op for op, _ in record]
+    # Cleanup still attempted under the failure, and Playwright stopped. A
+    # mid-smoke raise aborts the viewport loop (fail fast), so only the first
+    # context was opened/closed — but its cleanup and the driver stop still ran.
+    assert 'context.close' in ops and 'browser.close' in ops and 'pw.stop' in ops
+    assert ops.count('pw.stop') == 1
+    threads = {t for op, t in record if op != 'factory'}
+    assert len(threads) == 1 and threading.current_thread().name not in threads
+
+
+def test_smoke_direct_sync_path_when_no_running_loop(tmp_path):
+    """BL-1: with NO running loop on the caller, the direct synchronous path is
+    used unchanged — no worker bridge — and the same pw.stop cleanup applies."""
+    record = []
+    holder = []
+    factory = _factory_using_stack(record, holder)
+    assert not _calling_thread_has_running_loop()
+
+    result = PreviewSmokeTester(factory, lambda _: ['8.8.8.8']).run(
+        'https://test.vercel.app/', tmp_path)
+
+    assert result.success
+    ops = [op for op, _ in record]
+    for required in ('pw.start', 'chromium.launch', 'browser.new_context',
+                     'context.new_page', 'page.goto', 'page.screenshot',
+                     'context.close', 'browser.close', 'pw.stop'):
+        assert required in ops
+    # No dedicated worker thread: everything ran on this (caller) thread.
+    threads = {t for op, t in record}
+    assert threads == {threading.current_thread().name}, sorted(threads)
+
+
+def test_smoke_cleanup_stop_failure_does_not_mask_success(tmp_path):
+    """H-8: a pw.stop() cleanup failure is logged but must NOT turn a successful
+    smoke into a failure, nor replace an existing primary failure."""
+    record = []
+
+    class _StopBoomPlaywright(_LifecyclePlaywrightStack):
+        def stop(self):
+            self._note('pw.stop')
+            raise RuntimeError('stop-boom')
+
+    def factory():
+        record.append(('factory', threading.current_thread().name))
+        pw = _StopBoomPlaywright(record)
+        browser = pw.start().chromium.launch(headless=True)
+        browser._wb_playwright_owner = pw
+        return browser
+
+    result = PreviewSmokeTester(factory, lambda _: ['8.8.8.8']).run(
+        'https://test.vercel.app/', tmp_path)
+
+    assert result.success
+    assert [op for op, _ in record].count('pw.stop') == 2
+
+
+def test_smoke_owner_less_factory_stop_is_noop(tmp_path):
+    """H-8: an injected/test browser factory without a Playwright owner must
+    still work (cleanup stop is a best-effort no-op)."""
+    class OwnerlessBrowser(Browser):
+        pass
+
+    result = PreviewSmokeTester(lambda: OwnerlessBrowser(), lambda _: ['8.8.8.8']).run(
+        'https://test.vercel.app/', tmp_path)
+    assert result.success
 
 
 # ---------------------------------------------------------------------------

@@ -234,6 +234,77 @@ def _calling_thread_has_running_loop() -> bool:
     return loop.is_running()
 
 
+def _launch_smoke_browser(sync_playwright):
+    """Launch a Chromium Browser and keep its Playwright driver alive.
+
+    Playwright's sync ``Browser`` is thread-affine and delegates to a driver
+    connection created by ``sync_playwright().start()``. If that Playwright
+    object is stopped (or garbage-collected) while the Browser is still in
+    use, the next Browser/BrowserContext call raises "Event loop is closed" /
+    greenlet errors. We therefore retain the ``sync_playwright()`` object for
+    the browser's whole lifetime by exposing it on the returned Browser; the
+    caller closes the browser and then stops Playwright deterministically via
+    ``_stop_browser_playwright`` (FIX 2 / H-8).
+    """
+    pw = sync_playwright().start()
+    try:
+        browser = pw.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ],
+        )
+    except BaseException:
+        # The browser never came up: stop the driver we just started so a
+        # launch failure cannot orphan a Playwright driver/node process.
+        try:
+            pw.stop()
+        except BaseException:
+            logger.warning(
+                "Preview smoke browser factory: Playwright stop after launch "
+                "failure itself raised",
+                exc_info=True,
+            )
+        raise
+    # Thread-neutral handle: the Browser is opaque to the caller
+    # (PreviewSmokeTester only invokes new_context/new_page/goto/screenshot/
+    # close). Attaching the Playwright owner lets the same thread that closed
+    # the browser also stop the driver deterministically.
+    try:
+        browser._wb_playwright_owner = pw
+    except Exception:  # pragma: no cover - exotic Browser proxies
+        logger.debug("Preview smoke browser factory: could not attach pw owner", exc_info=True)
+    return browser
+
+
+def _stop_browser_playwright(browser) -> None:
+    """Deterministically stop the Playwright driver that owns *browser*.
+
+    Must be called on the SAME thread that created the browser. Best-effort
+    and non-fatal by design: it runs during cleanup, after the browser has
+    already been closed, so a failure here must never convert a successful or
+    already-classified smoke into a different outcome. If the Browser does not
+    carry a Playwright owner (e.g. a test/injected factory), this is a no-op.
+    """
+    owner = getattr(browser, "_wb_playwright_owner", None)
+    if owner is None:
+        return
+    stop = getattr(owner, "stop", None)
+    if stop is None:
+        return
+    try:
+        stop()
+    except BaseException:
+        # Cleanup-only failure (page/context/browser already closed). Log with
+        # traceback for operators; never replace the primary smoke result.
+        logger.warning(
+            "Preview smoke browser factory: Playwright stop (cleanup) failed",
+            exc_info=True,
+        )
+
 def _load_smoke_browser_factory():
     """Load the Playwright browser factory for smoke tests.
 
@@ -256,18 +327,6 @@ def _load_smoke_browser_factory():
     try:
         from playwright.sync_api import sync_playwright
 
-        def _launch():
-            pw = sync_playwright().start()
-            return pw.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                ],
-            )
-
         def factory():
             _diag_log("6.browser_factory.before_sync_playwright_start")
             if _calling_thread_has_running_loop():
@@ -276,8 +335,8 @@ def _load_smoke_browser_factory():
                     "on the calling thread — bridging Playwright launch to a "
                     "dedicated thread"
                 )
-                return _run_on_fresh_thread(_launch)
-            return _launch()
+                return _run_on_fresh_thread(lambda: _launch_smoke_browser(sync_playwright))
+            return _launch_smoke_browser(sync_playwright)
 
         return factory
     except ImportError:
@@ -453,6 +512,10 @@ def preflight_smoke_support(browser_factory: Optional[Any]) -> None:
                 browser.close()
             except Exception:
                 logger.warning("Preview smoke preflight: browser close failed", exc_info=True)
+            # Cleanup-only: stop the Playwright driver on the SAME thread that
+            # launched it (never on the caller here, so it cannot race the
+            # bridge). Failure is non-fatal and must not mask the outcome.
+            _stop_browser_playwright(browser)
 
     logger.info("Preview smoke preflight OK: browser factory produced a usable browser")
 
