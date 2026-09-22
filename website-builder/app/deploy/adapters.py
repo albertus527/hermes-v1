@@ -785,6 +785,86 @@ class VercelAdapter:
         except Exception:
             return _fail('INCOMPLETE_LOOKUP')
 
+    def reconcile_production_deployment(self, app_id, project, expected_identity, *,
+                                        expected_name=None):
+        """Read-only reconciliation of CURRENT production truth against an
+        expected deployment identity -- used after an AMBIGUOUS promote
+        (timeout / transport error) where the caller cannot tell whether the
+        promote request reached Vercel.
+
+        Truth is proven exclusively from provider state, exactly like
+        ``find_production_deployment``: the project's current
+        ``targets.production`` binding (never a promote response body), looked
+        up by deployment id and re-validated against the project + the
+        deployment's OWN ``wbOperation``/``wbRevision``/``wbArtifact`` meta.
+
+        ``expected_identity`` is the COMPLETE trusted identity tuple:
+        deployment_id, operation_id, source_revision, artifact_sha256. A
+        caller must never pass a partial identity (never infer success from a
+        URL or a bare deployment_id).
+
+        Outcomes (``OperationResult``):
+          * ``ok`` with ``{'status': 'PROMOTED', 'deployment_id': ...}`` --
+            current production IS the expected deployment, with every trusted
+            identity field matching exactly.
+          * ``ok`` with ``{'status': 'NOT_PROMOTED', 'deployment_id': ...}`` --
+            provider truth conclusively shows a DIFFERENT (or no) production
+            deployment; the expected deployment was not promoted.
+          * ``fail('PROMOTE_RECONCILIATION_REQUIRED')`` -- production truth is
+            still ambiguous, could not be read, or the expected deployment's
+            stored identity is incomplete. Callers MUST fail closed here and
+            MUST NOT blindly re-issue a promote request.
+        """
+        try:
+            if not self._project_valid(project, app_id, expected_name=expected_name):
+                return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+            if not isinstance(expected_identity, dict):
+                return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+            deployment_id = expected_identity.get('deployment_id')
+            operation_id = expected_identity.get('operation_id')
+            source_revision = expected_identity.get('source_revision')
+            artifact_sha256 = expected_identity.get('artifact_sha256')
+            if (not deployment_id
+                    or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', deployment_id)
+                    or not isinstance(operation_id, str) or not operation_id
+                    or type(source_revision) is not int or source_revision < 1
+                    or not isinstance(artifact_sha256, str)
+                    or not re.fullmatch('[a-f0-9]{64}', artifact_sha256)):
+                # Incomplete trusted identity -> cannot prove anything.
+                return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+            # The expected deployment must exist, belong to this project, and
+            # carry EXACTLY the expected operation identity. Anything else is
+            # ambiguous -- never guess.
+            status, body = self._call('GET', '/v13/deployments/' + quote(deployment_id, safe=''))
+            if status != 200 or body.get('id') != deployment_id:
+                return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+            team = body.get('teamId') or (body.get('team') or {}).get('id')
+            project_id_field = body.get('projectId') or (body.get('project') or {}).get('id')
+            meta = body.get('meta')
+            if (project_id_field != project['id'] or team != self.team_id
+                    or not isinstance(meta, dict)
+                    or meta.get('wbOperation') != operation_id
+                    or meta.get('wbRevision') != str(source_revision)
+                    or meta.get('wbArtifact') != artifact_sha256):
+                return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+            # Authoritative production binding, straight from the project.
+            try:
+                current_prod_id = self._current_production_id(project)
+            except Exception:
+                return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+            if current_prod_id == deployment_id:
+                if body.get('readyState') != 'READY':
+                    return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+                return OperationResult.ok({'status': 'PROMOTED',
+                                           'deployment_id': deployment_id})
+            # A conclusive, well-formed production binding to someone else
+            # (or no production at all) proves the expected deployment is not
+            # the live target.
+            return OperationResult.ok({'status': 'NOT_PROMOTED',
+                                       'deployment_id': current_prod_id})
+        except Exception:
+            return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+
 
 class TelegramAdapter:
     def __init__(self, bot_token, transport=None):

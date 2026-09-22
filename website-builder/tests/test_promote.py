@@ -1,4 +1,5 @@
 """Local behavioral tests for Phase 11 promotion orchestration using fake adapters."""
+import json
 import sys
 from pathlib import Path
 
@@ -68,6 +69,12 @@ class FakeVercel:
         # Records every expected_name threaded by the orchestrator so tests
         # can assert the canonical-slug / legacy-None contract end to end.
         self.expected_names = []
+        # Production truth for reconcile_production_deployment:
+        # 'NOT_SET' (default) means "the intended deployment is now live".
+        # None -> no production; dict -> explicit live identity; 'AMBIGUOUS'
+        # -> reconciliation cannot decide.
+        self.production_now = 'NOT_SET'
+        self.reconcile_calls = []
 
     def lookup_project(self, app_id, *, expected_name=None):
         self.expected_names.append(expected_name)
@@ -78,6 +85,40 @@ class FakeVercel:
         if self.previous_identity is None:
             return OperationResult.ok({'deployment_id': None})
         return OperationResult.ok(dict(self.previous_identity))
+
+    def reconcile_production_deployment(self, app_id, project, expected_identity, *,
+                                        expected_name=None):
+        """Default fake: report production truth from the configured
+        ``production_now`` identity (the deployment currently live), compared
+        against the COMPLETE expected identity tuple.
+
+        ``production_now`` is the authoritative provider truth:
+          * None               -> no production at all -> NOT_PROMOTED
+          * dict               -> promoted iff EVERY trusted field matches
+          * 'AMBIGUOUS'        -> lookup cannot decide -> reconciliation fail
+        """
+        self.reconcile_calls.append(dict(expected_identity))
+        self.expected_names.append(expected_name)
+        now = getattr(self, 'production_now', 'NOT_SET')
+        if now == 'NOT_SET':
+            # Default: production has NOT yet been switched to the candidate
+            # (models a crash BEFORE the remote promote landed). Explicit
+            # tests set production_now to model "already promoted" /
+            # "not promoted" / "ambiguous".
+            return OperationResult.ok({'status': 'NOT_PROMOTED',
+                                       'deployment_id': (self.previous_identity or {}).get('deployment_id')})
+        if now is None:
+            return OperationResult.ok({'status': 'NOT_PROMOTED', 'deployment_id': None})
+        if now == 'AMBIGUOUS':
+            return OperationResult.fail('PROMOTE_RECONCILIATION_REQUIRED',
+                                        error_code='PROMOTE_RECONCILIATION_REQUIRED')
+        if all(now.get(k) == expected_identity.get(k)
+               for k in ('deployment_id', 'operation_id', 'source_revision',
+                         'artifact_sha256')):
+            return OperationResult.ok({'status': 'PROMOTED',
+                                       'deployment_id': expected_identity['deployment_id']})
+        return OperationResult.ok({'status': 'NOT_PROMOTED',
+                                   'deployment_id': now.get('deployment_id')})
 
     def promote_deployment(self, app_id, project, deployment_id, operation_id,
                            source_revision, artifact_sha256, *, expected_name=None):
@@ -649,3 +690,381 @@ def test_smoke_failure_after_retry_rolls_back_to_true_last_known_good(tmp_path):
 
 def state_failed(store):
     return store.load('proj').failure['error_code']
+
+# ---------------------------------------------------------------------------
+# BL-2 — an AMBIGUOUS remote promote must be reconciled, never treated as a
+# confirmed failure and never blindly re-sent.
+# ---------------------------------------------------------------------------
+
+class AmbiguousPromoteVercel(FakeVercel):
+    """Models the adapter returning PROMOTE_RECONCILIATION_REQUIRED for the
+    candidate promote (request may have reached Vercel), while still recording
+    the remote promote so callers can assert it was sent exactly once."""
+
+    def __init__(self, ambiguous_deployment_id='dpl_1', **kw):
+        super().__init__(**kw)
+        self.ambiguous_deployment_id = ambiguous_deployment_id
+
+    def promote_deployment(self, app_id, project, deployment_id, operation_id,
+                           source_revision, artifact_sha256, *, expected_name=None):
+        self.promote_calls.append(deployment_id)
+        if deployment_id == self.ambiguous_deployment_id:
+            return OperationResult.fail('PROMOTE_RECONCILIATION_REQUIRED',
+                                        error_code='PROMOTE_RECONCILIATION_REQUIRED')
+        return super().promote_deployment(
+            app_id, project, deployment_id, operation_id, source_revision,
+            artifact_sha256, expected_name=expected_name)
+
+
+class IdentityMismatchReconcileVercel(AmbiguousPromoteVercel):
+    """Remote production carries the SAME deployment_id as the candidate but a
+    MISMATCHED trusted operation/revision/artifact identity -> the identity
+    comparison must NOT report success."""
+
+    def reconcile_production_deployment(self, app_id, project, expected_identity, *,
+                                        expected_name=None):
+        self.reconcile_calls.append(dict(expected_identity))
+        self.expected_names.append(expected_name)
+        return OperationResult.ok({
+            'status': 'NOT_PROMOTED',
+            'deployment_id': expected_identity['deployment_id'],
+        })
+
+
+class RaisingRollbackVercel(FakeVercel):
+    """Rollback promote raises; the exception must be classified + persisted,
+    never swallowed."""
+
+    def promote_deployment(self, app_id, project, deployment_id, operation_id,
+                           source_revision, artifact_sha256, *, expected_name=None):
+        self.promote_calls.append(deployment_id)
+        if deployment_id == 'dpl_old':
+            raise ConnectionError('leaked-secret-token-xyz')
+        return super().promote_deployment(
+            app_id, project, deployment_id, operation_id, source_revision,
+            artifact_sha256, expected_name=expected_name)
+
+
+def test_bl2_timeout_after_remote_acceptance_reconciles_success(tmp_path):
+    """BL-2 Test A: promote call times out but Vercel did promote the exact
+    intended deployment -> reconcile to SUCCESS, run production smoke, reach
+    LIVE, keep previous_production unchanged, no second POST."""
+    runner, store = _runner(tmp_path)
+    ws = _make_workspace(tmp_path)
+    _approved_state(store, 'proj')
+    vercel = AmbiguousPromoteVercel(previous_production='dpl_old')
+    # Production truth: the intended NEW deployment IS now live with the exact
+    # identity tuple (dpl_1/op-1/rev1/'b'*64).
+    vercel.production_now = {
+        'deployment_id': 'dpl_1', 'operation_id': 'op-1',
+        'source_revision': 1, 'artifact_sha256': 'b' * 64,
+    }
+    deps = _deps(vercel=vercel, smoke=FakeSmoke(success=True))
+    orch = PromotionOrchestrator(runner, store, deps)
+    assert orch.approve('proj', principal_id=OWNER).success
+
+    result = orch.promote('proj', ws, principal_id=OWNER)
+
+    assert result.success, result.error
+    assert result.data['reconciled'] is True
+    state = store.load('proj')
+    assert state.lifecycle == ProjectLifecycle.LIVE.value
+    # Exactly ONE remote promote POST for the candidate.
+    assert vercel.promote_calls == ['dpl_1']
+    # Post-promote flow ran: production smoke executed.
+    assert deps.smoke.calls == 1
+    # previous_production persisted BEFORE the side effect is untouched.
+    assert state.deployment['promotion_intent']['previous_production'] == {
+        'deployment_id': 'dpl_old', 'operation_id': 'op-0',
+        'source_revision': 1, 'artifact_sha256': 'c' * 64,
+    }
+
+
+def test_bl2_ambiguous_promote_lookup_shows_old_deployment(tmp_path):
+    """BL-2 Test B: ambiguity resolved conclusively as NOT promoted -> fail
+    safely, no blind retry, meaningful failure state."""
+    runner, store = _runner(tmp_path)
+    ws = _make_workspace(tmp_path)
+    _approved_state(store, 'proj')
+    vercel = AmbiguousPromoteVercel(previous_production='dpl_old')
+    vercel.production_now = None  # conclusively: intended deployment NOT live
+    deps = _deps(vercel=vercel, smoke=FakeSmoke(success=True))
+    orch = PromotionOrchestrator(runner, store, deps)
+    assert orch.approve('proj', principal_id=OWNER).success
+
+    result = orch.promote('proj', ws, principal_id=OWNER)
+
+    assert not result.success
+    assert result.error_code == 'PROMOTE_NOT_APPLIED'
+    assert vercel.promote_calls == ['dpl_1']  # no blind retry
+    state = store.load('proj')
+    assert state.lifecycle == ProjectLifecycle.FAILED.value
+    assert state.failure['error_code'] == 'PROMOTE_NOT_APPLIED'
+    assert deps.smoke.calls == 0
+
+
+def test_bl2_ambiguous_promote_still_ambiguous_preserves_publishing(tmp_path):
+    """BL-2 Test C: still ambiguous -> stay PUBLISHING with an intact
+    promotion_intent, report reconciliation required, no second POST; a later
+    same-operation resume reconciles FIRST and continues without another
+    promote POST once the NEW deployment is live."""
+    runner, store = _runner(tmp_path)
+    ws = _make_workspace(tmp_path)
+    _approved_state(store, 'proj')
+    vercel = AmbiguousPromoteVercel(previous_production='dpl_old')
+    vercel.production_now = 'AMBIGUOUS'
+    deps = _deps(vercel=vercel, smoke=FakeSmoke(success=True))
+    orch = PromotionOrchestrator(runner, store, deps)
+    assert orch.approve('proj', principal_id=OWNER).success
+
+    result = orch.promote('proj', ws, principal_id=OWNER)
+
+    assert not result.success
+    assert result.error_code == 'PROMOTION_RECONCILIATION_REQUIRED'
+    assert vercel.promote_calls == ['dpl_1']  # no second promote POST
+    state = store.load('proj')
+    # Lifecycle preserved (NOT terminal FAILED).
+    assert state.lifecycle == ProjectLifecycle.PUBLISHING.value
+    intent = state.deployment['promotion_intent']
+    assert intent['operation_id'] == 'op-1'
+    assert intent['previous_production']['deployment_id'] == 'dpl_old'
+    assert state.failure['reconciliation_required'] is True
+
+    # ---- Later same-operation resume: remote truth now shows NEW live.
+    vercel.production_now = {
+        'deployment_id': 'dpl_1', 'operation_id': 'op-1',
+        'source_revision': 1, 'artifact_sha256': 'b' * 64,
+    }
+    resume = orch.promote('proj', ws, principal_id=OWNER)
+
+    assert resume.success, resume.error
+    assert resume.data['reconciled'] is True
+    # Resume reconciled FIRST and never sent another promote POST.
+    assert vercel.promote_calls == ['dpl_1']
+    assert store.load('proj').lifecycle == ProjectLifecycle.LIVE.value
+
+
+def test_bl2_identity_mismatch_not_treated_as_success(tmp_path):
+    """BL-2 Test D: remote production has the same deployment_id but a
+    mismatched trusted identity -> NOT success; fail closed."""
+    runner, store = _runner(tmp_path)
+    ws = _make_workspace(tmp_path)
+    _approved_state(store, 'proj')
+    vercel = IdentityMismatchReconcileVercel(previous_production='dpl_old')
+    deps = _deps(vercel=vercel, smoke=FakeSmoke(success=True))
+    orch = PromotionOrchestrator(runner, store, deps)
+    assert orch.approve('proj', principal_id=OWNER).success
+
+    result = orch.promote('proj', ws, principal_id=OWNER)
+
+    assert not result.success
+    assert result.error_code == 'PROMOTE_NOT_APPLIED'
+    assert vercel.promote_calls == ['dpl_1']
+    state = store.load('proj')
+    assert state.lifecycle == ProjectLifecycle.FAILED.value
+    assert deps.smoke.calls == 0
+
+
+def test_bl2_non_ambiguous_promote_failure_still_terminal_failed(tmp_path):
+    """Regression guard: a non-ambiguous promote failure keeps its existing
+    terminal-FAILED semantics (no reconciliation attempted)."""
+    runner, store = _runner(tmp_path)
+    ws = _make_workspace(tmp_path)
+    _approved_state(store, 'proj')
+    vercel = FlakyPromoteVercel(fail_on={'dpl_1'})
+    deps = _deps(vercel=vercel)
+    orch = PromotionOrchestrator(runner, store, deps)
+    assert orch.approve('proj', principal_id=OWNER).success
+
+    result = orch.promote('proj', ws, principal_id=OWNER)
+
+    assert not result.success
+    assert result.error_code == 'PROMOTE_FAILED'
+    assert vercel.reconcile_calls == []
+    assert store.load('proj').lifecycle == ProjectLifecycle.FAILED.value
+
+# ---------------------------------------------------------------------------
+# BL-5 — the rollback result must be observed and persisted, distinctly.
+# ---------------------------------------------------------------------------
+
+def test_bl5_smoke_failure_rollback_success_is_distinguishable(tmp_path):
+    """BL-5 Test A: smoke fails, rollback succeeds -> failure clearly says
+    production smoke failed AND rollback succeeded; one rollback POST only."""
+    runner, store = _runner(tmp_path)
+    ws = _make_workspace(tmp_path)
+    _approved_state(store, 'proj')
+    vercel = FakeVercel(previous_production='dpl_old')
+    deps = _deps(vercel=vercel, smoke=FakeSmoke(success=False))
+    orch = PromotionOrchestrator(runner, store, deps)
+    assert orch.approve('proj', principal_id=OWNER).success
+
+    result = orch.promote('proj', ws, principal_id=OWNER)
+
+    assert not result.success
+    assert result.error_code == 'SMOKE_FAILED'
+    assert result.data['production_smoke_failed'] is True
+    assert result.data['rollback'] == 'SUCCEEDED'
+    state = store.load('proj')
+    assert state.failure['error_code'] == 'SMOKE_FAILED'
+    assert state.failure['primary_error_code'] == 'PRODUCTION_SMOKE_FAILED'
+    assert state.failure['rollback'] == 'SUCCEEDED'
+    assert state.failure['rollback_target'] == {
+        'deployment_id': 'dpl_old', 'operation_id': 'op-0',
+        'source_revision': 1, 'artifact_sha256': 'c' * 64,
+    }
+    assert vercel.promote_calls == ['dpl_1', 'dpl_old']
+
+
+def test_bl5_rollback_confirmed_failure_distinct_code(tmp_path):
+    """BL-5 Test B: rollback returns a confirmed failure -> distinct
+    ROLLBACK_FAILED code, target identity persisted, no retry loop."""
+    runner, store = _runner(tmp_path)
+    ws = _make_workspace(tmp_path)
+    _approved_state(store, 'proj')
+
+    class RollbackFailsVercel(FakeVercel):
+        def promote_deployment(self, app_id, project, deployment_id, operation_id,
+                               source_revision, artifact_sha256, *, expected_name=None):
+            self.promote_calls.append(deployment_id)
+            self.expected_names.append(expected_name)
+            if deployment_id == 'dpl_old':
+                return OperationResult.fail('PROMOTE_FAILED', error_code='PROMOTE_FAILED')
+            return OperationResult.ok({
+                'deployment_id': deployment_id,
+                'production_url': 'https://prod.vercel.app',
+                'state': 'READY',
+            })
+
+    vercel = RollbackFailsVercel(previous_production='dpl_old')
+    deps = _deps(vercel=vercel, smoke=FakeSmoke(success=False))
+    orch = PromotionOrchestrator(runner, store, deps)
+    assert orch.approve('proj', principal_id=OWNER).success
+
+    result = orch.promote('proj', ws, principal_id=OWNER)
+
+    assert not result.success
+    assert result.data['rollback'] == 'FAILED'
+    state = store.load('proj')
+    assert state.failure['error_code'] == 'ROLLBACK_FAILED'
+    assert state.failure['error_code'] != 'SMOKE_FAILED'
+    assert state.failure['rollback_target']['deployment_id'] == 'dpl_old'
+    assert state.lifecycle == ProjectLifecycle.FAILED.value
+    # Exactly one rollback attempt (no retry loop).
+    assert vercel.promote_calls == ['dpl_1', 'dpl_old']
+
+
+def test_bl5_rollback_ambiguous_reconciliation_required(tmp_path):
+    """BL-5 Test C: rollback outcome ambiguous -> distinct
+    ROLLBACK_RECONCILIATION_REQUIRED, no blind retry, target preserved."""
+    runner, store = _runner(tmp_path)
+    ws = _make_workspace(tmp_path)
+    _approved_state(store, 'proj')
+
+    class AmbiguousRollbackVercel(FakeVercel):
+        def promote_deployment(self, app_id, project, deployment_id, operation_id,
+                               source_revision, artifact_sha256, *, expected_name=None):
+            self.promote_calls.append(deployment_id)
+            self.expected_names.append(expected_name)
+            if deployment_id == 'dpl_old':
+                return OperationResult.fail(
+                    'PROMOTE_RECONCILIATION_REQUIRED',
+                    error_code='PROMOTE_RECONCILIATION_REQUIRED')
+            return OperationResult.ok({
+                'deployment_id': deployment_id,
+                'production_url': 'https://prod.vercel.app',
+                'state': 'READY',
+            })
+
+    vercel = AmbiguousRollbackVercel(previous_production='dpl_old')
+    deps = _deps(vercel=vercel, smoke=FakeSmoke(success=False))
+    orch = PromotionOrchestrator(runner, store, deps)
+    assert orch.approve('proj', principal_id=OWNER).success
+
+    result = orch.promote('proj', ws, principal_id=OWNER)
+
+    assert not result.success
+    assert result.data['rollback'] == 'RECONCILIATION_REQUIRED'
+    state = store.load('proj')
+    assert state.failure['error_code'] == 'ROLLBACK_RECONCILIATION_REQUIRED'
+    assert state.failure['rollback_reconciliation_required'] is True
+    assert state.failure['rollback_target']['deployment_id'] == 'dpl_old'
+    assert vercel.promote_calls == ['dpl_1', 'dpl_old']
+
+
+def test_bl5_rollback_exception_not_swallowed(tmp_path):
+    """BL-5 Test D: rollback raises -> classified + persisted, primary smoke
+    failure preserved, no secret leak into durable state."""
+    runner, store = _runner(tmp_path)
+    ws = _make_workspace(tmp_path)
+    _approved_state(store, 'proj')
+    vercel = RaisingRollbackVercel(previous_production='dpl_old')
+    deps = _deps(vercel=vercel, smoke=FakeSmoke(success=False))
+    orch = PromotionOrchestrator(runner, store, deps)
+    assert orch.approve('proj', principal_id=OWNER).success
+
+    result = orch.promote('proj', ws, principal_id=OWNER)
+
+    assert not result.success
+    assert result.data['rollback'] == 'FAILED'
+    state = store.load('proj')
+    assert state.failure['error_code'] == 'ROLLBACK_FAILED'
+    assert state.failure['primary_error_code'] == 'PRODUCTION_SMOKE_FAILED'
+    assert state.failure['rollback_exception_class'] == 'ConnectionError'
+    # The raw exception message (which contained a fake secret) is NEVER
+    # persisted.
+    assert 'leaked-secret-token-xyz' not in json.dumps(state.failure)
+
+
+def test_bl5_no_previous_production_preserves_existing_behavior(tmp_path):
+    """BL-5 Test E: no previous production -> no rollback target invented,
+    existing behavior preserved."""
+    runner, store = _runner(tmp_path)
+    ws = _make_workspace(tmp_path)
+    _approved_state(store, 'proj')
+    vercel = FakeVercel(previous_production=None)
+    deps = _deps(vercel=vercel, smoke=FakeSmoke(success=False))
+    orch = PromotionOrchestrator(runner, store, deps)
+    assert orch.approve('proj', principal_id=OWNER).success
+
+    result = orch.promote('proj', ws, principal_id=OWNER)
+
+    assert not result.success
+    assert result.error_code == 'SMOKE_FAILED'
+    assert result.data['rollback'] == 'NO_PREVIOUS_PRODUCTION'
+    assert vercel.promote_calls == ['dpl_1']
+    state = store.load('proj')
+    assert state.failure['error_code'] == 'SMOKE_FAILED'
+    assert state.lifecycle == ProjectLifecycle.FAILED.value
+
+
+def test_bl5_rollback_uses_persisted_identity_not_recomputed(tmp_path):
+    """BL-5 identity: the rollback target is the identity persisted in
+    promotion_intent BEFORE the remote promote, used verbatim -- it is never
+    re-derived from the (now drifted) current production state."""
+    runner, store = _runner(tmp_path)
+    ws = _make_workspace(tmp_path)
+    _approved_state(store, 'proj')
+    vercel = FakeVercel(previous_production='dpl_old')
+    deps = _deps(vercel=vercel, smoke=FakeSmoke(success=False))
+    orch = PromotionOrchestrator(runner, store, deps)
+    assert orch.approve('proj', principal_id=OWNER).success
+
+    captured = []
+    orig = vercel.promote_deployment
+
+    def spy(app_id, project, deployment_id, operation_id, source_revision,
+            artifact_sha256, *, expected_name=None):
+        captured.append((deployment_id, operation_id, source_revision, artifact_sha256))
+        return orig(app_id, project, deployment_id, operation_id, source_revision,
+                    artifact_sha256, expected_name=expected_name)
+
+    vercel.promote_deployment = spy
+    result = orch.promote('proj', ws, principal_id=OWNER)
+
+    assert not result.success
+    # The rollback used the persisted dpl_old identity (op-0/rev1/'c'*64),
+    # i.e. exactly the tuple captured before the remote promote.
+    assert captured[-1] == ('dpl_old', 'op-0', 1, 'c' * 64)
+    intent = store.load('proj').deployment['promotion_intent']
+    assert intent['previous_production']['deployment_id'] == 'dpl_old'
+    assert intent['previous_production']['artifact_sha256'] == 'c' * 64

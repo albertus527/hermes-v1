@@ -197,6 +197,106 @@ def test_lookup_paginated_then_authoritative_detail():
     assert a.find_deployment_by_operation_id('app', project(a), 'operation', 2, SHA).success
     assert 'until=10' in t.calls[1][1]
 
+# ---------------------------------------------------------------------------
+# BL-2 — reconcile_production_deployment: read-only remote-truth comparison
+# against the COMPLETE trusted identity tuple.
+# ---------------------------------------------------------------------------
+
+def _reconcile_identity():
+    return {'deployment_id': 'dpl_1', 'operation_id': 'operation',
+            'source_revision': 2, 'artifact_sha256': SHA}
+
+def test_reconcile_production_confirms_promoted_deployment():
+    """Current production IS the expected deployment (exact identity tuple)
+    -> PROMOTED, without ever POSTing a promote."""
+    a, t = adapter()
+    d = deployment(a)
+    p = project(a)
+    t.responses = [
+        (200, d),
+        (200, {**p, 'targets': {'production': {'id': d['id']}}}),
+    ]
+    result = a.reconcile_production_deployment('app', p, _reconcile_identity())
+    assert result.success and result.data['status'] == 'PROMOTED'
+    assert all(c[0] == 'GET' for c in t.calls)
+
+def test_reconcile_production_reports_not_promoted():
+    """Current production is a DIFFERENT deployment -> NOT_PROMOTED."""
+    a, t = adapter()
+    d = deployment(a)
+    p = project(a)
+    t.responses = [
+        (200, d),
+        (200, {**p, 'targets': {'production': {'id': 'dpl_other'}}}),
+    ]
+    result = a.reconcile_production_deployment('app', p, _reconcile_identity())
+    assert result.success and result.data['status'] == 'NOT_PROMOTED'
+
+def test_reconcile_production_no_binding_is_not_promoted():
+    a, t = adapter()
+    d = deployment(a)
+    p = project(a)
+    t.responses = [(200, d), (200, {**p, 'targets': {}})]
+    result = a.reconcile_production_deployment('app', p, _reconcile_identity())
+    assert result.success and result.data['status'] == 'NOT_PROMOTED'
+
+@pytest.mark.parametrize('mutate', [
+    lambda d: d.__setitem__('id', 'dpl_9'),
+    lambda d: d.__setitem__('projectId', 'foreign'),
+    lambda d: d.__setitem__('teamId', 'foreign'),
+    lambda d: d.__setitem__('meta', {**d['meta'], 'wbOperation': 'other'}),
+    lambda d: d.__setitem__('meta', {**d['meta'], 'wbRevision': '3'}),
+    lambda d: d.__setitem__('meta', {**d['meta'], 'wbArtifact': 'b' * 64}),
+    lambda d: d.__setitem__('readyState', 'BUILDING'),
+])
+def test_reconcile_production_identity_mismatch_ambiguous(mutate):
+    """Same/other deployment_id but any mismatched trusted field, or not
+    READY -> reconciliation-required (never inferred success)."""
+    a, t = adapter()
+    d = deployment(a)
+    mutate(d)
+    p = project(a)
+    t.responses = [
+        (200, d),
+        (200, {**p, 'targets': {'production': {'id': d.get('id')}}}),
+    ]
+    result = a.reconcile_production_deployment('app', p, _reconcile_identity())
+    assert not result.success
+    assert result.error_code == 'PROMOTE_RECONCILIATION_REQUIRED'
+
+def test_reconcile_production_ambiguous_lookup_fails_closed():
+    """Malformed production binding -> reconciliation-required."""
+    a, t = adapter()
+    d = deployment(a)
+    p = project(a)
+    t.responses = [(200, d), (200, {**p, 'targets': 'not-a-dict'})]
+    result = a.reconcile_production_deployment('app', p, _reconcile_identity())
+    assert not result.success
+    assert result.error_code == 'PROMOTE_RECONCILIATION_REQUIRED'
+
+@pytest.mark.parametrize('identity', [
+    {'deployment_id': 'dpl_1'},  # partial
+    {'deployment_id': 'dpl_1', 'operation_id': '', 'source_revision': 2,
+     'artifact_sha256': SHA},
+    {'deployment_id': 'dpl_1', 'operation_id': 'operation', 'source_revision': 0,
+     'artifact_sha256': SHA},
+    {'deployment_id': 'dpl_1', 'operation_id': 'operation', 'source_revision': 2,
+     'artifact_sha256': 'nope'},
+    None,
+])
+def test_reconcile_production_incomplete_identity_fails_closed(identity):
+    """A partial/absent expected identity can never prove success."""
+    a, t = adapter()
+    result = a.reconcile_production_deployment('app', project(a), identity)
+    assert not result.success
+    assert result.error_code == 'PROMOTE_RECONCILIATION_REQUIRED'
+    assert not t.calls
+
+def test_reconcile_production_transport_error_fails_closed():
+    a, t = adapter(TimeoutError('secret'))
+    result = a.reconcile_production_deployment('app', project(a), _reconcile_identity())
+    assert not result.success
+    assert result.error_code == 'PROMOTE_RECONCILIATION_REQUIRED'
 
 def test_lookup_ambiguity_across_pages():
     a, t = adapter()

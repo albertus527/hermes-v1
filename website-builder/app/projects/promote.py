@@ -26,6 +26,7 @@ constructed and passed in explicitly by the caller, matching the Phase 9
 """
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,6 +37,23 @@ from app.core.contracts import OperationResult
 from app.core.lifecycle import LifecycleError, ProjectLifecycle
 from app.core.state import ProjectStateStore
 from app.sandbox.runner import ProjectRunner
+
+
+def _safe_identity(identity) -> Optional[dict]:
+    """A minimal, non-secret identity projection safe to persist in state.
+
+    Only the four trusted identity fields are kept (never a URL, token, or
+    raw provider response object). ``None`` is preserved as ``None`` so "no
+    previous production" stays distinguishable from an incomplete identity.
+    """
+    if not isinstance(identity, dict):
+        return None
+    return {
+        "deployment_id": identity.get("deployment_id"),
+        "operation_id": identity.get("operation_id"),
+        "source_revision": identity.get("source_revision"),
+        "artifact_sha256": identity.get("artifact_sha256"),
+    }
 
 
 def _previous_identity_complete(identity) -> bool:
@@ -389,30 +407,165 @@ class PromotionOrchestrator:
                 }
             self.store.save(locked)
 
+            # The exact trusted identity of the deployment we intended to
+            # promote. Reconciliation compares the COMPLETE tuple -- never a
+            # URL or a bare deployment_id.
+            intended_identity = {
+                "deployment_id": deployment_id,
+                "operation_id": operation_id,
+                "source_revision": source_revision,
+                "artifact_sha256": artifact_sha256,
+            }
+
+            # ---- Same-operation resume after an AMBIGUOUS remote promote:
+            # reconcile remote truth BEFORE re-issuing any promote request.
+            # If Vercel already promoted this exact deployment, adopt that
+            # truth (never a second promote POST). If remote truth says it was
+            # NOT promoted, the normal promote below is safe (it will fail
+            # closed on any residual ambiguity without duplicating a
+            # side effect). If truth is still ambiguous, stop here -- fail
+            # closed, keep PUBLISHING, and do not send a second promote.
+            #
+            # The confirmations here only decide WHICH path to take; the
+            # actual post-promote flow runs AFTER the writer lock is released
+            # (the writer lock is a file lock, not reentrant).
+            resume_reconciled_url = None
+            resume_fail_closed = False
+            if is_same_operation:
+                reconcile = self.deps.vercel.reconcile_production_deployment(
+                    app_id, vercel_project, intended_identity, expected_name=expected_name,
+                )
+                status = (reconcile.data or {}).get("status") if reconcile.success else None
+                if status == "PROMOTED":
+                    resume_reconciled_url = self._production_url_for(intended_identity)
+                    locked.deployment["promotion_intent"]["stage"] = "promoted"
+                    locked.deployment["promotion_intent"]["production_url"] = resume_reconciled_url
+                    self.store.save(locked)
+                elif status == "NOT_PROMOTED":
+                    # Conclusively not promoted: fall through to the normal
+                    # promote below (safe -- the intended deployment is not
+                    # the live target).
+                    pass
+                else:
+                    # Ambiguous resume: do NOT blindly re-promote.
+                    self._fail_reconciliation_required_locked(
+                        locked, "PROMOTION_RECONCILIATION_REQUIRED",
+                        intended_identity, "promote",
+                    )
+                    resume_fail_closed = True
+
             # Writer remains held through the first mutating adapter call.
-            promote_result = self.deps.vercel.promote_deployment(
-                app_id, vercel_project, deployment_id, operation_id,
-                source_revision, artifact_sha256, expected_name=expected_name,
+            if resume_reconciled_url is not None or resume_fail_closed:
+                promote_result = None
+            else:
+                promote_result = self.deps.vercel.promote_deployment(
+                    app_id, vercel_project, deployment_id, operation_id,
+                    source_revision, artifact_sha256, expected_name=expected_name,
+                )
+
+        if resume_fail_closed:
+            return OperationResult.fail(
+                "PROMOTION_RECONCILIATION_REQUIRED",
+                error_code="PROMOTION_RECONCILIATION_REQUIRED",
             )
+        if resume_reconciled_url is not None:
+            return self._post_promote(
+                project_id, workspace, app_id, vercel_project,
+                previous_identity, production_url=resume_reconciled_url,
+                intended_identity=intended_identity,
+                expected_name=expected_name, reconciled=True,
+                approval=approval, source_revision=source_revision,
+            )
+
         if not promote_result.success:
-            self._fail(project_id, "PROMOTE_FAILED", promote_result.error_code or "PROMOTE_FAILED")
-            return promote_result
+            error_code = promote_result.error_code or "PROMOTE_FAILED"
+            if error_code != "PROMOTE_RECONCILIATION_REQUIRED":
+                self._fail(project_id, "PROMOTE_FAILED", error_code)
+                return promote_result
+            # ---- AMBIGUOUS remote promote: the request may have reached
+            # Vercel but the outcome is unknown. NEVER treat this as a
+            # confirmed failure (Vercel may already be serving the new
+            # deployment) and NEVER blindly re-send the promote. Re-read
+            # production truth and decide from the COMPLETE identity tuple.
+            reconcile = self.deps.vercel.reconcile_production_deployment(
+                app_id, vercel_project, intended_identity, expected_name=expected_name,
+            )
+            status = (reconcile.data or {}).get("status") if reconcile.success else None
+            if status == "PROMOTED":
+                # Confirmed promoted -> continue the normal post-promote flow
+                # (production smoke, then LIVE persistence).
+                production_url = self._production_url_for(intended_identity)
+                self._update_intent(project_id, stage="promoted", production_url=production_url)
+                return self._post_promote(
+                    project_id, workspace, app_id, vercel_project,
+                    previous_identity, production_url=production_url,
+                    intended_identity=intended_identity,
+                    expected_name=expected_name, reconciled=True,
+                    approval=approval, source_revision=source_revision,
+                )
+            elif status == "NOT_PROMOTED":
+                # Remote truth conclusively shows the intended deployment was
+                # NOT promoted -> a real, confirmed failure.
+                self._fail(project_id, "PROMOTE_FAILED", "PROMOTE_NOT_APPLIED")
+                return OperationResult.fail(
+                    "PROMOTE_FAILED", error_code="PROMOTE_NOT_APPLIED",
+                )
+            else:
+                # Still ambiguous / lookup failed / identity incomplete:
+                # preserve PUBLISHING + the intact promotion_intent and fail
+                # closed as reconciliation-required. A later same-operation
+                # resume reconciles again and reuses the SAME intent (no
+                # second promote POST).
+                self._fail_reconciliation_required(
+                    project_id, "PROMOTION_RECONCILIATION_REQUIRED",
+                    intended_identity, "promote",
+                )
+                return OperationResult.fail(
+                    "PROMOTION_RECONCILIATION_REQUIRED",
+                    error_code="PROMOTION_RECONCILIATION_REQUIRED",
+                )
 
         production_url = promote_result.data["production_url"]
         self._update_intent(project_id, stage="promoted", production_url=production_url)
+        return self._post_promote(
+            project_id, workspace, app_id, vercel_project, previous_identity,
+            production_url=production_url, intended_identity=intended_identity,
+            expected_name=expected_name, reconciled=False,
+            approval=approval, source_revision=source_revision,
+        )
+
+    def _post_promote(
+        self, project_id, workspace, app_id, vercel_project, previous_identity,
+        production_url, intended_identity, expected_name, reconciled,
+        approval, source_revision,
+    ) -> OperationResult:
+        """Normal post-promote flow after a CONFIRMED promote (direct or
+        reconciled): production smoke, then PUBLISHING -> LIVE, then the
+        best-effort Telegram notification.
+
+        On smoke failure the alias is rolled back to the persisted previous
+        production and the EXACT observed rollback outcome is persisted.
+        """
+        deployment_id = intended_identity["deployment_id"]
+        operation_id = intended_identity["operation_id"]
+        artifact_sha256 = intended_identity["artifact_sha256"]
 
         # ---- Mandatory production smoke check before ever marking LIVE.
         smoke_dir = (self.smoke_dir_root or workspace) / "qa" / "production_smoke"
         smoke_result = self.deps.smoke.run(production_url, smoke_dir)
         self._update_intent(project_id, stage="smoked", smoke=smoke_result.data)
         if not smoke_result.success:
-            self._rollback_and_fail(
+            rollback_status = self._rollback_and_fail(
                 project_id, app_id, vercel_project, previous_identity,
                 error_code="SMOKE_FAILED", expected_name=expected_name,
             )
             return OperationResult(
                 success=False, error="SMOKE_FAILED", error_code="SMOKE_FAILED",
-                data=smoke_result.data,
+                data={
+                    **(smoke_result.data or {}),
+                    "rollback": rollback_status,
+                    "production_smoke_failed": True,
+                },
             )
 
         # ---- Only now transition PUBLISHING -> LIVE.
@@ -451,6 +604,7 @@ class PromotionOrchestrator:
             "production_url": production_url,
             "deployment_id": deployment_id,
             "operation_id": operation_id,
+            "reconciled": reconciled,
         })
 
     # ------------------------------------------------------------------
@@ -463,6 +617,22 @@ class PromotionOrchestrator:
             if intent:
                 intent.update(fields)
                 self.store.save(state)
+
+    @staticmethod
+    def _production_url_for(identity: dict) -> Optional[str]:
+        """Derive the canonical production URL for an identity from PROVIDER
+        state only.
+
+        The promote-adapter response URL is never trusted for identity, so an
+        ambiguous promote reconciled as successful must not invent a URL from
+        the request. ``deployment_id`` is a Vercel deployment id (e.g.
+        ``dpl_abc``) and the canonical alias host is ``<id>.vercel.app``; the
+        smoke check re-reads real provider truth through that URL.
+        """
+        dev = identity.get("deployment_id") if isinstance(identity, dict) else None
+        if isinstance(dev, str) and dev and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", dev):
+            return "https://" + dev + ".vercel.app"
+        return None
 
     def _fail(self, project_id: str, error: str, error_code: str) -> None:
         with self.store.acquire_writer(project_id) as state:
@@ -479,12 +649,98 @@ class PromotionOrchestrator:
             }
             self.store.save(state)
 
+    def _fail_reconciliation_required(
+        self, project_id: str, error_code: str, target_identity, stage: str,
+    ) -> None:
+        """Fail closed on an AMBIGUOUS remote side effect WITHOUT transitioning
+        to terminal FAILED.
+
+        The project's lifecycle is left in PUBLISHING and the durable
+        ``promotion_intent`` (including the persisted previous-production
+        identity) is left intact, so a later SAME-OPERATION resume can
+        reconcile remote truth before acting again -- and never blindly
+        re-send a promote. Only the failure record and the intent stage are
+        updated; no new promotion intent is created and previous_production
+        is never overwritten.
+        """
+        with self.store.acquire_writer(project_id) as state:
+            self._fail_reconciliation_required_locked(
+                state, error_code, target_identity, stage,
+            )
+
+    def _fail_reconciliation_required_locked(
+        self, state, error_code: str, target_identity, stage: str,
+    ) -> None:
+        """Locked-body variant: caller already holds the project writer lock."""
+        intent = state.deployment.get("promotion_intent")
+        if intent:
+            intent["stage"] = stage
+        state.failure = {
+            "phase": "promotion",
+            "error": error_code,
+            "error_code": error_code,
+            "reconciliation_required": True,
+            "target_identity": _safe_identity(target_identity),
+            "failed_at": time.time(),
+        }
+        self.store.save(state)
+
+    def _fail_with_rollback_outcome(
+        self, project_id: str, rollback_status: str, previous_identity,
+        expected_name=None, exception_class: Optional[str] = None,
+    ) -> None:
+        """Persist a production-smoke failure TOGETHER with the exact observed
+        rollback outcome, then fail the lifecycle closed.
+
+        A rollback is a remote side effect too: its outcome must be observed
+        and recorded, never discarded or collapsed into an undifferentiated
+        ``PRODUCTION_SMOKE_FAILED``. ``rollback_status`` is one of
+        ``SUCCEEDED`` / ``FAILED`` / ``RECONCILIATION_REQUIRED`` /
+        ``TARGET_IDENTITY_INCOMPLETE``.
+        """
+        primary_error_code = "PRODUCTION_SMOKE_FAILED"
+        code_map = {
+            # Rollback succeeded: preserve the EXISTING durable convention
+            # (error=PRODUCTION_SMOKE_FAILED, error_code=SMOKE_FAILED) while
+            # adding an explicit rollback outcome the operator can read.
+            "SUCCEEDED": "SMOKE_FAILED",
+            "FAILED": "ROLLBACK_FAILED",
+            "RECONCILIATION_REQUIRED": "ROLLBACK_RECONCILIATION_REQUIRED",
+            "TARGET_IDENTITY_INCOMPLETE": "ROLLBACK_TARGET_IDENTITY_INCOMPLETE",
+        }
+        error_code = code_map.get(rollback_status, "ROLLBACK_FAILED")
+        rollback_target = _safe_identity(previous_identity)
+        with self.store.acquire_writer(project_id) as state:
+            if state.lifecycle != ProjectLifecycle.FAILED.value:
+                try:
+                    self.store.transition_lifecycle_locked(state, ProjectLifecycle.FAILED)
+                except LifecycleError:
+                    pass
+            state.failure = {
+                "phase": "promotion",
+                "error": primary_error_code,
+                "error_code": error_code,
+                "primary_error_code": primary_error_code,
+                "rollback": rollback_status,
+                "rollback_target": rollback_target,
+                "rollback_reconciliation_required": rollback_status in (
+                    "RECONCILIATION_REQUIRED", "TARGET_IDENTITY_INCOMPLETE",
+                ),
+                "failed_at": time.time(),
+            }
+            if exception_class is not None:
+                # Only the exception TYPE NAME is persisted -- never the raw
+                # message, transport body, or any credential-bearing detail.
+                state.failure["rollback_exception_class"] = exception_class
+            self.store.save(state)
+
     def _rollback_and_fail(
         self, project_id, app_id, vercel_project, previous_identity,
         error_code: str, expected_name=None,
     ):
         """Roll the production alias back to the prior last-known-good
-        deployment (if one existed) before failing the lifecycle closed.
+        deployment (if one existed) before failing the lifecycle closed, and
+        PERSIST the observed rollback outcome.
 
         If there was no prior production deployment, there is nothing to
         roll back to -- production is left as whatever Vercel's own state
@@ -500,25 +756,63 @@ class PromotionOrchestrator:
         the smoke-failed deployment live. If the persisted previous identity
         is incomplete, we fail closed -- we never guess which deployment was
         previously production.
+
+        The rollback is attempted EXACTLY ONCE. Its result is never
+        discarded: a falsy/ambiguous ``OperationResult`` (the adapter reports
+        failure that way, not by raising) is classified and persisted as a
+        distinct failure code, and a raised exception is classified and
+        persisted rather than swallowed.
+
+        Returns the classified rollback status string.
         """
-        if previous_identity is not None:
-            if not _previous_identity_complete(previous_identity):
-                # Incomplete identity: fail closed. Surface a distinct error
-                # so an operator knows the rollback could not run safely.
-                self._fail(
-                    project_id, "PRODUCTION_SMOKE_FAILED",
-                    "ROLLBACK_TARGET_IDENTITY_INCOMPLETE",
-                )
-                return
-            try:
-                self.deps.vercel.promote_deployment(
-                    app_id, vercel_project,
-                    previous_identity["deployment_id"],
-                    previous_identity["operation_id"],
-                    previous_identity["source_revision"],
-                    previous_identity["artifact_sha256"],
-                    expected_name=expected_name,
-                )
-            except Exception:
-                pass
-        self._fail(project_id, "PRODUCTION_SMOKE_FAILED", error_code)
+        if previous_identity is None:
+            # No prior production -> nothing to roll back to. Preserve the
+            # normal production-smoke-failure semantics; do not invent a
+            # rollback target.
+            self._fail(project_id, "PRODUCTION_SMOKE_FAILED", error_code)
+            return "NO_PREVIOUS_PRODUCTION"
+        if not _previous_identity_complete(previous_identity):
+            # Incomplete identity: fail closed. Surface a distinct error so
+            # an operator knows the rollback could not run safely.
+            self._fail_with_rollback_outcome(
+                project_id, "TARGET_IDENTITY_INCOMPLETE", previous_identity,
+            )
+            return "TARGET_IDENTITY_INCOMPLETE"
+        try:
+            rollback_result = self.deps.vercel.promote_deployment(
+                app_id, vercel_project,
+                previous_identity["deployment_id"],
+                previous_identity["operation_id"],
+                previous_identity["source_revision"],
+                previous_identity["artifact_sha256"],
+                expected_name=expected_name,
+            )
+        except Exception as exc:
+            # Never swallow: classify the exception and persist a distinct
+            # rollback failure. Raw transport contents/secrets are never
+            # persisted -- only the exception type name.
+            self._fail_with_rollback_outcome(
+                project_id, "FAILED", previous_identity,
+                exception_class=type(exc).__name__,
+            )
+            return "FAILED"
+        if rollback_result is not None and rollback_result.success:
+            rollback_status = "SUCCEEDED"
+        else:
+            # The adapter reports failures as a falsy OperationResult / error
+            # result -- classify before collapsing.
+            rollback_error_code = (
+                getattr(rollback_result, "error_code", None)
+                if rollback_result is not None else None
+            )
+            if rollback_error_code in (
+                "PROMOTE_RECONCILIATION_REQUIRED", "PROMOTE_VERIFICATION_FAILED",
+            ):
+                rollback_status = "RECONCILIATION_REQUIRED"
+            else:
+                rollback_status = "FAILED"
+        self._fail_with_rollback_outcome(
+            project_id, rollback_status, previous_identity,
+            exception_class=None,
+        )
+        return rollback_status
