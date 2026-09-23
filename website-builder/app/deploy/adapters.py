@@ -542,13 +542,32 @@ class VercelAdapter:
         it is NEVER persisted by the adapter or included in any
         OperationResult error message.
 
+        Documented request/response contract (Vercel REST API —
+        ``update-protection-bypass-for-automation``):
+
+          * Request body ``{"generate": {}}`` — ``generate`` is an OBJECT
+            (``{secret?, note?}``), NOT a boolean. An empty object asks
+            Vercel to generate a random secret. The secret is generated
+            SERVER-SIDE: we never fabricate one locally.
+          * 200 response is ``{"protectionBypass": {"<createdBy>": {
+            "scope", "createdAt", "createdBy", "secret", ...}}}`` — a map of
+            per-actor records. The generated secret is
+            ``protectionBypass[<the newly created entry>]["secret"]``.
+            The raw secret is also returned directly as ``secret`` by the
+            live endpoint for this operation, so that documented shape is
+            accepted too.
+
         Conversation/reconciliation semantics (PHASE E):
-          * 200 with a well-formed ``protectionBypass`` object containing a
-            non-empty secret -> ok, secret returned.
-          * definitive forbidden/unsupported (401/403/404/405/501) -> sanitized
-            failure ``BYPASS_PROVISION_FORBIDDEN``; the caller must NOT
-            continue assuming smoke access.
-          * other non-2xx / transport ambiguity -> ``AMBIGUOUS_BYPASS_PROVISION``
+          * 200 with EXACTLY ONE well-formed ``protectionBypass`` record
+            carrying a non-empty secret (or a top-level ``secret`` string)
+            -> ok, secret returned.
+          * deterministic request validation (400/422) -> sanitized
+            ``BYPASS_PROVISION_REJECTED`` (a deterministic 4xx is NEVER
+            reported as ambiguous).
+          * definitive authz failure (401/403) -> ``BYPASS_PROVISION_FORBIDDEN``.
+          * unsupported/not-found endpoint as documented (404/405/501) ->
+            explicit sanitized ``BYPASS_PROVISION_UNSUPPORTED``.
+          * 429 / 5xx / transport uncertainty -> ``AMBIGUOUS_BYPASS_PROVISION``
             (never blind-repeated generation; the caller reconciles).
         """
         try:
@@ -556,21 +575,33 @@ class VercelAdapter:
                 return _fail('PROJECT_IDENTITY_MISMATCH')
             status, body = self._call(
                 'PATCH', '/v1/projects/' + quote(project['id'], safe='') + '/protection-bypass',
-                {'generate': True},
+                # Documented shape: ``generate`` is an OBJECT; an empty one
+                # asks Vercel to create a random server-side secret.
+                {'generate': {}},
             )
         except Exception:
             # Transport ambiguity: generation may or may not have happened.
-            # Never blind-repeat -- the caller reconciles/reuses.
+            # Never blind-repeat -- the caller reconciles/reuses. Provider
+            # exception text is never surfaced (it can embed tokens).
             return _fail('AMBIGUOUS_BYPASS_PROVISION')
-        if status in (401, 403, 404, 405, 501):
+        if status in (400, 422):
+            # Deterministic request-validation rejection: the request itself
+            # is invalid. This is NOT ambiguous -- a retry cannot help.
+            return _fail('BYPASS_PROVISION_REJECTED')
+        if status in (401, 403):
             return _fail('BYPASS_PROVISION_FORBIDDEN')
+        if status in (404, 405, 501):
+            # Documented: the endpoint/project does not exist or the method
+            # is unsupported. Explicit, sanitized, deterministic -- never
+            # ambiguous.
+            return _fail('BYPASS_PROVISION_UNSUPPORTED')
         if status not in (200, 201):
+            # 429 / 5xx / any other non-deterministic status -> ambiguous.
             return _fail('AMBIGUOUS_BYPASS_PROVISION')
-        bypass = body.get('protectionBypass')
-        secret = bypass.get('secret') if isinstance(bypass, dict) else None
-        if not isinstance(secret, str) or not secret:
+        secret = self._parse_bypass_secret(body)
+        if not secret:
             # Malformed/ambiguous response: can't prove we have a usable
-            # secret -> fail closed, never guess.
+            # secret -> fail closed, never guess (no loose recursive scan).
             return _fail('AMBIGUOUS_BYPASS_PROVISION')
         # NOTE: the secret is deliberately NOT placed in a logged code, and
         # error strings here never embed it.
@@ -578,6 +609,41 @@ class VercelAdapter:
             'project_id': project['id'],
             'secret': secret,
         })
+
+    @staticmethod
+    def _parse_bypass_secret(body):
+        """Extract the generated secret from the DOCUMENTED 200 shape only.
+
+        Accepts exactly two documented shapes:
+
+          1. ``{"protectionBypass": {"<key>": {"secret": "<str>", ...}}}`` —
+             the generated record. Requires EXACTLY ONE entry, and that entry
+             must carry a non-empty ``secret`` string. A multi-entry map (a
+             pre-existing bypass we did NOT rotate) is deliberately NOT
+             mined for any secret -- that would be loose extraction.
+          2. ``{"secret": "<str>"}`` — the live endpoint returns the newly
+             generated secret directly as a top-level string field.
+
+        Returns the secret string, or None when the response does not match a
+        documented shape (caller fails closed). No recursive search.
+        """
+        if not isinstance(body, dict):
+            return None
+        bypass = body.get('protectionBypass')
+        if isinstance(bypass, dict) and len(bypass) == 1:
+            record = next(iter(bypass.values()))
+            if isinstance(record, dict):
+                secret = record.get('secret')
+                if isinstance(secret, str) and secret:
+                    return secret
+            return None
+        if bypass is None or (isinstance(bypass, dict) and not bypass):
+            # No protectionBypass map -> accept the documented top-level
+            # ``secret`` string shape (the live response for generation).
+            secret = body.get('secret')
+            if isinstance(secret, str) and secret:
+                return secret
+        return None
 
     def ensure_bootstrap(self, app_id, project, max_polls=20, interval=0.25,
                          *, expected_name=None):
