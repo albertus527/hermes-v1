@@ -204,6 +204,14 @@ class FakeVercel:
         self.lookup_calls = 0
         self.bypass_generation_calls = 0
         self.bypass_behavior = None  # None | "forbidden" | "ambiguous"
+        # PHASE E recovery: the REMOTE protection-bypass state as Vercel would
+        # report it on GET. ``None`` -> no bypass exists yet; a string -> the
+        # LIVE map-key shape (exactly ONE entry whose KEY is the secret); the
+        # sentinel strings below model an ambiguous/unreadable read and a
+        # malformed remote shape. A successful generation records its secret
+        # here so a retry can be RECONCILED instead of rotated.
+        self.remote_bypass = None
+        self.bypass_read_calls = 0
         # PHASE A/G: scriptable bootstrap confirmation states.
         self.bootstrap_states: List[str] = []
         # PHASE A/G: when True, the FIRST bootstrap attempt observes the real
@@ -217,6 +225,11 @@ class FakeVercel:
         self.project_name = None
         self.last_deployment: Dict[str, Any] = {}
         self.lookup_deployment = "ok"
+
+    @property
+    def project_id(self) -> str:
+        """The immutable Vercel project id the boundary currently reports."""
+        return self._project["id"]
 
     # -- production boundary ----------------------------------------------
     def ensure_project(self, app_id):
@@ -308,7 +321,8 @@ class FakeVercel:
 
         Counts generation attempts so tests can assert exactly-once / no-
         rotation semantics. ``bypass_behavior`` may be set to a code string to
-        simulate a sanitized failure.
+        simulate a sanitized failure. A successful generation records the
+        remote state (map KEY = secret) so a later run RECONCILES it.
         """
         self.bypass_generation_calls += 1
         if self.bypass_behavior == "forbidden":
@@ -324,7 +338,37 @@ class FakeVercel:
         project_id = (project or {}).get("id", "prj_1")
         # Deterministic per-project secret from the project id.
         secret = "bypass-" + hashlib.sha256(project_id.encode()).hexdigest()[:16]
+        # Vercel stores the created bypass remotely: the GET map KEY IS the
+        # secret (LIVE evidence). Record it so a retry reconciles (no rotation).
+        if self.remote_bypass is None:
+            self.remote_bypass = secret
         return OperationResult.ok({"project_id": project_id, "secret": secret})
+
+    def reconcile_protection_bypass(self, app_id, project, *, expected_name=None):
+        """Read-only recovery boundary: inspect the LIVE remote bypass.
+
+        Models the RECOVERABLE-SCAN contract (``exists``/``secret``) so the
+        provisioner can distinguish a PROVEN absence from an unreadable read:
+          * ``remote_bypass is None``  -> ok({'exists': False}) (no bypass),
+          * a secret string            -> ok({'exists': True, 'secret': ...}),
+          * 'AMBIGUOUS'                -> sanitized ambiguous failure,
+          * 'MALFORMED'                -> fail closed (never mine).
+        Never issues a PATCH.
+        """
+        self.bypass_read_calls += 1
+        if self.remote_bypass == "AMBIGUOUS":
+            return OperationResult.fail(
+                "AMBIGUOUS_BYPASS_PROVISION",
+                error_code="AMBIGUOUS_BYPASS_PROVISION",
+            )
+        if self.remote_bypass == "MALFORMED":
+            return OperationResult.fail(
+                "BYPASS_RECONCILIATION_REQUIRED",
+                error_code="BYPASS_RECONCILIATION_REQUIRED",
+            )
+        if self.remote_bypass is None:
+            return OperationResult.ok({"exists": False})
+        return OperationResult.ok({"exists": True, "secret": self.remote_bypass})
 
     def deploy_static_files(self, app_id, project, files, operation_id,
                             source_revision, artifact_sha256, expected_name=None):
@@ -590,7 +634,9 @@ class LocalR1Scenario:
                         app_id, project, expected_name=expected_name
                     )
                 ),
-            ),
+                bypass_is_stored=lambda project_id, state: bool(
+                    self.bypass_store.get(self.vercel.project_id)
+                ),            ),
             runner=self.runner,
         )
         self.builder = FrontendBuilder(
@@ -669,6 +715,17 @@ class LocalR1Scenario:
     def restart(self) -> None:
         """Simulate a process restart over the SAME temp state root."""
         self._loop = self._make_loop()
+
+    def _wipe_bypass_store(self) -> None:
+        """Test-only: empty the LOCAL secure bypass store (simulating a run
+        where the remote bypass exists but the local secret was never
+        persisted, e.g. a prior response-parse failure). The REMOTE bypass
+        state on the fake Vercel boundary is left intact."""
+        root = self.hermes_home / "vercel-bypass"
+        if root.exists():
+            for child in root.iterdir():
+                if child.is_file():
+                    child.unlink()
 
     # -- scripting passthroughs -------------------------------------------
     def set_router_decision(self, *args, **kwargs):

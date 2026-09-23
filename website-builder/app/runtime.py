@@ -731,6 +731,14 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
             app_id, vercel_project, expected_name=expected_name
         )
 
+    def _bypass_is_stored(project_id, state):
+        # Read-only: only the OPAQUE (hash-derived) Vercel project id is
+        # derivable here without a remote read. Once a friendly slug is bound,
+        # the id is only known from the remote project, so recover on the next
+        # preview run (one extra read, no rotation). The secret is never read
+        # from or written to ProjectState.
+        return bool(bypass_store.get(vercel.project_name_for(project_id)))
+
     preview_deps = PreviewDeps(
         vercel=vercel,
         telegram=telegram_out,
@@ -745,6 +753,7 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
         slug_for=_slug_for,
         bind_slug=_bind_slug,
         ensure_bypass=_ensure_bypass,
+        bypass_is_stored=_bypass_is_stored,
     )
     preview = PreviewOrchestrator(store, preview_deps, runner=runner)
 

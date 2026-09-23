@@ -88,6 +88,11 @@ _BOOTSTRAP_HTML = b'<!doctype html><title>.</title>'
 # normal transient state and simply keeps polling within the bounded loop.
 _BOOTSTRAP_TERMINAL_STATES = frozenset({'ERROR', 'CANCELED'})
 
+# Vercel automation-bypass secrets are 32 alphanumeric characters
+# (``^[a-zA-Z0-9]{32}$``). Used to conservatively validate the LIVE map-key
+# shape (the map key IS the secret) before accepting it.
+_BYPASS_SECRET_RE = re.compile(r'[A-Za-z0-9]{32}')
+
 
 def _json_call(transport, method, url, headers, payload=None):
     data = None if payload is None else json.dumps(payload).encode()
@@ -549,18 +554,18 @@ class VercelAdapter:
             (``{secret?, note?}``), NOT a boolean. An empty object asks
             Vercel to generate a random secret. The secret is generated
             SERVER-SIDE: we never fabricate one locally.
-          * 200 response is ``{"protectionBypass": {"<createdBy>": {
-            "scope", "createdAt", "createdBy", "secret", ...}}}`` — a map of
-            per-actor records. The generated secret is
-            ``protectionBypass[<the newly created entry>]["secret"]``.
-            The raw secret is also returned directly as ``secret`` by the
-            live endpoint for this operation, so that documented shape is
-            accepted too.
+          * 200 response — LIVE-EVIDENCE shapes (see ``_parse_bypass_secret``):
+            the ``protectionBypass`` value is a MAP keyed by the secret
+            itself, e.g. ``{"<secret>": {"createdAt", "createdBy",
+            "isEnvVar", "scope"}}`` — the map KEY is the secret. The
+            documented per-actor shape ``{"<createdBy>": {...,"secret":
+            "<str>"}}`` and the top-level ``{"secret": "<str>"}`` string are
+            also accepted.
 
         Conversation/reconciliation semantics (PHASE E):
-          * 200 with EXACTLY ONE well-formed ``protectionBypass`` record
-            carrying a non-empty secret (or a top-level ``secret`` string)
-            -> ok, secret returned.
+          * 200 with EXACTLY ONE well-formed ``protectionBypass`` entry
+            (map-key secret, or a record carrying a non-empty ``secret``) or a
+            top-level ``secret`` string -> ok, secret returned.
           * deterministic request validation (400/422) -> sanitized
             ``BYPASS_PROVISION_REJECTED`` (a deterministic 4xx is NEVER
             reported as ambiguous).
@@ -610,40 +615,158 @@ class VercelAdapter:
             'secret': secret,
         })
 
+    # ------------------------------------------------------------------
+    # PROJECT_IDENTITY_MISMATCH / read-only recovery
+    # ------------------------------------------------------------------
+
+    def read_protection_bypass(self, app_id, project, *, expected_name=None):
+        """Read-ONLY recovery: fetch the owned project and classify its
+        existing automation-bypass entry WITHOUT issuing any PATCH.
+
+        ``GET /v9/projects/{idOrName}`` returns the LIVE ``protectionBypass``
+        map whose KEY is the secret (see ``_bypass_entries``). This exists so
+        a run whose local secure store is empty (e.g. the response parse
+        failed AFTER Vercel already created the bypass) can RECONCILE the
+        existing remote secret instead of blindly rotating it.
+
+        Outcomes:
+          * exactly ONE valid bypass entry -> ok({'secret': <key>}).
+          * explicit null/empty ``protectionBypass`` -> ok({}) (no secret
+            exists yet; the caller may generate one exactly once).
+          * more than one entry, or a malformed body/shape -> fail closed
+            ``BYPASS_RECONCILIATION_REQUIRED`` (never guess, never rotate).
+          * unreadable provider response -> ``AMBIGUOUS_BYPASS_PROVISION``.
+          * identity mismatch -> ``PROJECT_IDENTITY_MISMATCH``.
+
+        The secret is returned in ``data`` only; it is never logged or
+        embedded in an error string.
+        """
+        try:
+            if not self._project_valid(project, app_id, expected_name=expected_name):
+                return _fail('PROJECT_IDENTITY_MISMATCH')
+            name = expected_name or self.project_name_for(app_id)
+            status, body = self._call('GET', '/v9/projects/' + quote(name, safe=''))
+            if status == 404:
+                return _fail('PROJECT_RECONCILIATION_REQUIRED')
+            if status != 200:
+                return _fail('AMBIGUOUS_BYPASS_PROVISION')
+            if not self._project_valid(body, app_id, expected_name=expected_name):
+                # A READ response without the ownership marker is a malformed
+                # identity response, NOT proof that we do not own the project.
+                return _fail('PROJECT_RECONCILIATION_REQUIRED')
+        except Exception:
+            return _fail('AMBIGUOUS_BYPASS_PROVISION')
+        kind, secret = self._bypass_entries(body)
+        if kind == 'secret':
+            return OperationResult.ok({'project_id': project['id'], 'secret': secret})
+        if kind == 'none':
+            return OperationResult.ok({})
+        # 'multiple' or 'malformed' -> fail closed; never guess the entry that
+        # belongs to this app, never rotate to "fix" an unknown remote state.
+        return _fail('BYPASS_RECONCILIATION_REQUIRED')
+
     @staticmethod
-    def _parse_bypass_secret(body):
-        """Extract the generated secret from the DOCUMENTED 200 shape only.
+    def _valid_bypass_secret(value):
+        """Conservative validation of a candidate bypass secret.
 
-        Accepts exactly two documented shapes:
+        Vercel documents the automation bypass secret as exactly 32
+        alphanumeric characters (``^[a-zA-Z0-9]{32}$``). Anything else is NOT
+        accepted as a secret we would report/persist. The value is never
+        logged or embedded in an error.
+        """
+        return isinstance(value, str) and _BYPASS_SECRET_RE.fullmatch(value) is not None
 
-          1. ``{"protectionBypass": {"<key>": {"secret": "<str>", ...}}}`` —
-             the generated record. Requires EXACTLY ONE entry, and that entry
-             must carry a non-empty ``secret`` string. A multi-entry map (a
-             pre-existing bypass we did NOT rotate) is deliberately NOT
-             mined for any secret -- that would be loose extraction.
-          2. ``{"secret": "<str>"}`` — the live endpoint returns the newly
-             generated secret directly as a top-level string field.
+    @classmethod
+    def _bypass_entries(cls, body):
+        """Classify a protection-bypass response body WITHOUT extracting.
 
-        Returns the secret string, or None when the response does not match a
-        documented shape (caller fails closed). No recursive search.
+        Returns ``(kind, value)`` where ``kind`` is one of:
+          * ``'secret'``   — ``value`` is ONE valid secret (list below);
+          * ``'none'``     — a PROVEN absence: an explicit null/empty
+                             ``protectionBypass`` map, or the key absent from a
+                             read response with no top-level secret;
+          * ``'multiple'`` — more than one ``protectionBypass`` entry: a
+                             pre-existing bypass we did NOT rotate -- the
+                             caller must fail closed and never guess which
+                             entry belongs to this app;
+          * ``'malformed'``— anything else (wrong types, invalid key, value
+                             that is not a well-formed metadata object).
+
+        Accepted ONE-secret shapes (all require EXACTLY ONE entry):
+          1. LIVE map-key shape (authoritative evidence):
+             ``{"protectionBypass": {"<secret>": {"createdAt": ...,
+             "createdBy": ..., "isEnvVar": ..., "scope": ...}}}`` — the map
+             KEY is the secret (validated against ``^[a-zA-Z0-9]{32}$``) and
+             the value is a well-formed metadata object.
+          2. Documented per-actor shape:
+             ``{"protectionBypass": {"<createdBy>": {..., "secret": "<str>"}}}``
+             — the record carries a non-empty secret string.
+          3. ``{"secret": "<str>"}`` — the generated secret returned directly
+             as a top-level string field.
+
+        There is NO recursive scan of arbitrary fields.
         """
         if not isinstance(body, dict):
-            return None
-        bypass = body.get('protectionBypass')
-        if isinstance(bypass, dict) and len(bypass) == 1:
-            record = next(iter(bypass.values()))
-            if isinstance(record, dict):
-                secret = record.get('secret')
-                if isinstance(secret, str) and secret:
-                    return secret
-            return None
+            return 'malformed', None
+        if cls._valid_bypass_secret(body.get('secret')):
+            # Documented generation shape: the top-level ``secret`` string.
+            return 'secret', body['secret']
+        if 'protectionBypass' not in body:
+            # No map at all and no top-level secret. A provider READ body
+            # simply omits an empty map -> a PROVEN absence; a response that
+            # is not a project body at all is caught upstream by the
+            # ownership check.
+            return 'none', None
+        bypass = body['protectionBypass']
         if bypass is None or (isinstance(bypass, dict) and not bypass):
-            # No protectionBypass map -> accept the documented top-level
-            # ``secret`` string shape (the live response for generation).
-            secret = body.get('secret')
-            if isinstance(secret, str) and secret:
-                return secret
-        return None
+            # Explicit null/empty map: PROVEN absence of a remote bypass.
+            return 'none', None
+        if not isinstance(bypass, dict):
+            return 'malformed', None
+        if len(bypass) != 1:
+            # More than one entry -> never mine a pre-existing bypass.
+            return 'multiple', None
+        key, value = next(iter(bypass.items()))
+        if isinstance(value, dict):
+            # Shape 1: the key IS the secret and the value is metadata.
+            if cls._valid_bypass_secret(key) and cls._bypass_metadata_well_formed(value):
+                return 'secret', key
+            # Shape 2: the record carries the secret itself.
+            record_secret = value.get('secret')
+            if isinstance(record_secret, str) and record_secret:
+                return 'secret', record_secret
+        return 'malformed', None
+
+    @staticmethod
+    def _bypass_metadata_well_formed(record):
+        """A bypass metadata object must look like a real per-entry record.
+
+        LIVE evidence keys: ``createdAt``, ``createdBy``, ``isEnvVar``,
+        ``scope``. Require at least one recognised field with the right type;
+        anything else (an empty/opaque value) is malformed, never mined.
+        """
+        checks = (
+            ('createdAt', (int, float)),
+            ('createdBy', str),
+            ('isEnvVar', bool),
+            ('scope', str),
+        )
+        for field, types in checks:
+            if field in record:
+                value = record[field]
+                if isinstance(value, bool) and types is not bool:
+                    continue
+                if types is bool and isinstance(value, bool):
+                    return True
+                if types is not bool and isinstance(value, types):
+                    return True
+        return False
+
+    @classmethod
+    def _parse_bypass_secret(cls, body):
+        """Extract the ONE generated secret, or None (caller fails closed)."""
+        kind, secret = cls._bypass_entries(body)
+        return secret if kind == 'secret' else None
 
     def ensure_bootstrap(self, app_id, project, max_polls=20, interval=0.25,
                          *, expected_name=None):

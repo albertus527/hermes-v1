@@ -46,6 +46,30 @@ from app.deploy.bypass import BypassProvisioner  # noqa: E402
 SECRET = "abcdef0123456789abcdef0123456789"  # matches documented pattern
 
 
+class FakeVercelBypass:
+    """Provisioner-level double with NO read-only reconciliation surface.
+
+    Used by the tests that pin the BypassProvisioner's storage semantics and
+    the adapter's ensure_protection_bypass parse/status classification. The
+    read-first reconciliation path is exercised against the REAL adapter (and
+    the harness FakeVercel, which does expose read_protection_bypass).
+    """
+
+    def __init__(self, *responses):
+        self.adapter, self.transport = adapter(*responses)
+
+    def project_name_for(self, app_id):
+        return self.adapter.project_name_for(app_id)
+
+    def _marker(self, app_id):
+        return self.adapter._marker(app_id)
+
+    def ensure_protection_bypass(self, app_id, project, *, expected_name=None):
+        return self.adapter.ensure_protection_bypass(
+            app_id, project, expected_name=expected_name
+        )
+
+
 class Transport:
     """Scripted HTTP boundary. Records every request; never touches network."""
 
@@ -88,6 +112,50 @@ def documented_record(secret=SECRET):
     }}}
 
 
+LIVE_SECRET = "abcdefghijklmnopqrstuvwxyz123456"  # ^[A-Za-z0-9]{32}$
+
+
+def live_map_record(secret=LIVE_SECRET):
+    """The LIVE-EVIDENCE 200/GET shape: the protectionBypass MAP KEY IS the
+    secret and the value is metadata with NO inner ``secret`` field."""
+    return {"protectionBypass": {secret: {
+        "createdAt": 1,
+        "createdBy": "user",
+        "isEnvVar": False,
+        "scope": "project",
+    }}}
+
+
+def owned_project_body(a, *, pid="prj_1", name=None, bypass=None):
+    """A well-formed owned project READ body (marker present), plus the
+    optional ``protectionBypass`` map -- exactly what GET /v9/projects
+    returns. No secret is ever added unless the caller asks for one."""
+    body = {
+        "id": pid,
+        "name": name or a.project_name_for("app"),
+        "accountId": "team_1",
+        "env": [
+            {"key": "WEBSITE_BUILDER_OWNER", "value": a._marker("app"), "type": "plain"}
+        ],
+    }
+    if bypass is not None:
+        body["protectionBypass"] = bypass
+    return body
+
+
+def owned_project_body_without_bypass_key(a):
+    """A well-formed owned project READ body where ``protectionBypass`` is
+    GENUINELY ABSENT (legacy project)."""
+    return {
+        "id": "prj_1",
+        "name": a.project_name_for("app"),
+        "accountId": "team_1",
+        "env": [
+            {"key": "WEBSITE_BUILDER_OWNER", "value": a._marker("app"), "type": "plain"}
+        ],
+    }
+
+
 # ---------------------------------------------------------------------------
 # A. exact request body
 # ---------------------------------------------------------------------------
@@ -110,7 +178,7 @@ def test_A_patch_body_is_documented_empty_generate_object():
 # ---------------------------------------------------------------------------
 
 def test_B_documented_success_parsed_and_persisted(tmp_path):
-    a, _ = adapter((200, documented_record()))
+    a = FakeVercelBypass((200, documented_record()))
     store = BypassSecretStore(tmp_path / "hermes-home" / "vercel-bypass")
     prov = BypassProvisioner(a, store)
 
@@ -160,7 +228,7 @@ def test_C_deterministic_validation_is_rejected_not_ambiguous(status):
 
 
 def test_C_rejected_does_not_persist_secret(tmp_path):
-    a, _ = adapter((400, {"error": {}}))
+    a = FakeVercelBypass((400, {"error": {}}))
     store = BypassSecretStore(tmp_path / "hh" / "vercel-bypass")
     prov = BypassProvisioner(a, store)
     result = prov.ensure("app", project(a))
@@ -222,7 +290,7 @@ def test_E_transport_exception_is_ambiguous():
                           "user_1": {"secret": SECRET}}},
 ])
 def test_F_malformed_200_fails_closed_no_persist(tmp_path, body):
-    a, _ = adapter((200, body))
+    a = FakeVercelBypass((200, body))
     store = BypassSecretStore(tmp_path / "hh" / "vercel-bypass")
     prov = BypassProvisioner(a, store)
     result = prov.ensure("app", project(a))
@@ -238,7 +306,7 @@ def test_F_malformed_200_fails_closed_no_persist(tmp_path, body):
 def test_G_retry_with_stored_secret_sends_no_patch(tmp_path):
     # Transport has NO scripted response: if a PATCH were sent, pop() would
     # raise -> the call would be ambiguous. Success proves no PATCH happened.
-    a, t = adapter()
+    a = FakeVercelBypass()
     store = BypassSecretStore(tmp_path / "hh" / "vercel-bypass")
     store.set("prj_1", SECRET)
     prov = BypassProvisioner(a, store)
@@ -247,9 +315,7 @@ def test_G_retry_with_stored_secret_sends_no_patch(tmp_path):
     assert result.success
     assert result.data["source"] == "stored"
     assert result.data["secret"] == SECRET
-    assert t.calls == []  # no provider call whatsoever
-
-
+    assert a.transport.calls == []  # no provider call whatsoever
 # ---------------------------------------------------------------------------
 # unsupported / not-found endpoint as documented -> explicit sanitized failure
 # ---------------------------------------------------------------------------
@@ -274,3 +340,154 @@ def test_identity_mismatch_still_fails_closed():
     assert not result.success
     assert result.error_code == "PROJECT_IDENTITY_MISMATCH"
     assert t.calls == []  # never even sent the PATCH
+
+
+# ---------------------------------------------------------------------------
+# H. LIVE-EVIDENCE shape: the protectionBypass MAP KEY is the secret
+# ---------------------------------------------------------------------------
+
+def test_H_live_map_key_shape_is_parsed_and_is_authoritative():
+    """REAL LIVE EVIDENCE: GET/PATCH protectionBypass = {<secret>: {metadata}}
+    with NO inner ``secret`` field. The MAP KEY is the secret."""
+    a, _ = adapter((200, live_map_record()))
+    result = a.ensure_protection_bypass("app", project(a))
+    assert result.success
+    assert result.data["secret"] == LIVE_SECRET
+
+
+def test_H_live_map_key_shape_persisted_by_provisioner(tmp_path):
+    """The reconciled/generated secret is persisted once by the provisioner."""
+    a = FakeVercelBypass((200, live_map_record()))
+    store = BypassSecretStore(tmp_path / "hh" / "vercel-bypass")
+    prov = BypassProvisioner(a, store)
+    result = prov.ensure("app", project(a))
+    assert result.success, result.error
+    assert result.data["source"] == "generated"
+    assert store.get("prj_1") == LIVE_SECRET
+
+
+@pytest.mark.parametrize("key,value", [
+    # A key that is not a 32-alphanumeric secret -> never mined.
+    ("user_owner", {"createdAt": 1, "createdBy": "user", "isEnvVar": False,
+                    "scope": "project"}),
+    # Value is not a metadata object.
+    (LIVE_SECRET, "just-a-string"),
+    (LIVE_SECRET, []),
+    # An opaque/empty metadata object is malformed, never mined.
+    (LIVE_SECRET, {}),
+])
+def test_H_malformed_single_entry_fails_closed(tmp_path, key, value):
+    a = FakeVercelBypass((200, {"protectionBypass": {key: value}}))
+    store = BypassSecretStore(tmp_path / "hh" / "vercel-bypass")
+    prov = BypassProvisioner(a, store)
+    result = prov.ensure("app", project(a))
+    assert not result.success
+    assert result.error_code == "AMBIGUOUS_BYPASS_PROVISION"
+    assert store.get("prj_1") is None
+
+
+def test_H_multi_entry_live_map_never_mined(tmp_path):
+    a = FakeVercelBypass((200, {"protectionBypass": {
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": {
+            "createdAt": 1, "createdBy": "a", "isEnvVar": False, "scope": "project"},
+        LIVE_SECRET: {
+            "createdAt": 2, "createdBy": "b", "isEnvVar": False, "scope": "project"},
+    }}))
+    store = BypassSecretStore(tmp_path / "hh" / "vercel-bypass")
+    prov = BypassProvisioner(a, store)
+    result = prov.ensure("app", project(a))
+    assert not result.success
+    assert result.error_code == "AMBIGUOUS_BYPASS_PROVISION"
+    assert store.get("prj_1") is None
+
+
+# ---------------------------------------------------------------------------
+# I. read_protection_bypass — read-only recovery, no PATCH
+# ---------------------------------------------------------------------------
+
+def test_I_read_only_recovery_returns_map_key_secret_without_patch():
+    a0, _ = adapter()
+    a, t = adapter((200, owned_project_body(a0, bypass=live_map_record()["protectionBypass"])))
+    result = a.read_protection_bypass("app", project(a))
+    assert result.success
+    assert result.data["secret"] == LIVE_SECRET
+    # Read-only: exactly one GET, never a PATCH.
+    assert [c[0] for c in t.calls] == ["GET"]
+
+
+@pytest.mark.parametrize("bypass", ["__ABSENT__", {}])
+def test_I_read_only_reports_absence(bypass):
+    """A proven-absent key is reported as a real absence (data=={}); the
+    provisioner layer (not the adapter) owns the generate/fail-closed
+    decision, since only a recoverable-scan surface is authoritative."""
+    a0, _ = adapter()
+    if bypass == "__ABSENT__":
+        # The key is genuinely absent from the READ body (legacy projects).
+        body = owned_project_body_without_bypass_key(a0)
+    else:
+        body = owned_project_body(a0, bypass={})
+    a, t = adapter((200, body))
+    result = a.read_protection_bypass("app", project(a))
+    assert result.success
+    assert result.data == {}
+    assert [c[0] for c in t.calls] == ["GET"]
+
+
+def test_I_provisioner_never_generates_from_a_non_authoritative_read(tmp_path):
+    """A bare ``read_protection_bypass`` absence must NOT trigger generation:
+    only an authoritative recoverable scan may prove "no remote bypass"."""
+    a0, _ = adapter()
+    body = owned_project_body(a0, bypass={})
+    a, t = adapter((200, body))
+    store = BypassSecretStore(tmp_path / "hh" / "vercel-bypass")
+    prov = BypassProvisioner(a, store)
+    result = prov.ensure("app", project(a))
+    assert not result.success
+    assert result.error_code == "BYPASS_RECONCILIATION_REQUIRED"
+    # Exactly one read-only GET; never a generation PATCH.
+    assert [c[0] for c in t.calls] == ["GET"]
+    assert store.get("prj_1") is None
+
+
+@pytest.mark.parametrize("bypass", [
+    {LIVE_SECRET: {"createdAt": 1, "createdBy": "u", "isEnvVar": False, "scope": "p"},
+     "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb": {"createdAt": 2, "createdBy": "v",
+                                          "isEnvVar": False, "scope": "p"}},
+    {LIVE_SECRET: {}},                       # malformed metadata
+    {LIVE_SECRET: "opaque"},                 # malformed value
+    "not-an-object",                         # malformed map
+])
+def test_I_read_only_multiple_or_malformed_fails_closed(bypass):
+    a0, _ = adapter()
+    a, t = adapter((200, owned_project_body(a0, bypass=bypass)))
+    result = a.read_protection_bypass("app", project(a))
+    assert not result.success
+    assert result.error_code == "BYPASS_RECONCILIATION_REQUIRED"
+    assert [c[0] for c in t.calls] == ["GET"]  # never guessed by PATCHing
+
+
+def test_I_read_only_identity_guard_never_calls_provider():
+    a0, _ = adapter()
+    a, t = adapter((200, owned_project_body(a0, bypass=live_map_record()["protectionBypass"])))
+    bad = {"id": "prj_1", "name": "someone-elses", "accountId": "team_1", "env": []}
+    result = a.read_protection_bypass("app", bad)
+    assert not result.success
+    assert result.error_code == "PROJECT_IDENTITY_MISMATCH"
+    assert t.calls == []
+
+
+def test_I_read_only_unreadable_response_is_ambiguous():
+    a0, _ = adapter()
+    a, _ = adapter((503, {"error": {"message": "unavailable"}}))
+    result = a.read_protection_bypass("app", project(a0))
+    assert not result.success
+    assert result.error_code == "AMBIGUOUS_BYPASS_PROVISION"
+
+
+def test_I_read_only_secret_absent_from_error_and_repr():
+    a0, _ = adapter()
+    a, _ = adapter((503, {"error": {"message": "unavailable"}}))
+    result = a.read_protection_bypass("app", project(a0))
+    assert LIVE_SECRET not in str(result)
+    assert LIVE_SECRET not in repr(result)
+

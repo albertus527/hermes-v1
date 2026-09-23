@@ -130,6 +130,12 @@ class PreviewDeps:
     # data['secret']. None disables bypass provisioning entirely (existing
     # call sites keep their exact behavior: smoke runs without bypass).
     ensure_bypass: Any = None
+    # Optional callable(project_id, state) -> bool. Read-only: True when the
+    # LOCAL secure store already holds a bypass secret for this project's
+    # Vercel project id, so the already-delivered recovery path can skip the
+    # extra reconciliation read entirely. None (or no stored secret) means the
+    # recovery path checks the remote state once to restore a lost secret.
+    bypass_is_stored: Any = None
 
 
 class PreviewOrchestrator:
@@ -212,7 +218,41 @@ class PreviewOrchestrator:
         operation_id = hashlib.sha256((project_id + ':' + str(state.revisions.source_revision)
                                       + ':' + snapshot.identity).encode()).hexdigest()
         shown = state.deployment.get('latest_shown_preview', {})
+        # The owned Vercel project, once resolved below; None on the
+        # already-delivered recovery path until it is resolved read-only.
+        resolved_project = None
+        expected_name = None
         if shown.get('operation_id') == operation_id:
+            # Local bypass durability check (READ-ONLY when the store already
+            # holds a secret): if the exact preview was already delivered but
+            # the LOCAL secure store lost/never persisted the project bypass
+            # (e.g. a prior response parse failed after Vercel created it),
+            # recover it from the remote project state before short-circuiting.
+            # This is a PROJECT-level identity operation: it runs once per
+            # project lifecycle, NOT a per-preview rotation.
+            if (self.deps.ensure_bypass is not None
+                    and not self.deps.bypass_is_stored(project_id, state)):
+                with self.store.acquire_writer(project_id) as locked:
+                    app_id_l = self.deps.app_id_for(project_id)
+                    project_l = resolved_project
+                    if project_l is None:
+                        # Resolve the owned project READ-ONLY (no create).
+                        try:
+                            slug_l = (self.deps.slug_for(project_id, locked)
+                                      if self.deps.slug_for is not None else None)
+                        except Exception:
+                            slug_l = None
+                        expected_l = slug_l if slug_l else None
+                        lookup = self.deps.vercel.lookup_project(
+                            app_id_l, expected_name=expected_l
+                        )
+                        if not lookup.success:
+                            return lookup
+                        project_l = lookup.data["project"]
+                    bypass_result = self.deps.ensure_bypass(
+                        app_id_l, project_l, expected_name=expected_l)
+                    if not bypass_result.success:
+                        return bypass_result
             # Short-circuit: this exact preview was durably delivered. The
             # follow-up is re-evaluated here so a crash between "preview
             # marked shown" and "follow-up attempted" is recoverable — but
@@ -307,6 +347,10 @@ class PreviewOrchestrator:
             if not project_result.success:
                 return project_result
             vercel_project = project_result.data["project"]
+        # The owned project is now known for this run; the bypass recovery
+        # barrier above can only use ``resolved_project`` once we reach the
+        # full preview path (never a remote read on the pure short-circuit).
+        resolved_project = vercel_project
 
         # ---- 2b. Consume Vercel's unavoidable first-deployment
         # auto-promotion with content-free bytes BEFORE any real user

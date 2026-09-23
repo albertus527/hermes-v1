@@ -221,3 +221,40 @@ class TestPhaseGFullStory:
         assert h.bypass_store.get("prj_1") == secret_first
         assert h.vercel.bypass_generation_calls == 1
         assert h.vercel.deploy_calls == 1
+
+    def test_p7_recovery_existing_remote_bypass_reconciled_no_regeneration(
+            self, tmp_path):
+        """p7-style recovery: the REMOTE project already has a bypass entry and
+        a preview, but the LOCAL secret store is empty (a prior response parse
+        failed after creation). Recovery must RECONCILE the remote bypass -- no
+        new bypass generation -- then smoke the SAME preview (no duplicate
+        deploy) and deliver Telegram."""
+        h = LocalR1Scenario(tmp_path)
+        pid = _open_project(h, bootstrap_transient=False)
+        assert h.preview.run_owned(pid, h.runner.create_workspace(pid)).success
+
+        # The remote bypass exists (Vercel created it) and its map KEY is the
+        # authoritative secret, but the local secure store was never populated.
+        remote_secret = h.vercel.remote_bypass
+        assert remote_secret
+        h._wipe_bypass_store()
+        assert h.bypass_store.get("prj_1") is None
+
+        gen_before = h.vercel.bypass_generation_calls
+        deploy_before = h.vercel.deploy_calls
+        photos_before = len(h.telegram.photo_calls)
+        shown_before = h.latest_shown_preview(pid)
+
+        # Retry the SAME preview (recovery) -> reconcile, smoke, deliver.
+        result = h.preview.run_owned(pid, h.runner.create_workspace(pid))
+        assert result.success, result.error
+
+        # Reconciled the EXISTING remote bypass: no new generation, no
+        # duplicate preview deployment, same delivered preview, Telegram
+        # eligible (delivery short-circuits on the durably-shown preview).
+        assert h.vercel.bypass_generation_calls == gen_before
+        assert h.vercel.deploy_calls == deploy_before
+        assert h.bypass_store.get("prj_1") == remote_secret
+        assert h.latest_shown_preview(pid) == shown_before
+        assert len(h.telegram.photo_calls) >= photos_before
+        assert h.smoke.bypass_secrets[-1] == remote_secret
