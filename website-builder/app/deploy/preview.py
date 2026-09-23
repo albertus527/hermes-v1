@@ -273,12 +273,26 @@ class PreviewOrchestrator:
             if not project_result.success:
                 return project_result
             vercel_project = project_result.data["project"]
+            # BUG 4: once we have STARTED using a friendly Vercel project
+            # identity, that binding MUST be durable before we proceed as if
+            # the preview identity is safe. Previously a persistence failure
+            # here was logged and execution continued -- the preview would be
+            # deployed/delivered under a friendly project while local state
+            # still had no bound slug (and a later run would either re-create
+            # or silently fall back to the opaque name). Fail closed instead:
+            # the remote project already exists, so we must NEVER fall back to
+            # the opaque name; the next run reconciles the SAME remote project
+            # via the idempotent set_vercel_slug_once binding.
             if self.deps.bind_slug is not None:
                 try:
                     self.deps.bind_slug(project_id, state, slug)
                 except Exception:
                     logging.getLogger(__name__).exception(
                         "Failed to persist vercel_slug binding for %s", project_id
+                    )
+                    return OperationResult.fail(
+                        "SLUG_BIND_PERSIST_FAILED",
+                        error_code="SLUG_BIND_PERSIST_FAILED",
                     )
         else:
             project_result = (self.deps.vercel.lookup_project(app_id) if attempted

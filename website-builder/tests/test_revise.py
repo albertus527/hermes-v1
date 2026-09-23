@@ -26,6 +26,11 @@ def _make_workspace(tmpdir: Path, project_id: str) -> Path:
     (ws / "src").mkdir(parents=True)
     (ws / "src" / "App.tsx").write_text("// content", encoding="utf-8")
     (ws / "design-dna.json").write_text('{"version": 1}', encoding="utf-8")
+    # The revision pipeline re-records the ``checked`` binding via
+    # record_checks, which fingerprints the built ``dist`` tree. Production
+    # workspaces always have one after a FRONTEND build.
+    (ws / "dist").mkdir(exist_ok=True)
+    (ws / "dist" / "index.html").write_text("<html>rev</html>", encoding="utf-8")
     return ws
 
 
@@ -45,6 +50,19 @@ class RevisionOrchestratorTestBase(unittest.TestCase):
             hermes_adapter=self.mock_adapter,
             preview_orchestrator=self.mock_preview,
         )
+        # The revision pipeline re-runs the fixed cheap checks (npm ci/build/
+        # typecheck) before QA so it can re-record the ``checked`` binding the
+        # preview stage requires. These tests intentionally never spawn npm, so
+        # stub the shared check runner exactly like QAOrchestrator/preview are
+        # stubbed. Production uses the real ``run_fixed_checks``.
+        self._checks_patch = patch(
+            "app.projects.revise.run_fixed_checks",
+            return_value={"npm_ci": {"success": True},
+                          "npm_build": {"success": True},
+                          "npm_typecheck": {"success": True}},
+        )
+        self._checks_patch.start()
+        self.addCleanup(self._checks_patch.stop)
 
     def tearDown(self):
         self.tmpdir_obj.cleanup()
@@ -267,8 +285,12 @@ class TestApply(RevisionOrchestratorTestBase):
         state = self.store.load("proj-g")
         self.assertEqual(state.revisions.revision_seq, 1)
         self.assertEqual(state.revisions.source_revision, 1)
-        self.assertNotIn("checked", state.deployment)
-        self.assertNotIn("tested_snapshot", state.deployment)
+        # The stale pre-revision binding (source_revision 5 / snapshot {"x":1})
+        # is invalidated, and a FRESH ``checked`` binding for the NEW source
+        # revision is re-recorded so the revision can actually preview.
+        self.assertEqual(state.deployment["checked"]["source_revision"],
+                         state.revisions.source_revision)
+        self.assertNotEqual(state.deployment.get("tested_snapshot"), {"x": 1})
         self.mock_preview.run_owned.assert_called_once()
 
     def test_apply_rejects_typography_violation(self):

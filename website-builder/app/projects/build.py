@@ -82,6 +82,42 @@ def _bounded_output(text: Optional[str], limit: int = _DIAGNOSTIC_CAPTURE_LIMIT)
     tail = limit - head
     return text[:head] + _DIAGNOSTIC_TRUNCATION_MARKER + text[-tail:]
 
+
+def run_fixed_checks(runner, project_id: str, workspace: Path) -> Dict[str, Any]:
+    """Run the fixed Phase-7 cheap checks (npm ci / build / typecheck).
+
+    Shared by the initial build AND the revision pipeline so a revision
+    re-records the same ``checked`` binding Phase 9 preview requires. Each
+    check runs at most once; ``npm_build``/``npm_typecheck`` are skipped when
+    ``npm_ci`` fails (dependency installation is never repairable).
+    """
+    results: Dict[str, Any] = {}
+
+    proc = runner.run_command(project_id, ["npm", "ci"], cwd=workspace, timeout=300)
+    results["npm_ci"] = {
+        "success": proc.returncode == 0,
+        "stdout": _bounded_output(proc.stdout),
+        "stderr": _bounded_output(proc.stderr),
+    }
+    if proc.returncode != 0:
+        return results
+
+    proc = runner.run_command(project_id, ["npm", "run", "build"], cwd=workspace, timeout=300)
+    results["npm_build"] = {
+        "success": proc.returncode == 0,
+        "stdout": _bounded_output(proc.stdout),
+        "stderr": _bounded_output(proc.stderr),
+    }
+
+    proc = runner.run_command(project_id, ["npm", "run", "typecheck"], cwd=workspace, timeout=120)
+    results["npm_typecheck"] = {
+        "success": proc.returncode == 0,
+        "stdout": _bounded_output(proc.stdout),
+        "stderr": _bounded_output(proc.stderr),
+    }
+
+    return results
+
 # Deterministic source/code-level build failure signatures. Any match makes a
 # failing npm_build / npm_typecheck check eligible for one targeted repair.
 _REPAIRABLE_SOURCE_PATTERNS = tuple(
@@ -300,50 +336,7 @@ class FrontendBuilder:
         Checks: npm ci, npm run build, npm run typecheck
         Each check runs exactly once through ProjectRunner.
         """
-        results: Dict[str, Any] = {}
-
-        # npm ci
-        proc = self.runner.run_command(
-            project_id,
-            ["npm", "ci"],
-            cwd=workspace,
-            timeout=300,
-        )
-        results["npm_ci"] = {
-            "success": proc.returncode == 0,
-            "stdout": _bounded_output(proc.stdout),
-            "stderr": _bounded_output(proc.stderr),
-        }
-        if proc.returncode != 0:
-            return results
-
-        # npm run build
-        proc = self.runner.run_command(
-            project_id,
-            ["npm", "run", "build"],
-            cwd=workspace,
-            timeout=300,
-        )
-        results["npm_build"] = {
-            "success": proc.returncode == 0,
-            "stdout": _bounded_output(proc.stdout),
-            "stderr": _bounded_output(proc.stderr),
-        }
-
-        # npm run typecheck
-        proc = self.runner.run_command(
-            project_id,
-            ["npm", "run", "typecheck"],
-            cwd=workspace,
-            timeout=120,
-        )
-        results["npm_typecheck"] = {
-            "success": proc.returncode == 0,
-            "stdout": _bounded_output(proc.stdout),
-            "stderr": _bounded_output(proc.stderr),
-        }
-
-        return results
+        return run_fixed_checks(self.runner, project_id, workspace)
 
     def _build_compile_repair_instructions(
         self,

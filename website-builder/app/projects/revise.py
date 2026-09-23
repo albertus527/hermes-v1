@@ -37,6 +37,8 @@ from app.core.design_dna import typography_violation_message, validate_typograph
 from app.core.composition import compose_project_instructions, validate_composed_dna
 from app.core.lifecycle import LifecycleError, ProjectLifecycle
 from app.core.state import ProjectStateStore
+from app.deploy.snapshot import record_checks, source_fingerprint
+from app.projects.build import _CHEAP_CHECK_SEQUENCE, run_fixed_checks
 from app.qa.orchestrator import QAOrchestrator
 from app.sandbox.runner import ProjectRunner
 
@@ -52,6 +54,9 @@ class RevisionResult:
     seq: int
     error: Optional[str] = None
     error_code: Optional[str] = None
+    # True when this call did NOT re-run the revision but reconciled a
+    # crash-window reservation whose preview had already been delivered.
+    reconciled: bool = False
 
 
 class RevisionOrchestrator:
@@ -158,6 +163,48 @@ class RevisionOrchestrator:
     # Application
     # ------------------------------------------------------------------
 
+    def _is_delivered_unapplied_reservation(self, state, seq: int) -> bool:
+        """True when ``seq`` is a crash-window revision whose preview was
+        already durably delivered but never finalized.
+
+        Evidence required (all of it, fail-closed otherwise):
+          * the reservation for ``seq`` exists and is unapplied;
+          * ``revision_seq`` has not yet reached ``seq``;
+          * the CURRENT source revision's preview was durably shown
+            (``latest_shown_preview.source_revision`` matches the live
+            ``source_revision`` and ``preview_revision``);
+          * that preview was shown AFTER the reservation was created
+            (``shown_at > reserved_at``) — this distinguishes the revision's
+            OWN delivered preview from the pre-revision preview that was
+            already on the project when the reservation was made.
+        """
+        if state is None:
+            return False
+        rev = state.revisions
+        if rev.queued_revision_seq != seq or rev.revision_seq >= seq:
+            return False
+        reservation = next(
+            (e for e in (state.pending_revisions or [])
+             if isinstance(e, dict) and e.get("seq") == seq
+             and e.get("applied") is False),
+            None,
+        )
+        if reservation is None:
+            return False
+        shown = state.deployment.get("latest_shown_preview") or {}
+        if not (
+            bool(shown.get("operation_id"))
+            and shown.get("source_revision") == rev.source_revision
+            and rev.preview_revision == rev.source_revision
+        ):
+            return False
+        reserved_at = reservation.get("reserved_at")
+        shown_at = shown.get("shown_at")
+        if not isinstance(reserved_at, (int, float)) or not isinstance(shown_at, (int, float)):
+            # Missing timestamps -> cannot prove ordering -> fail closed.
+            return False
+        return shown_at > reserved_at
+
     def apply(
         self,
         project_id: str,
@@ -196,6 +243,35 @@ class RevisionOrchestrator:
             # Already applied, or a stale/duplicate replay -- never re-apply.
             return RevisionResult(False, project_id, seq, error="REVISION_ALREADY_APPLIED",
                                   error_code="REVISION_ALREADY_APPLIED")
+
+        # ---- BUG 7 crash-window reconciliation -------------------------
+        # A crash AFTER a durable preview delivery but BEFORE the final
+        # revision application write leaves: the reservation unapplied,
+        # ``revision_seq`` still < seq, and a preview already shown for the
+        # CURRENT source revision (QA already reached PREVIEW_READY). In that
+        # case the revision's remote effect (the preview) already happened and
+        # must NOT be repeated. Finalize seq N exactly once against the
+        # already-delivered preview: advance ``revision_seq`` and mark the
+        # reservation applied. No frontend/QA/preview re-run, no re-send.
+        if self._is_delivered_unapplied_reservation(state, seq):
+            with self.store.acquire_writer(project_id) as locked:
+                try:
+                    require_mutating_role(locked, principal_id, reference_token)
+                except AuthzError as exc:
+                    return RevisionResult(False, project_id, seq, error=exc.error_code,
+                                          error_code=exc.error_code)
+                if not self._is_delivered_unapplied_reservation(locked, seq):
+                    return RevisionResult(False, project_id, seq,
+                                          error="REVISION_NOT_RESERVED",
+                                          error_code="REVISION_NOT_RESERVED")
+                locked.revisions.revision_seq = seq
+                for entry in locked.pending_revisions:
+                    if entry.get("seq") == seq:
+                        entry["applied"] = True
+                        entry["applied_at"] = time.time()
+                self.store.save(locked)
+            return RevisionResult(True, project_id, seq, reconciled=True)
+
         if state.lifecycle != ProjectLifecycle.REVISION_REQUESTED.value:
             return RevisionResult(False, project_id, seq, error="REVISION_NOT_RESERVED",
                                   error_code="REVISION_NOT_RESERVED")
@@ -315,6 +391,28 @@ class RevisionOrchestrator:
                         "version", locked.revisions.design_dna_version + 1
                     )
                 self.store.save(locked)
+
+            # Phase 7 parity: a revision clears the previous ``checked``
+            # binding (see the invalidation block above), so it must re-run the
+            # SAME fixed cheap checks and re-record the binding BEFORE QA. QA's
+            # preview hand-off requires ``deployment['checked']`` to capture the
+            # tested snapshot; without this, QA would reach PREVIEW_READY with
+            # no tested_snapshot and Phase 9 preview would fail closed with
+            # QA_REQUIRED (the revision could never preview).
+            before = source_fingerprint(workspace)
+            checks = run_fixed_checks(self.runner, project_id, workspace)
+            if not all(r.get("success", False) for r in checks.values()):
+                failed = next(
+                    (name for name in _CHEAP_CHECK_SEQUENCE
+                     if not checks.get(name, {}).get("success", False)),
+                    "npm_build",
+                )
+                return self._fail(
+                    project_id, seq,
+                    f"Revision cheap checks failed: {failed}",
+                    f"CHEAP_CHECKS_FAILED:{failed}",
+                )
+            record_checks(self.store, project_id, workspace, before)
 
             qa_orchestrator = QAOrchestrator(
                 self.runner, self.store, hermes_adapter=self.hermes_adapter,

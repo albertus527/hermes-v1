@@ -220,6 +220,8 @@ def test_dispatch_revise_reserve_apply_authorized(tmp_path):
     (ws / "src").mkdir(parents=True)
     (ws / "src" / "App.tsx").write_text("x", encoding="utf-8")
     (ws / "design-dna.json").write_text('{"version": 1}', encoding="utf-8")
+    (ws / "dist").mkdir(exist_ok=True)
+    (ws / "dist" / "index.html").write_text("<html>x</html>", encoding="utf-8")
 
     with store.acquire_writer("proj") as state:
         state.roles["owner"] = "telegram:999"
@@ -235,6 +237,11 @@ def test_dispatch_revise_reserve_apply_authorized(tmp_path):
     with patch(
         "app.projects.revise.QAOrchestrator",
         return_value=MagicMock(run=MagicMock(return_value=MagicMock(success=True, error=None))),
+    ), patch(
+        "app.projects.revise.run_fixed_checks",
+        return_value={"npm_ci": {"success": True},
+                      "npm_build": {"success": True},
+                      "npm_typecheck": {"success": True}},
     ):
         result = dispatcher.dispatch(payload, "proj", "revise", authenticated=ctx, seq=1)
     assert result.success, result.error

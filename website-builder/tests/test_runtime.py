@@ -1777,6 +1777,22 @@ class TestRevisionRedriveReachability:
             return_value=MagicMock(run=MagicMock(side_effect=_run)),
         )
 
+    def _checks_patch(self):
+        """The revision pipeline re-runs the fixed cheap checks before QA so it
+        can re-record the ``checked`` binding. These tests never spawn npm and
+        their minimal workspaces have no built ``dist`` tree, so both the check
+        runner and the snapshot recorder are stubbed."""
+        import contextlib
+        stack = contextlib.ExitStack()
+        stack.enter_context(patch(
+            "app.projects.revise.run_fixed_checks",
+            return_value={"npm_ci": {"success": True},
+                          "npm_build": {"success": True},
+                          "npm_typecheck": {"success": True}},
+        ))
+        stack.enter_context(patch("app.projects.revise.record_checks"))
+        return stack
+
     def test_redrive_same_principal_adopts_existing_seq(self, tmp_path):
         """(H-7 Test A) A crash-after-reserve (REVISION_REQUESTED + unapplied
         reservation) is re-driven by the next legitimate Telegram revision
@@ -1790,7 +1806,7 @@ class TestRevisionRedriveReachability:
         })
         loop = _h7_loop(store, revise)
 
-        with self._qa_patch(store):
+        with self._qa_patch(store), self._checks_patch():
             loop._process_update(_h7_update())
 
         state = store.load("tg-555")
@@ -1965,7 +1981,12 @@ class TestRevisionRedriveRoutedPath:
         with patch(
             "app.projects.revise.QAOrchestrator",
             return_value=MagicMock(run=MagicMock(side_effect=_qa_run)),
-        ):
+        ), patch(
+            "app.projects.revise.run_fixed_checks",
+            return_value={"npm_ci": {"success": True},
+                          "npm_build": {"success": True},
+                          "npm_typecheck": {"success": True}},
+        ), patch("app.projects.revise.record_checks"):
             loop._process_update(_h7_update())
 
         state = store.load("tg-555-p1")

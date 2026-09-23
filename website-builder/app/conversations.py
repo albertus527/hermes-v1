@@ -304,7 +304,60 @@ class ConversationRouter:
         # "cafe".
         if normalize_project_name(stripped) in _GENERIC_TOPIC_STOPWORDS:
             return None
+        # BUG 1: without an EXPLICIT identity marker ("namanya X"/"called X"),
+        # the residual text after the create-verb prefix is often a
+        # DESCRIPTION, not a name:
+        #   "aku mau bikin web untuk membaca, jadi disitu bisa sewa bahan
+        #    bacaan ... soft tone dan bright"
+        # has no business name at all. Using that descriptive tail as the
+        # canonical display name silently invents an identity. Only accept the
+        # residual as a name when it actually looks like one (bounded length,
+        # no clause separators/description markers); otherwise ask for a name.
+        if not ConversationRouter._looks_like_name(stripped):
+            return None
         return stripped or None
+
+    # Separators that prove the residual text is a multi-clause DESCRIPTION
+    # rather than a short human name.
+    _NAME_CLAUSE_SEPARATORS = (",", ";", ":", "(", ")")
+
+    # Descriptive/instruction words that mark the residual as prose, not a
+    # name. Matched as whole tokens.
+    _NAME_DESCRIPTOR_TOKENS = frozenset({
+        "yang", "untuk", "dengan", "dari", "jadi", "disitu", "di", "itu",
+        "bisa", "bisanya", "supaya", "agar", "karena", "tapi", "seperti",
+        "mau", "aku", "saya", "kita", "tone", "warna", "warnanya", "gaya",
+        "style", "suasana", "tema", "tampilan", "tampilannya", "desain",
+        "desainnya", "isinya", "fitur", "fiturnya", "dan", "atau", "plus",
+        "with", "for", "that", "which", "so", "and", "or", "feel", "vibe",
+        "like", "bright", "dark", "soft", "clean", "modern", "minimalis",
+        "minimalist",
+    })
+
+    # A plausible human project name is short. Anything longer is a phrase.
+    _NAME_MAX_WORDS = 3
+    _NAME_MAX_CHARS = 30
+
+    @staticmethod
+    def _looks_like_name(candidate: str) -> bool:
+        """True when residual create-request text plausibly IS a name.
+
+        Conservative and deterministic: a real human name is short, has no
+        clause separators, and contains no descriptive/instruction tokens.
+        Anything else is treated as a description -> the caller asks for a
+        name instead of inventing one.
+        """
+        text = (candidate or "").strip()
+        if not text or len(text) > ConversationRouter._NAME_MAX_CHARS:
+            return False
+        if any(sep in text for sep in ConversationRouter._NAME_CLAUSE_SEPARATORS):
+            return False
+        words = [w for w in re.findall(r"[a-z0-9]+", text.lower()) if w]
+        if not words or len(words) > ConversationRouter._NAME_MAX_WORDS:
+            return False
+        if any(w in ConversationRouter._NAME_DESCRIPTOR_TOKENS for w in words):
+            return False
+        return True
 
     def _mentioned_projects(self, text: str, registry) -> List[ProjectEntry]:
         """Return the known projects whose name appears as a token in text.
@@ -903,6 +956,42 @@ User message:
         # the next retry re-asks for the name.
         pending = registry.pending_action
         if pending and pending.get("action") == "CREATE_PROJECT" and pending.get("awaiting") == "NAME":
+            # BUG 6: a pending CREATE_PROJECT/NAME must NOT blindly steal the
+            # next message when the conversation ALSO has an active project
+            # sitting in WAITING_INPUT (an intake question was asked and the
+            # user is plausibly answering THAT). Misrouting would (a) lose
+            # Project A's intake answer and (b) allocate an accidental
+            # project named after the answer.
+            #
+            # Deterministic disambiguation:
+            #   * The message does NOT look like a plausible project name
+            #     (it reads as a sentence/description) -> it is answering the
+            #     active intake question, NOT naming a new project. Route it
+            #     to the active WAITING_INPUT project; leave pending intact.
+            #   * The message DOES look like a plausible name -> both
+            #     interpretations are plausible. Ask explicitly rather than
+            #     guessing; leave pending intact for a later explicit answer.
+            if (active_project_context or {}).get("active_project_lifecycle") == "WAITING_INPUT":
+                active_id = self.registry.active_project_id(conversation_id)
+                if active_id and self._materialized(active_id):
+                    candidate = self.extract_new_project_name(text) or text.strip() or None
+                    if not candidate or not self._looks_like_name(candidate):
+                        logger.debug(
+                            "Pending CREATE_PROJECT/NAME deferred: message on "
+                            "conversation %s reads as an intake answer for %s",
+                            conversation_id, active_id,
+                        )
+                        return self._resolve_project_turn(
+                            conversation_id, None, registry
+                        )
+                    return RouteResult(
+                        route=ConversationRoute.CLARIFICATION,
+                        clarification=(
+                            "Maksud kamu ini nama untuk website baru, atau "
+                            "jawaban buat pertanyaan project yang sekarang? "
+                            "Bisa dijelasin lagi?"
+                        ),
+                    )
             # Use the full text as the name candidate; deterministic
             # extraction/truncation applies as usual.
             requested_name = self.extract_new_project_name(text) or text.strip() or None
@@ -1165,16 +1254,20 @@ User message:
             )
 
         # Duplicate name: never silently create a second project.
+        #
+        # BUG 5: a CREATE_PROJECT request whose name collides with an existing
+        # project must be a CLARIFICATION ONLY. Previously this path called
+        # set_active + returned PROJECT, which switched the conversation's
+        # active pointer and then dispatched the *creation* message into the
+        # OLD project's intake/revise pipeline -- mutating an unrelated
+        # project and misinterpreting a create request as a project turn. Do
+        # NOT switch, do NOT record an event mapping, do NOT route at the old
+        # project. Ask the user which they meant.
         existing = self.registry.resolve_name(conversation_id, requested)
         if existing.status == "ok" and existing.entry:
-            self.registry.set_active(conversation_id, existing.entry.project_id)
-            if event_id:
-                self.registry.record_event(conversation_id, event_id, existing.entry.project_id)
             return RouteResult(
-                route=ConversationRoute.PROJECT,
-                project_id=existing.entry.project_id,
+                route=ConversationRoute.CLARIFICATION,
                 entry=existing.entry,
-                switched=True,
                 clarification=(
                     f"Kamu sudah punya project {existing.entry.display_name}. "
                     "Lanjut ke project itu, atau kasih nama lain untuk website "

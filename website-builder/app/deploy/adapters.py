@@ -194,24 +194,103 @@ class VercelAdapter:
 
         Reconciliation is a subsequent call. Ownership is set atomically in
         create, then read back; timeout/conflict never causes another POST.
+
+        BUG 3: a non-2xx create response is NOT automatically "ambiguous".
+        Classification is evidence-based on the provider's status code (see
+        ``_classify_create_failure``): a deterministic validation rejection is
+        a CONFIRMED failure, a collision is proven by a read-only lookup, and
+        only a transport/5xx/rate-limit case is genuinely ambiguous.
         """
         try:
             name = self.project_name_for(app_id)
             status, project = self._call('GET', '/v9/projects/' + name)
+            create_attempted = False
             if status == 404:
+                create_attempted = True
                 status, project = self._call('POST', '/v11/projects', {
                     'name': name, 'framework': None,
                     'environmentVariables': [{'key': 'WEBSITE_BUILDER_OWNER',
                         'value': self._marker(app_id), 'type': 'plain', 'target': ['preview']}],
                 })
                 if status not in (200, 201):
-                    return _fail('AMBIGUOUS_PROJECT_CREATE')
+                    return self._classify_create_failure(
+                        app_id, name, status, expected_name=None)
                 status, project = self._call('GET', '/v9/projects/' + name)
             if status != 200 or not self._project_valid(project, app_id):
                 return _fail('PROJECT_IDENTITY_MISMATCH')
             return OperationResult.ok({'project': project, 'app_id': app_id})
         except Exception:
+            # A transport failure DURING create leaves the outcome unknown ->
+            # ambiguous. A pre-create lookup failure created nothing ->
+            # reconciliation-required (preserving the prior contract).
+            if create_attempted:
+                return _fail('AMBIGUOUS_PROJECT_CREATE')
             return _fail('PROJECT_RECONCILIATION_REQUIRED')
+
+    # Status codes that prove a DETERMINISTIC, non-ambiguous create rejection
+    # (the request was received and rejected on its merits — never transport
+    # ambiguity, never "maybe it was created").
+    _CREATE_CONFIRMED_REJECTION = frozenset({400, 401, 403, 404, 405, 415, 422})
+
+    def _classify_create_failure(self, app_id, name, status, *, expected_name):
+        """Classify a non-2xx POST /v11/projects response.
+
+        Never blindly reports AMBIGUOUS_PROJECT_CREATE for every non-2xx.
+        """
+        if status in self._CREATE_CONFIRMED_REJECTION:
+            # Deterministic validation/auth rejection: the provider received
+            # and rejected the request. This is a CONFIRMED create failure.
+            return _fail('PROJECT_CREATE_REJECTED')
+        if status == 409:
+            # Collision: a project with this name already exists. It may be
+            # OURS (a concurrent/previous create that beat us) or FOREIGN.
+            # Resolve with a READ-ONLY lookup — never a second POST.
+            return self._reconcile_after_create_collision(
+                app_id, name, expected_name=expected_name)
+        # 408 / 429 / 5xx / anything else: the request may or may not have
+        # been accepted. Ambiguous — never a blind retry.
+        return _fail('AMBIGUOUS_PROJECT_CREATE')
+
+    def _reconcile_after_create_collision(self, app_id, name, *, expected_name):
+        """Read-only resolution after a 409 create collision.
+
+        Chooses the canonical name for the lookup: the friendly slug when one
+        was requested, else the opaque hash-derived default.
+        """
+        lookup_name = expected_name or self.project_name_for(app_id)
+        try:
+            status, project = self._call('GET', '/v9/projects/' + lookup_name)
+        except Exception:
+            return _fail('AMBIGUOUS_PROJECT_CREATE')
+        if status != 200 or not isinstance(project, dict):
+            # Cannot prove who owns the colliding name -> ambiguous.
+            return _fail('AMBIGUOUS_PROJECT_CREATE')
+        if self._project_valid(project, app_id, expected_name=lookup_name):
+            # The colliding project is OURS after all: created concurrently.
+            return OperationResult.ok({'project': project, 'app_id': app_id})
+        if not project.get('id') or project.get('name') != lookup_name:
+            # Malformed/incomplete foreign record -> not proof of anything.
+            return _fail('AMBIGUOUS_PROJECT_CREATE')
+        # A well-formed, distinct project owned by someone else: a proven
+        # name collision (never transport ambiguity).
+        return _fail('PROJECT_NAME_TAKEN')
+
+    def _fail_slug_collision_or_own(self, app_id, slug):
+        """Read-only resolution of a 409 create response on the friendly-slug
+        path. Same evidence discipline as ``_reconcile_after_create_collision``
+        but keeps the slug-specific ``SLUG_COLLISION`` code the product
+        surfaces to the user."""
+        try:
+            status, project = self._call('GET', '/v9/projects/' + slug)
+        except Exception:
+            return _fail('AMBIGUOUS_PROJECT_CREATE')
+        if status != 200 or not isinstance(project, dict):
+            return _fail('AMBIGUOUS_PROJECT_CREATE')
+        if self._project_valid(project, app_id, expected_name=slug):
+            return OperationResult.ok({'project': project, 'app_id': app_id, 'slug': slug})
+        if not project.get('id') or project.get('name') != slug:
+            return _fail('AMBIGUOUS_PROJECT_CREATE')
+        return _fail('SLUG_COLLISION')
 
     def ensure_project_with_slug(self, app_id, slug):
         """Like ``ensure_project``, but requests the human-friendly ``slug``
@@ -233,16 +312,25 @@ class VercelAdapter:
         No retry/second POST on ambiguity — same no-duplicate-create
         discipline as ``ensure_project``.
         """
+        create_attempted = False
         try:
             status, project = self._call('GET', '/v9/projects/' + slug)
             if status == 404:
+                create_attempted = True
                 status, project = self._call('POST', '/v11/projects', {
                     'name': slug, 'framework': None,
                     'environmentVariables': [{'key': 'WEBSITE_BUILDER_OWNER',
                         'value': self._marker(app_id), 'type': 'plain', 'target': ['preview']}],
                 })
                 if status not in (200, 201):
-                    return _fail('AMBIGUOUS_PROJECT_CREATE')
+                    # BUG 3: classify by evidence, never blanket-ambiguous.
+                    # A deterministic 4xx rejection is a confirmed failure; a
+                    # 409 is a PROVEN collision resolved read-only; only a
+                    # transport/5xx/rate-limit case is ambiguous.
+                    if status == 409:
+                        return self._fail_slug_collision_or_own(app_id, slug)
+                    return self._classify_create_failure(
+                        app_id, slug, status, expected_name=slug)
                 status, project = self._call('GET', '/v9/projects/' + slug)
                 if status != 200 or not self._project_valid(project, app_id, expected_name=slug):
                     return _fail('PROJECT_IDENTITY_MISMATCH')
@@ -267,6 +355,11 @@ class VercelAdapter:
             # overwrite; surface as a distinct proven collision.
             return _fail('SLUG_COLLISION')
         except Exception:
+            # BUG 3: distinguish a transport failure DURING create (outcome
+            # unknown -> ambiguous, never a blind retry) from a pre-create
+            # lookup failure (nothing was created -> reconciliation).
+            if create_attempted:
+                return _fail('AMBIGUOUS_PROJECT_CREATE')
             return _fail('PROJECT_RECONCILIATION_REQUIRED')
 
     def _meta(self, app_id, operation_id, source_revision, artifact_sha256):
