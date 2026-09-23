@@ -220,6 +220,11 @@ class RouteResult:
     forced_intent: Optional[str] = None
     # Name-scanned known projects that appear in the text (audit/debug).
     mentioned: List[str] = field(default_factory=list)
+    # PHASE B: the ORIGINAL descriptive user request that triggered a
+    # CREATE_PROJECT whose name had to be clarified. Carried on the
+    # NEW_PROJECT result so the runtime can feed the original semantics (not
+    # just the bare name answer) into intake. None when not applicable.
+    original_request: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +363,50 @@ class ConversationRouter:
         if any(w in ConversationRouter._NAME_DESCRIPTOR_TOKENS for w in words):
             return False
         return True
+
+    @staticmethod
+    def _looks_like_project_name(candidate: str) -> bool:
+        """PHASE D: canonical validation for a MACHINE-PROPOSED project name.
+
+        A ``proposed_new_project_name`` from FAST is machine inference, not a
+        human-confirmed identity, so it must clear the same name-likeness bar
+        as deterministic extraction: short, no clause separators, no
+        descriptive/instruction tokens. Descriptive phrases FAST sometimes
+        proposes ("membaca soft tone dan bright") are rejected.
+
+        NOTE: this policy is deliberately NOT applied to an EXPLICIT human
+        answer to a NAME clarification (see ``route``'s pending-name gate) —
+        a human naming their site "Soft Corner" is a legitimate, syntactically
+        safe name even though "soft" is a descriptor token.
+        """
+        return ConversationRouter._looks_like_name(candidate)
+
+    @staticmethod
+    def _is_safe_confirmed_name(candidate: str) -> bool:
+        """PHASE D: the LESS restrictive safe path for an EXPLICIT human
+        answer to a NAME clarification.
+
+        A human answering "what should I call it?" is supplying an identity,
+        not inventing one — so descriptor tokens ("soft", "bright") must NOT
+        cause rejection. The bar is only syntactic safety: a bounded-length,
+        single-clause string with no control characters and at least one
+        alphanumeric character. Over-tightening here would reject legitimate
+        names like "Soft Corner".
+        """
+        text = (candidate or "").strip()
+        if not text or len(text) > ConversationRouter._CONFIRMED_NAME_MAX_CHARS:
+            return False
+        if any(sep in text for sep in ConversationRouter._NAME_CLAUSE_SEPARATORS):
+            return False
+        if any(c in text for c in ("\n", "\r", "\t")):
+            return False
+        if not re.search(r"[a-z0-9]", text.lower()):
+            return False
+        return True
+
+    # Explicit human-confirmed names may be a little longer/looser than
+    # machine-derived residual text, while still bounded.
+    _CONFIRMED_NAME_MAX_CHARS = 60
 
     def _mentioned_projects(self, text: str, registry) -> List[ProjectEntry]:
         """Return the known projects whose name appears as a token in text.
@@ -697,7 +746,27 @@ User message:
         # FAST's proposed name is the semantic authority for the human name;
         # deterministic extraction is only a derivation fallback when FAST
         # did not propose one at all.
-        requested = proposed_name or self.extract_new_project_name(text)
+        #
+        # PHASE D: a MACHINE-PROPOSED name (FAST's proposed_new_project_name)
+        # must pass the SAME canonical name-likeness validation as the
+        # deterministic extractor. FAST occasionally proposes a descriptive
+        # phrase ("membaca soft tone dan bright") as if it were a project
+        # name; accepting that silently invents a machine-named identity. When
+        # machine inference is not name-like, fall back to deterministic
+        # extraction, and if that also yields nothing, ask for a name
+        # (the existing clarification path). This never treats machine
+        # inference as an explicit human-confirmed name.
+        requested = None
+        if proposed_name:
+            if self._looks_like_project_name(proposed_name):
+                requested = proposed_name.strip()
+            else:
+                logger.info(
+                    "Rejecting machine-proposed project name %r (not name-like)",
+                    proposed_name,
+                )
+        if not requested:
+            requested = self.extract_new_project_name(text)
         return self._route_new_project(
             conversation_id, text, event_id, requested_name=requested
         )
@@ -992,17 +1061,42 @@ User message:
                             "Bisa dijelasin lagi?"
                         ),
                     )
-            # Use the full text as the name candidate; deterministic
-            # extraction/truncation applies as usual.
-            requested_name = self.extract_new_project_name(text) or text.strip() or None
+            # Use the full text as the name candidate. PHASE D: this is an
+            # EXPLICIT human answer to a direct "what should I call it?"
+            # question, so it takes the LESS restrictive (still syntactically
+            # safe) path — a human naming their site "Soft Corner" must not be
+            # rejected merely because "soft" is a descriptor token. Only a
+            # syntactically unsafe answer is rejected (re-ask for the name).
+            candidate = self.extract_new_project_name(text) or text.strip() or None
+            if candidate and not self._is_safe_confirmed_name(candidate):
+                logger.debug(
+                    "Pending CREATE_PROJECT/NAME answer on conversation %s is "
+                    "not a syntactically safe name; re-asking",
+                    conversation_id,
+                )
+                return RouteResult(
+                    route=ConversationRoute.CLARIFICATION,
+                    clarification=(
+                        "Nama website-nya sepertinya kurang pas. Bisa kasih "
+                        "nama yang lebih singkat ya?"
+                    ),
+                )
+            requested_name = candidate
+            # PHASE B: recover the ORIGINAL descriptive request preserved when
+            # the name was first asked for, so the same project creation and
+            # intake continue with the confirmed name PLUS the original
+            # semantics (never relying on the model to reconstruct them).
+            original_request = pending.get("original_request") or None
             logger.debug(
-                "Consuming pending CREATE_PROJECT/NAME for conversation %s: %r",
-                conversation_id, requested_name,
+                "Consuming pending CREATE_PROJECT/NAME for conversation %s: %r "
+                "(original_request preserved: %s)",
+                conversation_id, requested_name, bool(original_request),
             )
             result = self._route_new_project(
                 conversation_id, text, event_id,
                 requested_name=requested_name,
                 clear_pending_on_success=True,
+                original_request=original_request,
             )
             return result
 
@@ -1190,6 +1284,7 @@ User message:
         event_id: Optional[str],
         requested_name: Optional[str] = None,
         clear_pending_on_success: bool = False,
+        original_request: Optional[str] = None,
     ) -> RouteResult:
         """Route a CREATE_PROJECT decision to a new or recovered project.
 
@@ -1197,6 +1292,16 @@ User message:
         cleared in the SAME atomic write as the allocation (via
         ``allocate_project(clear_pending=True)``), eliminating a separate
         second save and its associated Windows file-handle window.
+
+        PHASE B: when no name is available yet, the ORIGINAL descriptive
+        request (``text`` on the naming turn, or the caller-supplied
+        ``original_request`` when flowing through the pending-name gate) is
+        persisted inside ``pending_action`` alongside the awaiting marker.
+        That turn never reaches intake (no project is allocated yet), so the
+        description would otherwise be silently lost. It is re-supplied on
+        the NEW_PROJECT result once the name arrives so the SAME project
+        creation/intake runs with the confirmed name PLUS the original
+        descriptive context.
         """
         if event_id:
             replay = self.registry.recorded_event(conversation_id, event_id)
@@ -1213,6 +1318,7 @@ User message:
                         project_id=replay,
                         entry=entry,
                         switched=False,
+                        original_request=original_request,
                     )
                 else:
                     # Crash window: registry persisted the allocation (and the
@@ -1233,6 +1339,7 @@ User message:
                             "Lagi beresin project kamu yang tadi sempet "
                             "kepotong. Sebentar ya…"
                         ),
+                        original_request=original_request,
                     )
 
         requested = requested_name or self.extract_new_project_name(text)
@@ -1241,10 +1348,16 @@ User message:
             # deterministically (before FAST runs) as the project name.
             # This prevents the multi-turn loop where FAST re-classifies
             # the name answer from scratch and goes AMBIGUOUS again.
-            self.registry.set_pending_action(
-                conversation_id,
-                {"action": "CREATE_PROJECT", "awaiting": "NAME"},
-            )
+            #
+            # PHASE B: ALSO durably preserve the original descriptive request
+            # so the eventual project creation/intake keeps this turn's
+            # semantics instead of relying on the model to reconstruct them.
+            pending = {"action": "CREATE_PROJECT", "awaiting": "NAME"}
+            preserved = (original_request if original_request is not None
+                         else text) or ""
+            if preserved.strip():
+                pending["original_request"] = preserved
+            self.registry.set_pending_action(conversation_id, pending)
             return RouteResult(
                 route=ConversationRoute.CLARIFICATION,
                 clarification=(
@@ -1295,6 +1408,7 @@ User message:
             project_id=entry.project_id,
             entry=entry,
             reply=None,
+            original_request=original_request,
         )
 
     # ------------------------------------------------------------------

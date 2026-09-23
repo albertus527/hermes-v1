@@ -49,7 +49,9 @@ def test_matrix_01_long_description_asks_name(tmp_path):
                           proposed_new_project_name=None)
     h.send_user_message(LONG_DESCRIPTION)
     assert h.conversation_registry.projects == []
-    assert h.pending_action == {"action": "CREATE_PROJECT", "awaiting": "NAME"}
+    assert h.pending_action["action"] == "CREATE_PROJECT"
+    assert h.pending_action["awaiting"] == "NAME"
+    assert h.pending_action.get("original_request")
     assert h.vercel_calls["create_post"] == 0
 
 

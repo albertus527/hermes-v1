@@ -909,7 +909,131 @@ def test_real_content_deploy_after_bootstrap_consumed_promotion_is_accepted():
 
 
 # ---------------------------------------------------------------------------
-# tg-6329821361-p4 regression: slug-named projects + canonical expected_name
+# PHASE A -- bootstrap TRANSIENT-state classification.
+#
+# Real p7 evidence: the project's production slot was already bound to the
+# deterministic bootstrap deployment (Vercel auto-promotes the first deploy),
+# but that deployment was still BUILDING when polled. The old code treated
+# "bound but not READY" as an immediate terminal failure
+# (BOOTSTRAP_RECONCILIATION_REQUIRED) even though BUILDING/QUEUED are normal
+# transient provider states. The fix classifies the state: READY -> success,
+# clearly nonterminal -> keep polling, ERROR/CANCELED -> terminal, malformed
+# or foreign binding -> fail closed. Exactly ONE bootstrap POST is ever made.
+# ---------------------------------------------------------------------------
+
+
+def test_bootstrap_bound_but_building_then_ready_succeeds():
+    """PHASE A #1: production id == bootstrap id with deployment BUILDING is
+    a NORMAL transient state -- poll again (bounded) and succeed once READY.
+    Must never fail here, and must never POST a second bootstrap."""
+    a, t = adapter()
+    p = project(a)
+    t.responses = [
+        (200, {**p, 'targets': {}}),                                     # no production yet
+        (200, {'deployments': [], 'pagination': {'next': None}}),         # no existing bootstrap
+        (201, {'id': 'dpl_bootstrap_1'}),                                 # POST create
+        (200, {**p, 'targets': {'production': {'id': 'dpl_bootstrap_1'}}}),  # poll 1: bound
+        (200, {'id': 'dpl_bootstrap_1', 'readyState': 'BUILDING'}),       # poll 1: BUILDING
+        (200, {**p, 'targets': {'production': {'id': 'dpl_bootstrap_1'}}}),  # poll 2: still bound
+        (200, {'id': 'dpl_bootstrap_1', 'readyState': 'READY'}),          # poll 2: READY
+    ]
+    result = a.ensure_bootstrap('app', p, interval=0)
+    assert result.success
+    assert result.data == {'bootstrapped': True, 'deployment_id': 'dpl_bootstrap_1',
+                           'reconciled': False, 'confirmed': True}
+    assert sum(c[0] == 'POST' for c in t.calls) == 1
+
+
+def test_bootstrap_building_until_timeout_fails_closed_no_duplicate_post():
+    """PHASE A #2: bound but BUILDING for the whole bounded poll -> timeout/
+    fail closed. Never a second POST, never success."""
+    a, t = adapter()
+    p = project(a)
+    t.responses = [
+        (200, {**p, 'targets': {}}),
+        (200, {'deployments': [], 'pagination': {'next': None}}),
+        (201, {'id': 'dpl_bootstrap_1'}),
+    ]
+    for _ in range(3):  # max_polls=3 iterations: bound + BUILDING each time
+        t.responses.append((200, {**p, 'targets': {'production': {'id': 'dpl_bootstrap_1'}}}))
+        t.responses.append((200, {'id': 'dpl_bootstrap_1', 'readyState': 'BUILDING'}))
+    result = a.ensure_bootstrap('app', p, max_polls=3, interval=0)
+    assert not result.success
+    assert result.error_code == 'BOOTSTRAP_CONFIRMATION_TIMEOUT'
+    assert sum(c[0] == 'POST' for c in t.calls) == 1
+
+
+def test_bootstrap_terminal_error_fails_closed_no_duplicate_post():
+    """PHASE A #3: bound to our bootstrap but the deployment reports ERROR ->
+    terminal failure. Never a second POST."""
+    a, t = adapter()
+    p = project(a)
+    t.responses = [
+        (200, {**p, 'targets': {}}),
+        (200, {'deployments': [], 'pagination': {'next': None}}),
+        (201, {'id': 'dpl_bootstrap_1'}),
+        (200, {**p, 'targets': {'production': {'id': 'dpl_bootstrap_1'}}}),
+        (200, {'id': 'dpl_bootstrap_1', 'readyState': 'ERROR'}),
+    ]
+    result = a.ensure_bootstrap('app', p, interval=0)
+    assert not result.success
+    assert result.error_code == 'BOOTSTRAP_DEPLOYMENT_FAILED'
+    assert sum(c[0] == 'POST' for c in t.calls) == 1
+
+
+def test_bootstrap_terminal_canceled_fails_closed_no_duplicate_post():
+    """PHASE A #4: bound but CANCELED -> terminal failure."""
+    a, t = adapter()
+    p = project(a)
+    t.responses = [
+        (200, {**p, 'targets': {}}),
+        (200, {'deployments': [], 'pagination': {'next': None}}),
+        (201, {'id': 'dpl_bootstrap_1'}),
+        (200, {**p, 'targets': {'production': {'id': 'dpl_bootstrap_1'}}}),
+        (200, {'id': 'dpl_bootstrap_1', 'readyState': 'CANCELED'}),
+    ]
+    result = a.ensure_bootstrap('app', p, interval=0)
+    assert not result.success
+    assert result.error_code == 'BOOTSTRAP_DEPLOYMENT_FAILED'
+    assert sum(c[0] == 'POST' for c in t.calls) == 1
+
+
+def test_bootstrap_malformed_deployment_response_fails_closed():
+    """PHASE A #6: bound to our bootstrap but the deployment GET returns a
+    malformed / wrong-identity payload -> fail closed (never success, never
+    a second POST)."""
+    a, t = adapter()
+    p = project(a)
+    t.responses = [
+        (200, {**p, 'targets': {}}),
+        (200, {'deployments': [], 'pagination': {'next': None}}),
+        (201, {'id': 'dpl_bootstrap_1'}),
+        (200, {**p, 'targets': {'production': {'id': 'dpl_bootstrap_1'}}}),
+        (200, {'id': 'dpl_OTHER', 'readyState': 'READY'}),   # wrong identity
+    ]
+    result = a.ensure_bootstrap('app', p, interval=0)
+    assert not result.success
+    assert result.error_code == 'BOOTSTRAP_RECONCILIATION_REQUIRED'
+    assert sum(c[0] == 'POST' for c in t.calls) == 1
+
+
+def test_bootstrap_existing_ready_on_retry_no_post_success():
+    """PHASE A #7: on retry the bootstrap deployment already exists AND is
+    already READY + bound -> no POST, success (crash-replay reconciliation)."""
+    a, t = adapter()
+    p = project(a)
+    existing = {'id': 'dpl_bootstrap_1', 'meta': {'wbBootstrap': a._bootstrap_operation_id('app')}}
+    t.responses = [
+        (200, {**p, 'targets': {}}),
+        (200, {'deployments': [existing], 'pagination': {'next': None}}),
+        (200, {**p, 'targets': {'production': {'id': 'dpl_bootstrap_1'}}}),
+        (200, {'id': 'dpl_bootstrap_1', 'readyState': 'READY'}),
+    ]
+    result = a.ensure_bootstrap('app', p)
+    assert result.success
+    assert result.data == {'bootstrapped': True, 'deployment_id': 'dpl_bootstrap_1',
+                           'reconciled': True, 'confirmed': True}
+    assert not any(c[0] == 'POST' for c in t.calls)
 # threaded through every downstream revalidation.
 #
 # Before the fix, only ensure_project_with_slug passed expected_name (the

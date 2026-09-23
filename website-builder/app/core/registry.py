@@ -411,7 +411,6 @@ class ConversationRegistryStore:
     ) -> str:
         """Bind the project's stable Vercel slug on FIRST successful Vercel
         project creation/reconciliation only.
-
         Idempotent: if a slug is already bound, that existing slug is
         returned unchanged — a later call (e.g. after a display_name
         rename) NEVER overwrites it. This is the persistence half of the
@@ -439,6 +438,72 @@ class ConversationRegistryStore:
             if normalized and normalized not in entry.aliases:
                 entry.aliases.append(normalized)
                 self.save(registry)
+
+    # ------------------------------------------------------------------
+    # PHASE C — canonical identity convergence
+    # ------------------------------------------------------------------
+
+    def converge_display_name(
+        self, conversation_id: str, project_id: str, confirmed_name: str
+    ) -> "ResolutionResult":
+        """Converge a provisional registry display name onto the user-confirmed
+        canonical name WITHOUT allocating a second identity.
+
+        A first-contact/bootstrap fallback path may allocate a project under a
+        PROVISIONAL or derived name, while later intake discovers the true
+        human name (``brief['name']``). Vercel's slug derives from
+        ``registry.display_name`` -- so if the registry stayed stale the remote
+        project would be created under the provisional name.
+
+        Rules (fail closed):
+          * the project's ``vercel_slug`` is ALREADY bound -> NO implicit
+            rename. The remote identity is frozen; return the existing entry
+            unchanged (status ``"noop"``). Renaming here would fork remote
+            identity, which R1 forbids.
+          * the confirmed name already normalizes to the current display name
+            -> no-op (status ``"noop"``).
+          * the confirmed name collides with ANOTHER project in the
+            conversation -> NO overwrite, NO duplicate: status ``"ambiguous"``
+            with the colliding candidates. The caller decides how to surface
+            this (clarification/failure).
+          * otherwise -> the SAME entry is updated in place (display_name),
+            the previous display name is retained as an alias so old
+            references still resolve, and the entry is returned (status
+            ``"ok"``). ``project_id`` never changes.
+        """
+        confirmed_normalized = normalize_project_name(confirmed_name)
+        if confirmed_normalized is None:
+            return ResolutionResult(status="none")
+        with self._lock_for(conversation_id):
+            registry = self.load_or_create(conversation_id)
+            entry = registry.find_by_id(project_id)
+            if entry is None:
+                return ResolutionResult(status="none")
+            # Remote identity already bound -> never rename/fork it.
+            if entry.vercel_slug:
+                return ResolutionResult(status="noop", entry=entry)
+            current_normalized = normalize_project_name(entry.display_name)
+            if current_normalized == confirmed_normalized:
+                return ResolutionResult(status="noop", entry=entry)
+            # Collision with a DIFFERENT project -> fail closed.
+            collisions = [
+                e for e in registry.projects
+                if e.project_id != project_id
+                and confirmed_normalized in (
+                    {normalize_project_name(e.display_name)}
+                    | {normalize_project_name(a) for a in e.aliases}
+                )
+            ]
+            if collisions:
+                return ResolutionResult(status="ambiguous", candidates=collisions)
+            previous = entry.display_name
+            entry.display_name = confirmed_name
+            prev_normalized = normalize_project_name(previous)
+            if (prev_normalized and prev_normalized != confirmed_normalized
+                    and prev_normalized not in entry.aliases):
+                entry.aliases.append(prev_normalized)
+            self.save(registry)
+            return ResolutionResult(status="ok", entry=entry)
 
     # ------------------------------------------------------------------
     # Resolution helpers

@@ -110,6 +110,11 @@ class PromoteDeps:
     # which is what binds the slug). None disables slug resolution: the
     # legacy opaque hash-derived project name governs, exactly as before.
     slug_for: Any = None
+    # PHASE F: optional callable(vercel_project_id) -> Optional[str] returning
+    # the project-specific Vercel automation-bypass secret for the production
+    # smoke (same access contract as preview smoke). None disables bypass
+    # (legacy behavior: production smoke runs without a bypass header).
+    bypass_for: Any = None
 
 
 class PromotionOrchestrator:
@@ -552,7 +557,10 @@ class PromotionOrchestrator:
 
         # ---- Mandatory production smoke check before ever marking LIVE.
         smoke_dir = (self.smoke_dir_root or workspace) / "qa" / "production_smoke"
-        smoke_result = self.deps.smoke.run(production_url, smoke_dir)
+        smoke_result = self._run_production_smoke(
+            production_url, smoke_dir,
+            (vercel_project or {}).get("id"),
+        )
         self._update_intent(project_id, stage="smoked", smoke=smoke_result.data)
         if not smoke_result.success:
             rollback_status = self._rollback_and_fail(
@@ -734,8 +742,39 @@ class PromotionOrchestrator:
                 state.failure["rollback_exception_class"] = exception_class
             self.store.save(state)
 
-    def _rollback_and_fail(
-        self, project_id, app_id, vercel_project, previous_identity,
+    def _run_production_smoke(self, production_url, smoke_dir, vercel_project_id=None):
+        """PHASE F: run the production smoke with the SAME access contract as
+        the preview smoke (project-specific bypass), when configured.
+
+        The bypass secret (if any) is passed only when the smoke collaborator
+        accepts it; legacy 2-arg smoke doubles keep working unchanged. The
+        secret is scoped to ``*.vercel.app`` by the smoke tester itself, so a
+        custom-domain production URL simply receives no bypass header.
+        """
+        secret = None
+        if self.deps.bypass_for is not None:
+            try:
+                secret = self.deps.bypass_for(vercel_project_id)
+            except Exception:
+                secret = None
+        if secret is None:
+            return self.deps.smoke.run(production_url, smoke_dir)
+        try:
+            import inspect
+            params = inspect.signature(self.deps.smoke.run).parameters
+            accepts = (
+                "bypass_secret" in params
+                or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+            )
+        except (TypeError, ValueError):
+            accepts = False
+        if accepts:
+            return self.deps.smoke.run(
+                production_url, smoke_dir, bypass_secret=secret
+            )
+        return self.deps.smoke.run(production_url, smoke_dir)
+
+    def _rollback_and_fail(self, project_id, app_id, vercel_project, previous_identity,
         error_code: str, expected_name=None,
     ):
         """Roll the production alias back to the prior last-known-good

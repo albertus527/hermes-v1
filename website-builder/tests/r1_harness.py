@@ -202,6 +202,14 @@ class FakeVercel:
         self.promote_calls = 0
         self.bootstrap_calls = 0
         self.lookup_calls = 0
+        self.bypass_generation_calls = 0
+        self.bypass_behavior = None  # None | "forbidden" | "ambiguous"
+        # PHASE A/G: scriptable bootstrap confirmation states.
+        self.bootstrap_states: List[str] = []
+        # PHASE A/G: when True, the FIRST bootstrap attempt observes the real
+        # "bound but BUILDING" transient state; later attempts observe READY.
+        self.bootstrap_building_then_ready = False
+        self._bootstrap_confirmed = False
         self.created_projects: List[str] = []
         self.deployed_operations: List[str] = []
         self.promoted_deployments: List[str] = []
@@ -269,7 +277,54 @@ class FakeVercel:
 
     def ensure_bootstrap(self, app_id, project, expected_name=None):
         self.bootstrap_calls += 1
+        # PHASE A/G: scriptable bootstrap confirmation. ``bootstrap_states``
+        # may hold an explicit per-call sequence; otherwise, when
+        # ``bootstrap_building_then_ready`` is set, the FIRST attempt for a
+        # project observes the real "bound but BUILDING" transient state and
+        # every later attempt observes READY (mirrors the real p7 timing).
+        if self.bootstrap_states:
+            state = self.bootstrap_states.pop(0)
+        elif self.bootstrap_building_then_ready and not self._bootstrap_confirmed:
+            self._bootstrap_confirmed = True
+            state = "building"
+        else:
+            state = None
+        if state == "building":
+            return OperationResult.fail(
+                "BOOTSTRAP_CONFIRMATION_TIMEOUT",
+                error_code="BOOTSTRAP_CONFIRMATION_TIMEOUT",
+            )
+        if state == "ready":
+            return OperationResult.ok({
+                "bootstrapped": True,
+                "deployment_id": "dpl_bootstrap_1",
+                "reconciled": False,
+                "confirmed": True,
+            })
         return OperationResult.ok({"bootstrapped": False, "already_current_production": True})
+
+    def ensure_protection_bypass(self, app_id, project, *, expected_name=None):
+        """PHASE E boundary: generate a PROJECT-SPECIFIC bypass secret.
+
+        Counts generation attempts so tests can assert exactly-once / no-
+        rotation semantics. ``bypass_behavior`` may be set to a code string to
+        simulate a sanitized failure.
+        """
+        self.bypass_generation_calls += 1
+        if self.bypass_behavior == "forbidden":
+            return OperationResult.fail(
+                "BYPASS_PROVISION_FORBIDDEN",
+                error_code="BYPASS_PROVISION_FORBIDDEN",
+            )
+        if self.bypass_behavior == "ambiguous":
+            return OperationResult.fail(
+                "AMBIGUOUS_BYPASS_PROVISION",
+                error_code="AMBIGUOUS_BYPASS_PROVISION",
+            )
+        project_id = (project or {}).get("id", "prj_1")
+        # Deterministic per-project secret from the project id.
+        secret = "bypass-" + hashlib.sha256(project_id.encode()).hexdigest()[:16]
+        return OperationResult.ok({"project_id": project_id, "secret": secret})
 
     def deploy_static_files(self, app_id, project, files, operation_id,
                             source_revision, artifact_sha256, expected_name=None):
@@ -337,9 +392,14 @@ class FakeSmoke:
     def __init__(self, success=True):
         self.success = success
         self.calls: List[str] = []
+        # PHASE F: records the bypass secret passed to each run so tests can
+        # assert the smoke received the project-specific credential, and that
+        # it is never sent to non-Vercel origins.
+        self.bypass_secrets: List[Any] = []
 
-    def run(self, url, out_dir):
+    def run(self, url, out_dir, *, bypass_secret=None):
         self.calls.append(url)
+        self.bypass_secrets.append(bypass_secret)
         Path(out_dir).mkdir(parents=True, exist_ok=True)
         shot = Path(out_dir) / "desktop.png"
         shot.write_bytes(b"\x89PNG\r\n\x1a\nfake")
@@ -504,6 +564,13 @@ class LocalR1Scenario:
         self.router = ConversationRouter(self.store, self.registry,
                                         telegram_out=self.telegram, hermes=self.hermes)
 
+        # PHASE E: real secret store under the scenario's hermes-home, wired
+        # to the real provisioner over the fake Vercel boundary.
+        from app.core.secrets import BypassSecretStore
+        from app.deploy.bypass import BypassProvisioner
+        self.bypass_store = BypassSecretStore(self.hermes_home / "vercel-bypass")
+        self.bypass_provisioner = BypassProvisioner(self.vercel, self.bypass_store)
+
         self.preview = PreviewOrchestrator(
             self.store,
             PreviewDeps(
@@ -518,6 +585,11 @@ class LocalR1Scenario:
                 ),
                 slug_for=self._slug_for,
                 bind_slug=self._bind_slug,
+                ensure_bypass=lambda app_id, project, expected_name=None: (
+                    self.bypass_provisioner.ensure(
+                        app_id, project, expected_name=expected_name
+                    )
+                ),
             ),
             runner=self.runner,
         )
@@ -561,6 +633,15 @@ class LocalR1Scenario:
             return None
         if entry.vercel_slug:
             return entry.vercel_slug
+        # PHASE C: converge registry.display_name onto the confirmed
+        # brief['name'] BEFORE deriving the slug (mirrors app/runtime.py).
+        confirmed = (state.brief or {}).get("name")
+        if isinstance(confirmed, str) and confirmed.strip():
+            resolution = self.registry.converge_display_name(
+                state.conversation_id, pid, confirmed.strip()
+            )
+            if resolution.status in ("ok", "noop") and resolution.entry is not None:
+                entry = resolution.entry
         from app.core.registry import slugify_display_name
         return slugify_display_name(entry.display_name)
 
@@ -659,6 +740,7 @@ class LocalR1Scenario:
             "deploy_post": self.vercel.deploy_calls,
             "promote_post": self.vercel.promote_calls,
             "bootstrap": self.vercel.bootstrap_calls,
+            "bypass_generation": self.vercel.bypass_generation_calls,
         }
 
     @property

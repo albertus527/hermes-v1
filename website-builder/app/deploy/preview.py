@@ -123,6 +123,13 @@ class PreviewDeps:
     # slug binding EXACTLY ONCE after the first successful Vercel project
     # creation/reconciliation under that slug. No-op when slug_for is None.
     bind_slug: Any = None
+    # Optional callable(app_id, vercel_project, *, expected_name=None)
+    # -> OperationResult. Provisions/reuses the PROJECT-SPECIFIC Vercel
+    # automation-bypass secret so the smoke browser can pass Deployment
+    # Protection on a protected *.vercel.app preview. Returns ok with
+    # data['secret']. None disables bypass provisioning entirely (existing
+    # call sites keep their exact behavior: smoke runs without bypass).
+    ensure_bypass: Any = None
 
 
 class PreviewOrchestrator:
@@ -311,6 +318,22 @@ class PreviewOrchestrator:
         if not bootstrap_result.success:
             return bootstrap_result
 
+        # ---- 2c. Ensure the PROJECT-SPECIFIC Vercel automation bypass.
+        # Deployment Protection is ON by default at the team level, so a
+        # protected preview would otherwise redirect the smoke browser to
+        # Vercel's SSO login. The bypass secret is provisioned/reused here,
+        # stored OUTSIDE ProjectState by the injected collaborator (never
+        # persisted in any state/metadata/log), and only injected into the
+        # smoke run. A definitive provisioning failure FAILS CLOSED -- never
+        # proceed assuming smoke access. The secret value is never logged.
+        bypass_secret = None
+        if self.deps.ensure_bypass is not None:
+            bypass_result = self.deps.ensure_bypass(
+                app_id, vercel_project, expected_name=expected_name)
+            if not bypass_result.success:
+                return bypass_result
+            bypass_secret = (bypass_result.data or {}).get('secret')
+
         # ---- 3. Deploy, reconciling any ambiguous prior attempt by lookup ----
         attempted = previous.get('deployment_attempted', False)
         self._update_intent(project_id, operation_id, deployment_attempted=True,
@@ -344,11 +367,20 @@ class PreviewOrchestrator:
         from app.runtime import _diag_log  # deferred: avoids import cycle
         _diag_log("5.before_PreviewSmokeTester_run")
         smoke_dir = (self.smoke_dir_root or workspace) / "qa" / "preview_smoke"
-        smoke_result = self.deps.smoke.run(preview_url, smoke_dir)
+        smoke_result = self._run_smoke(preview_url, smoke_dir, bypass_secret)
         self._update_intent(project_id, operation_id, stage="smoked", smoke=smoke_result.data)
         if not smoke_result.success:
-            return OperationResult(success=False, error="SMOKE_FAILED",
-                                   error_code="SMOKE_FAILED", data=smoke_result.data)
+            # Preserve the sanitized provider error code (e.g.
+            # VERCEL_BYPASS_AUTH_FAILED) instead of flattening it to
+            # SMOKE_FAILED, so a protection/bypass auth failure is
+            # distinguishable from an ordinary smoke failure. The secret is
+            # never part of this code or the data.
+            return OperationResult(
+                success=False,
+                error=smoke_result.error_code or "SMOKE_FAILED",
+                error_code=smoke_result.error_code or "SMOKE_FAILED",
+                data=smoke_result.data,
+            )
 
         # ---- 6. Telegram delivery — durable identities, fail closed on ambiguity ----
         chat_id = self.deps.chat_id_for(project_id, state)
@@ -655,6 +687,30 @@ class PreviewOrchestrator:
             if intent and intent.get("operation_id") == operation_id:
                 intent.update(fields)
                 self.store.save(state)
+
+    def _run_smoke(self, preview_url, smoke_dir, bypass_secret):
+        """Run the mandatory preview smoke, injecting the project-specific
+        bypass secret when the smoke collaborator supports it.
+
+        Signature guard: pass the keyword only when the smoke tester accepts
+        it (named param or **kwargs). Injected test doubles / legacy smoke
+        collaborators with a 2-arg ``run(url, out_dir)`` signature continue to
+        work unchanged (no bypass). The secret is NEVER logged.
+        """
+        if bypass_secret is None:
+            return self.deps.smoke.run(preview_url, smoke_dir)
+        try:
+            import inspect
+            params = inspect.signature(self.deps.smoke.run).parameters
+            accepts = (
+                "bypass_secret" in params
+                or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+            )
+        except (TypeError, ValueError):
+            accepts = False
+        if accepts:
+            return self.deps.smoke.run(preview_url, smoke_dir, bypass_secret=bypass_secret)
+        return self.deps.smoke.run(preview_url, smoke_dir)
 
     def _deploy_or_reconcile(self, app_id, project, snapshot, operation_id, source_revision,
                              *, expected_name=None):

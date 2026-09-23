@@ -306,9 +306,9 @@ class TestPendingClarificationSequence:
         )
 
         assert route.route == ConversationRoute.CLARIFICATION
-        assert registry.load(CONV).pending_action == {
-            "action": "CREATE_PROJECT", "awaiting": "NAME"
-        }
+        pending = registry.load(CONV).pending_action
+        assert pending["action"] == "CREATE_PROJECT"
+        assert pending["awaiting"] == "NAME"
 
     def test_pending_name_consumed_before_fast_and_clears(self, tmp_path):
         """After pending is set, the next turn bypasses FAST, allocates exactly
@@ -328,9 +328,9 @@ class TestPendingClarificationSequence:
             CONV, "bikin website baru", event_id="2"
         )
         assert route1.route == ConversationRoute.CLARIFICATION
-        assert registry.load(CONV).pending_action == {
-            "action": "CREATE_PROJECT", "awaiting": "NAME"
-        }
+        pending1 = registry.load(CONV).pending_action
+        assert pending1["action"] == "CREATE_PROJECT"
+        assert pending1["awaiting"] == "NAME"
 
         # Turn 2: user supplies the name. Sentinel proves FAST is bypassed.
         router.hermes = _FastRaisesIfCalled()
@@ -482,10 +482,9 @@ class TestNewProjectWhileActiveIntake:
         )
 
         assert route.route == ConversationRoute.CLARIFICATION
-        assert registry.load(CONV).pending_action == {
-            "action": "CREATE_PROJECT",
-            "awaiting": "NAME",
-        }
+        pending = registry.load(CONV).pending_action
+        assert pending["action"] == "CREATE_PROJECT"
+        assert pending["awaiting"] == "NAME"
         # No extra project allocated.
         assert len(registry.load(CONV).projects) == 1
 

@@ -81,6 +81,13 @@ def _fail(code):
 # never referenced by latest_shown_preview/approval/revision history.
 _BOOTSTRAP_HTML = b'<!doctype html><title>.</title>'
 
+# Provider readyState values that PROVE the bootstrap deployment can never
+# become READY. Once the project's production binding points at our bootstrap
+# deployment, observing one of these is a terminal failure (fail closed); any
+# OTHER non-READY value (BUILDING, QUEUED, INITIALIZING, ...) is treated as a
+# normal transient state and simply keeps polling within the bounded loop.
+_BOOTSTRAP_TERMINAL_STATES = frozenset({'ERROR', 'CANCELED'})
+
 
 def _json_call(transport, method, url, headers, payload=None):
     data = None if payload is None else json.dumps(payload).encode()
@@ -518,6 +525,60 @@ class VercelAdapter:
         # from this fixed 'bootstrap' literal).
         return hashlib.sha256((self.namespace + '\0bootstrap\0' + app_id).encode()).hexdigest()
 
+    # ------------------------------------------------------------------
+    # PHASE E — Vercel Deployment Protection automation bypass
+    # ------------------------------------------------------------------
+
+    def ensure_protection_bypass(self, app_id, project, *, expected_name=None):
+        """Provision a PROJECT-SPECIFIC automation bypass secret for the
+        owned project, via the official Vercel API:
+
+            PATCH /v1/projects/{idOrName}/protection-bypass
+
+        The automation bypass is PROJECT-SPECIFIC — one global secret does
+        NOT work across projects. This call generates (or returns) the
+        project's bypass secret. The secret is returned to the CALLER, which
+        is responsible for storing it securely (see ``BypassSecretStore``);
+        it is NEVER persisted by the adapter or included in any
+        OperationResult error message.
+
+        Conversation/reconciliation semantics (PHASE E):
+          * 200 with a well-formed ``protectionBypass`` object containing a
+            non-empty secret -> ok, secret returned.
+          * definitive forbidden/unsupported (401/403/404/405/501) -> sanitized
+            failure ``BYPASS_PROVISION_FORBIDDEN``; the caller must NOT
+            continue assuming smoke access.
+          * other non-2xx / transport ambiguity -> ``AMBIGUOUS_BYPASS_PROVISION``
+            (never blind-repeated generation; the caller reconciles).
+        """
+        try:
+            if not self._project_valid(project, app_id, expected_name=expected_name):
+                return _fail('PROJECT_IDENTITY_MISMATCH')
+            status, body = self._call(
+                'PATCH', '/v1/projects/' + quote(project['id'], safe='') + '/protection-bypass',
+                {'generate': True},
+            )
+        except Exception:
+            # Transport ambiguity: generation may or may not have happened.
+            # Never blind-repeat -- the caller reconciles/reuses.
+            return _fail('AMBIGUOUS_BYPASS_PROVISION')
+        if status in (401, 403, 404, 405, 501):
+            return _fail('BYPASS_PROVISION_FORBIDDEN')
+        if status not in (200, 201):
+            return _fail('AMBIGUOUS_BYPASS_PROVISION')
+        bypass = body.get('protectionBypass')
+        secret = bypass.get('secret') if isinstance(bypass, dict) else None
+        if not isinstance(secret, str) or not secret:
+            # Malformed/ambiguous response: can't prove we have a usable
+            # secret -> fail closed, never guess.
+            return _fail('AMBIGUOUS_BYPASS_PROVISION')
+        # NOTE: the secret is deliberately NOT placed in a logged code, and
+        # error strings here never embed it.
+        return OperationResult.ok({
+            'project_id': project['id'],
+            'secret': secret,
+        })
+
     def ensure_bootstrap(self, app_id, project, max_polls=20, interval=0.25,
                          *, expected_name=None):
         """Consume Vercel's unavoidable first-deployment auto-promotion with
@@ -545,9 +606,18 @@ class VercelAdapter:
             polled for confirmation exactly like a fresh create.
           * no production binding and no existing bootstrap -> POST the fixed
             minimal static payload once, then polled for confirmation.
-          * confirmation not reached within the bounded poll -> fail closed;
-            real content must NOT be deployed.
-          * anything ambiguous/malformed -> fail closed, never guess.
+          * production bound to our bootstrap, deployment still BUILDING/
+            QUEUED/INITIALIZING/other transient state -> keep polling within
+            the bound (never a premature terminal failure).
+          * production bound to our bootstrap, deployment ERROR/CANCELED ->
+            terminal failure (BOOTSTRAP_DEPLOYMENT_FAILED), never a second
+            bootstrap POST.
+          * confirmation never reaches READY within the bounded poll -> fail
+            closed (BOOTSTRAP_CONFIRMATION_TIMEOUT); real content must NOT be
+            deployed.
+          * production bound to a DIFFERENT deployment, or anything
+            ambiguous/malformed -> fail closed, never guess, never a second
+            bootstrap POST.
         """
         try:
             if not self._project_valid(project, app_id, expected_name=expected_name):
@@ -585,27 +655,51 @@ class VercelAdapter:
             # ---- Remote confirmation barrier: a POST/reconcile alone is
             # never proof. Promotion/alias assignment is eventually
             # consistent -- poll (bounded) until targets.production.id
-            # actually equals this bootstrap deployment AND it is READY.
+            # actually equals this bootstrap deployment AND that deployment
+            # is READY.
+            #
+            # State classification (do NOT treat every not-yet-READY poll as
+            # terminal): once production is bound to OUR bootstrap id we must
+            # distinguish a NORMAL transient provider state (buildingAt set,
+            # promotion still settling) from a TERMINAL provider failure.
+            #   * production id != ours and not None -> fail closed (moved).
+            #   * production id is None              -> keep polling (bounded).
+            #   * production id == ours:
+            #       READY                       -> success.
+            #       BUILDING/QUEUED/INITIALIZING/... -> keep polling (bounded).
+            #       ERROR/CANCELED              -> terminal, fail closed.
+            #       malformed/wrong identity    -> fail closed.
             for _ in range(max_polls):
                 try:
                     prod_id = self._current_production_id(project)
                 except Exception:
                     return _fail('BOOTSTRAP_RECONCILIATION_REQUIRED')
-                if prod_id == identifier:
-                    status, dep = self._call(
-                        'GET', '/v13/deployments/' + quote(identifier, safe=''))
-                    if (status == 200 and dep.get('id') == identifier
-                            and dep.get('readyState') == 'READY'):
-                        return OperationResult.ok({'bootstrapped': True,
-                                                   'deployment_id': identifier,
-                                                   'reconciled': reconciled,
-                                                   'confirmed': True})
-                    return _fail('BOOTSTRAP_RECONCILIATION_REQUIRED')
-                if prod_id is not None:
+                if prod_id is not None and prod_id != identifier:
                     # Production binding points somewhere else entirely --
                     # never assume our bootstrap will still land; fail closed
                     # rather than keep polling against a moving target.
                     return _fail('BOOTSTRAP_RECONCILIATION_REQUIRED')
+                if prod_id == identifier:
+                    status, dep = self._call(
+                        'GET', '/v13/deployments/' + quote(identifier, safe=''))
+                    # Malformed / wrong-identity response is never evidence of
+                    # success OR of a terminal failure -- fail closed now.
+                    if (status != 200 or not isinstance(dep, dict)
+                            or dep.get('id') != identifier):
+                        return _fail('BOOTSTRAP_RECONCILIATION_REQUIRED')
+                    state = dep.get('readyState')
+                    if state == 'READY':
+                        return OperationResult.ok({'bootstrapped': True,
+                                                   'deployment_id': identifier,
+                                                   'reconciled': reconciled,
+                                                   'confirmed': True})
+                    if state in _BOOTSTRAP_TERMINAL_STATES:
+                        # Definitively failed/canceled -- never retry by
+                        # creating a second bootstrap deployment.
+                        return _fail('BOOTSTRAP_DEPLOYMENT_FAILED')
+                    # Anything else is a transient (or unknown) provider state:
+                    # keep polling within the same bounded loop. Unknown state
+                    # is NEVER treated as success.
                 time.sleep(interval)
             return _fail('BOOTSTRAP_CONFIRMATION_TIMEOUT')
         except Exception:
@@ -1119,6 +1213,57 @@ class PreviewSmokeTester:
         self.factory = browser_factory
         self.resolver = resolver or (lambda h: [a[4][0] for a in socket.getaddrinfo(h, 443)])
 
+    @staticmethod
+    def _is_vercel_preview_origin(url):
+        """True when ``url`` is an ``https://*.vercel.app`` origin that may be
+        behind Vercel Deployment Protection. The bypass credential is scoped
+        to exactly these origins -- never sent to unrelated hosts."""
+        try:
+            parts = urlsplit(url)
+            host = parts.hostname or ''
+        except ValueError:
+            return False
+        return (
+            parts.scheme == 'https'
+            and (host == 'vercel.app' or host.endswith('.vercel.app'))
+        )
+
+    @staticmethod
+    def _bypass_headers(bypass_secret, url):
+        """Build the protection-bypass headers for a protected Vercel preview.
+
+        Returns {} when there is no secret or the URL is not a Vercel preview
+        origin, so the credential is NEVER leaked to arbitrary asset hosts or
+        non-Vercel domains.
+        """
+        if not bypass_secret:
+            return {}
+        if not PreviewSmokeTester._is_vercel_preview_origin(url):
+            return {}
+        return {
+            'x-vercel-protection-bypass': bypass_secret,
+            'x-vercel-set-bypass-cookie': 'true',
+        }
+
+    @staticmethod
+    def _looks_like_vercel_auth_wall(url, title):
+        """Detect a Vercel Deployment Protection auth wall.
+
+        HTTP 200 is NOT enough: a protected preview redirects to Vercel's SSO
+        login. Detect at minimum a /login final path, an /api/sso redirect, or
+        the Vercel login page title/markers.
+        """
+        try:
+            path = urlsplit(url).path or ''
+        except ValueError:
+            path = ''
+        if path.rstrip('/').endswith('/login') or '/api/sso' in path:
+            return True
+        lowered = (title or '').lower()
+        if 'login' in lowered and 'vercel' in lowered:
+            return True
+        return False
+
     def _allowed_origin(self, url):
         if self.custom_hostname is None:
             return _safe_origin(url)
@@ -1130,9 +1275,14 @@ class PreviewSmokeTester:
         except ValueError:
             return False
 
-    def run(self, url, out_dir):
+    def run(self, url, out_dir, *, bypass_secret=None):
         if not self._allowed_origin(url):
             return _fail('INVALID_PREVIEW_URL')
+        # PHASE F: the project-specific Vercel automation-bypass secret is
+        # injected per run (dependency injection / runtime composition). It is
+        # scoped to the protected *.vercel.app preview origin only and is never
+        # sent to non-Vercel domains or arbitrary asset hosts.
+        headers = self._bypass_headers(bypass_secret, url)
         # Thread-affinity dispatch: Playwright Sync objects (Browser,
         # BrowserContext, Page, greenlets) are bound to the thread that
         # created them. If the caller owns a running asyncio loop, run the
@@ -1144,11 +1294,15 @@ class PreviewSmokeTester:
                 "thread — executing the full Playwright lifecycle on a "
                 "dedicated worker thread"
             )
-            return _run_on_dedicated_thread(lambda: self._run_sync(url, out_dir))
-        return self._run_sync(url, out_dir)
+            return _run_on_dedicated_thread(
+                lambda: self._run_sync(url, out_dir, headers=headers)
+            )
+        return self._run_sync(url, out_dir, headers=headers)
 
-    def _run_sync(self, url, out_dir):
+    def _run_sync(self, url, out_dir, headers=None):
         failures, shots = [], {}
+        auth_wall = False
+        headers = dict(headers or {})
         origin = urlsplit(url).netloc
         try:
             Path(out_dir).mkdir(parents=True, exist_ok=True)
@@ -1157,8 +1311,14 @@ class PreviewSmokeTester:
                 browser = self.factory()
                 context = None
                 try:
-                    context = browser.new_context(viewport=viewport, service_workers='block',
-                                                  accept_downloads=False, ignore_https_errors=False)
+                    context = browser.new_context(
+                        viewport=viewport, service_workers='block',
+                        accept_downloads=False, ignore_https_errors=False)
+                    # Scope the bypass headers to the protected preview origin
+                    # only: same-origin navigation + same-origin asset loads
+                    # get them; anything off-origin does not.
+                    if headers:
+                        context.set_extra_http_headers(headers)
                     def route_request(route):
                         request = route.request
                         try:
@@ -1189,6 +1349,22 @@ class PreviewSmokeTester:
                     page.on('response', lambda response: failures.append('HTTP asset failure')
                             if response.status >= 400 else None)
                     response = page.goto(url, wait_until='networkidle', timeout=30000)
+                    # PHASE F: AUTH WALL DETECTION. HTTP 200 is NOT enough --
+                    # a protected preview redirects to Vercel's SSO login,
+                    # which can still return 200. Explicitly detect the Vercel
+                    # auth page and fail with a sanitized code instead of
+                    # treating the login page as a healthy site.
+                    try:
+                        title = page.title()
+                    except Exception:
+                        title = ''
+                    try:
+                        final_url = page.url
+                    except Exception:
+                        final_url = url
+                    if self._looks_like_vercel_auth_wall(final_url, title):
+                        auth_wall = True
+                        failures.append(label + ': vercel auth wall')
                     if response is None or response.status != 200 or page.url != url:
                         failures.append(label + ': navigation failed/redirected')
                     healthy = page.evaluate('''() => Boolean(document.body &&
@@ -1224,5 +1400,8 @@ class PreviewSmokeTester:
         return OperationResult(
             success=not failures,
             data={**shots, 'url': url, 'failures': failures},
-            error_code='SMOKE_FAILED' if failures else None,
+            error_code=(
+                'VERCEL_BYPASS_AUTH_FAILED' if auth_wall
+                else ('SMOKE_FAILED' if failures else None)
+            ),
         )

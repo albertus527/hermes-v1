@@ -35,7 +35,11 @@ class TestBug1DescriptionIsNotName:
         assert reg.projects == []
         assert reg.active_project_id is None
         # System asked for a name; pending action records the clarification.
-        assert reg.pending_action == {"action": "CREATE_PROJECT", "awaiting": "NAME"}
+        # PHASE B: the pending action ALSO preserves the original descriptive
+        # request so the eventual project keeps this turn's semantics.
+        assert reg.pending_action["action"] == "CREATE_PROJECT"
+        assert reg.pending_action["awaiting"] == "NAME"
+        assert reg.pending_action.get("original_request")
         assert any("nama" in t.lower() for _, t in h.telegram.text_calls)
         # No Vercel project creation yet.
         assert h.vercel.post_calls == 0

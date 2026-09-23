@@ -70,6 +70,7 @@ from app.channels.telegram import NormalizedMessage, TelegramNormalizer
 from app.core.intake import IntakeProcessor
 from app.core.state import ProjectStateStore
 from app.core.registry import ConversationRegistryStore, DuplicateProjectName, slugify_display_name
+from app.core.secrets import BypassSecretStore
 from app.conversations import ConversationRoute, ConversationRouter
 from app.deploy.adapters import (
     PreviewSmokeTester,
@@ -77,6 +78,7 @@ from app.deploy.adapters import (
     UrllibHttpTransport,
     VercelAdapter,
 )
+from app.deploy.bypass import BypassProvisioner
 from app.deploy.git_output import OutputGitRepository
 from app.deploy.preview import PreviewDeps, PreviewOrchestrator
 from app.hermes.adapter import HermesAdapter
@@ -656,6 +658,14 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
     # display_name -- never invented, never truncated. bind_slug persists
     # that candidate EXACTLY ONCE on first successful Vercel resolution
     # (idempotent — see ConversationRegistryStore.set_vercel_slug_once).
+    #
+    # PHASE C: BEFORE any remote Vercel project creation, the registry's
+    # display_name is converged onto the confirmed ``brief['name']`` (when one
+    # exists and differs), so the slug derives from the canonical identity the
+    # user actually confirmed. A provisional/bootstrap display name must never
+    # leak into the remote Vercel project name. Convergence is a no-op once
+    # the slug is already bound (never forks remote identity) and fails closed
+    # on a collision with another project.
     def _slug_for(pid, state):
         if state is None or not state.conversation_id:
             return None
@@ -665,6 +675,25 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
             return None
         if entry.vercel_slug:
             return entry.vercel_slug
+        confirmed = (state.brief or {}).get("name")
+        if isinstance(confirmed, str) and confirmed.strip():
+            resolution = registry_store.converge_display_name(
+                state.conversation_id, pid, confirmed.strip()
+            )
+            if resolution.status in ("ok", "noop") and resolution.entry is not None:
+                entry = resolution.entry
+            elif resolution.status == "ambiguous":
+                # A confirmed name that collides with another project must
+                # NEVER be silently adopted/overwritten, and must never fork a
+                # second identity. Leave the registry entry unchanged (the
+                # collision surfaces via the normal duplicate-name
+                # clarification path) and derive the slug from the CURRENT
+                # display name only -- no rename happens here.
+                logger.warning(
+                    "Confirmed name %r for project %s collides with another "
+                    "project; not converging registry display name",
+                    confirmed, pid,
+                )
         return slugify_display_name(entry.display_name)
 
     def _bind_slug(pid, state, slug):
@@ -690,6 +719,18 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
 
     smoke_tester = PreviewSmokeTester(config.smoke_browser_factory)
 
+    # PHASE E: project-scoped Vercel automation-bypass provisioning. The
+    # secret store lives under HERMES_HOME, SEPARATE from all project/
+    # conversation state, keyed by immutable Vercel project id. Future
+    # projects never require manual dashboard setup.
+    bypass_store = BypassSecretStore(config.hermes_home / "vercel-bypass")
+    bypass_provisioner = BypassProvisioner(vercel, bypass_store)
+
+    def _ensure_bypass(app_id, vercel_project, *, expected_name=None):
+        return bypass_provisioner.ensure(
+            app_id, vercel_project, expected_name=expected_name
+        )
+
     preview_deps = PreviewDeps(
         vercel=vercel,
         telegram=telegram_out,
@@ -703,6 +744,7 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
         ),
         slug_for=_slug_for,
         bind_slug=_bind_slug,
+        ensure_bypass=_ensure_bypass,
     )
     preview = PreviewOrchestrator(store, preview_deps, runner=runner)
 
@@ -731,6 +773,7 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
         smoke=smoke_tester,
         chat_id_for=chat_id_for,
         slug_for=_bound_slug_for,
+        bypass_for=lambda vercel_project_id: bypass_store.resolve(vercel_project_id),
     )
     promote = PromotionOrchestrator(runner, store, promote_deps)
 
@@ -1334,7 +1377,57 @@ User message:
                 "Project-nya belum bisa dibuka. Coba kirim ulang pesannya ya.",
             )
             return
+        # PHASE B: when the router preserved the ORIGINAL descriptive request
+        # that prompted the name clarification, feed BOTH the confirmed name
+        # answer AND the original description into intake so the project keeps
+        # its original semantics. The name answer comes first so FAST labels
+        # it NAME; the preserved description supplies WHAT/WHY/theme details.
+        #
+        # The dispatcher re-normalizes the Telegram update payload itself (it
+        # never trusts the caller's NormalizedMessage), so the enrichment must
+        # be applied to the UPDATE payload. The claim key is derived from the
+        # event_id only, so this text change never alters claim identity.
+        original_request = getattr(route, "original_request", None)
+        if original_request and original_request.strip() != (message.text or "").strip():
+            combined = self._combine_name_and_request(message.text, original_request)
+            update = self._with_message_text(update, combined)
         self._handle_intake(update, project_id, authenticated, message, state)
+
+    @staticmethod
+    def _with_message_text(update: dict, text: str) -> dict:
+        """Return a shallow copy of ``update`` with the message text replaced.
+
+        Used to enrich an intake turn with preserved context WITHOUT mutating
+        the caller's payload. Message/edited_message (and its text field) are
+        shallow-copied so no shared structure is modified.
+        """
+        if not isinstance(update, dict):
+            return update
+        for key in ("message", "edited_message"):
+            payload = update.get(key)
+            if isinstance(payload, dict):
+                new_update = dict(update)
+                new_message = dict(payload)
+                new_message["text"] = text
+                new_update[key] = new_message
+                return new_update
+        return update
+
+    @staticmethod
+    def _combine_name_and_request(name_answer: str, original_request: str) -> str:
+        """Compose the intake text for a clarified new project.
+
+        The user's name answer is preserved verbatim and the original
+        descriptive request is appended as the authoritative description of
+        what the website is about. Deterministic, no LLM involvement.
+        """
+        name = (name_answer or "").strip()
+        request = (original_request or "").strip()
+        if not request:
+            return name
+        if not name:
+            return request
+        return f"{name}\n\n(deskripsi awal: {request})"
 
     def _handle_legacy_first_project(self, update, message, authenticated, project_id) -> None:
         create_result = self.dispatcher.dispatch(
