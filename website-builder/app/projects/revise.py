@@ -38,7 +38,12 @@ from app.core.composition import compose_project_instructions, validate_composed
 from app.core.lifecycle import LifecycleError, ProjectLifecycle
 from app.core.state import ProjectStateStore
 from app.deploy.snapshot import record_checks, source_fingerprint
-from app.projects.build import _CHEAP_CHECK_SEQUENCE, run_fixed_checks
+from app.core.selfcontained import EXTERNAL_RUNTIME_DEPENDENCY
+from app.projects.build import (
+    _CHEAP_CHECK_SEQUENCE,
+    normalize_and_check_self_contained,
+    run_fixed_checks,
+)
 from app.qa.orchestrator import QAOrchestrator
 from app.sandbox.runner import ProjectRunner
 
@@ -412,6 +417,19 @@ class RevisionOrchestrator:
                     f"Revision cheap checks failed: {failed}",
                     f"CHEAP_CHECKS_FAILED:{failed}",
                 )
+            # BUILD-TIME self-contained gate (Phase 7 parity): normalize
+            # supported external dependencies into local assets and reject any
+            # remaining unsupported external runtime dependency BEFORE the
+            # ``checked`` binding is recorded. It reuses the existing revision
+            # failure handling -- no second, asset-specific repair system.
+            self_contained = normalize_and_check_self_contained(project_id, workspace)
+            if not self_contained.ok:
+                return self._fail(
+                    project_id, seq,
+                    self_contained.error_text() or EXTERNAL_RUNTIME_DEPENDENCY,
+                    EXTERNAL_RUNTIME_DEPENDENCY,
+                )
+            before = source_fingerprint(workspace)
             record_checks(self.store, project_id, workspace, before)
 
             qa_orchestrator = QAOrchestrator(

@@ -65,7 +65,7 @@ def test_failed_rebuild_never_renders_stale_output(tmp_path):
     qa = QAOrchestrator(ProjectRunner(tmp_path / 'work', store), store, adapter)
     blocked = QAAttempt(0, DeterministicFindings(failures=['broken']), VisionFindings(False, blocking_findings=['broken']))
     with patch.object(qa, '_run_one_attempt', return_value=blocked) as render, patch.object(
-        qa, '_run_rebuild_checks', return_value=(False, False)
+        qa, '_run_rebuild_checks', return_value=(False, False, True)
     ):
         result = qa.run('project', tmp_path, {})
     assert not result.success

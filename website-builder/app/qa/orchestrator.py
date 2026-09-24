@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 from app.deploy.snapshot import TestedSnapshot, source_fingerprint, record_checks
 from app.core.lifecycle import ProjectLifecycle
 from app.core.composition import compose_project_instructions, validate_composed_dna, invalidate_artifact
+from app.core.selfcontained import (
+    EXTERNAL_RUNTIME_DEPENDENCY,
+    normalize_and_check_self_contained,
+)
 from app.core.state import ProjectStateStore
 from app.qa.deterministic import run_deterministic_checks
 from app.qa.findings import DeterministicFindings, QAAttempt, QAResult, VisionFindings
@@ -75,6 +79,11 @@ class QAOrchestrator:
         # protected starter/toolchain files after every FRONTEND repair.
         self._toolchain_verify = toolchain_verify
         self._toolchain_error: Optional[str] = None
+        # Latest self-contained report produced by a post-repair rebuild; read
+        # by the repair loop to attach an explicit, FRONTEND-actionable
+        # blocking finding. Never persisted as evidence (the artifact itself
+        # is the evidence).
+        self._self_contained_report = None
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -188,8 +197,9 @@ class QAOrchestrator:
                 design_dna = self.store.load(project_id).design_dna
 
                 # Deterministic rebuild checks after repair.
-                build_ok, typecheck_ok = self._run_rebuild_checks(project_id, workspace)
-                if not build_ok or not typecheck_ok:
+                build_ok, typecheck_ok, self_contained_ok = self._run_rebuild_checks(
+                    project_id, workspace)
+                if not build_ok or not typecheck_ok or not self_contained_ok:
                     # Record a synthetic failing attempt reflecting the
                     # broken rebuild. A failed deterministic rebuild is
                     # metadata about this repair, not a fresh QA pass — but
@@ -209,6 +219,12 @@ class QAOrchestrator:
                         failing.failures.append("npm run build failed after repair")
                     if not typecheck_ok:
                         failing.failures.append("npm run typecheck failed after repair")
+                    if build_ok and typecheck_ok and not self_contained_ok:
+                        report = self._self_contained_report
+                        failing.failures.append(
+                            "External runtime dependency remained after repair:\n"
+                            + (report.error_text() if report is not None else EXTERNAL_RUNTIME_DEPENDENCY)
+                        )
                     rebuild_failure = QAAttempt(
                         attempt=next_attempt_num,
                         deterministic=failing,
@@ -443,7 +459,16 @@ Instructions:
 """
 
     def _run_rebuild_checks(self, project_id: str, workspace: Path) -> tuple:
-        """Run build + typecheck once after a repair. Does not re-run npm ci."""
+        """Run build + typecheck once after a repair. Does not re-run npm ci.
+
+        ``self_contained`` holds a THIRD, independent outcome: the same
+        build-time artifact gate Phase 7 applies. A repair is free to fix a
+        blocking finding any way it likes, but it must not leave the artifact
+        with an unsupported external runtime dependency. ``record_checks`` (and
+        therefore the ``checked`` binding QA/preview trust) only happens when
+        all three are clean.
+        """
+        self_contained = True
         before = source_fingerprint(workspace)
         build_proc = self.runner.run_command(
             project_id, ["npm", "run", "build"], cwd=workspace, timeout=300,
@@ -452,8 +477,18 @@ Instructions:
             project_id, ["npm", "run", "typecheck"], cwd=workspace, timeout=120,
         )
         if build_proc.returncode == 0 and typecheck_proc.returncode == 0:
-            record_checks(self.store, project_id, workspace, before)
-        return build_proc.returncode == 0, typecheck_proc.returncode == 0
+            # Normalize supported external dependencies into local assets,
+            # then reject whatever unsupported external runtime dependency the
+            # repair left behind. The report is carried on the orchestrator so
+            # the caller can turn it into an explicit blocking finding instead
+            # of an opaque "npm run build failed after repair".
+            report = normalize_and_check_self_contained(project_id, workspace)
+            self._self_contained_report = report
+            self_contained = report.ok
+            if self_contained:
+                before = source_fingerprint(workspace)
+                record_checks(self.store, project_id, workspace, before)
+        return build_proc.returncode == 0, typecheck_proc.returncode == 0, self_contained
 
     # ------------------------------------------------------------------
     # Lifecycle finalization

@@ -158,7 +158,7 @@ class TestInitialBlockingThenRepairPasses(_FixtureBase):
         ]
         self.mock_adapter.frontend_build.return_value = {"success": True, "design_dna": self.design_dna}
 
-        with patch.object(self.orchestrator, "_run_rebuild_checks", return_value=(True, True)):
+        with patch.object(self.orchestrator, "_run_rebuild_checks", return_value=(True, True, True)):
             result = self.orchestrator.run("proj", self.workspace, self.brief, self.design_dna)
 
         self.assertTrue(result.success)
@@ -213,7 +213,7 @@ class TestRepairValidatesAgainstLockedReferenceSnapshot(_FixtureBase):
             "app.qa.orchestrator.validate_composed_dna",
             side_effect=_capture,
         ) as mock_validate, patch.object(
-            self.orchestrator, "_run_rebuild_checks", return_value=(True, True)
+            self.orchestrator, "_run_rebuild_checks", return_value=(True, True, True)
         ):
             result = self.orchestrator.run("proj", self.workspace, self.brief, self.design_dna)
 
@@ -240,7 +240,7 @@ class TestRepairBudgetExhaustion(_FixtureBase):
         ]
         self.mock_adapter.frontend_build.return_value = {"success": True, "design_dna": self.design_dna}
 
-        with patch.object(self.orchestrator, "_run_rebuild_checks", return_value=(True, True)):
+        with patch.object(self.orchestrator, "_run_rebuild_checks", return_value=(True, True, True)):
             result = self.orchestrator.run("proj", self.workspace, self.brief, self.design_dna)
 
         self.assertFalse(result.success)
@@ -619,7 +619,7 @@ class TestScreenshotsRequired(_FixtureBase):
         self.mock_adapter.vision_inspect.return_value = self._passing_vision()
         self.mock_adapter.frontend_build.return_value = {"success": True, "design_dna": self.design_dna}
 
-        with patch.object(self.orchestrator, "_run_rebuild_checks", return_value=(True, True)):
+        with patch.object(self.orchestrator, "_run_rebuild_checks", return_value=(True, True, True)):
             result = self.orchestrator.run("proj", self.workspace, self.brief, self.design_dna)
 
         self.assertFalse(result.success)
@@ -638,7 +638,7 @@ class TestScreenshotsRequired(_FixtureBase):
         self.mock_adapter.vision_inspect.return_value = self._passing_vision()
         self.mock_adapter.frontend_build.return_value = {"success": True, "design_dna": self.design_dna}
 
-        with patch.object(self.orchestrator, "_run_rebuild_checks", return_value=(True, True)):
+        with patch.object(self.orchestrator, "_run_rebuild_checks", return_value=(True, True, True)):
             result = self.orchestrator.run("proj", self.workspace, self.brief, self.design_dna)
 
         self.assertFalse(result.success)
@@ -776,7 +776,7 @@ class TestEvidenceIntegrityBlocksBeforeVision(_FixtureBase):
         self.mock_adapter.frontend_build.return_value = {
             "success": True, "design_dna": self.design_dna,
         }
-        with patch.object(self.orchestrator, "_run_rebuild_checks", return_value=(True, True)):
+        with patch.object(self.orchestrator, "_run_rebuild_checks", return_value=(True, True, True)):
             result = self.orchestrator.run("proj", self.workspace, self.brief, self.design_dna)
 
         self.assertFalse(result.success)
@@ -809,7 +809,7 @@ class TestBrokenBuildAfterRepairBlocks(_FixtureBase):
         self.mock_adapter.frontend_build.return_value = {"success": True, "design_dna": self.design_dna}
 
         # Rebuild checks always fail after repair.
-        with patch.object(self.orchestrator, "_run_rebuild_checks", return_value=(False, True)):
+        with patch.object(self.orchestrator, "_run_rebuild_checks", return_value=(False, True, True)):
             result = self.orchestrator.run("proj", self.workspace, self.brief, self.design_dna)
 
         self.assertFalse(result.success)
@@ -825,7 +825,7 @@ class TestDeterministicFunctionalFailureBlocks(_FixtureBase):
         self.mock_renderer.start.side_effect = RenderError("did not become ready")
         self.mock_adapter.frontend_build.return_value = {"success": True, "design_dna": self.design_dna}
 
-        with patch.object(self.orchestrator, "_run_rebuild_checks", return_value=(True, True)):
+        with patch.object(self.orchestrator, "_run_rebuild_checks", return_value=(True, True, True)):
             result = self.orchestrator.run("proj", self.workspace, self.brief, self.design_dna)
 
         self.assertFalse(result.success)
@@ -872,7 +872,7 @@ class TestLifecycleNeverEarlyPreviewReady(_FixtureBase):
         self.mock_adapter.vision_inspect.side_effect = _vision
         self.mock_adapter.frontend_build.return_value = {"success": True, "design_dna": self.design_dna}
 
-        with patch.object(self.orchestrator, "_run_rebuild_checks", return_value=(True, True)):
+        with patch.object(self.orchestrator, "_run_rebuild_checks", return_value=(True, True, True)):
             result = self.orchestrator.run("proj", self.workspace, self.brief, self.design_dna)
 
         self.assertTrue(result.success)
@@ -902,7 +902,7 @@ class TestCleanupRuns(_FixtureBase):
         self.mock_adapter.vision_inspect.return_value = self._blocking_vision()
         self.mock_adapter.frontend_build.return_value = {"success": False, "error": "repair failed"}
 
-        with patch.object(self.orchestrator, "_run_rebuild_checks", return_value=(True, True)):
+        with patch.object(self.orchestrator, "_run_rebuild_checks", return_value=(True, True, True)):
             self.orchestrator.run("proj", self.workspace, self.brief, self.design_dna)
 
         # Render started once (attempt 0); repair failed to execute so the
@@ -1474,7 +1474,7 @@ class TestRepairAttemptNumbering(unittest.TestCase):
             # but QA still blocks -> budget exhausted at MAX_REPAIR_ATTEMPTS.
             with patch.object(
                 orchestrator, "_run_rebuild_checks",
-                side_effect=[(False, True), (True, True)],
+                side_effect=[(False, True, True), (True, True, True)],
             ):
                 result = orchestrator.run("proj", workspace, {"name": "N", "what": "W", "why": "Y"}, {"version": 1})
 
@@ -1601,7 +1601,7 @@ class TestInfrastructureFailureIsolation(_FixtureBase):
             "design_dna": self.design_dna,
         }
 
-        with patch.object(self.orchestrator, "_run_rebuild_checks", return_value=(True, True)):
+        with patch.object(self.orchestrator, "_run_rebuild_checks", return_value=(True, True, True)):
             result = self.orchestrator.run("proj", self.workspace, self.brief, self.design_dna)
 
         self.assertFalse(result.success)
@@ -1652,7 +1652,7 @@ class TestToolchainProtectionRepair(_FixtureBase):
             "design_dna": self.design_dna,
         }
 
-        with patch.object(orchestrator, "_run_rebuild_checks", return_value=(True, True)):
+        with patch.object(orchestrator, "_run_rebuild_checks", return_value=(True, True, True)):
             result = orchestrator.run("proj", self.workspace, self.brief, self.design_dna)
 
         self.assertFalse(result.success)
@@ -1684,7 +1684,7 @@ class TestToolchainProtectionRepair(_FixtureBase):
             "design_dna": self.design_dna,
         }
 
-        with patch.object(orchestrator, "_run_rebuild_checks", return_value=(True, True)):
+        with patch.object(orchestrator, "_run_rebuild_checks", return_value=(True, True, True)):
             result = orchestrator.run("proj", self.workspace, self.brief, self.design_dna)
 
         self.assertTrue(result.success)
@@ -1715,7 +1715,7 @@ class TestVisionBlockingVsObservationContract(_FixtureBase):
             "success": True,
             "design_dna": self.design_dna,
         }
-        with patch.object(self.orchestrator, "_run_rebuild_checks", return_value=(True, True)):
+        with patch.object(self.orchestrator, "_run_rebuild_checks", return_value=(True, True, True)):
             return self.orchestrator.run("proj", self.workspace, self.brief, self.design_dna)
 
     def test_p5_case1_preferred_hex_color_is_non_blocking(self):

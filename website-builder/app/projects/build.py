@@ -34,6 +34,12 @@ from app.core.composition import (
     validate_composed_dna,
 )
 from app.core.lifecycle import ProjectLifecycle
+from app.core.selfcontained import (
+    EXTERNAL_RUNTIME_DEPENDENCY,
+    SelfContainedReport,
+    check_self_contained,
+    normalize_artifact,
+)
 from app.core.state import ProjectStateStore
 from app.qa.orchestrator import QAOrchestrator
 from app.sandbox.runner import ProjectRunner, WorkspaceError
@@ -118,6 +124,36 @@ def run_fixed_checks(runner, project_id: str, workspace: Path) -> Dict[str, Any]
 
     return results
 
+
+# ---------------------------------------------------------------------------
+# Self-contained artifact gate (build-time half of the same-origin invariant)
+# ---------------------------------------------------------------------------
+#
+# FRONTEND keeps full design freedom; the FINAL artifact must render without
+# third-party runtime assets. The build owns two deterministic steps that run
+# AFTER npm build has produced ``dist/`` and BEFORE the artifact is ever
+# bound as ``checked`` for QA/preview:
+#
+#   1. NORMALIZE supported external dependencies into local files (Phase 1:
+#      Google Fonts web fonts) -- custom typography is preserved, never
+#      replaced with a system font stack merely to pass a check.
+#   2. VALIDATE that no unsupported external runtime dependency remains.
+#      The ``checked`` binding carries the report so a later consumer never
+#      has to re-derive it.
+#
+# This never touches PreviewSmokeTester's same-origin rule; smoke stays the
+# independent RUNTIME verification boundary.
+
+# The shared workspace-level helpers live in ``app.core.selfcontained`` so the
+# QA post-repair rebuild boundary can enforce the exact same invariant without
+# importing this module (avoids a build <-> qa import cycle).
+from app.core.selfcontained import (  # noqa: E402  (imported with the gate block)
+    normalize_and_check_self_contained,
+    normalize_self_contained,
+    self_contained_preflight,
+    sync_vendored_assets,
+)
+
 # Deterministic source/code-level build failure signatures. Any match makes a
 # failing npm_build / npm_typecheck check eligible for one targeted repair.
 _REPAIRABLE_SOURCE_PATTERNS = tuple(
@@ -136,6 +172,12 @@ _REPAIRABLE_SOURCE_PATTERNS = tuple(
         # Tailwind v4 generated-source diagnostic (real p5 failure). Narrow on
         # purpose: this exact @theme contract violation, not generic "Error:".
         r"@theme` blocks must only contain custom properties or `@keyframes`",
+        # Build-time self-contained gate. An external runtime dependency left
+        # in the generated artifact is a deterministic SOURCE-level defect
+        # that FRONTEND owns and can fix (replace a CDN script/stylesheet/asset
+        # with a local copy). It reuses the EXISTING single compile-repair
+        # budget -- no second, asset-specific repair system exists.
+        r"\bEXTERNAL_RUNTIME_DEPENDENCY\b",
     )
 )
 
@@ -195,7 +237,8 @@ def classify_cheap_check_failure(checks: Dict[str, Any]) -> CompileRepairDecisio
       defect, so it is not eligible.
     """
     failed_check = next(
-        (name for name in _CHEAP_CHECK_SEQUENCE if checks.get(name, {}).get("success") is False),
+        (name for name in (*_CHEAP_CHECK_SEQUENCE, "self_contained")
+         if checks.get(name, {}).get("success") is False),
         None,
     )
     if failed_check is None:
@@ -355,7 +398,7 @@ class FrontendBuilder:
             return (value or "").strip() or "(no output)"
 
         full_results = []
-        for name in _CHEAP_CHECK_SEQUENCE:
+        for name in (*_CHEAP_CHECK_SEQUENCE, "self_contained"):
             if name not in checks:
                 continue
             entry = checks[name] or {}
@@ -628,6 +671,26 @@ Respond with a JSON summary:
             before = source_fingerprint(workspace)
             checks = self._run_fixed_checks(project_id, workspace)
             build_success = all(r.get("success", False) for r in checks.values())
+            self_contained = None
+            if build_success:
+                # BUILD-TIME self-contained gate. normalize supported external
+                # dependencies (Phase 1: Google Fonts) into local assets, then
+                # reject any remaining unsupported external runtime dependency.
+                # The normalized assets enter ``before``/``record_checks``
+                # below, so the checked binding can never certify bytes that
+                # still carry an external runtime dependency.
+                self_contained = normalize_and_check_self_contained(project_id, workspace)
+                if not self_contained.ok:
+                    checks["self_contained"] = {
+                        "success": False,
+                        "stdout": "",
+                        "stderr": _bounded_output(self_contained.error_text()),
+                        "findings": [f.to_dict() for f in self_contained.findings],
+                    }
+                    build_success = False
+                else:
+                    checks["self_contained"] = {"success": True, "stdout": "", "stderr": ""}
+                before = source_fingerprint(workspace)
             if build_success:
                 record_checks(self.store, project_id, workspace, before)
 
@@ -686,6 +749,25 @@ Respond with a JSON summary:
                         checks = self._run_fixed_checks(project_id, workspace)
                         build_success = all(r.get("success", False) for r in checks.values())
                         if build_success:
+                            # The repair may have INTRODUCED an external runtime
+                            # dependency (or removed a vendored one): re-run the
+                            # full self-contained gate before the checked
+                            # binding is ever recorded.
+                            self_contained = normalize_and_check_self_contained(
+                                project_id, workspace)
+                            if not self_contained.ok:
+                                checks["self_contained"] = {
+                                    "success": False,
+                                    "stdout": "",
+                                    "stderr": _bounded_output(self_contained.error_text()),
+                                    "findings": [f.to_dict() for f in self_contained.findings],
+                                }
+                                build_success = False
+                            else:
+                                checks["self_contained"] = {
+                                    "success": True, "stdout": "", "stderr": ""}
+                            before = source_fingerprint(workspace)
+                        if build_success:
                             record_checks(self.store, project_id, workspace, before)
                         logger.info(
                             "Phase-7 cheap checks rerun for %s: final result=%s",
@@ -741,14 +823,25 @@ Respond with a JSON summary:
                         error="TOOLCHAIN_MUTATION_REJECTED",
                         duration_seconds=time.time() - start_time,
                     )
-                failed_check = next((name for name, r in checks.items() if not r.get("success")), "unknown")
+                failed_check = next(
+                    (name for name in (*_CHEAP_CHECK_SEQUENCE, "self_contained")
+                     if not (checks.get(name) or {}).get("success")),
+                    "unknown",
+                )
+                error = f"CHEAP_CHECKS_FAILED:{failed_check}"
+                if failed_check == "self_contained":
+                    # Surface the sanitized, FRONTEND-actionable contract
+                    # together with the exact failing check, so the operator
+                    # sees BOTH the stable failure code and (in build_output)
+                    # the per-file diagnostics with kind/host/file metadata.
+                    error = f"{error}:{EXTERNAL_RUNTIME_DEPENDENCY}"
                 return BuildResult(
                     success=False,
                     project_id=project_id,
                     workspace=workspace,
                     design_dna=design_dna,
                     build_output=json.dumps(checks, indent=2),
-                    error=f"CHEAP_CHECKS_FAILED:{failed_check}",
+                    error=error,
                     duration_seconds=time.time() - start_time,
                 )
 
