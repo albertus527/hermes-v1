@@ -1276,6 +1276,79 @@ class TestPhase7CompileRepair(unittest.TestCase):
         self.assertEqual(state.lifecycle, ProjectLifecycle.RUNNING.value)
         self.assertIsNone(state.failure)
 
+    def test_masked_syntax_failure_preserves_unused_icon_prop_api(self):
+        syntax_output = (
+            "src/components/Catalog.tsx(29,14): error TS1005: '>' expected."
+        )
+        unused_prop_output = (
+            "src/components/icons.tsx(54,35): error TS6133: "
+            "'className' is declared but its value is never read."
+        )
+        initial = {
+            "npm_ci": {"success": True, "stdout": "", "stderr": ""},
+            "npm_build": {
+                "success": False,
+                "stdout": syntax_output,
+                "stderr": "",
+            },
+            "npm_typecheck": {
+                "success": False,
+                "stdout": syntax_output,
+                "stderr": "",
+            },
+        }
+        post_repair = {
+            "npm_ci": {"success": True, "stdout": "", "stderr": ""},
+            "npm_build": {
+                "success": False,
+                "stdout": unused_prop_output,
+                "stderr": "",
+            },
+            "npm_typecheck": {
+                "success": False,
+                "stdout": unused_prop_output,
+                "stderr": "",
+            },
+        }
+
+        result, mock_checks, mock_qa = self._run_build_with_checks(
+            "proj-repair-masked-icon-prop",
+            [initial, post_repair],
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error, "CHEAP_CHECKS_FAILED:npm_build")
+        self.assertEqual(self.adapter.frontend_build.call_count, 2)
+        self.assertEqual(mock_checks.call_count, 2)
+        mock_qa.run.assert_not_called()
+
+        repair_instructions = self.adapter.frontend_build.call_args_list[1].kwargs[
+            "design_dna_instructions"
+        ]
+        self.assertIn("error TS1005", repair_instructions)
+        self.assertIn(
+            "parse/syntax error can mask later TypeScript diagnostics",
+            repair_instructions,
+        )
+        self.assertIn("part of a component's public API", repair_instructions)
+        self.assertIn("component's\n  root rendered element", repair_instructions)
+        self.assertIn("<svg className={className}>", repair_instructions)
+        self.assertIn(
+            "inspect sibling icon components in src/components", repair_instructions
+        )
+        self.assertIn(
+            "Do NOT modify or delete protected toolchain files", repair_instructions
+        )
+
+        state = self.store.load("proj-repair-masked-icon-prop")
+        self.assertEqual(state.lifecycle, ProjectLifecycle.FAILED.value)
+        self.assertEqual(state.failure["compile_repair_attempts"], 1)
+        self.assertEqual(state.failure["final_stage"], "post_repair")
+        self.assertIn(
+            "TS1005", state.failure["initial_checks"]["npm_build"]["stdout"]
+        )
+        self.assertIn("TS6133", state.failure["checks"]["npm_typecheck"]["stdout"])
+
     # -- B: repair runs, build still fails, NO second repair ---------------
 
     def test_b_repair_still_failing_has_no_second_repair(self):

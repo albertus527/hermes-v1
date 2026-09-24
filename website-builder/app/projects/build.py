@@ -446,9 +446,16 @@ Repair rules (HARD constraints):
   npm run typecheck.
 - Do NOT rewrite, redesign, regenerate, or re-create the website. Do not
   touch unrelated files or components.
-- Work only inside the existing workspace source files (e.g. remove or use
-  an unused import/variable for TS6133). The starter placeholder replacement
-  step is already complete; do not repeat it.
+- Work only inside the existing workspace source files. For TS6133, remove
+  only unused declarations that are not part of a component's public API. If
+  an unused prop belongs to the API, preserve and apply it to the component's
+  root rendered element; for an icon component accepting className, forward it
+  to the root SVG as
+  <svg className={{className}}> instead of deleting the prop. The starter
+  placeholder replacement step is already complete; do not repeat it.
+- A parse/syntax error can mask later TypeScript diagnostics. After fixing
+  the reported parser error, inspect sibling icon components in src/components
+  for the same unused public-prop pattern and fix only identical defects.
 - Do NOT modify or delete protected toolchain files: .nvmrc, .npmrc,
   package.json, package-lock.json, tsconfig.json, tsconfig.app.json,
   tsconfig.node.json, vite.config.ts.
