@@ -87,10 +87,8 @@ class BypassProvisioner:
         """
         reader = getattr(self.vercel, 'reconcile_protection_bypass', None)
         if reader is None:
-            # The real adapter offers a read-only variant instead.
-            reader = getattr(self.vercel, 'read_protection_bypass', None)
-        if reader is None:
             return None
+
         try:
             return reader(app_id, project, expected_name=expected_name)
         except Exception:

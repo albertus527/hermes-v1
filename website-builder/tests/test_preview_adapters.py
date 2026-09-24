@@ -357,8 +357,10 @@ def test_stdlib_transport_no_redirect_or_proxy(monkeypatch):
 
 
 class Browser:
-    def __init__(self, request_url=None, redirect=False, bad_assets=False):
+    def __init__(self, request_url=None, redirect=False, bad_assets=False,
+                 resource_type='document'):
         self.request_url, self.redirect, self.bad_assets = request_url, redirect, bad_assets
+        self.resource_type = resource_type
         self.closed = self.context_closed = False
         self.handlers = {}
         self.blocked = False
@@ -382,6 +384,7 @@ class Browser:
     def goto(self, url, **kwargs):
         self.url = url
         request = SimpleNamespace(url=self.request_url or url, method='GET',
+                                  resource_type=self.resource_type,
                                   redirected_from=object() if self.redirect else None)
         route = SimpleNamespace(request=request, continue_=lambda: None,
                                 abort=lambda: setattr(self, 'blocked', True))
@@ -398,6 +401,61 @@ class Browser:
 
     def close(self):
         self.closed = True
+
+
+def test_smoke_records_sanitized_blocked_request_and_causal_events(tmp_path, caplog):
+    secret = 'https://fonts.googleapis.com/css2?family=Inter&token=sekret'
+    request_url = secret
+    console_messages = []
+
+    class AssetBrowser(Browser):
+        def goto(self, url, **kwargs):
+            self.url = url
+            request = SimpleNamespace(
+                url=request_url, method='GET', resource_type='stylesheet',
+                redirected_from=None,
+            )
+            route = SimpleNamespace(
+                request=request, continue_=lambda: None,
+                abort=lambda: setattr(self, 'blocked', True),
+            )
+            self.callback(route)
+            self.handlers['requestfailed'](request)
+            console_messages.append(SimpleNamespace(
+                type='error', text='Failed to load resource: net::ERR_FAILED',
+                location={'url': request_url},
+            ))
+            self.handlers['console'](console_messages[-1])
+            return SimpleNamespace(status=200)
+
+    with caplog.at_level('ERROR', logger='app.deploy.adapters'):
+        result = PreviewSmokeTester(
+            lambda: AssetBrowser(), lambda _: ['8.8.8.8']
+        ).run('https://test.vercel.app/', tmp_path)
+
+    assert not result.success
+    assert result.error_code == 'SMOKE_FAILED'
+    assert result.data['failure_classification'] == 'artifact_defect'
+    assert 'url' not in result.data
+    assert 'sekret' not in repr(result.data)
+    assert 'sekret' not in '\n'.join(record.getMessage() for record in caplog.records)
+    records = result.data['failure_records']
+    blocked = [r for r in records if r['category'] == 'blocked_request']
+    assert blocked
+    first = blocked[0]
+    assert first['host'] == 'fonts.googleapis.com'
+    assert first['path'] == '/css2'
+    assert first['method'] == 'GET'
+    assert first['resource_type'] == 'stylesheet'
+    assert first['reason'] == 'off_origin_or_method'
+    assert first['viewport_size'] == {'width': 1440, 'height': 900}
+    secondary = [r for r in records if r['category'] in {'request_failed', 'console_error'}]
+    assert secondary
+    blocked_by_viewport = {r['viewport']: r['id'] for r in blocked}
+    assert all(
+        record.get('caused_by') == blocked_by_viewport.get(record.get('viewport'))
+        for record in secondary
+    )
 
 
 def test_smoke_desktop_mobile_anonymous(tmp_path):
@@ -1239,7 +1297,8 @@ def test_smoke_exception_persists_type_only_and_is_logged(tmp_path, caplog):
     # exception TYPE persisted, message is NOT
     assert 'browser smoke failed: RuntimeError' in result.data['failures']
     assert not any(secret in f for f in result.data['failures'])
-    # full exception logged for operators, but state stays message-free
+    # The operator log is sanitized and does not attach raw exception text.
     assert any('Preview smoke browser failure' in r.getMessage() for r in caplog.records)
-    assert any(r.exc_info for r in caplog.records)
+    assert all(not r.exc_info for r in caplog.records)
+    assert secret not in '\n'.join(r.getMessage() for r in caplog.records)
     assert secret not in result.data['failures'][-1]

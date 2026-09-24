@@ -55,6 +55,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 EXTERNAL_RUNTIME_DEPENDENCY = "EXTERNAL_RUNTIME_DEPENDENCY"
+PREVIEW_NORMALIZATION_INFRASTRUCTURE = "PREVIEW_NORMALIZATION_INFRASTRUCTURE"
 
 # Diagnostic ``kind`` values. These are stable, sanitized identifiers that
 # FRONTEND can repair against; they never contain provider bodies or secrets.
@@ -112,25 +113,34 @@ class SelfContainedReport:
     """Deterministic result of the self-contained preflight."""
 
     findings: Tuple[ExternalDependencyFinding, ...] = ()
+    infrastructure_error: Optional[str] = None
 
     @property
     def ok(self) -> bool:
-        return not self.findings
+        return not self.findings and self.infrastructure_error is None
 
     @property
     def error_code(self) -> Optional[str]:
-        return None if self.ok else EXTERNAL_RUNTIME_DEPENDENCY
+        if self.infrastructure_error:
+            return PREVIEW_NORMALIZATION_INFRASTRUCTURE
+        if self.findings:
+            return EXTERNAL_RUNTIME_DEPENDENCY
+        return None
 
     def error_text(self) -> Optional[str]:
         if self.ok:
             return None
+        code = self.error_code or EXTERNAL_RUNTIME_DEPENDENCY
+        if self.infrastructure_error:
+            return f"{code}\n{self.infrastructure_error[:200]}"
         lines = "\n".join(f"- {f.render()}" for f in self.findings)
-        return f"{EXTERNAL_RUNTIME_DEPENDENCY}\n{lines}"
+        return f"{code}\n{lines}"
 
     def to_dict(self) -> Dict[str, object]:
         return {
             "ok": self.ok,
             "error_code": self.error_code,
+            "infrastructure_error": self.infrastructure_error,
             "findings": [f.to_dict() for f in self.findings],
         }
 
@@ -274,6 +284,15 @@ def _scan_html(text: str, rel_name: str, ctx: _ScanContext,
             ctx.add(KIND_JS_IMPORT, _host_of(url), rel_name,
                     "static remote import in inline script")
 
+    # Inline <style> block CSS (url(...) / @import). An external reference in
+    # an inline style block is fetched by the browser on load exactly like a
+    # linked stylesheet, but it lives in element TEXT (not a tag attribute),
+    # so the generic attribute walk below can never see it. Scan the block
+    # body with the same CSS rules used for .css files.
+    for match in _style_body_ranges(text):
+        body = text[match[0]:match[1]]
+        _scan_css(body, rel_name, ctx, links)
+
     # Every tag: href / src / srcset / style attributes.
     for tag_match in _TAG_RE.finditer(text):
         tag = tag_match.group("tag").lower()
@@ -381,6 +400,34 @@ def _script_body_ranges(text: str) -> List[Tuple[int, int]]:
         if open_end == -1:
             return ranges
         closing = lowered.find("</script", open_end)
+        if closing == -1:
+            return ranges
+        ranges.append((open_end + 1, closing))
+        cursor = closing + 8
+
+
+def _style_body_ranges(text: str) -> List[Tuple[int, int]]:
+    """Ranges of the CSS text *inside* each ``<style>`` element.
+
+    An inline ``<style>body{background:url(https://cdn/...) }</style>`` block is
+    a render-critical runtime dependency: the browser fetches it on load even
+    though the request never appears in the HTML tag attributes. The static
+    scanner must therefore treat the content of a ``<style>`` block exactly
+    like a stylesheet body (mirroring ``_script_body_ranges`` for inline
+    scripts). Bounded and non-greedy so a malformed document cannot cause
+    catastrophic backtracking.
+    """
+    ranges = []
+    lowered = text.lower()
+    cursor = 0
+    while True:
+        start = lowered.find("<style", cursor)
+        if start == -1:
+            return ranges
+        open_end = lowered.find(">", start)
+        if open_end == -1:
+            return ranges
+        closing = lowered.find("</style", open_end)
         if closing == -1:
             return ranges
         ranges.append((open_end + 1, closing))
@@ -1283,13 +1330,26 @@ def self_contained_preflight(project_id: str, workspace: Path) -> SelfContainedR
 def normalize_and_check_self_contained(project_id: str, workspace: Path) -> SelfContainedReport:
     """Normalize, then preflight. Never raises for content-level findings.
 
-    A normalization failure is NOT an infrastructure crash: the unsupported
-    external reference is deliberately left in place so the deterministic
-    preflight below turns it into a stable ``EXTERNAL_RUNTIME_DEPENDENCY``
-    failure that FRONTEND can repair.
+    A supported vendor transport failure is reported as infrastructure, not an
+    artifact defect; remaining unsupported references still use the stable
+    ``EXTERNAL_RUNTIME_DEPENDENCY`` failure that FRONTEND can repair.
     """
     try:
         normalize_self_contained(project_id, workspace)
-    except Exception:
-        logger.exception("Self-contained normalization raised for %s", project_id)
+    except FontVendorError as exc:
+        report = self_contained_preflight(project_id, workspace)
+        return SelfContainedReport(
+            findings=report.findings,
+            infrastructure_error=exc.code,
+        )
+    except Exception as exc:
+        logger.error(
+            "Self-contained normalization raised for %s (type=%s)",
+            project_id, type(exc).__name__,
+        )
+        report = self_contained_preflight(project_id, workspace)
+        return SelfContainedReport(
+            findings=report.findings,
+            infrastructure_error=type(exc).__name__,
+        )
     return self_contained_preflight(project_id, workspace)

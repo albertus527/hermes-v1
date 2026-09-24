@@ -440,18 +440,32 @@ class FakeSmoke:
         # assert the smoke received the project-specific credential, and that
         # it is never sent to non-Vercel origins.
         self.bypass_secrets: List[Any] = []
+        # Failure classification mirroring the REAL PreviewSmokeTester's
+        # `failure_classification`, so the runtime recovery gate exercises the
+        # production decision path. None means "not classified" (legacy).
+        self.failure_classification: Optional[str] = None
+        # Structured, sanitized records (mirrors the real tester's shape).
+        self.failure_records: List[Dict[str, Any]] = []
+        self._success_sequence: List[bool] = []
 
     def run(self, url, out_dir, *, bypass_secret=None):
         self.calls.append(url)
         self.bypass_secrets.append(bypass_secret)
+        success = self._success_sequence.pop(0) if self._success_sequence else self.success
         Path(out_dir).mkdir(parents=True, exist_ok=True)
         shot = Path(out_dir) / "desktop.png"
         shot.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+        data = {"desktop_screenshot": str(shot), "mobile_screenshot": str(shot),
+                "url": url, "failures": [] if success else ["x"]}
+        if not success:
+            if self.failure_classification:
+                data["failure_classification"] = self.failure_classification
+            if self.failure_records:
+                data["failure_records"] = list(self.failure_records)
         return OperationResult(
-            success=self.success,
-            data={"desktop_screenshot": str(shot), "mobile_screenshot": str(shot),
-                  "url": url, "failures": [] if self.success else ["x"]},
-            error_code=None if self.success else "SMOKE_FAILED",
+            success=success,
+            data=data,
+            error_code=None if success else "SMOKE_FAILED",
         )
 
 
@@ -636,7 +650,15 @@ class LocalR1Scenario:
                 ),
                 bypass_is_stored=lambda project_id, state: bool(
                     self.bypass_store.get(self.vercel.project_id)
-                ),            ),
+                ),
+                reprovision_bypass=lambda app_id, project, expected_name=None: (
+                    self.bypass_provisioner.ensure(
+                        app_id, project, expected_name=expected_name,
+                        reprovision=True,
+                    )
+                ),
+                sleep=lambda _seconds: None,
+            ),
             runner=self.runner,
         )
         self.builder = FrontendBuilder(
@@ -716,6 +738,74 @@ class LocalR1Scenario:
         """Simulate a process restart over the SAME temp state root."""
         self._loop = self._make_loop()
 
+    def restart_components(self) -> None:
+        """Recreate production collaborators while preserving external fakes."""
+        from app.core.secrets import BypassSecretStore
+        from app.deploy.bypass import BypassProvisioner
+        self.store = ProjectStateStore(self.state_root)
+        self.registry = ConversationRegistryStore(self.state_root / "conversations")
+        self.runner = RecordingRunner(self.workspace_root)
+        self.intake = IntakeProcessor(self.store, hermes_adapter=self.hermes)
+        self.router = ConversationRouter(
+            self.store, self.registry, telegram_out=self.telegram, hermes=self.hermes
+        )
+        self.bypass_store = BypassSecretStore(self.hermes_home / "vercel-bypass")
+        self.bypass_provisioner = BypassProvisioner(self.vercel, self.bypass_store)
+        self.preview = PreviewOrchestrator(
+            self.store,
+            PreviewDeps(
+                vercel=self.vercel,
+                telegram=self.telegram,
+                smoke=self.smoke,
+                output_repo=self.output_repo,
+                chat_id_for=lambda pid, state: state.conversation_id,
+                display_name_for=lambda pid, state: (
+                    self.registry.display_name_for(state.conversation_id, pid)
+                    if state is not None and state.conversation_id else None
+                ),
+                slug_for=self._slug_for,
+                bind_slug=self._bind_slug,
+                ensure_bypass=lambda app_id, project, expected_name=None: (
+                    self.bypass_provisioner.ensure(
+                        app_id, project, expected_name=expected_name
+                    )
+                ),
+                bypass_is_stored=lambda project_id, state: bool(
+                    self.bypass_store.get(self.vercel.project_id)
+                ),
+                reprovision_bypass=lambda app_id, project, expected_name=None: (
+                    self.bypass_provisioner.ensure(
+                        app_id, project, expected_name=expected_name,
+                        reprovision=True,
+                    )
+                ),
+                sleep=lambda _seconds: None,
+            ),
+            runner=self.runner,
+        )
+        self.builder = FrontendBuilder(
+            runner=self.runner, store=self.store,
+            hermes_adapter=self.hermes, preview_orchestrator=self.preview,
+        )
+        self.revise = RevisionOrchestrator(
+            runner=self.runner, store=self.store, hermes_adapter=self.hermes,
+            preview_orchestrator=self.preview,
+        )
+        self.promote = PromotionOrchestrator(
+            self.runner, self.store,
+            PromoteDeps(
+                vercel=self.vercel, telegram=self.telegram, smoke=self.smoke,
+                chat_id_for=lambda pid, state: state.conversation_id,
+                slug_for=self._bound_slug_for,
+            ),
+        )
+        self.dispatcher = TelegramDispatcher(
+            store=self.store, intake=self.intake, revise=self.revise,
+            promote=self.promote, workspace_for=self.runner.create_workspace,
+            builder=self.builder, preview=self.preview,
+        )
+        self._loop = self._make_loop()
+
     def _wipe_bypass_store(self) -> None:
         """Test-only: empty the LOCAL secure bypass store (simulating a run
         where the remote bypass exists but the local secret was never
@@ -735,7 +825,11 @@ class LocalR1Scenario:
         self.hermes.clear_router_decision()
 
     def set_intent_response(self, intent: str):
-        self.hermes.intent_response = json.dumps({"intent": intent})
+        # Production `_parse_intent_response` expects the BARE intent name
+        # (the prompt instructs "Respond with ONLY the intent name"), so the
+        # fake must return plain text -- not JSON -- or classification would
+        # always fail-safe to INTAKE and mask the routing/recovery paths.
+        self.hermes.intent_response = intent
 
     def set_intake_response(self, **fields):
         base = {
@@ -759,6 +853,20 @@ class LocalR1Scenario:
 
     def set_smoke_result(self, success: bool):
         self.smoke.success = success
+        self.smoke._success_sequence = []
+
+    def set_smoke_sequence(self, results):
+        self.smoke._success_sequence = list(results)
+        if results:
+            self.smoke.success = results[0]
+
+    def set_smoke_failure(self, *, classification: Optional[str] = None,
+                          records: Optional[List[Dict[str, Any]]] = None):
+        """Configure a FAILING smoke with an optional classification/records,
+        mirroring the real PreviewSmokeTester's sanitized diagnostic shape."""
+        self.smoke.success = False
+        self.smoke.failure_classification = classification
+        self.smoke.failure_records = list(records or [])
 
     def set_telegram_behavior(self, *, send_photo_raises=None):
         self.telegram.send_photo_raises = send_photo_raises

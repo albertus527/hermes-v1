@@ -35,6 +35,51 @@ def _ready_project(h: LocalR1Scenario, name: str = "kitsunereading") -> str:
     return pid
 
 
+def test_legacy_opaque_project_is_reconciled_before_friendly_create(tmp_path):
+    h = LocalR1Scenario(tmp_path)
+    pid = _ready_project(h)
+    registry = h.registry.load_or_create(h.chat_id)
+    entry = registry.find_by_id(pid)
+    entry.vercel_slug = None
+    h.registry.save(registry)
+    with h.store.acquire_writer(pid) as state:
+        state.deployment["vercel_project_id"] = "prj_1"
+        h.store.save(state)
+    h.vercel.get_status = 200
+    h.vercel.post_status = 201
+
+    result = h.preview.run_owned(pid, h.runner.create_workspace(pid))
+
+    assert result.success, result.error
+    assert h.vercel.post_calls == 0
+    assert h.vercel.deploy_calls == 1
+    assert h.registry_entry(pid).vercel_slug is None
+
+
+def test_slug_resolver_failure_does_not_switch_to_opaque_identity(tmp_path):
+    h = LocalR1Scenario(tmp_path)
+    pid = _ready_project(h)
+    original = h.preview.deps.slug_for
+    calls = {"count": 0}
+
+    def flaky_slug(project_id, state):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("registry read failed")
+        return original(project_id, state)
+
+    h.preview.deps.slug_for = flaky_slug
+    first = h.preview.run_owned(pid, h.runner.create_workspace(pid))
+    assert not first.success
+    assert first.error_code == "SLUG_RESOLUTION_REQUIRED"
+    assert h.vercel.post_calls == 0
+
+    second = h.preview.run_owned(pid, h.runner.create_workspace(pid))
+    assert second.success, second.error
+    assert h.vercel.post_calls == 1
+    assert h.registry_entry(pid).vercel_slug == "kitsunereading"
+
+
 class TestSlugBindPersistFailure:
     def test_bind_failure_fails_closed_before_deploy_and_delivery(self, tmp_path):
         h = LocalR1Scenario(tmp_path)

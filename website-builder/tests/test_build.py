@@ -28,6 +28,7 @@ def fake_build_artifact(monkeypatch):
     monkeypatch.setattr(ProjectRunner, 'create_workspace', create)
 
 
+from app.core.contracts import OperationResult
 from app.core.lifecycle import ProjectLifecycle
 from app.core.state import ProjectStateStore
 from app.projects.build import FrontendBuilder, BuildResult
@@ -650,7 +651,57 @@ class TestPhase8Handoff(unittest.TestCase):
         state = self.store.load("proj-handoff-d")
         self.assertEqual(state.lifecycle, ProjectLifecycle.PREVIEW_READY.value)
 
-    def test_qa_failure_reaches_failed(self):
+    def test_preview_failure_preserves_sanitized_diagnostics_and_remote_boundary(self):
+        self._passing_frontend()
+        self._queue("proj-preview-failure")
+        boundary = MagicMock()
+        preview = MagicMock()
+        diagnostics = {
+            "operation_id": "op-1",
+            "deployment_id": "dpl-1",
+            "failure_classification": "artifact_defect",
+            "failure_records": [],
+        }
+
+        def run_preview(project_id, workspace, *, slot_held=True,
+                        on_remote_boundary=None):
+            on_remote_boundary()
+            return OperationResult(
+                success=False, error="SMOKE_FAILED", error_code="SMOKE_FAILED",
+                data=dict(diagnostics),
+            )
+
+        preview.run_owned.side_effect = run_preview
+        builder = FrontendBuilder(
+            self.runner, self.store, hermes_adapter=self.mock_adapter,
+            preview_orchestrator=preview,
+        )
+        with patch.object(builder, "_run_fixed_checks") as mock_checks:
+            mock_checks.return_value = self._passing_checks()
+            with patch("app.projects.build.QAOrchestrator") as mock_qa_cls:
+                mock_qa = MagicMock()
+
+                def run_qa(project_id, workspace, brief, design_dna):
+                    with self.store.acquire_writer(project_id) as state:
+                        self.store.transition_lifecycle_locked(
+                            state, ProjectLifecycle.PREVIEW_READY
+                        )
+                        self.store.save(state)
+                    return MagicMock(success=True, error=None)
+
+                mock_qa.run.side_effect = run_qa
+                mock_qa_cls.return_value = mock_qa
+                result = builder.build(
+                    "proj-preview-failure", self._brief(),
+                    on_remote_boundary=boundary,
+                )
+
+        self.assertFalse(result.success)
+        self.assertTrue(result.reached_remote)
+        self.assertEqual(result.diagnostics["operation_id"], "op-1")
+        self.assertEqual(result.diagnostics["failure_classification"], "artifact_defect")
+        boundary.assert_called_once()
+
         """E. QA failure -> final lifecycle FAILED."""
         self._passing_frontend()
         self._queue("proj-handoff-e")

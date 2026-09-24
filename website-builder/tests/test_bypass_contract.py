@@ -433,20 +433,18 @@ def test_I_read_only_reports_absence(bypass):
     assert [c[0] for c in t.calls] == ["GET"]
 
 
-def test_I_provisioner_never_generates_from_a_non_authoritative_read(tmp_path):
-    """A bare ``read_protection_bypass`` absence must NOT trigger generation:
-    only an authoritative recoverable scan may prove "no remote bypass"."""
+def test_I_provisioner_uses_authoritative_reconcile_for_fresh_project(tmp_path):
+    """The production adapter's authoritative empty scan may provision once."""
     a0, _ = adapter()
     body = owned_project_body(a0, bypass={})
-    a, t = adapter((200, body))
+    a, t = adapter((200, body), (200, documented_record()))
     store = BypassSecretStore(tmp_path / "hh" / "vercel-bypass")
     prov = BypassProvisioner(a, store)
     result = prov.ensure("app", project(a))
-    assert not result.success
-    assert result.error_code == "BYPASS_RECONCILIATION_REQUIRED"
-    # Exactly one read-only GET; never a generation PATCH.
-    assert [c[0] for c in t.calls] == ["GET"]
-    assert store.get("prj_1") is None
+    assert result.success
+    assert result.data["source"] == "generated"
+    assert store.get("prj_1") == SECRET
+    assert [c[0] for c in t.calls] == ["GET", "PATCH"]
 
 
 @pytest.mark.parametrize("bypass", [

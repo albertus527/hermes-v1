@@ -126,7 +126,7 @@ def test_matrix_08_lookup_found_after_ambiguity(tmp_path):
     pid, ws = _seed_preview_ready(h)
     h.set_vercel_behavior(get_status=404, post_raises=TimeoutError("t"))
     assert not h.preview.run_owned(pid, ws).success
-    h.restart()
+    h.restart_components()
     h.set_vercel_behavior(post_raises=None, get_status=200)
     assert h.preview.run_owned(pid, ws).success
     assert h.vercel_calls["create_post"] == 1
@@ -220,19 +220,21 @@ def test_matrix_14_15_revision_crash_after_preview_then_restart(tmp_path):
         return r
 
     h.preview.run_owned = hook
-    with pytest.raises(RuntimeError):
-        h.run_revision("ganti warna")
+    result = h.run_revision("ganti warna")
+    assert result.success
+    assert result.reconciled
 
-    # Crash window durable state.
-    assert h.revision_counters(pid)["revision_seq"] == 0
+    # The preview is already shown and the owner finalized the reservation
+    # despite the injected post-delivery exception.
+    assert h.revision_counters(pid)["revision_seq"] == 1
     assert h.revision_counters(pid)["queued_revision_seq"] == 1
     assert h.telegram_calls["photo"] == photos0 + 1
 
-    # Restart over the SAME state and recover exactly once, no re-send.
-    h.restart()
+    # Restart over the SAME state and re-drive exactly once, no re-send.
+    h.restart_components()
     recovered = h.revise.apply(pid, 1, "ganti warna", principal_id=h.principal_id)
-    assert recovered.success
-    assert h.revision_counters(pid)["revision_seq"] == 1
+    assert not recovered.success
+    assert recovered.error_code == "REVISION_ALREADY_APPLIED"
     assert h.telegram_calls["photo"] == photos0 + 1
     seqs = sorted(e["seq"] for e in h.pending_revisions(pid))
     assert seqs == list(range(1, len(seqs) + 1))

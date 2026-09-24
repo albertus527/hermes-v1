@@ -185,7 +185,7 @@ class TelegramDispatcher:
                 # so a purely local/pre-remote failure (e.g.
                 # CHEAP_CHECKS_FAILED before any Vercel call) is provably
                 # retryable. Legacy claims with a missing flag stay UNKNOWN.
-                if action == "build":
+                if action in {"build", "revise"}:
                     state.dispatch_events[key] = {
                         "action": action,
                         "status": "CLAIMED",
@@ -322,9 +322,18 @@ class TelegramDispatcher:
                                 bstate.dispatch_events[build_key]["status"] = (
                                     "DONE" if getattr(build_result, "success", False) else "FAILED"
                                 )
+                                bstate.dispatch_events[build_key]["build_diagnostics"] = dict(
+                                    getattr(build_result, "diagnostics", {}) or {}
+                                )
                                 self.store.save(bstate)
                             result.data["build_triggered"] = True
                             result.data["build_success"] = bool(getattr(build_result, "success", False))
+                            result.data["build_reached_remote"] = bool(
+                                getattr(build_result, "reached_remote", False)
+                            )
+                            result.data["build_diagnostics"] = dict(
+                                getattr(build_result, "diagnostics", {}) or {}
+                            )
                             if not getattr(build_result, "success", False):
                                 result.data["build_error"] = getattr(build_result, "error", None)
                 elif action == "reference_upload":
@@ -376,7 +385,20 @@ class TelegramDispatcher:
                 elif action == "revise":
                     result = self.revise.reserve(project_id, seq, principal_id=principal)
                     if result.success:
-                        result = self.revise.apply(project_id, seq, message.text, principal_id=principal)
+                        revise_sig = inspect.signature(self.revise.apply)
+                        if 'on_remote_boundary' in revise_sig.parameters or any(
+                            p.kind == inspect.Parameter.VAR_KEYWORD
+                            for p in revise_sig.parameters.values()
+                        ):
+                            result = self.revise.apply(
+                                project_id, seq, message.text,
+                                principal_id=principal,
+                                on_remote_boundary=lambda: _mark_build_reached_remote(key),
+                            )
+                        else:
+                            result = self.revise.apply(
+                                project_id, seq, message.text, principal_id=principal,
+                            )
                 elif action == "approve":
                     result = self.promote.approve(project_id, principal_id=principal)
                 elif action == "publish":
@@ -424,11 +446,20 @@ class TelegramDispatcher:
                     "EVENT_RECONCILIATION_REQUIRED",
                     error_code="EVENT_RECONCILIATION_REQUIRED",
                 )
+            if action == "revise" and not result.success:
+                result.data = dict(getattr(result, "data", {}) or {})
+                diagnostics = dict(getattr(result, "diagnostics", {}) or {})
+                if diagnostics:
+                    result.data["revision_diagnostics"] = diagnostics
             try:
                 with self.store.acquire_writer(project_id) as state:
                     claim = state.dispatch_events.get(key)
                     if claim is not None:
                         claim["status"] = "DONE" if result.success else "FAILED"
+                        if action == "revise" and not result.success:
+                            claim["revision_diagnostics"] = dict(
+                                result.data.get("revision_diagnostics", {}) or {}
+                            )
                         self.store.save(state)
             except Exception:
                 # The action already completed (result in hand). A persistence

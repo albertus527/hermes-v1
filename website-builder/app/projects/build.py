@@ -15,6 +15,7 @@ never consume the attempt.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import logging
 import re
@@ -255,6 +256,13 @@ def classify_cheap_check_failure(checks: Dict[str, Any]) -> CompileRepairDecisio
         )
 
     entry = checks.get(failed_check) or {}
+    if entry.get("classification") == "infrastructure":
+        return CompileRepairDecision(
+            eligible=False,
+            failed_check=failed_check,
+            classification="infrastructure_failure",
+            failed_check_output=((entry.get("stdout") or "") + "\n" + (entry.get("stderr") or "")).strip(),
+        )
     output = ((entry.get("stdout") or "") + "\n" + (entry.get("stderr") or "")).strip()
 
     if any(pattern.search(output) for pattern in _INFRASTRUCTURE_PATTERNS):
@@ -332,6 +340,7 @@ class BuildResult:
     # unsafe post-remote replay. Absent on legacy results == UNKNOWN ==
     # fail-closed.
     reached_remote: bool = False
+    diagnostics: Optional[Dict[str, Any]] = None
 
 
 class FrontendBuilder:
@@ -685,6 +694,11 @@ Respond with a JSON summary:
                         "success": False,
                         "stdout": "",
                         "stderr": _bounded_output(self_contained.error_text()),
+                        "error_code": self_contained.error_code,
+                        "classification": (
+                            "infrastructure" if self_contained.infrastructure_error
+                            else "artifact"
+                        ),
                         "findings": [f.to_dict() for f in self_contained.findings],
                     }
                     build_success = False
@@ -760,6 +774,11 @@ Respond with a JSON summary:
                                     "success": False,
                                     "stdout": "",
                                     "stderr": _bounded_output(self_contained.error_text()),
+                                    "error_code": self_contained.error_code,
+                                    "classification": (
+                                        "infrastructure" if self_contained.infrastructure_error
+                                        else "artifact"
+                                    ),
                                     "findings": [f.to_dict() for f in self_contained.findings],
                                 }
                                 build_success = False
@@ -830,11 +849,7 @@ Respond with a JSON summary:
                 )
                 error = f"CHEAP_CHECKS_FAILED:{failed_check}"
                 if failed_check == "self_contained":
-                    # Surface the sanitized, FRONTEND-actionable contract
-                    # together with the exact failing check, so the operator
-                    # sees BOTH the stable failure code and (in build_output)
-                    # the per-file diagnostics with kind/host/file metadata.
-                    error = f"{error}:{EXTERNAL_RUNTIME_DEPENDENCY}"
+                    error = f"{error}:{(self_contained.error_code if self_contained else EXTERNAL_RUNTIME_DEPENDENCY)}"
                 return BuildResult(
                     success=False,
                     project_id=project_id,
@@ -864,21 +879,45 @@ Respond with a JSON summary:
                 design_dna=design_dna,
             )
 
-            if qa_result.success and self.preview_orchestrator is not None:
-                # F4: the preview hand-off is the first REMOTE (Vercel) side
-                # effect of this pipeline. Invoke the caller's boundary
-                # callback BEFORE the remote call so the durable "reached
-                # remote" marker is persisted ahead of the side effect.
+            remote_reached = False
+
+            def mark_remote_boundary():
+                nonlocal remote_reached
+                if remote_reached:
+                    return
                 if on_remote_boundary is not None:
                     on_remote_boundary()
-                preview = self.preview_orchestrator.run_owned(
-                    project_id, workspace, slot_held=True
-                )
+                remote_reached = True
+
+            if qa_result.success and self.preview_orchestrator is not None:
+                try:
+                    params = inspect.signature(
+                        self.preview_orchestrator.run_owned
+                    ).parameters
+                    accepts_boundary = (
+                        'on_remote_boundary' in params
+                        or any(p.kind == inspect.Parameter.VAR_KEYWORD
+                               for p in params.values())
+                    )
+                except (TypeError, ValueError):
+                    accepts_boundary = False
+                if accepts_boundary:
+                    preview = self.preview_orchestrator.run_owned(
+                        project_id, workspace, slot_held=True,
+                        on_remote_boundary=mark_remote_boundary,
+                    )
+                else:
+                    preview = self.preview_orchestrator.run_owned(
+                        project_id, workspace, slot_held=True
+                    )
                 if not preview.success:
-                    return BuildResult(False, project_id, workspace=workspace,
-                                       error=preview.error or preview.error_code,
-                                       reached_remote=True,
-                                       duration_seconds=time.time() - start_time)
+                    return BuildResult(
+                        False, project_id, workspace=workspace,
+                        error=preview.error or preview.error_code,
+                        reached_remote=remote_reached,
+                        diagnostics=dict(getattr(preview, 'data', {}) or {}),
+                        duration_seconds=time.time() - start_time,
+                    )
 
             duration = time.time() - start_time
 
@@ -890,16 +929,17 @@ Respond with a JSON summary:
                 build_output=json.dumps(checks, indent=2),
                 error=qa_result.error,
                 duration_seconds=duration,
-                reached_remote=bool(
-                    qa_result.success and self.preview_orchestrator is not None
-                ),
+                reached_remote=remote_reached,
             )
 
         except Exception as exc:
             # MEDIUM-3: unexpected exceptions are logged with full detail
             # operator-side; the returned BuildResult stays a stable,
             # sanitized application error code.
-            logger.exception("Unexpected error during Phase 7 build of %s", project_id)
+            logger.error(
+                "Unexpected error during Phase 7 build of %s (type=%s)",
+                project_id, type(exc).__name__,
+            )
             with self.store.acquire_writer(project_id) as state:
                 self.store.transition_lifecycle_locked(state, ProjectLifecycle.FAILED)
                 state.failure = {

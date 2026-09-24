@@ -726,18 +726,24 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
     bypass_store = BypassSecretStore(config.hermes_home / "vercel-bypass")
     bypass_provisioner = BypassProvisioner(vercel, bypass_store)
 
-    def _ensure_bypass(app_id, vercel_project, *, expected_name=None):
+    def _ensure_bypass(app_id, vercel_project, *, expected_name=None,
+                       reprovision=False):
         return bypass_provisioner.ensure(
-            app_id, vercel_project, expected_name=expected_name
+            app_id, vercel_project, expected_name=expected_name,
+            reprovision=reprovision,
+        )
+
+    def _reprovision_bypass(app_id, vercel_project, *, expected_name=None):
+        return _ensure_bypass(
+            app_id, vercel_project, expected_name=expected_name,
+            reprovision=True,
         )
 
     def _bypass_is_stored(project_id, state):
-        # Read-only: only the OPAQUE (hash-derived) Vercel project id is
-        # derivable here without a remote read. Once a friendly slug is bound,
-        # the id is only known from the remote project, so recover on the next
-        # preview run (one extra read, no rotation). The secret is never read
-        # from or written to ProjectState.
-        return bool(bypass_store.get(vercel.project_name_for(project_id)))
+        intent = (state.deployment.get('preview_intent') or {}) if state else {}
+        remote_project_id = intent.get('vercel_project_id')
+        keys = [remote_project_id, vercel.project_name_for(project_id)]
+        return any(key and bypass_store.get(key) for key in keys)
 
     preview_deps = PreviewDeps(
         vercel=vercel,
@@ -753,6 +759,7 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
         slug_for=_slug_for,
         bind_slug=_bind_slug,
         ensure_bypass=_ensure_bypass,
+        reprovision_bypass=_reprovision_bypass,
         bypass_is_stored=_bypass_is_stored,
     )
     preview = PreviewOrchestrator(store, preview_deps, runner=runner)
@@ -880,6 +887,67 @@ _LIFECYCLE_INTENTS: Dict[str, List[ConversationIntent]] = {
     "PAUSED": [ConversationIntent.INTAKE],
     "CANCELED": [ConversationIntent.INTAKE],
 }
+
+# Bounded number of PRE-TURN preview reconciliations the runtime will attempt
+# for ONE preview operation before it stops blocking the conversation. A
+# transient smoke infrastructure failure is worth a couple of retries; a
+# reproducible artifact defect is not. Once the bound is reached the project
+# is left in a RECOVERABLE blocked state: the failed preview is NEVER shown or
+# published, but the next turn is allowed to fall through so a revision (fix)
+# or a new build can make real progress instead of looping forever.
+MAX_PRE_TURN_PREVIEW_RECONCILE_ATTEMPTS = 3
+
+# Smoke classifications that are DETERMINISTIC for the SAME artifact bytes: a
+# retry of the identical deployment cannot clear them. The only safe recovery
+# is a NEW revision (repaired artifact) that produces a new tested snapshot.
+_NON_RETRYABLE_SMOKE_CLASSIFICATIONS = ("artifact_defect", "policy_failure")
+_HARD_PREVIEW_ERRORS = frozenset({
+    "PROJECT_IDENTITY_MISMATCH",
+    "PROJECT_RECONCILIATION_REQUIRED",
+    "PROJECT_CREATE_REJECTED",
+    "AMBIGUOUS_PROJECT_CREATE",
+    "SLUG_RESOLUTION_REQUIRED",
+    "SLUG_BIND_PERSIST_FAILED",
+    "PREVIEW_RECONCILIATION_REQUIRED",
+    "DEPLOYMENT_IDENTITY_MISMATCH",
+    "DEPLOYMENT_RECONCILIATION_REQUIRED",
+    "INCOMPLETE_LOOKUP",
+    "BYPASS_RECONCILIATION_REQUIRED",
+    "BYPASS_PROVISION_UNAVAILABLE",
+    "AMBIGUOUS_BYPASS_PROVISION",
+    "BYPASS_SECRET_PERSIST_FAILED",
+    "DEPLOYMENT_TIMEOUT",
+    "DEPLOYMENT_FAILED",
+    "DEPLOY_EXCEPTION",
+    "DELIVERY_RECONCILIATION_REQUIRED",
+    "EVENT_RECONCILIATION_REQUIRED",
+    "EVENT_ACTION_MISMATCH",
+})
+
+
+def _smoke_recovery_message(classification: Optional[str], failures) -> str:
+    """Bounded, meaningful, secret-free user status for a blocked preview.
+
+    Replaces the endless generic "Something went wrong. Please try again."
+    with a specific, actionable status. Never includes URLs, hosts, paths or
+    any provider payload.
+    """
+    if classification == "artifact_defect":
+        return (
+            "Preview-nya belum bisa ditampilkan karena masih memuat aset dari "
+            "luar. Aku akan coba benerin dan bikin preview baru — kirim aja "
+            "perubahan atau 'benerin' untuk aku perbaiki."
+        )
+    if classification == "policy_failure":
+        return (
+            "Preview-nya diblokir oleh pemeriksaan keamanan. Aku akan coba "
+            "perbaiki dan bikin preview baru — kirim aja perubahan atau "
+            "'benerin' untuk aku perbaiki."
+        )
+    return (
+        "Preview-nya lagi gagal dicek. Aku akan coba lagi; kalau tetap gagal "
+        "aku akan bikin preview baru — kirim aja perubahan atau 'benerin'."
+    )
 
 
 class TelegramReceiveLoop:
@@ -1231,35 +1299,177 @@ User message:
             return
         self._dispatch_project_turn(update, project_id, authenticated, message, state, route)
 
+    def _needs_preview_reconcile(self, state) -> bool:
+        """True when a project has a tested snapshot but no shown preview AND
+        the current preview operation has NOT already been classified as
+        deterministically un-previewable.
+
+        Once a reproducible smoke defect has been classified and reported for
+        a given operation, further pre-turn reconciliations of the SAME bytes
+        can only reproduce the same failure; continuing to run them is the
+        permanent-wedge loop. A NEW operation (new revision/deployment) resets
+        the marker and is reconciled normally.
+        """
+        if not (
+            state is not None
+            and state.lifecycle == "PREVIEW_READY"
+            and state.deployment.get("tested_snapshot")
+            and not state.deployment.get("latest_shown_preview")
+        ):
+            return False
+        intent = state.deployment.get("preview_intent") or {}
+        smoke = intent.get("smoke") or {}
+        if intent.get("smoke_blocked") is True or intent.get("stage") == "smoke_failed":
+            return intent.get("failure_status_outcome") not in {"SENT", "PENDING"}
+        if intent.get("stage") == "smoked" and smoke.get("failures"):
+            return intent.get("failure_status_outcome") not in {"SENT", "PENDING"}
+        if (
+            intent.get("smoke_attempts", 0) >= MAX_PRE_TURN_PREVIEW_RECONCILE_ATTEMPTS
+            and smoke.get("failure_classification") in {"transient", "ambiguous"}
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _preview_reconcile_attempts(state) -> int:
+        """Durable count of pre-turn reconcile attempts for the CURRENT
+        preview operation. Keyed on the operation identity so a NEW operation
+        (new revision/deployment) starts its own bounded budget."""
+        intent = (state.deployment.get("preview_intent") or {}) if state else {}
+        attempts = intent.get("pre_turn_reconcile_attempts")
+        return attempts if isinstance(attempts, int) and attempts >= 0 else 0
+
+    @staticmethod
+    def _record_preview_reconcile_attempt(store, project_id, *, operation_id,
+                                          classification):
+        if not operation_id:
+            return None
+        with store.acquire_writer(project_id) as locked:
+            intent = locked.deployment.get("preview_intent") or {}
+            if intent.get("operation_id") != operation_id:
+                return None
+            if intent.get("smoke_blocked") is True or intent.get("stage") == "smoke_failed":
+                return None
+            attempts = intent.get("pre_turn_reconcile_attempts")
+            attempts = attempts + 1 if isinstance(attempts, int) and attempts >= 0 else 1
+            intent["pre_turn_reconcile_attempts"] = attempts
+            if classification:
+                intent["last_smoke_classification"] = classification
+            if classification in _NON_RETRYABLE_SMOKE_CLASSIFICATIONS or attempts >= MAX_PRE_TURN_PREVIEW_RECONCILE_ATTEMPTS:
+                intent["smoke_blocked"] = True
+            locked.deployment["preview_intent"] = intent
+            store.save(locked)
+            return attempts
+
+    def _reconcile_preview_before_turn(self, update, project_id, authenticated,
+                                       message, state, *, diag_tag):
+        """Run the mandatory pre-turn preview reconciliation, bounded.
+
+        Returns the (possibly reloaded) state to CONTINUE the turn with, or
+        ``None`` to STOP the turn.
+
+        Recovery contract (fixes the permanent-wedge loop):
+
+          * On reconcile SUCCESS -> continue with the refreshed state.
+          * On a DETERMINISTIC/reproducible smoke failure (artifact defect or
+            policy failure) -> the SAME deployment can never smoke clean, so we
+            do NOT keep retrying. Send ONE bounded, meaningful status for this
+            operation and let the turn FALL THROUGH so a revision (repair) or a
+            new build can make progress. The failed preview is never shown.
+          * On a TRANSIENT/ambiguous failure -> retry within
+            MAX_PRE_TURN_PREVIEW_RECONCILE_ATTEMPTS; once the bound is reached,
+            stop blocking and fall through the same way (with a bounded status).
+          * Claim/identity failures (EVENT_RECONCILIATION_REQUIRED) -> stop
+            FAIL-CLOSED as before: a possibly-remote mutation must never be
+            blindly replayed or masked by FAST/intake.
+        """
+        _diag_log(diag_tag)
+        recon = self.dispatcher.dispatch(
+            update, project_id, "reconcile_preview", authenticated=authenticated,
+            claim_suffix=":reconcile_preview",
+        )
+        if recon.success:
+            return self.dispatcher.store.load(project_id)
+
+        error_code = recon.error_code
+        if error_code in _HARD_PREVIEW_ERRORS:
+            logger.error(
+                "Preview reconciliation needs manual reconcile for project %s: %s",
+                project_id, error_code,
+            )
+            if not (getattr(recon, 'data', {}) or {}).get('duplicate'):
+                self._send_error_reply(message.conversation_id, error_code)
+            return None
+
+        fresh = self.dispatcher.store.load(project_id)
+        if fresh is None:
+            return None
+        intent = fresh.deployment.get("preview_intent") or {}
+        smoke = intent.get("smoke") or {}
+        classification = (
+            intent.get("last_smoke_classification")
+            or smoke.get("failure_classification")
+        )
+        operation_id = intent.get("operation_id")
+        if not self._needs_preview_reconcile(fresh):
+            if smoke and classification and operation_id:
+                self._send_preview_status_once(
+                    project_id, message.conversation_id,
+                    {**smoke, 'operation_id': operation_id,
+                     'failure_classification': classification},
+                )
+            return fresh
+        if not operation_id or not classification:
+            logger.error(
+                "Preview reconciliation failed for project %s: missing operation or smoke classification",
+                project_id,
+            )
+            self._send_error_reply(message.conversation_id, error_code)
+            return None
+        if intent.get("smoke_blocked") is True or intent.get("stage") == "smoke_failed":
+            self._send_preview_status_once(
+                project_id, message.conversation_id,
+                {**smoke, 'operation_id': operation_id,
+                 'failure_classification': classification},
+            )
+            return self.dispatcher.store.load(project_id)
+        attempts = self._record_preview_reconcile_attempt(
+            self.dispatcher.store, project_id,
+            operation_id=operation_id, classification=classification,
+        )
+        logger.error(
+            "Preview reconciliation failed for project %s op=%s: %s "
+            "(classification=%s, attempt=%s)",
+            project_id, operation_id, error_code, classification, attempts,
+        )
+        if attempts is None:
+            refreshed = self.dispatcher.store.load(project_id)
+            if not self._needs_preview_reconcile(refreshed):
+                return refreshed
+            self._send_error_reply(message.conversation_id, error_code)
+            return None
+        if classification in _NON_RETRYABLE_SMOKE_CLASSIFICATIONS or attempts >= MAX_PRE_TURN_PREVIEW_RECONCILE_ATTEMPTS:
+            self._send_preview_status_once(
+                project_id, message.conversation_id,
+                {**smoke, 'operation_id': operation_id,
+                 'failure_classification': classification},
+            )
+            return self.dispatcher.store.load(project_id)
+        self._send_error_reply(message.conversation_id, error_code)
+        return None
+
     def _dispatch_project_turn(
         self, update, project_id, authenticated, message, state, route=None
     ) -> None:
         """Per-project intent routing. All existing gates stay authoritative."""
         # Preview reconciliation check: if project is in PREVIEW_READY with a tested_snapshot
         # but latest_shown_preview is missing, reconcile Phase 9 before dispatching the turn.
-        if (
-            state is not None
-            and state.lifecycle == "PREVIEW_READY"
-            and state.deployment.get("tested_snapshot")
-            and not state.deployment.get("latest_shown_preview")
-        ):
-            _diag_log("4.before_reconcile_preview_dispatch")
-            recon = self.dispatcher.dispatch(
-                update, project_id, "reconcile_preview", authenticated=authenticated,
-                claim_suffix=":reconcile_preview",
+        if self._needs_preview_reconcile(state):
+            state = self._reconcile_preview_before_turn(
+                update, project_id, authenticated, message, state,
+                diag_tag="4.before_reconcile_preview_dispatch",
             )
-            if recon.success:
-                state = self.dispatcher.store.load(project_id)
-            else:
-                # Fail-closed recovery gate: a failed reconciliation must STOP
-                # this turn. Falling through to FAST/intake would let intake
-                # attempt an invalid PREVIEW_READY -> READY transition and mask
-                # the real reconcile error behind EVENT_RECONCILIATION_REQUIRED.
-                logger.error(
-                    "Preview reconciliation failed for project %s: %s",
-                    project_id, recon.error_code,
-                )
-                self._send_error_reply(message.conversation_id, recon.error_code)
+            if state is None:
                 return
 
         lifecycle = state.lifecycle if state else "DISCOVERING"
@@ -1506,27 +1716,15 @@ User message:
         if state is None:
             self._handle_legacy_first_project(update, message, authenticated, project_id)
             state = self.dispatcher.store.load(project_id)
-        if (
-            state is not None
-            and state.lifecycle == "PREVIEW_READY"
-            and state.deployment.get("tested_snapshot")
-            and not state.deployment.get("latest_shown_preview")
-        ):
-            recon = self.dispatcher.dispatch(
-                update, project_id, "reconcile_preview", authenticated=authenticated,
-                claim_suffix=":reconcile_preview",
+        if self._needs_preview_reconcile(state):
+            # Legacy path: identical bounded recovery contract to the routed
+            # path -- a reproducible artifact smoke failure must not wedge the
+            # conversation behind the old preview's mandatory reconciliation.
+            state = self._reconcile_preview_before_turn(
+                update, project_id, authenticated, message, state,
+                diag_tag="4.before_reconcile_preview_legacy",
             )
-            if recon.success:
-                state = self.dispatcher.store.load(project_id)
-            else:
-                # Fail-closed recovery gate (legacy path): identical contract to
-                # _dispatch_project_turn — a failed reconciliation stops the turn
-                # before FAST/intake so the real reconcile error is not masked.
-                logger.error(
-                    "Preview reconciliation failed for project %s: %s",
-                    project_id, recon.error_code,
-                )
-                self._send_error_reply(message.conversation_id, recon.error_code)
+            if state is None:
                 return
 
         lifecycle = state.lifecycle if state else "DISCOVERING"
@@ -1632,12 +1830,17 @@ User message:
             return
 
         if result.data.get("build_triggered") and not result.data.get("build_success"):
-            logger.warning(
-                "Build dispatch failed for project %s: %s",
-                project_id,
-                result.data.get("build_error"),
-            )
-            self._send_error_reply(message.conversation_id, result.data.get("build_error"))
+            diagnostics = result.data.get("build_diagnostics") or {}
+            if diagnostics.get("failure_classification"):
+                self._send_preview_status_once(
+                    project_id, message.conversation_id, diagnostics,
+                )
+            else:
+                logger.warning(
+                    "Build dispatch failed for project %s: %s",
+                    project_id, result.data.get("build_error"),
+                )
+                self._send_error_reply(message.conversation_id, result.data.get("build_error"))
 
     def _handle_revise(
         self,
@@ -1682,12 +1885,18 @@ User message:
         )
 
         if not result.success:
-            logger.warning(
-                "Revise dispatch failed for project %s: %s",
-                project_id,
-                result.error_code,
-            )
-            self._send_error_reply(message.conversation_id, result.error_code)
+            diagnostics = result.data.get("revision_diagnostics") or {}
+            if diagnostics.get("failure_classification"):
+                self._send_preview_status_once(
+                    project_id, message.conversation_id, diagnostics,
+                )
+            else:
+                logger.warning(
+                    "Revise dispatch failed for project %s: %s",
+                    project_id,
+                    result.error_code,
+                )
+                self._send_error_reply(message.conversation_id, result.error_code)
 
     def _handle_approve(
         self,
@@ -1749,6 +1958,47 @@ User message:
             )
             self._send_error_reply(conversation_id, result.error_code)
 
+    def _send_preview_status_once(self, project_id, chat_id, diagnostics):
+        if not isinstance(diagnostics, dict):
+            return False
+        operation_id = diagnostics.get('operation_id')
+        if not operation_id:
+            state = self.dispatcher.store.load(project_id)
+            intent = (state.deployment.get('preview_intent') or {}) if state else {}
+            operation_id = intent.get('operation_id')
+        if not operation_id:
+            return False
+        classification = diagnostics.get('failure_classification')
+        with self.dispatcher.store.acquire_writer(project_id) as state:
+            intent = state.deployment.get('preview_intent') or {}
+            if intent.get('operation_id') != operation_id:
+                return False
+            if intent.get('failure_status_outcome') in {'PENDING', 'SENT'}:
+                return False
+            intent['failure_status_operation_id'] = operation_id
+            intent['failure_status_outcome'] = 'PENDING'
+            state.deployment['preview_intent'] = intent
+            self.dispatcher.store.save(state)
+        try:
+            result = self.telegram_out.send_text(
+                chat_id, _smoke_recovery_message(classification, diagnostics)
+            )
+        except Exception:
+            logger.error(
+                "Preview status outcome ambiguous for project %s op %s",
+                project_id, operation_id,
+            )
+            return False
+        outcome = 'SENT' if result is None or getattr(result, 'success', False) else 'PENDING'
+        with self.dispatcher.store.acquire_writer(project_id) as state:
+            intent = state.deployment.get('preview_intent') or {}
+            if intent.get('operation_id') == operation_id:
+                intent['failure_status_outcome'] = outcome
+                if outcome == 'SENT' and isinstance(getattr(result, 'data', None), dict):
+                    intent['failure_status_message_id'] = result.data.get('message_id')
+                self.dispatcher.store.save(state)
+        return outcome == 'SENT'
+
     def _send_error_reply(self, chat_id: str, error_code: Optional[str]) -> None:
         """Send a sanitized error reply to the user. Never leaks internals."""
         messages = {
@@ -1771,6 +2021,14 @@ User message:
                 "lain, atau aku kasih beberapa pilihan?"
             ),
             "DEPLOYMENT_ALREADY_LIVE": "This deployment is already live in production.",
+            "SMOKE_FAILED": (
+                "Preview-nya belum lolos pemeriksaan. Aku akan coba benerin dan "
+                "bikin preview baru — kirim aja perubahan yang kamu mau."
+            ),
+            "VERCEL_BYPASS_AUTH_FAILED": (
+                "Preview-nya belum bisa diakses untuk dicek. Aku akan coba lagi; "
+                "kalau tetap gagal aku akan bikin preview baru."
+            ),
         }
         if error_code and error_code.startswith("CHEAP_CHECKS_FAILED:"):
             check_name = error_code.split(":", 1)[1]

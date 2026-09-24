@@ -665,6 +665,17 @@ class VercelAdapter:
         # belongs to this app, never rotate to "fix" an unknown remote state.
         return _fail('BYPASS_RECONCILIATION_REQUIRED')
 
+    def reconcile_protection_bypass(self, app_id, project, *, expected_name=None):
+        result = self.read_protection_bypass(
+            app_id, project, expected_name=expected_name
+        )
+        if not result.success:
+            return result
+        secret = (result.data or {}).get('secret')
+        if secret:
+            return OperationResult.ok({'exists': True, 'secret': secret})
+        return OperationResult.ok({'exists': False})
+
     @staticmethod
     def _valid_bypass_secret(value):
         """Conservative validation of a candidate bypass secret.
@@ -1463,6 +1474,210 @@ def _run_on_dedicated_thread(fn):
     return box.get("value")
 
 
+# ---------------------------------------------------------------------------
+# Sanitized smoke-failure diagnostics
+# ---------------------------------------------------------------------------
+#
+# Every smoke failure is recorded as a bounded, STRUCTURED record so an
+# operator (or a persisting caller) can act on it -- which viewport failed,
+# what KIND of resource, the host, the path -- WITHOUT ever persisting or
+# logging query strings, credentials, headers, or the Vercel bypass secret.
+#
+# Failure categories (stable, sanitized):
+#   blocked_request       -- the route policy aborted a request (see subtype)
+#   navigation_redirect   -- final URL was not the requested document
+#   http_error            -- a same-origin response returned status >= 400
+#   console_error         -- page console reported an error
+#   page_error            -- an uncaught page/runtime exception
+#   request_failed        -- a request failed at the network layer
+#   broken_image          -- page health check failed (empty body / broken img)
+#   networkidle_timeout   -- page.goto(..., wait_until='networkidle') timed out
+#   browser_exception     -- the browser/driver raised
+#   auth_wall             -- Vercel Deployment Protection login detected
+#   missing_screenshot    -- a valid PNG screenshot was not produced
+#
+# Classification (what the caller should DO):
+#   artifact_defect  -- deterministic; the generated artifact references an
+#                       external/off-origin or otherwise unfetchable resource.
+#                       Repairable by a new revision that removes that
+#                       dependency; retrying the SAME bytes cannot fix it.
+#   policy_failure   -- a security-policy rule fired (cross-origin, downgrade,
+#                       private target, non-GET/HEAD). Also deterministic.
+#   transient        -- infrastructure (timeout, networkidle, driver) that a
+#                       bounded retry of the SAME bytes could plausibly clear.
+#   ambiguous        -- outcome not conclusively classified.
+_SMOKE_CATEGORY_CLASSIFICATION = {
+    'blocked_request': 'artifact_defect',
+    'navigation_redirect': 'artifact_defect',
+    'http_error': 'artifact_defect',
+    'console_error': 'artifact_defect',
+    'page_error': 'artifact_defect',
+    'request_failed': 'ambiguous',
+    'broken_image': 'artifact_defect',
+    'networkidle_timeout': 'transient',
+    'browser_exception': 'ambiguous',
+    'auth_wall': 'policy_failure',
+    'missing_screenshot': 'transient',
+    'invalid_screenshot': 'transient',
+}
+
+# Bounded so a pathological page cannot persist an unbounded failure list.
+_MAX_SMOKE_FAILURE_RECORDS = 24
+_MAX_SMOKE_FIELD_LEN = 253
+
+
+def _sanitize_smoke_url(url):
+    """Split an absolute request URL into ``(host, path)`` with NO query,
+    credentials, fragment, or scheme. Returns ``('', '')`` for anything that is
+    not a well-formed absolute http(s) URL (never persist garbage as a path).
+
+    The path is included (bounded) because it is the single most useful
+    actionable datum ("which asset 404'd / was blocked"), and it never carries
+    query-string credentials. No Host header, no full URL, ever.
+    """
+    if not isinstance(url, str) or not url:
+        return '', ''
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return '', ''
+    if parts.scheme not in ('http', 'https') or not parts.hostname:
+        return '', ''
+    host = (parts.hostname or '')[: _MAX_SMOKE_FIELD_LEN]
+    path = (parts.path or '')[: _MAX_SMOKE_FIELD_LEN]
+    return host, path
+
+
+def _sanitize_resource_type(request):
+    """Best-effort resource type WITHOUT any value from the page.
+
+    Playwright exposes ``request.resource_type``; fall back to the method when
+    a test double omits it. Never derived from a query string or header.
+    """
+    value = getattr(request, 'resource_type', None)
+    if isinstance(value, str) and value:
+        return value[:32]
+    return ''
+
+
+def _smoke_failure_record(category, *, viewport, request=None, host='', path='',
+                          status=None, detail='', reason=None, classification=None,
+                          caused_by=None, primary=False, viewport_size=None):
+    """Build one bounded, URL/secret-safe structured smoke failure record."""
+    method = ''
+    resource_type = ''
+    if request is not None:
+        method_value = getattr(request, 'method', None)
+        if isinstance(method_value, str) and method_value:
+            method = method_value[:32]
+        resource_type = _sanitize_resource_type(request)
+        if not host:
+            host, path = _sanitize_smoke_url(getattr(request, 'url', None))
+    record = {
+        'category': str(category or 'unknown')[:64],
+        'classification': str(
+            classification
+            or _SMOKE_CATEGORY_CLASSIFICATION.get(str(category or ''), 'ambiguous')
+        )[:32],
+        'viewport': str(viewport or 'unknown')[:32],
+    }
+    if resource_type:
+        record['resource_type'] = resource_type
+    if method:
+        record['method'] = method
+    if host:
+        record['host'] = str(host).lower()[:_MAX_SMOKE_FIELD_LEN]
+    if path:
+        record['path'] = str(path)[:_MAX_SMOKE_FIELD_LEN]
+    if status is not None:
+        try:
+            record['status'] = int(status)
+        except (TypeError, ValueError):
+            pass
+    detail_text = str(detail or '')[:120]
+    record['reason'] = str(reason or detail_text or category or 'unknown')[:120]
+    if detail_text:
+        record['detail'] = detail_text
+    if caused_by:
+        record['caused_by'] = str(caused_by)[:96]
+    if primary:
+        record['primary'] = True
+    if viewport_size:
+        try:
+            if isinstance(viewport_size, dict):
+                width = viewport_size.get('width')
+                height = viewport_size.get('height')
+            else:
+                width, height = viewport_size
+            record['viewport_size'] = {
+                'width': int(width), 'height': int(height),
+            }
+        except (TypeError, ValueError, IndexError, KeyError):
+            pass
+    return record
+
+
+def _request_failure_reason(request):
+    value = getattr(request, 'failure', None)
+    text = str(value or '').lower()
+    if 'timed out' in text or 'timeout' in text:
+        return 'timeout'
+    if 'reset' in text:
+        return 'connection_reset'
+    if 'refused' in text:
+        return 'connection_refused'
+    if 'name' in text or 'resolve' in text or 'dns' in text:
+        return 'dns_failure'
+    if 'abort' in text or 'blocked' in text:
+        return 'blocked_or_aborted'
+    return 'request_failed'
+
+
+def _smoke_classification(records):
+    """Roll retained primary records up to one action-oriented class."""
+    active = [r for r in records if not r.get('caused_by')
+              and r.get('classification') != 'secondary']
+    if not active:
+        return None
+    classes = {r.get('classification', 'ambiguous') for r in active}
+    if 'policy_failure' in classes:
+        return 'policy_failure'
+    if 'artifact_defect' in classes:
+        return 'artifact_defect'
+    if classes == {'transient'}:
+        return 'transient'
+    return 'ambiguous'
+
+
+def _smoke_failure_summary(records):
+    """One bounded, human-readable line per record, secret-free.
+
+    Example: ``desktop blocked_request external:fonts.googleapis.com/css2``.
+    The PATH is included (no query); the host+path is the actionable part.
+    """
+    lines = []
+    for record in records[: _MAX_SMOKE_FAILURE_RECORDS]:
+        parts = [record.get('viewport', '?'), record.get('category', 'failure')]
+        target = record.get('host', '')
+        if record.get('path'):
+            target = target + record['path'] if target else record['path']
+        if record.get('method') or record.get('resource_type'):
+            request_shape = '/'.join(
+                part for part in (record.get('method', ''), record.get('resource_type', ''))
+                if part
+            )
+            if request_shape:
+                parts.append(request_shape)
+        if record.get('reason'):
+            parts.append(str(record['reason']))
+        if record.get('status') is not None:
+            parts.append(f"status={record['status']}")
+        if target:
+            parts.append(target)
+        lines.append(': '.join(parts[:2]) + (' ' + ' '.join(parts[2:]) if parts[2:] else ''))
+    return lines
+
+
 class PreviewSmokeTester:
     """Fresh anonymous browser contexts; same-origin GET/HEAD requests only.
 
@@ -1614,79 +1829,236 @@ class PreviewSmokeTester:
         return self._run_sync(url, out_dir, headers=headers)
 
     def _run_sync(self, url, out_dir, headers=None):
-        failures, shots = [], {}
+        failures: List[str] = []
+        shots: Dict[str, str] = {}
+        records: List[dict] = []
+        primary_failure = None
+        observed_classes = set()
+        blocked_by_key: Dict[tuple, dict] = {}
+        record_counter = 0
         auth_wall = False
         headers = dict(headers or {})
         origin = urlsplit(url).netloc
+
+        def _viewport_size(label):
+            return {'width': 1440, 'height': 900} if label == 'desktop' else {
+                'width': 390, 'height': 844,
+            }
+
+        def _request_key(label, request=None, host='', path=''):
+            method = str(getattr(request, 'method', '') or '') if request is not None else ''
+            if not host:
+                host, path = _sanitize_smoke_url(str(getattr(request, 'url', '') or '')) \
+                    if request is not None else ('', '')
+            return (label, method, str(host or '').lower(), str(path or ''))
+
+        def _record(category, label, *, request=None, host='', path='',
+                    status=None, detail='', reason=None, classification=None,
+                    caused_by=None, legacy=None, primary=True):
+            nonlocal record_counter, primary_failure
+            record_counter += 1
+            record = _smoke_failure_record(
+                category,
+                viewport=label,
+                request=request,
+                host=host,
+                path=path,
+                status=status,
+                detail=detail,
+                reason=reason,
+                classification=classification,
+                caused_by=caused_by,
+                primary=primary and not caused_by,
+                viewport_size=_viewport_size(label),
+            )
+            record['id'] = f'smoke-{record_counter}'
+            active_class = record.get('classification')
+            if not caused_by and active_class != 'secondary':
+                observed_classes.add(active_class)
+                priority = {
+                    'policy_failure': 4,
+                    'artifact_defect': 3,
+                    'transient': 2,
+                    'ambiguous': 1,
+                }.get(active_class, 0)
+                if primary_failure is None or priority > primary_failure[0]:
+                    primary_failure = (priority, record)
+            if len(records) < _MAX_SMOKE_FAILURE_RECORDS:
+                records.append(record)
+            if len(failures) < _MAX_SMOKE_FAILURE_RECORDS:
+                failures.append(legacy or str(category).replace('_', ' '))
+            return record
+
+        def _mark_secondary(record, cause):
+            nonlocal primary_failure
+            if not record or not cause:
+                return
+            previous_class = record.get('classification')
+            if previous_class != cause.get('classification'):
+                observed_classes.discard(previous_class)
+            record['caused_by'] = cause.get('id')
+            record['classification'] = 'secondary'
+            record['primary'] = False
+            if primary_failure is not None and primary_failure[1].get('id') == record.get('id'):
+                primary_failure = (
+                    {'policy_failure': 4, 'artifact_defect': 3,
+                     'transient': 2, 'ambiguous': 1}.get(
+                         cause.get('classification'), 0),
+                    cause,
+                )
+
+        def _correlate_console(label, msg):
+            text = str(getattr(msg, 'text', '') or '').lower()
+            location = getattr(msg, 'location', None) or {}
+            location_url = location.get('url') if isinstance(location, dict) else ''
+            host, path = _sanitize_smoke_url(location_url or '')
+            if not host:
+                candidates = [
+                    value for key, value in blocked_by_key.items() if key[0] == label
+                ]
+                cause = candidates[-1] if candidates else None
+            else:
+                cause = blocked_by_key.get((label, '', host, path))
+                if cause is None:
+                    candidates = [
+                        value for key, value in blocked_by_key.items()
+                        if key[0] == label and key[2] == host and key[3] == path
+                    ]
+                    cause = candidates[-1] if candidates else None
+            if cause is not None and (
+                not text or 'err_' in text or 'failed' in text or 'resource' in text
+            ):
+                return cause
+            return None
+
         try:
             Path(out_dir).mkdir(parents=True, exist_ok=True)
-            for label, viewport in (('desktop', {'width': 1440, 'height': 900}),
-                                    ('mobile', {'width': 390, 'height': 844})):
+            for label in ('desktop', 'mobile'):
+                viewport = _viewport_size(label)
                 browser = self.factory()
                 context = None
                 try:
                     context = browser.new_context(
                         viewport=viewport, service_workers='block',
                         accept_downloads=False, ignore_https_errors=False)
-                    # Scope the bypass headers to the protected preview origin
-                    # only: same-origin navigation + same-origin asset loads
-                    # get them; anything off-origin does not.
                     if headers:
                         context.set_extra_http_headers(headers)
-                    # Per-navigation bound on same-origin redirect hops; the
-                    # netloc comparison keeps loads scoped to the preview
-                    # origin (the general cross-origin asset policy is
-                    # deliberately unchanged).
                     redirects = {'count': 0}
 
                     def route_request(route):
                         request = route.request
+                        block_reason = ''
                         try:
                             url_ok = (self._allowed_origin(request.url)
-                                and urlsplit(request.url).netloc == origin
-                                and request.method in ('GET', 'HEAD'))
+                                      and urlsplit(request.url).netloc == origin
+                                      and request.method in ('GET', 'HEAD'))
+                            if not url_ok:
+                                block_reason = 'off_origin_or_method'
                             redirected = request.redirected_from is not None
                             if redirected:
                                 allowed = url_ok and _is_same_origin_preview_redirect(
                                     request.redirected_from.url, request.url,
                                     dest_resolver=self.resolver,
                                     max_redirects=self.max_redirects)
+                                if url_ok and not allowed:
+                                    block_reason = 'unsafe_redirect'
                                 if allowed:
                                     redirects['count'] += 1
                                     if redirects['count'] > self.max_redirects:
                                         allowed = False
+                                        block_reason = 'redirect_depth_exceeded'
                             else:
                                 allowed = url_ok
-                            # Private/loopback destinations stay blocked for the
-                            # initial navigation AND every redirect hop.
-                            addresses = self.resolver(urlsplit(request.url).hostname) if allowed else []
+                            addresses = (
+                                self.resolver(urlsplit(request.url).hostname)
+                                if allowed else []
+                            )
                             allowed = bool(addresses) and all(
-                                _is_global_address(a) for a in addresses)
+                                _is_global_address(address) for address in addresses)
+                            if not allowed and not block_reason:
+                                block_reason = 'non_public_destination'
                         except Exception:
                             allowed = False
+                            block_reason = 'policy_evaluation_error'
                         if allowed:
                             route.continue_()
                         else:
-                            failures.append(label + ': blocked request')
+                            record = _record(
+                                'blocked_request', label, request=request,
+                                detail=block_reason or 'blocked',
+                                reason=block_reason or 'blocked',
+                                classification='artifact_defect',
+                                legacy='blocked request',
+                            )
+                            blocked_by_key[
+                                _request_key(label, request)
+                            ] = record
                             route.abort()
+
                     context.route('**/*', route_request)
+
                     def block_socket(ws):
-                        failures.append(label + ': blocked websocket')
+                        _record(
+                            'blocked_request', label, detail='websocket',
+                            reason='websocket', classification='artifact_defect',
+                            legacy='blocked websocket',
+                        )
                         ws.close()
+
                     context.route_web_socket('**/*', block_socket)
                     page = context.new_page()
-                    page.on('pageerror', lambda _: failures.append('runtime error'))
-                    page.on('console', lambda msg: failures.append('console error')
-                            if msg.type == 'error' else None)
-                    page.on('requestfailed', lambda _: failures.append('asset/request failure'))
-                    page.on('response', lambda response: failures.append('HTTP asset failure')
-                            if response.status >= 400 else None)
-                    response = page.goto(url, wait_until='networkidle', timeout=30000)
-                    # PHASE F: AUTH WALL DETECTION. HTTP 200 is NOT enough --
-                    # a protected preview redirects to Vercel's SSO login,
-                    # which can still return 200. Explicitly detect the Vercel
-                    # auth page and fail with a sanitized code instead of
-                    # treating the login page as a healthy site.
+                    page.on('pageerror', lambda _: _record(
+                        'page_error', label, reason='page_error',
+                        classification='artifact_defect', legacy='runtime error'))
+
+                    def on_console(msg):
+                        if msg.type != 'error':
+                            return
+                        record = _record(
+                            'console_error', label, reason='console_error',
+                            classification='artifact_defect', legacy='console error')
+                        cause = _correlate_console(label, msg)
+                        if cause is not None:
+                            _mark_secondary(record, cause)
+
+                    def on_request_failed(req):
+                        record = _record(
+                            'request_failed', label, request=req,
+                            reason=_request_failure_reason(req), classification='ambiguous',
+                            legacy='asset/request failure')
+                        cause = blocked_by_key.get(_request_key(label, req))
+                        if cause is not None:
+                            _mark_secondary(record, cause)
+
+                    page.on('console', on_console)
+                    page.on('requestfailed', on_request_failed)
+                    page.on('response', lambda response: _record(
+                        'http_error', label,
+                        request=getattr(response, 'request', None),
+                        status=response.status,
+                        reason='http_status',
+                        classification=(
+                            'policy_failure' if response.status in (401, 403)
+                            else 'transient' if response.status == 429 or response.status >= 500
+                            else 'artifact_defect'
+                        ),
+                        legacy='HTTP asset failure')
+                        if response.status >= 400 else None)
+                    try:
+                        response = page.goto(url, wait_until='networkidle', timeout=30000)
+                    except Exception as exc:
+                        exception_name = type(exc).__name__
+                        if 'timeout' in exception_name.lower():
+                            _record(
+                                'networkidle_timeout', label, reason='navigation_timeout',
+                                classification='transient', legacy=f'browser smoke failed: {exception_name}',
+                            )
+                        else:
+                            _record(
+                                'browser_exception', label, reason='navigation_exception',
+                                classification='ambiguous', legacy=f'browser smoke failed: {exception_name}',
+                            )
+                        raise
                     try:
                         title = page.title()
                     except Exception:
@@ -1695,50 +2067,118 @@ class PreviewSmokeTester:
                         final_url = page.url
                     except Exception:
                         final_url = url
+                    final_host, final_path = _sanitize_smoke_url(final_url)
                     if self._looks_like_vercel_auth_wall(final_url, title):
                         auth_wall = True
-                        failures.append(label + ': vercel auth wall')
-                    # Canonical-equivalence check: a trailing-slash-only move
-                    # (the preview's root 307) is the SAME document and MUST
-                    # NOT be reported as a redirect/navigation failure. Any
-                    # other final URL -- cross-origin, different path/query --
-                    # is still a failure.
+                        auth_record = _record(
+                            'auth_wall', label, host=final_host, path=final_path,
+                            reason='vercel_auth_wall', classification='policy_failure',
+                            legacy='vercel auth wall',
+                        )
+                        for record in records:
+                            if (record.get('viewport') == label
+                                    and record.get('category') in {'navigation_redirect', 'http_error'}
+                                    and record.get('id') != auth_record.get('id')):
+                                _mark_secondary(record, auth_record)
                     if (response is None or response.status != 200
                             or self._canonical(final_url) != self._canonical(url)):
-                        failures.append(label + ': navigation failed/redirected')
+                        _record(
+                            'navigation_redirect', label, host=final_host, path=final_path,
+                            status=(response.status if response is not None else None),
+                            reason='navigation_mismatch', classification='artifact_defect',
+                            legacy='navigation failed/redirected',
+                        )
                     healthy = page.evaluate('''() => Boolean(document.body &&
                         document.body.innerText.trim().length &&
                         [...document.images].every(i => i.complete && i.naturalWidth > 0))''')
                     if healthy is not True:
-                        failures.append(label + ': empty page or broken images')
-                    png = page.screenshot(full_page=True, type='png')
-                    if not isinstance(png, bytes) or not png.startswith(b'\x89PNG\r\n\x1a\n'):
-                        failures.append(label + ': invalid screenshot')
-                    else:
-                        path = Path(out_dir) / (label + '.png')
-                        path.write_bytes(png)
-                        shots[label + '_screenshot'] = str(path)
+                        try:
+                            broken_targets = page.evaluate(
+                                '''() => [...document.images]
+                                    .filter(i => !i.complete || i.naturalWidth <= 0)
+                                    .map(i => i.src).slice(0, 5)'''
+                            )
+                        except Exception:
+                            broken_targets = []
+                        if isinstance(broken_targets, list) and broken_targets:
+                            for target in broken_targets:
+                                broken_host, broken_path = _sanitize_smoke_url(str(target))
+                                _record(
+                                    'broken_image', label, host=broken_host, path=broken_path,
+                                    reason='broken_image', classification='artifact_defect',
+                                    legacy='empty page or broken images',
+                                )
+                        else:
+                            _record(
+                                'broken_image', label, reason='empty_or_broken_image',
+                                classification='artifact_defect',
+                                legacy='empty page or broken images',
+                            )
+                    try:
+                        png = page.screenshot(full_page=True, type='png')
+                    except Exception:
+                        png = None
+                        _record(
+                            'missing_screenshot', label, reason='screenshot_error',
+                            classification='transient', legacy='screenshot missing',
+                        )
+                    if png is not None:
+                        if not isinstance(png, bytes) or not png.startswith(b'\x89PNG\r\n\x1a\n'):
+                            _record(
+                                'invalid_screenshot', label, reason='invalid_png',
+                                classification='transient', legacy='invalid screenshot',
+                            )
+                        else:
+                            path = Path(out_dir) / (label + '.png')
+                            path.write_bytes(png)
+                            shots[label + '_screenshot'] = str(path)
                 finally:
                     try:
                         if context is not None:
                             context.close()
                     finally:
                         browser.close()
-                        # Deterministic Playwright driver cleanup (H-8): runs on
-                        # the SAME thread that launched the browser (this frame),
-                        # after the browser has closed, and is best-effort so it
-                        # never masks a smoke failure. No-op for injected/test
-                        # factories whose Browser carries no Playwright owner.
                         _stop_browser_playwright(browser)
         except Exception as exc:
-            # Operator logs get the full exception + traceback. Persisted
-            # failures carry ONLY the exception TYPE -- never str(exc), which
-            # can embed URLs/query params or other sensitive runtime detail.
-            logger.exception("Preview smoke browser failure for %s", url)
-            failures.append(f'browser smoke failed: {type(exc).__name__}')
+            host, path = _sanitize_smoke_url(url)
+            logger.error(
+                "Preview smoke browser failure type=%s host=%s path=%s",
+                type(exc).__name__, host, path,
+            )
+            if primary_failure is None or primary_failure[0] < 1:
+                _record(
+                    'browser_exception', 'all', reason=type(exc).__name__,
+                    classification='ambiguous', legacy=f'browser smoke failed: {type(exc).__name__}',
+                )
+        if primary_failure is not None and primary_failure[1] not in records:
+            if len(records) >= _MAX_SMOKE_FAILURE_RECORDS:
+                records[-1] = primary_failure[1]
+            else:
+                records.append(primary_failure[1])
+        if observed_classes:
+            if 'policy_failure' in observed_classes:
+                classification = 'policy_failure'
+            elif 'artifact_defect' in observed_classes:
+                classification = 'artifact_defect'
+            elif observed_classes == {'transient'}:
+                classification = 'transient'
+            else:
+                classification = 'ambiguous'
+        else:
+            classification = None
+        target_host, target_path = _sanitize_smoke_url(url)
         return OperationResult(
             success=not failures,
-            data={**shots, 'url': url, 'failures': failures},
+            data={**shots,
+                  'target_host': target_host, 'target_path': target_path,
+                  'viewport_sizes': {
+                      'desktop': _viewport_size('desktop'),
+                      'mobile': _viewport_size('mobile'),
+                  },
+                  'failures': failures,
+                  'failure_records': records,
+                  'failure_classification': classification,
+                  'failure_summary': _smoke_failure_summary(records)},
             error_code=(
                 'VERCEL_BYPASS_AUTH_FAILED' if auth_wall
                 else ('SMOKE_FAILED' if failures else None)

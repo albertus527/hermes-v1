@@ -892,6 +892,19 @@ class TestQaIntegration:
         assert not (store.load("proj").deployment or {}).get("checked")
 
 
+def test_font_vendor_transport_failure_is_infrastructure(tmp_path, monkeypatch):
+    from app.core import selfcontained as module
+
+    def fail_normalization(project_id, workspace):
+        raise FontVendorError("FONT_VENDOR_TIMEOUT")
+
+    monkeypatch.setattr(module, "normalize_self_contained", fail_normalization)
+    report = normalize_and_check_self_contained("proj", tmp_path)
+    assert not report.ok
+    assert report.infrastructure_error == "FONT_VENDOR_TIMEOUT"
+    assert report.error_code == "PREVIEW_NORMALIZATION_INFRASTRUCTURE"
+
+
 # ---------------------------------------------------------------------------
 # I. P7-style recovery through the real pipeline
 # ---------------------------------------------------------------------------

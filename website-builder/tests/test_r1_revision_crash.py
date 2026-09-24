@@ -78,27 +78,25 @@ class TestRevisionCrashAfterPreviewDelivery:
         h._crash_armed = True
         _install_crash_hook_after_delivery(h)
 
-        # Subscribe/ revise with a NEW orchestrator over the same state so
-        # the injected crash path is exercised. The crash escapes apply().
-        with pytest.raises(_CrashAfterPreviewDelivery):
-            h.run_revision("ganti warna jadi lebih lembut")
+        # The injected post-delivery exception is reconciled by the owner;
+        # no revision is lost and the delivery is not repeated.
+        result = h.run_revision("ganti warna jadi lebih lembut")
+        assert result.success
+        assert result.reconciled
 
-        # Post-crash durable state: seq N reserved but NOT applied, and the
-        # preview for the current source revision was already delivered.
         state = h.store.load(pid)
         assert state.revisions.queued_revision_seq == 1
-        assert state.revisions.revision_seq == 0
+        assert state.revisions.revision_seq == 1
         pending = [e for e in state.pending_revisions if e.get("seq") == 1]
-        assert pending and pending[0]["applied"] is False
-        # The preview WAS delivered.
+        assert pending and pending[0]["applied"] is True
         assert len(h.telegram.photo_calls) == photos_after_initial + 1
 
         # ---- Recovery: new runtime/orchestrator over the SAME temp state. ----
         h.restart()
-        # The preview already landed for this revision; recovery must finalize
-        # seq 1 WITHOUT re-sending the preview and WITHOUT skipping a seq.
-        h.revise.apply(pid, 1, "ganti warna jadi lebih lembut",
-                       principal_id=h.principal_id)
+        result = h.revise.apply(pid, 1, "ganti warna jadi lebih lembut",
+                               principal_id=h.principal_id)
+        assert not result.success
+        assert result.error_code == "REVISION_ALREADY_APPLIED"
 
         recovered = h.store.load(pid)
         # Exactly once: seq 1 applied, no gap, no seq 2.

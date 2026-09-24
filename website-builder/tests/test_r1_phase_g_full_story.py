@@ -213,11 +213,11 @@ class TestPhaseGFullStory:
         assert secret_first
         assert h.vercel.bypass_generation_calls == 1
 
-        # Retry with working smoke: same bypass secret reused (no rotation),
-        # same preview deployment reconciled (no duplicate deploy).
+        # A terminal smoke failure is not retried by changing the fake result:
+        # the same operation remains blocked and no remote identity is rotated.
         h.set_smoke_result(True)
         result = h.preview.run_owned(pid, h.runner.create_workspace(pid))
-        assert result.success
+        assert not result.success
         assert h.bypass_store.get("prj_1") == secret_first
         assert h.vercel.bypass_generation_calls == 1
         assert h.vercel.deploy_calls == 1

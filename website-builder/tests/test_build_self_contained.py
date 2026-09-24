@@ -24,7 +24,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from app.core.selfcontained import EXTERNAL_RUNTIME_DEPENDENCY  # noqa: E402
+from app.core.selfcontained import (  # noqa: E402
+    EXTERNAL_RUNTIME_DEPENDENCY,
+    PREVIEW_NORMALIZATION_INFRASTRUCTURE,
+)
 from app.projects.build import (  # noqa: E402
     _CHEAP_CHECK_SEQUENCE,
     FrontendBuilder,
@@ -79,6 +82,17 @@ class TestGateClassification:
         assert decision.eligible is True
         assert decision.failed_check == "self_contained"
         assert decision.classification == "source_error"
+
+    def test_self_contained_infrastructure_failure_is_not_repairable(self):
+        checks = self._checks(self_contained={
+            "success": False,
+            "stdout": "",
+            "stderr": PREVIEW_NORMALIZATION_INFRASTRUCTURE,
+            "classification": "infrastructure",
+        })
+        decision = classify_cheap_check_failure(checks)
+        assert decision.eligible is False
+        assert decision.classification == "infrastructure_failure"
 
     def test_self_contained_is_not_masked_by_a_passing_build(self):
         """The gate is the FIRST failing check when npm steps all passed."""

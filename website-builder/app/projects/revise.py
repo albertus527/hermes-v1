@@ -62,6 +62,8 @@ class RevisionResult:
     # True when this call did NOT re-run the revision but reconciled a
     # crash-window reservation whose preview had already been delivered.
     reconciled: bool = False
+    diagnostics: Optional[Dict[str, Any]] = None
+    data: Optional[Dict[str, Any]] = None
 
 
 class RevisionOrchestrator:
@@ -218,6 +220,7 @@ class RevisionOrchestrator:
         workspace: Optional[Path] = None,
         principal_id: Optional[str] = None,
         reference_token: Optional[str] = None,
+        on_remote_boundary=None,
     ) -> RevisionResult:
         """Apply a previously-reserved ordered revision.
 
@@ -453,13 +456,77 @@ class RevisionOrchestrator:
                 )
 
             if self.preview_orchestrator is not None:
-                preview = self.preview_orchestrator.run_owned(
-                    project_id, workspace, slot_held=True
-                )
-                if not preview.success:
+                try:
+                    try:
+                        import inspect
+                        preview_params = inspect.signature(
+                            self.preview_orchestrator.run_owned
+                        ).parameters
+                        accepts_boundary = (
+                            'on_remote_boundary' in preview_params
+                            or any(p.kind == inspect.Parameter.VAR_KEYWORD
+                                   for p in preview_params.values())
+                        )
+                    except (TypeError, ValueError):
+                        accepts_boundary = False
+                    if accepts_boundary:
+                        preview = self.preview_orchestrator.run_owned(
+                            project_id, workspace, slot_held=True,
+                            on_remote_boundary=on_remote_boundary,
+                        )
+                    else:
+                        preview = self.preview_orchestrator.run_owned(
+                            project_id, workspace, slot_held=True,
+                        )
+                except Exception as exc:
+                    refreshed = self.store.load(project_id)
+                    if self._is_delivered_unapplied_reservation(refreshed, seq):
+                        with self.store.acquire_writer(project_id) as locked:
+                            if not self._is_delivered_unapplied_reservation(locked, seq):
+                                return RevisionResult(
+                                    False, project_id, seq,
+                                    error='PREVIEW_RECONCILIATION_REQUIRED',
+                                    error_code='PREVIEW_RECONCILIATION_REQUIRED',
+                                )
+                            locked.revisions.revision_seq = seq
+                            for entry in locked.pending_revisions:
+                                if entry.get('seq') == seq:
+                                    entry['applied'] = True
+                                    entry['applied_at'] = time.time()
+                            self.store.save(locked)
+                        return RevisionResult(True, project_id, seq, reconciled=True)
                     return self._fail(
-                        project_id, seq, preview.error or preview.error_code,
-                        preview.error_code or "PREVIEW_FAILED_AFTER_REVISION",
+                        project_id, seq, type(exc).__name__,
+                        'PREVIEW_RECONCILIATION_REQUIRED',
+                    )
+                if not preview.success:
+                    preview_error = preview.error or preview.error_code or "PREVIEW_FAILED_AFTER_REVISION"
+                    preview_code = preview.error_code or "PREVIEW_FAILED_AFTER_REVISION"
+                    if preview_code in {"SMOKE_FAILED", "VERCEL_BYPASS_AUTH_FAILED"}:
+                        with self.store.acquire_writer(project_id) as locked:
+                            locked.revisions.revision_seq = seq
+                            for entry in locked.pending_revisions:
+                                if entry.get("seq") == seq:
+                                    entry["applied"] = True
+                                    entry["applied_at"] = time.time()
+                                    entry["preview_failed"] = True
+                                    entry["error_code"] = preview_code
+                            locked.failure = {
+                                "phase": "preview",
+                                "seq": seq,
+                                "error": preview_error,
+                                "error_code": preview_code,
+                                "failed_at": time.time(),
+                            }
+                            self.store.save(locked)
+                        return RevisionResult(
+                            False, project_id, seq, error=preview_error,
+                            error_code=preview_code,
+                            diagnostics=dict(getattr(preview, 'data', {}) or {}),
+                            data=dict(getattr(preview, 'data', {}) or {}),
+                        )
+                    return self._fail(
+                        project_id, seq, preview_error, preview_code,
                     )
 
             # Success -- mark this ordered revision applied. This is the

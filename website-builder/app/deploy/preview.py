@@ -136,6 +136,8 @@ class PreviewDeps:
     # extra reconciliation read entirely. None (or no stored secret) means the
     # recovery path checks the remote state once to restore a lost secret.
     bypass_is_stored: Any = None
+    reprovision_bypass: Any = None
+    sleep: Any = None
 
 
 class PreviewOrchestrator:
@@ -157,7 +159,7 @@ class PreviewOrchestrator:
     # ------------------------------------------------------------------
 
     def run_owned(self, project_id: str, workspace: Path, *,
-                  slot_held: bool = False) -> OperationResult:
+                  slot_held: bool = False, on_remote_boundary=None) -> OperationResult:
         """Serialize preview orchestrators without nesting project writer locks.
 
         ProjectRunner MAX_WORKERS=1 provides exclusive worker-slot ownership
@@ -173,12 +175,15 @@ class PreviewOrchestrator:
                 return OperationResult.fail('PREVIEW_BUSY', error_code='PREVIEW_BUSY')
             acquired = True
         try:
-            return self._run(project_id, workspace)
-        except Exception:
+            return self._run(
+                project_id, workspace, on_remote_boundary=on_remote_boundary
+            )
+        except Exception as exc:
             # Persisted intents survive crashes/exceptions; retry only reconciles.
             # Log operator-side: the failure text itself is a stable code.
-            logging.getLogger(__name__).exception(
-                "Preview execution for %s raised unexpectedly", project_id
+            logging.getLogger(__name__).error(
+                "Preview execution for %s raised unexpectedly (type=%s)",
+                project_id, type(exc).__name__,
             )
             return OperationResult.fail('PREVIEW_RECONCILIATION_REQUIRED',
                                         error_code='PREVIEW_RECONCILIATION_REQUIRED')
@@ -186,7 +191,7 @@ class PreviewOrchestrator:
             if acquired:
                 self.runner.release_project(project_id)
 
-    def _run(self, project_id, workspace):
+    def _run(self, project_id, workspace, *, on_remote_boundary=None):
         state = self.store.load(project_id)
         if state is None:
             return OperationResult.fail("NO_PROJECT_STATE", error_code="NO_PROJECT_STATE")
@@ -217,6 +222,32 @@ class PreviewOrchestrator:
 
         operation_id = hashlib.sha256((project_id + ':' + str(state.revisions.source_revision)
                                       + ':' + snapshot.identity).encode()).hexdigest()
+        existing_intent = state.deployment.get('preview_intent') or {}
+        if (existing_intent.get('operation_id') == operation_id
+                and existing_intent.get('smoke_blocked') is True):
+            smoke_state = existing_intent.get('smoke') or {}
+            return OperationResult(
+                success=False,
+                error=existing_intent.get('smoke_error_code') or 'SMOKE_FAILED',
+                error_code=existing_intent.get('smoke_error_code') or 'SMOKE_FAILED',
+                data=dict(smoke_state),
+            )
+        if (existing_intent.get('operation_id') == operation_id
+                and existing_intent.get('stage') == 'smoked'
+                and (existing_intent.get('smoke') or {}).get('failures')
+                and existing_intent.get('smoke_blocked') is not True):
+            legacy_smoke = dict(existing_intent.get('smoke') or {})
+            legacy_smoke['failure_classification'] = 'ambiguous_legacy'
+            self._update_intent(
+                project_id, operation_id, stage='smoke_failed',
+                smoke=legacy_smoke, smoke_attempts=1,
+                last_smoke_classification='ambiguous_legacy',
+                smoke_blocked=True, smoke_error_code='SMOKE_FAILED',
+            )
+            return OperationResult(
+                success=False, error='SMOKE_FAILED', error_code='SMOKE_FAILED',
+                data=legacy_smoke,
+            )
         shown = state.deployment.get('latest_shown_preview', {})
         # The owned Vercel project, once resolved below; None on the
         # already-delivered recovery path until it is resolved read-only.
@@ -290,67 +321,111 @@ class PreviewOrchestrator:
         # ---- 2. Ensure owned Vercel project identity ----
         app_id = self.deps.app_id_for(project_id)
         previous = state.deployment.get('preview_intent', {})
-        attempted = state.deployment.get('project_create_attempted', False)
+        attempted = bool(
+            state.deployment.get('project_create_attempted', False)
+            or previous.get('project_attempted')
+        )
+        remote_boundary_called = False
+
+        def _mark_remote_boundary():
+            nonlocal remote_boundary_called
+            if not remote_boundary_called:
+                if on_remote_boundary is not None:
+                    on_remote_boundary()
+                remote_boundary_called = True
+
+        slug = previous.get('slug_candidate')
+        if self.deps.slug_for is not None:
+            try:
+                resolved_slug = self.deps.slug_for(project_id, state)
+                if resolved_slug:
+                    slug = resolved_slug
+            except Exception:
+                if not slug:
+                    return OperationResult.fail(
+                        'SLUG_RESOLUTION_REQUIRED', error_code='SLUG_RESOLUTION_REQUIRED'
+                    )
+        if slug:
+            self._update_intent(
+                project_id, operation_id,
+                slug_candidate=slug, expected_name=slug,
+            )
+        expected_name = slug if slug else previous.get('expected_name')
         with self.store.acquire_writer(project_id) as locked:
             locked.deployment['project_create_attempted'] = True
             self.store.save(locked)
         self._update_intent(project_id, operation_id, project_attempted=True)
 
-        slug = None
-        if self.deps.slug_for is not None:
-            try:
-                slug = self.deps.slug_for(project_id, state)
-            except Exception:
-                slug = None
-        # Canonical Vercel project name for downstream identity validation,
-        # determined BEFORE and independently of any provider response:
-        # the friendly slug when one is bound/derivable, else None (legacy
-        # opaque hash-derived name path). Threaded through every adapter call
-        # that revalidates the owned project so those checks assert the same
-        # canonical name instead of re-deriving the opaque default.
-        expected_name = slug if slug else None
-
-        if slug:
-            # Friendly-slug resolution path. The SHA-based ownership marker
-            # (checked inside ensure_project_with_slug) remains the sole
-            # identity authority; the slug never proves ownership. A
-            # collision with a foreign/unowned project surfaces as a
-            # distinct, fail-closed result -- never adopted/overwritten.
+        _mark_remote_boundary()
+        if slug and not attempted and (
+            state.deployment.get('vercel_project_id')
+            or previous.get('legacy_project')
+        ):
+            # A legacy project may already exist under the opaque name. Check
+            # it before creating a friendly project, then create only on a
+            # proven absence.
+            legacy_result = self.deps.vercel.lookup_project(app_id)
+            if legacy_result.success:
+                vercel_project = legacy_result.data['project']
+                expected_name = None
+            elif legacy_result.error_code == 'PROJECT_RECONCILIATION_REQUIRED':
+                project_result = self.deps.vercel.ensure_project_with_slug(app_id, slug)
+                if not project_result.success:
+                    return project_result
+                vercel_project = project_result.data['project']
+                if self.deps.bind_slug is not None:
+                    try:
+                        self.deps.bind_slug(project_id, state, slug)
+                    except Exception:
+                        return OperationResult.fail(
+                            'SLUG_BIND_PERSIST_FAILED',
+                            error_code='SLUG_BIND_PERSIST_FAILED',
+                        )
+            else:
+                return legacy_result
+        elif slug and not attempted:
             project_result = self.deps.vercel.ensure_project_with_slug(app_id, slug)
             if not project_result.success:
                 return project_result
-            vercel_project = project_result.data["project"]
-            # BUG 4: once we have STARTED using a friendly Vercel project
-            # identity, that binding MUST be durable before we proceed as if
-            # the preview identity is safe. Previously a persistence failure
-            # here was logged and execution continued -- the preview would be
-            # deployed/delivered under a friendly project while local state
-            # still had no bound slug (and a later run would either re-create
-            # or silently fall back to the opaque name). Fail closed instead:
-            # the remote project already exists, so we must NEVER fall back to
-            # the opaque name; the next run reconciles the SAME remote project
-            # via the idempotent set_vercel_slug_once binding.
+            vercel_project = project_result.data['project']
             if self.deps.bind_slug is not None:
                 try:
                     self.deps.bind_slug(project_id, state, slug)
                 except Exception:
-                    logging.getLogger(__name__).exception(
-                        "Failed to persist vercel_slug binding for %s", project_id
-                    )
                     return OperationResult.fail(
-                        "SLUG_BIND_PERSIST_FAILED",
-                        error_code="SLUG_BIND_PERSIST_FAILED",
+                        'SLUG_BIND_PERSIST_FAILED',
+                        error_code='SLUG_BIND_PERSIST_FAILED',
                     )
-        else:
-            project_result = (self.deps.vercel.lookup_project(app_id) if attempted
-                              else self.deps.vercel.ensure_project(app_id))
+        elif slug:
+            project_result = self.deps.vercel.lookup_project(
+                app_id, expected_name=slug
+            )
             if not project_result.success:
                 return project_result
-            vercel_project = project_result.data["project"]
-        # The owned project is now known for this run; the bypass recovery
-        # barrier above can only use ``resolved_project`` once we reach the
-        # full preview path (never a remote read on the pure short-circuit).
+            vercel_project = project_result.data['project']
+            if self.deps.bind_slug is not None:
+                try:
+                    self.deps.bind_slug(project_id, state, slug)
+                except Exception:
+                    return OperationResult.fail(
+                        'SLUG_BIND_PERSIST_FAILED',
+                        error_code='SLUG_BIND_PERSIST_FAILED',
+                    )
+        else:
+            project_result = (
+                self.deps.vercel.lookup_project(app_id)
+                if attempted else self.deps.vercel.ensure_project(app_id)
+            )
+            if not project_result.success:
+                return project_result
+            vercel_project = project_result.data['project']
         resolved_project = vercel_project
+        if isinstance(vercel_project, dict) and vercel_project.get('id'):
+            self._update_intent(
+                project_id, operation_id,
+                vercel_project_id=vercel_project['id'],
+            )
+
 
         # ---- 2b. Consume Vercel's unavoidable first-deployment
         # auto-promotion with content-free bytes BEFORE any real user
@@ -411,19 +486,83 @@ class PreviewOrchestrator:
         from app.runtime import _diag_log  # deferred: avoids import cycle
         _diag_log("5.before_PreviewSmokeTester_run")
         smoke_dir = (self.smoke_dir_root or workspace) / "qa" / "preview_smoke"
-        smoke_result = self._run_smoke(preview_url, smoke_dir, bypass_secret)
-        self._update_intent(project_id, operation_id, stage="smoked", smoke=smoke_result.data)
+        smoke_attempt = int(previous.get('smoke_attempts', 0) or 0)
+        max_smoke_attempts = 3
+        smoke_result = None
+        smoke_classification = None
+        sleep_fn = self.deps.sleep or time.sleep
+        while smoke_attempt < max_smoke_attempts:
+            smoke_attempt += 1
+            self._update_intent(
+                project_id, operation_id, stage="smoke_running",
+                smoke_attempts=smoke_attempt,
+            )
+            smoke_result = self._run_smoke(preview_url, smoke_dir, bypass_secret)
+            smoke_data = dict(smoke_result.data or {})
+            smoke_data.pop('url', None)
+            smoke_data['operation_id'] = operation_id
+            smoke_data['deployment_id'] = deployment.data.get('deployment_id')
+            smoke_data.setdefault('failure_records', [])
+            smoke_data.setdefault('failure_summary', [])
+            smoke_classification = smoke_data.get('failure_classification')
+            if not smoke_classification:
+                smoke_classification = (
+                    'transient'
+                    if smoke_result.error_code in {
+                        'BROWSER_TIMEOUT', 'NETWORKIDLE_TIMEOUT', 'PREVIEW_TIMEOUT',
+                        'BROWSER_LAUNCH_FAILED', 'BROWSER_EXCEPTION',
+                    }
+                    else 'policy_failure'
+                    if smoke_result.error_code == 'VERCEL_BYPASS_AUTH_FAILED'
+                    else 'ambiguous'
+                )
+            smoke_data['failure_classification'] = smoke_classification
+            blocked = smoke_classification in {'artifact_defect', 'policy_failure'}
+            if smoke_result.success:
+                self._update_intent(
+                    project_id, operation_id, stage="smoked", smoke=smoke_data,
+                    smoke_attempts=smoke_attempt, last_smoke_classification=None,
+                    smoke_blocked=False, smoke_error_code=None,
+                )
+                break
+            if (
+                smoke_result.error_code == 'VERCEL_BYPASS_AUTH_FAILED'
+                and self.deps.reprovision_bypass is not None
+            ):
+                reprovision = self.deps.reprovision_bypass(
+                    app_id, vercel_project, expected_name=expected_name
+                )
+                if reprovision.success:
+                    bypass_secret = (reprovision.data or {}).get('secret')
+                    if smoke_attempt < max_smoke_attempts:
+                        continue
+            if smoke_classification not in {'transient', 'ambiguous'}:
+                break
+            if smoke_attempt >= max_smoke_attempts:
+                break
+            sleep_fn(1 if smoke_attempt == 1 else 2)
+        if smoke_result is None:
+            return OperationResult.fail('PREVIEW_RECONCILIATION_REQUIRED',
+                                        error_code='PREVIEW_RECONCILIATION_REQUIRED')
+        smoke_data = dict(smoke_result.data or {})
+        smoke_data.pop('url', None)
+        smoke_data['operation_id'] = operation_id
+        smoke_data['deployment_id'] = deployment.data.get('deployment_id')
+        smoke_data.setdefault('failure_records', [])
+        smoke_data.setdefault('failure_summary', [])
+        smoke_data['failure_classification'] = smoke_classification or 'ambiguous'
         if not smoke_result.success:
-            # Preserve the sanitized provider error code (e.g.
-            # VERCEL_BYPASS_AUTH_FAILED) instead of flattening it to
-            # SMOKE_FAILED, so a protection/bypass auth failure is
-            # distinguishable from an ordinary smoke failure. The secret is
-            # never part of this code or the data.
+            terminal = smoke_classification not in {'transient', 'ambiguous'} or smoke_attempt >= max_smoke_attempts
+            self._update_intent(
+                project_id, operation_id, stage="smoke_failed", smoke=smoke_data,
+                smoke_attempts=smoke_attempt, last_smoke_classification=smoke_classification,
+                smoke_blocked=terminal, smoke_error_code=smoke_result.error_code or 'SMOKE_FAILED',
+            )
             return OperationResult(
                 success=False,
                 error=smoke_result.error_code or "SMOKE_FAILED",
                 error_code=smoke_result.error_code or "SMOKE_FAILED",
-                data=smoke_result.data,
+                data=smoke_data,
             )
 
         # ---- 6. Telegram delivery — durable identities, fail closed on ambiguity ----
