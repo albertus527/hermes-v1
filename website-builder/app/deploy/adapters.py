@@ -1309,6 +1309,93 @@ def _safe_origin(url):
         return False
 
 
+def _no_smuggling_chars(url):
+    """Reject control/space/backslash characters anywhere in a URL.
+
+    Defense-in-depth against header/URL smuggling: Playwright/Python already
+    normalize the obvious cases, but a redirect Location is provider-sourced
+    and must never be trusted to be free of them.
+    """
+    return not any(c.isspace() or c == '\\' or ord(c) < 0x20 or ord(c) == 0x7f
+                   for c in url)
+
+
+def _is_global_address(address):
+    """True only for a globally routable, public unicast address.
+
+    Returns False for private/loopback/link-local/reserved/multicast or any
+    value that is not a parsable IP literal -- i.e. fail closed.
+    """
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return (ip.is_global and not ip.is_private and not ip.is_loopback
+            and not ip.is_link_local and not ip.is_reserved
+            and not ip.is_multicast and not ip.is_unspecified)
+
+
+def _is_same_origin_preview_redirect(source_url, target_url, *, dest_resolver,
+                                     max_redirects):
+    """True when *target_url* is a BOUNDED SAME-ORIGIN redirect from *source_url*.
+
+    The protected Vercel preview 307s its canonical root
+    (``https://x.vercel.app`` -> ``https://x.vercel.app/``); that safe,
+    same-origin canonical hop must NOT be reported as a navigation failure.
+    Everything else stays blocked:
+
+      * scheme MUST remain ``https`` (no http downgrade),
+      * hostname MUST be byte-identical (no cross-origin hop),
+      * port MUST stay equivalent / default :443,
+      * no username/password (no credential-bearing URLs),
+      * no fragment-based trickery (fragments only ever live client-side),
+      * both URLs free of whitespace/backslash/control characters,
+      * destination DNS MUST resolve exclusively to global/public IPs
+        (private/link-local/loopback/reserved fail closed),
+      * redirect depth stays within ``max_redirects``.
+
+    This deliberately does NOT loosen the general cross-origin asset policy:
+    it only sanctions canonical, same-origin, method-preserving navigation.
+    """
+    try:
+        source = urlsplit(source_url)
+        target = urlsplit(target_url)
+    except ValueError:
+        return False
+    if not _no_smuggling_chars(target_url):
+        return False
+    # Scheme stays https (block downgrade off https) and host is identical.
+    if target.scheme != 'https' or source.scheme != 'https':
+        return False
+    source_host = source.hostname or ''
+    target_host = target.hostname or ''
+    if not target_host or target_host != source_host:
+        return False
+    # Port must remain equivalent / default 443 on both sides.
+    try:
+        source_port = source.port
+        target_port = target.port
+    except ValueError:
+        return False
+    if source_port not in (None, 443) or target_port not in (None, 443):
+        return False
+    # No credential-bearing URL, no fragment trickery.
+    if target.username or target.password or target.fragment:
+        return False
+    # Redirect depth stays within the small explicit bound.
+    depth = getattr(dest_resolver, 'count', 0)
+    if depth >= max_redirects:
+        return False
+    # Destination DNS must resolve ONLY to global/public IPs.
+    try:
+        addresses = dest_resolver(target_host)
+    except Exception:
+        return False
+    if not addresses:
+        return False
+    return all(_is_global_address(a) for a in addresses)
+
+
 def _stop_browser_playwright(browser):
     """Deterministically stop the Playwright driver that owns *browser*.
 
@@ -1379,10 +1466,18 @@ def _run_on_dedicated_thread(fn):
 class PreviewSmokeTester:
     """Fresh anonymous browser contexts; same-origin GET/HEAD requests only.
 
-    Blocks redirects before following, websockets, workers, cross-origin and
-    private DNS requests. Strict policy intentionally fails externally hosted
-    assets; caller must self-host assets. Factory returns a Playwright-style
-    Browser. Requires route_web_socket support, otherwise fails closed.
+    Bounded SAME-ORIGIN redirects are followed: the protected Vercel preview
+    canonically 307s ``https://x.vercel.app`` -> ``https://x.vercel.app/``, and
+    that safe hop is equivalent to the original request. All other redirects
+    stay blocked before following -- cross-origin hops, http downgrades,
+    private/link-local/loopback destinations, credential-bearing URLs,
+    non-GET/HEAD methods, fragments, and redirect loops / excessive depth.
+    Websockets, workers, cross-origin and private DNS requests are blocked.
+    Strict policy intentionally fails externally hosted assets; caller must
+    self-host assets. Factory returns a Playwright-style Browser. Requires
+    route_web_socket support, otherwise fails closed.
+
+    The general cross-origin ASSET policy is intentionally NOT loosened.
 
     Thread affinity: when the calling thread owns a RUNNING asyncio loop
     (the state left by the in-process Hermes FAST turn on the runtime path),
@@ -1395,6 +1490,9 @@ class PreviewSmokeTester:
     no-loop path (startup preflight, non-async callers) the direct
     synchronous path is preserved unchanged.
     """
+    # Small explicit bound on same-origin redirect hops per navigation.
+    max_redirects = 5
+
     def __init__(self, browser_factory, resolver=None, *, custom_hostname=None):
         if custom_hostname is not None and not valid_custom_hostname(custom_hostname):
             raise ValueError('INVALID_HOSTNAME')
@@ -1453,6 +1551,33 @@ class PreviewSmokeTester:
             return True
         return False
 
+    @staticmethod
+    def _canonical(url):
+        """Normalize a same-origin URL for trailing-slash equivalence.
+
+        ``https://x.vercel.app`` and ``https://x.vercel.app/`` denote the same
+        document; the protected preview's 307 to the canonical root slash must
+        not be read as "navigated somewhere else". Everything else (lowercased
+        scheme/host, :443 elision) is preserved so the comparison can never
+        erase a real cross-origin move. Query strings are significant.
+        """
+        try:
+            parts = urlsplit(url)
+        except ValueError:
+            return None
+        if parts.scheme not in ('https', '') or parts.username or parts.password:
+            return None
+        try:
+            port = parts.port
+        except ValueError:
+            return None
+        if port not in (None, 443):
+            return None
+        path = parts.path or '/'
+        if path != '/' and path.endswith('/'):
+            path = path.rstrip('/')
+        return (parts.hostname or '', path, parts.query)
+
     def _allowed_origin(self, url):
         if self.custom_hostname is None:
             return _safe_origin(url)
@@ -1508,16 +1633,35 @@ class PreviewSmokeTester:
                     # get them; anything off-origin does not.
                     if headers:
                         context.set_extra_http_headers(headers)
+                    # Per-navigation bound on same-origin redirect hops; the
+                    # netloc comparison keeps loads scoped to the preview
+                    # origin (the general cross-origin asset policy is
+                    # deliberately unchanged).
+                    redirects = {'count': 0}
+
                     def route_request(route):
                         request = route.request
                         try:
-                            allowed = (self._allowed_origin(request.url)
+                            url_ok = (self._allowed_origin(request.url)
                                 and urlsplit(request.url).netloc == origin
-                                and request.method in ('GET', 'HEAD')
-                                and request.redirected_from is None)
+                                and request.method in ('GET', 'HEAD'))
+                            redirected = request.redirected_from is not None
+                            if redirected:
+                                allowed = url_ok and _is_same_origin_preview_redirect(
+                                    request.redirected_from.url, request.url,
+                                    dest_resolver=self.resolver,
+                                    max_redirects=self.max_redirects)
+                                if allowed:
+                                    redirects['count'] += 1
+                                    if redirects['count'] > self.max_redirects:
+                                        allowed = False
+                            else:
+                                allowed = url_ok
+                            # Private/loopback destinations stay blocked for the
+                            # initial navigation AND every redirect hop.
                             addresses = self.resolver(urlsplit(request.url).hostname) if allowed else []
                             allowed = bool(addresses) and all(
-                                ipaddress.ip_address(a).is_global for a in addresses)
+                                _is_global_address(a) for a in addresses)
                         except Exception:
                             allowed = False
                         if allowed:
@@ -1554,7 +1698,13 @@ class PreviewSmokeTester:
                     if self._looks_like_vercel_auth_wall(final_url, title):
                         auth_wall = True
                         failures.append(label + ': vercel auth wall')
-                    if response is None or response.status != 200 or page.url != url:
+                    # Canonical-equivalence check: a trailing-slash-only move
+                    # (the preview's root 307) is the SAME document and MUST
+                    # NOT be reported as a redirect/navigation failure. Any
+                    # other final URL -- cross-origin, different path/query --
+                    # is still a failure.
+                    if (response is None or response.status != 200
+                            or self._canonical(final_url) != self._canonical(url)):
                         failures.append(label + ': navigation failed/redirected')
                     healthy = page.evaluate('''() => Boolean(document.body &&
                         document.body.innerText.trim().length &&
