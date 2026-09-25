@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from app.qa.findings import DeterministicFindings
-from app.qa.screenshot import ScreenshotSet
+from app.qa.screenshot import DESKTOP_VIEWPORT, MOBILE_VIEWPORT, ScreenshotSet
 
 
 def check_design_dna(workspace: Path) -> bool:
@@ -69,5 +69,20 @@ def run_deterministic_checks(
         findings.failures.append("npm run build failed")
     if not findings.typecheck_ok:
         findings.failures.append("npm run typecheck failed")
+
+    # Browser metrics are captured before the full-page PNG, so overflow is
+    # deterministic page-layout evidence rather than subjective VISION output.
+    for label, metrics, viewport_width in (
+        ("desktop", screenshots.desktop_metrics, DESKTOP_VIEWPORT[0]),
+        ("mobile", screenshots.mobile_metrics, MOBILE_VIEWPORT[0]),
+    ):
+        if metrics is None:
+            continue
+        largest_width = max(metrics.document_scroll_width, metrics.body_scroll_width)
+        if largest_width > metrics.document_client_width:
+            findings.failures.append(
+                f"{label} horizontal overflow: {largest_width}px document width "
+                f"exceeds {viewport_width}px viewport"
+            )
 
     return findings

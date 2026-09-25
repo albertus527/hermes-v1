@@ -290,12 +290,11 @@ class QAOrchestrator:
             if handle is not None:
                 self.renderer.stop(handle)
 
-        # Evidence-integrity guard: verify the actual PNG pixel dimensions
-        # match the intended viewports BEFORE VISION consumes the evidence.
-        # Wrong-dimension evidence (e.g. the browser's default 1280px width
-        # when the viewport command silently failed) is a capture
-        # infrastructure error, not a visual QA finding — it must never
-        # reach VISION or consume a FRONTEND repair attempt.
+        # Evidence-integrity guard: verify live browser metrics against the
+        # intended viewports before VISION consumes the full-page PNGs.
+        # Mismatch or malformed metrics is capture infrastructure failure;
+        # a legitimately wider full-page PNG is accepted and later classified
+        # as deterministic horizontal overflow by the existing repair loop.
         if not infra_error and render_ok:
             try:
                 validate_screenshot_dimensions(screenshots)

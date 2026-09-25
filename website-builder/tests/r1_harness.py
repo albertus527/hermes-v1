@@ -548,21 +548,39 @@ class _RenderHandle:
 
 
 class FakeScreenshotCapture:
-    """Writes valid PNGs at the intended viewport widths so the QA
-    evidence-integrity guard passes with real IHDR bytes."""
+    """Writes valid PNGs and matching live metrics for the QA orchestrator."""
 
     DESKTOP = (1440, 900)
     MOBILE = (390, 844)
 
     def capture(self, url, qa_dir, attempt):
-        from app.qa.screenshot import ScreenshotSet
+        from app.qa.screenshot import BrowserMetrics, ScreenshotSet
         out = Path(qa_dir) / f"attempt-{attempt}"
         out.mkdir(parents=True, exist_ok=True)
         desktop = out / "desktop.png"
         mobile = out / "mobile.png"
         desktop.write_bytes(_png_bytes(*self.DESKTOP))
         mobile.write_bytes(_png_bytes(*self.MOBILE))
-        return ScreenshotSet(desktop=desktop, mobile=mobile)
+        desktop_metrics = BrowserMetrics(
+            inner_width=self.DESKTOP[0],
+            inner_height=self.DESKTOP[1],
+            document_client_width=self.DESKTOP[0],
+            document_scroll_width=self.DESKTOP[0],
+            body_scroll_width=self.DESKTOP[0],
+        )
+        mobile_metrics = BrowserMetrics(
+            inner_width=self.MOBILE[0],
+            inner_height=self.MOBILE[1],
+            document_client_width=self.MOBILE[0],
+            document_scroll_width=self.MOBILE[0],
+            body_scroll_width=self.MOBILE[0],
+        )
+        return ScreenshotSet(
+            desktop=desktop,
+            mobile=mobile,
+            desktop_metrics=desktop_metrics,
+            mobile_metrics=mobile_metrics,
+        )
 
 
 def _png_bytes(width: int, height: int) -> bytes:

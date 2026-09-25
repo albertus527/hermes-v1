@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from typing import List, Optional
 from unittest.mock import MagicMock, patch
 
 from app.core.lifecycle import ProjectLifecycle
@@ -19,8 +20,86 @@ from app.core.state import ProjectStateStore
 from app.qa.findings import DeterministicFindings, QAAttempt, VisionFindings
 from app.qa.orchestrator import MAX_REPAIR_ATTEMPTS, QAOrchestrator
 from app.qa.render import RenderHandle, RenderError
-from app.qa.screenshot import ScreenshotSet
+from app.qa.screenshot import BrowserMetrics, CaptureResult, ScreenshotSet
 from app.sandbox.runner import ProjectRunner
+
+
+def _metrics(
+    width: int,
+    height: int,
+    *,
+    document_width: int | None = None,
+    body_width: int | None = None,
+) -> BrowserMetrics:
+    document_width = width if document_width is None else document_width
+    body_width = width if body_width is None else body_width
+    return BrowserMetrics(
+        inner_width=width,
+        inner_height=height,
+        document_client_width=width,
+        document_scroll_width=document_width,
+        body_scroll_width=body_width,
+    )
+
+
+def _agent_metrics_response(metrics: BrowserMetrics) -> str:
+    payload = json.dumps({
+        "innerWidth": metrics.inner_width,
+        "innerHeight": metrics.inner_height,
+        "documentClientWidth": metrics.document_client_width,
+        "documentScrollWidth": metrics.document_scroll_width,
+        "bodyScrollWidth": metrics.body_scroll_width,
+    })
+    return json.dumps({"success": True, "data": {"result": payload}})
+
+
+class _FakeBrowserRun:
+    """Records argv and answers like the real file-backed browser spawn.
+
+    ``_run_browser_command`` hands the child a temporary file as stdout and
+    reads the reply back from that file, so a fake must WRITE to
+    ``kwargs["stdout"]`` rather than return a ``stdout`` attribute.
+    """
+
+    def __init__(self, metrics: Optional[BrowserMetrics] = None, *,
+                 returncodes: Optional[dict] = None, fail_on=()):
+        self.calls: List[List[str]] = []
+        self.metrics = metrics
+        self.returncodes = returncodes or {}
+        self.fail_on = fail_on
+
+    def _command(self, argv: List[str]) -> str:
+        if "open" in argv:
+            return "open"
+        if "viewport" in argv:
+            return "viewport"
+        if "eval" in argv:
+            return "eval"
+        if "screenshot" in argv:
+            return "screenshot"
+        if "close" in argv:
+            return "close"
+        return "unknown"
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        command = self._command(argv)
+        if command in self.fail_on:
+            raise subprocess.TimeoutExpired(argv, kwargs.get("timeout", 30))
+        stdout = kwargs.get("stdout")
+        out_path = None
+        if command == "screenshot":
+            out_path = argv[argv.index("--full") + 1]
+            if out_path:
+                Path(out_path).write_bytes(b"fake-png")
+        payload = ""
+        if command == "eval" and self.metrics is not None:
+            payload = _agent_metrics_response(self.metrics)
+        if command == "close":
+            payload = json.dumps({"success": True, "data": {"closed": True}})
+        if stdout is not None and payload:
+            stdout.write(payload)
+        return MagicMock(returncode=self.returncodes.get(command, 0), stdout=payload)
 
 
 def _queue_and_run_project(store: ProjectStateStore, project_id: str) -> None:
@@ -106,7 +185,12 @@ class _FixtureBase(unittest.TestCase):
         mobile = qa_dir / "mobile.png"
         desktop.write_bytes(_png_bytes(1440, 900))
         mobile.write_bytes(_png_bytes(390, 844))
-        return ScreenshotSet(desktop=desktop, mobile=mobile)
+        return ScreenshotSet(
+            desktop=desktop,
+            mobile=mobile,
+            desktop_metrics=_metrics(1440, 900),
+            mobile_metrics=_metrics(390, 844),
+        )
 
     def _passing_vision(self):
         return {"pass": True, "blocking": [], "observations": [], "summary": "Looks good."}
@@ -613,7 +697,11 @@ class TestScreenshotsRequired(_FixtureBase):
 
         def _partial(url, qa_dir, attempt):
             s = self._passing_screenshots(attempt)
-            return ScreenshotSet(desktop=None, mobile=s.mobile)
+            return ScreenshotSet(
+                desktop=None,
+                mobile=s.mobile,
+                mobile_metrics=s.mobile_metrics,
+            )
 
         self.mock_capture.capture.side_effect = _partial
         self.mock_adapter.vision_inspect.return_value = self._passing_vision()
@@ -632,7 +720,11 @@ class TestScreenshotsRequired(_FixtureBase):
 
         def _partial(url, qa_dir, attempt):
             s = self._passing_screenshots(attempt)
-            return ScreenshotSet(desktop=s.desktop, mobile=None)
+            return ScreenshotSet(
+                desktop=s.desktop,
+                mobile=None,
+                desktop_metrics=s.desktop_metrics,
+            )
 
         self.mock_capture.capture.side_effect = _partial
         self.mock_adapter.vision_inspect.return_value = self._passing_vision()
@@ -647,128 +739,294 @@ class TestScreenshotsRequired(_FixtureBase):
 
 
 class TestEvidenceIntegrityGuard(unittest.TestCase):
-    """Evidence-integrity guard: actual PNG pixel dimensions must match the
-    intended viewports before evidence may be consumed downstream.
+    """Live metrics prove viewport integrity; full-page PNG overflow is valid."""
 
-    The tg-6329821361 incident produced valid-looking PNGs at the browser's
-    default 1280px width for BOTH viewports; these tests pin the guard that
-    rejects that class of broken evidence.
-    """
+    def _evidence(self, tmpdir: str, *, mobile_width=390, desktop_width=1440,
+                  mobile_metrics=None, desktop_metrics=None):
+        desktop = Path(tmpdir) / "desktop.png"
+        mobile = Path(tmpdir) / "mobile.png"
+        desktop.write_bytes(_png_bytes(desktop_width, 900))
+        mobile.write_bytes(_png_bytes(mobile_width, 844))
+        return ScreenshotSet(
+            desktop=desktop,
+            mobile=mobile,
+            desktop_metrics=_metrics(1440, 900) if desktop_metrics is None else desktop_metrics,
+            mobile_metrics=_metrics(390, 844) if mobile_metrics is None else mobile_metrics,
+        )
 
-    def test_valid_dimensions_pass(self):
+    def test_mobile_live_metrics_and_matching_png_pass(self):
         from app.qa.screenshot import validate_screenshot_dimensions
-
         with tempfile.TemporaryDirectory() as tmpdir:
-            desktop = Path(tmpdir) / "desktop.png"
-            mobile = Path(tmpdir) / "mobile.png"
-            desktop.write_bytes(_png_bytes(1440, 900))
-            mobile.write_bytes(_png_bytes(390, 844))
-            # Must not raise.
-            validate_screenshot_dimensions(ScreenshotSet(desktop=desktop, mobile=mobile))
+            validate_screenshot_dimensions(self._evidence(tmpdir))
 
-    def test_desktop_wrong_width_rejected(self):
+    def test_wider_full_page_png_is_valid_for_390_viewport(self):
+        from app.qa.screenshot import validate_screenshot_dimensions
+        with tempfile.TemporaryDirectory() as tmpdir:
+            validate_screenshot_dimensions(self._evidence(tmpdir, mobile_width=411))
+
+    def test_mobile_live_width_mismatch_rejected(self):
         from app.qa.screenshot import ScreenshotError, validate_screenshot_dimensions
-
+        malformed = BrowserMetrics(411, 844, 390, 411, 411)
         with tempfile.TemporaryDirectory() as tmpdir:
-            desktop = Path(tmpdir) / "desktop.png"
-            mobile = Path(tmpdir) / "mobile.png"
-            desktop.write_bytes(_png_bytes(1280, 720))  # browser default width
-            mobile.write_bytes(_png_bytes(390, 844))
             with self.assertRaises(ScreenshotError) as ctx:
-                validate_screenshot_dimensions(ScreenshotSet(desktop=desktop, mobile=mobile))
-        self.assertIn("desktop", str(ctx.exception))
-        self.assertIn("1440", str(ctx.exception))
+                validate_screenshot_dimensions(
+                    self._evidence(tmpdir, mobile_width=411, mobile_metrics=malformed)
+                )
+        self.assertIn("mobile innerWidth is 411", str(ctx.exception))
+        self.assertIn("expected 390", str(ctx.exception))
 
-    def test_mobile_wrong_width_rejected(self):
+    def test_missing_metrics_rejected(self):
         from app.qa.screenshot import ScreenshotError, validate_screenshot_dimensions
+        with tempfile.TemporaryDirectory() as tmpdir:
+            evidence = self._evidence(tmpdir)
+            evidence.mobile_metrics = None
+            with self.assertRaisesRegex(ScreenshotError, "live browser metrics are missing"):
+                validate_screenshot_dimensions(evidence)
+
+    def test_malformed_metric_probe_rejected_as_integrity_failure(self):
+        from app.qa.screenshot import ScreenshotError
+        with self.assertRaisesRegex(ScreenshotError, "documentClientWidth is missing or non-numeric"):
+            BrowserMetrics.from_payload({
+                "innerWidth": 390,
+                "innerHeight": 844,
+                "documentScrollWidth": 411,
+                "bodyScrollWidth": 411,
+            })
+
+    def test_non_finite_or_fractional_metrics_rejected(self):
+        from app.qa.screenshot import ScreenshotError
+        with self.assertRaisesRegex(ScreenshotError, "not a finite non-negative integer"):
+            BrowserMetrics.from_payload({
+                "innerWidth": 390.5,
+                "innerHeight": 844,
+                "documentClientWidth": 390,
+                "documentScrollWidth": 411,
+                "bodyScrollWidth": 411,
+            })
+
+    def test_malformed_stored_metric_rejected_by_integrity_guard(self):
+        from app.qa.screenshot import ScreenshotError, validate_screenshot_dimensions
+        malformed = _metrics(390, 844)
+        object.__setattr__(malformed, "inner_height", float("nan"))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaisesRegex(ScreenshotError, "live browser metrics are malformed"):
+                validate_screenshot_dimensions(
+                    self._evidence(tmpdir, mobile_metrics=malformed)
+                )
+
+    def test_metric_probe_failure_surfaces_without_screenshoting(self):
+        import app.qa.screenshot as screenshot_mod
+
+        fake = _FakeBrowserRun()
+        original = fake.__call__
+
+        def _run(argv, **kwargs):
+            result = original(argv, **kwargs)
+            if "eval" in argv:
+                kwargs.get("stdout").write(json.dumps({
+                    "success": False, "error": "probe failed",
+                }))
+            return result
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            desktop = Path(tmpdir) / "desktop.png"
-            mobile = Path(tmpdir) / "mobile.png"
-            desktop.write_bytes(_png_bytes(1440, 900))
-            mobile.write_bytes(_png_bytes(1280, 720))  # browser default width
-            with self.assertRaises(ScreenshotError) as ctx:
-                validate_screenshot_dimensions(ScreenshotSet(desktop=desktop, mobile=mobile))
-        self.assertIn("mobile", str(ctx.exception))
-        self.assertIn("390", str(ctx.exception))
+            out_path = Path(tmpdir) / "shot.png"
+            with patch.object(screenshot_mod.shutil, "which", return_value="/usr/bin/agent-browser"), \
+                 patch.object(screenshot_mod.subprocess, "run", side_effect=_run):
+                result = screenshot_mod._default_capture_fn(
+                    "https://example.com", 390, 844, out_path
+                )
+        self.assertEqual(result.status, "metric_probe_failed")
+        self.assertIsNone(result.metrics)
+        self.assertFalse(any("screenshot" in call for call in fake.calls))
+        self.assertEqual(fake.calls[-1][-1], "close")
+
+    def test_browser_commands_never_spawn_with_inherited_pipes(self):
+        """Regression: a cold Chromium launch inherits the parent's stdout
+        handle, so a PIPE-backed spawn never sees EOF and every capture times
+        out on Windows. Every browser call must be file-backed."""
+        import app.qa.screenshot as screenshot_mod
+
+        seen_kwargs = []
+
+        def _fake_run(argv, **kwargs):
+            seen_kwargs.append(kwargs)
+            return MagicMock(returncode=0, stdout="")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = Path(tmpdir) / "shot.png"
+            with patch.object(screenshot_mod.shutil, "which", return_value="/usr/bin/agent-browser"), \
+                 patch.object(screenshot_mod.subprocess, "run", side_effect=_fake_run):
+                screenshot_mod._default_capture_fn(
+                    "https://example.com", 1440, 900, out_path
+                )
+
+        self.assertTrue(seen_kwargs)
+        for kwargs in seen_kwargs:
+            self.assertNotIn("capture_output", kwargs)
+            self.assertIn("stdout", kwargs)
+            self.assertIs(kwargs["stderr"], subprocess.STDOUT)
+
+    def test_browser_timeout_is_reported_as_capture_failure(self):
+        import app.qa.screenshot as screenshot_mod
+
+        def _fake_run(argv, **kwargs):
+            raise subprocess.TimeoutExpired(argv, kwargs.get("timeout", 30))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = Path(tmpdir) / "shot.png"
+            with patch.object(screenshot_mod.shutil, "which", return_value="/usr/bin/agent-browser"), \
+                 patch.object(screenshot_mod.subprocess, "run", side_effect=_fake_run):
+                result = screenshot_mod._default_capture_fn(
+                    "https://example.com", 1440, 900, out_path
+                )
+        self.assertFalse(result.captured)
+        self.assertEqual(result.status, "capture_failed")
+        self.assertIn("timed out", result.error)
 
     def test_non_png_evidence_rejected(self):
         from app.qa.screenshot import ScreenshotError, validate_screenshot_dimensions
-
         with tempfile.TemporaryDirectory() as tmpdir:
-            desktop = Path(tmpdir) / "desktop.png"
-            mobile = Path(tmpdir) / "mobile.png"
-            desktop.write_bytes(b"fake-png")  # not a PNG at all
-            mobile.write_bytes(_png_bytes(390, 844))
+            evidence = self._evidence(tmpdir)
+            evidence.desktop.write_bytes(b"fake-png")
             with self.assertRaises(ScreenshotError):
-                validate_screenshot_dimensions(ScreenshotSet(desktop=desktop, mobile=mobile))
+                validate_screenshot_dimensions(evidence)
 
-    def test_missing_files_are_skipped_here(self):
-        """Missing files are the deterministic presence checks' job, not the
-        dimension guard's — the guard only validates files that exist."""
+    def test_missing_files_are_skipped_for_presence_checks(self):
         from app.qa.screenshot import validate_screenshot_dimensions
-
         with tempfile.TemporaryDirectory() as tmpdir:
             missing = Path(tmpdir) / "does-not-exist.png"
-            # Must not raise.
             validate_screenshot_dimensions(ScreenshotSet(desktop=missing, mobile=missing))
 
 
-class TestEvidenceIntegrityBlocksBeforeVision(_FixtureBase):
-    """Wrong-dimension evidence is a capture-infrastructure failure: it must
-    never reach VISION and must never consume the FRONTEND repair budget."""
+class TestDeterministicHorizontalOverflow(unittest.TestCase):
+    """Live scrollWidth overflow is one deterministic finding per viewport."""
 
-    def _run_with_bad_evidence(self, width: int, height: int, target="desktop"):
+    def _findings(self, screenshots: ScreenshotSet):
+        from app.qa.deterministic import run_deterministic_checks
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = _make_workspace(Path(tmpdir), "proj")
+            return run_deterministic_checks(workspace, screenshots, True, True, True)
+
+    def _screens(self, desktop_metrics, mobile_metrics, mobile_png=390):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            desktop = Path(tmpdir) / "desktop.png"
+            mobile = Path(tmpdir) / "mobile.png"
+            desktop.write_bytes(_png_bytes(1440, 900))
+            mobile.write_bytes(_png_bytes(mobile_png, 844))
+            return ScreenshotSet(desktop, mobile, desktop_metrics, mobile_metrics)
+
+    def test_clean_mobile_has_no_overflow_finding(self):
+        findings = self._findings(self._screens(_metrics(1440, 900), _metrics(390, 844)))
+        self.assertNotIn("mobile horizontal overflow: 390px document width exceeds 390px viewport", findings.failures)
+        self.assertFalse(any("horizontal overflow" in item for item in findings.failures))
+
+    def test_ordinary_1440_desktop_behavior_is_unchanged(self):
+        findings = self._findings(self._screens(_metrics(1440, 900), _metrics(390, 844)))
+        self.assertEqual(findings.failures, [])
+
+    def test_root_and_body_411_emit_one_exact_mobile_finding(self):
+        metrics = _metrics(390, 844, document_width=411, body_width=411)
+        findings = self._findings(self._screens(_metrics(1440, 900), metrics, mobile_png=411))
+        expected = "mobile horizontal overflow: 411px document width exceeds 390px viewport"
+        self.assertEqual(findings.failures.count(expected), 1)
+
+    def test_root_only_uses_largest_observed_width(self):
+        metrics = _metrics(390, 844, document_width=423, body_width=390)
+        findings = self._findings(self._screens(_metrics(1440, 900), metrics, mobile_png=423))
+        self.assertIn("mobile horizontal overflow: 423px document width exceeds 390px viewport", findings.failures)
+
+    def test_body_only_uses_largest_observed_width(self):
+        metrics = _metrics(390, 844, document_width=390, body_width=435)
+        findings = self._findings(self._screens(_metrics(1440, 900), metrics, mobile_png=435))
+        self.assertIn("mobile horizontal overflow: 435px document width exceeds 390px viewport", findings.failures)
+
+    def test_desktop_uses_analogous_wording(self):
+        metrics = _metrics(1440, 900, document_width=1440, body_width=1480)
+        findings = self._findings(self._screens(metrics, _metrics(390, 844)))
+        self.assertIn("desktop horizontal overflow: 1480px document width exceeds 1440px viewport", findings.failures)
+
+    def test_combined_viewports_emit_one_finding_each(self):
+        findings = self._findings(self._screens(
+            _metrics(1440, 900, document_width=1500),
+            _metrics(390, 844, body_width=411),
+            mobile_png=411,
+        ))
+        overflow = [item for item in findings.failures if "horizontal overflow" in item]
+        self.assertEqual(overflow, [
+            "desktop horizontal overflow: 1500px document width exceeds 1440px viewport",
+            "mobile horizontal overflow: 411px document width exceeds 390px viewport",
+        ])
+
+
+class TestEvidenceIntegrityBlocksBeforeVision(_FixtureBase):
+    """Untrusted live metrics fail before VISION and consume no repair budget."""
+
+    def _run_with_metrics(self, mutate):
         _queue_and_run_project(self.store, "proj")
         self._passing_render()
 
-        def _bad_capture(url, qa_dir, attempt):
-            s = self._passing_screenshots(attempt)
-            getattr(s, target).write_bytes(_png_bytes(width, height))
-            return s
+        def _capture(url, qa_dir, attempt):
+            screenshots = self._passing_screenshots(attempt)
+            mutate(screenshots, attempt)
+            return screenshots
 
-        self.mock_capture.capture.side_effect = _bad_capture
+        self.mock_capture.capture.side_effect = _capture
         self.mock_adapter.vision_inspect.return_value = self._passing_vision()
-        self.mock_adapter.frontend_build.return_value = {"success": True, "design_dna": self.design_dna}
-
+        self.mock_adapter.frontend_build.return_value = {
+            "success": True, "design_dna": self.design_dna,
+        }
         return self.orchestrator.run("proj", self.workspace, self.brief, self.design_dna)
 
-    def test_bad_desktop_dimensions_fail_as_capture_error(self):
-        result = self._run_with_bad_evidence(1280, 720)
+    def test_requested_390_actual_411_is_infrastructure_failure(self):
+        def mutate(screenshots, attempt):
+            screenshots.mobile_metrics = BrowserMetrics(411, 844, 390, 411, 411)
+
+        result = self._run_with_metrics(mutate)
+        self.assertFalse(result.success)
+        self.assertIn("INFRASTRUCTURE_ERROR:capture_failed", result.error)
+        self.assertIn("mobile innerWidth is 411", result.error)
+        self.mock_adapter.vision_inspect.assert_not_called()
+        self.mock_adapter.frontend_build.assert_not_called()
+        self.assertEqual(result.repair_attempts, 0)
+
+    def test_missing_metrics_fail_before_vision_without_repair(self):
+        result = self._run_with_metrics(lambda screenshots, attempt: setattr(screenshots, "mobile_metrics", None))
+        self.assertFalse(result.success)
+        self.assertIn("live browser metrics are missing", result.error)
+        self.mock_adapter.vision_inspect.assert_not_called()
+        self.mock_adapter.frontend_build.assert_not_called()
+        self.assertEqual(result.repair_attempts, 0)
+
+    def test_metric_probe_failure_is_infrastructure_without_repair(self):
+        from app.qa.screenshot import ScreenshotCapture
+
+        _queue_and_run_project(self.store, "proj")
+        self._passing_render()
+
+        def _probe_failed(url, width, height, out_path):
+            return CaptureResult.failure("metric_probe_failed", "data.result missing")
+
+        self.orchestrator.screenshot_capture = ScreenshotCapture(capture_fn=_probe_failed)
+        self.mock_adapter.vision_inspect.return_value = self._passing_vision()
+        self.mock_adapter.frontend_build.return_value = {
+            "success": True, "design_dna": self.design_dna,
+        }
+        result = self.orchestrator.run("proj", self.workspace, self.brief, self.design_dna)
 
         self.assertFalse(result.success)
-        # VISION must never consume invalid evidence.
+        self.assertIn("metric_probe_failed: data.result missing", result.error)
         self.mock_adapter.vision_inspect.assert_not_called()
-        # Capture infrastructure failure must not consume the repair budget.
-        self.assertEqual(result.repair_attempts, 0)
         self.mock_adapter.frontend_build.assert_not_called()
-        # Explicit capture/evidence failure, not a visual QA failure.
-        self.assertIn("screenshot evidence integrity", result.error)
-        state = self.store.load("proj")
-        self.assertEqual(state.lifecycle, ProjectLifecycle.FAILED.value)
-        self.assertEqual(state.failure["phase"], "qa")
-        self.assertIn("screenshot evidence integrity", state.failure["error"])
-
-    def test_bad_mobile_dimensions_fail_as_capture_error(self):
-        result = self._run_with_bad_evidence(1280, 720, target="mobile")
-
-        self.assertFalse(result.success)
-        self.mock_adapter.vision_inspect.assert_not_called()
         self.assertEqual(result.repair_attempts, 0)
-        self.mock_adapter.frontend_build.assert_not_called()
-        self.assertIn("screenshot evidence integrity", result.error)
-        self.assertIn("mobile", result.error)
-        self.mock_renderer.stop.assert_called_once()
-        self.assertEqual(self.store.load("proj").failure["vision_findings"], [])
 
-    def test_bad_evidence_after_repair_stops_without_another_repair(self):
+    def test_bad_metrics_after_repair_stop_without_another_repair(self):
         _queue_and_run_project(self.store, "proj")
         self._passing_render()
 
         def capture(url, qa_dir, attempt):
             screenshots = self._passing_screenshots(attempt)
             if attempt:
-                screenshots.mobile.write_bytes(_png_bytes(1280, 2501))
+                screenshots.mobile_metrics = None
             return screenshots
 
         self.mock_capture.capture.side_effect = capture
@@ -783,19 +1041,51 @@ class TestEvidenceIntegrityBlocksBeforeVision(_FixtureBase):
         self.assertEqual(result.repair_attempts, 1)
         self.mock_adapter.frontend_build.assert_called_once()
         self.mock_adapter.vision_inspect.assert_called_once()
-        self.assertIn("mobile", result.error)
         self.assertIn("screenshot evidence integrity", result.error)
         self.assertEqual(self.mock_renderer.stop.call_count, 2)
 
-    def test_bad_evidence_does_not_consume_repair_budget(self):
-        """Even with a passing VISION stub ready, invalid evidence fails the
-        run with zero repairs — the budget is reserved for visual QA only."""
-        result = self._run_with_bad_evidence(1280, 720)
 
-        self.assertEqual(result.repair_attempts, 0)
-        self.assertEqual(self.mock_adapter.frontend_build.call_count, 0)
-        state = self.store.load("proj")
-        self.assertEqual(state.failure["repair_attempts"], 0)
+class TestP8OverflowUsesBoundedFrontendRepair(_FixtureBase):
+    """P8: a valid 390px viewport with 411px overflow reaches VISION as
+    full-page evidence, then FRONTEND receives the deterministic blocker and
+    one successful repair is sufficient."""
+
+    def test_overflow_repairs_once_then_passes(self):
+        _queue_and_run_project(self.store, "proj")
+        self._passing_render()
+        captured_paths = []
+
+        def _capture(url, qa_dir, attempt):
+            screenshots = self._passing_screenshots(attempt)
+            if attempt == 0:
+                screenshots.mobile.write_bytes(_png_bytes(411, 2000))
+                screenshots.mobile_metrics = _metrics(
+                    390, 844, document_width=411, body_width=411
+                )
+            captured_paths.append(screenshots.mobile)
+            return screenshots
+
+        self.mock_capture.capture.side_effect = _capture
+        self.mock_adapter.vision_inspect.return_value = self._passing_vision()
+        self.mock_adapter.frontend_build.return_value = {
+            "success": True, "design_dna": self.design_dna,
+        }
+
+        with patch.object(self.orchestrator, "_run_rebuild_checks", return_value=(True, True, True)):
+            result = self.orchestrator.run("proj", self.workspace, self.brief, self.design_dna)
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(result.repair_attempts, 1)
+        first_mobile = self.mock_adapter.vision_inspect.call_args_list[0].args[1]
+        self.assertEqual(_png_dimensions(first_mobile)[0], 411)
+        self.assertEqual(first_mobile, captured_paths[0])
+        instructions = self.mock_adapter.frontend_build.call_args.kwargs["design_dna_instructions"]
+        self.assertIn(
+            "mobile horizontal overflow: 411px document width exceeds 390px viewport",
+            instructions,
+        )
+        self.assertEqual(self.mock_adapter.vision_inspect.call_count, 2)
+        self.mock_adapter.frontend_build.assert_called_once()
 
 
 class TestBrokenBuildAfterRepairBlocks(_FixtureBase):
@@ -985,22 +1275,14 @@ class TestAgentBrowserArgsEnv(unittest.TestCase):
         import app.qa.screenshot as screenshot_mod
 
         out_path = Path(tmpdir) / "shot.png"
-        run_calls = []
-
-        def _fake_run(argv, **kwargs):
-            run_calls.append(list(argv))
-            # Simulate a successful screenshot on the screenshot call.
-            if "screenshot" in argv:
-                out_path.write_bytes(b"fake-png")
-                return MagicMock(returncode=0)
-            return MagicMock(returncode=0)
+        fake = _FakeBrowserRun(metrics=_metrics(1440, 900))
 
         env = {}
         if env_value is not None:
             env["AGENT_BROWSER_ARGS"] = env_value
 
         with patch.object(screenshot_mod.shutil, "which", return_value="/usr/bin/agent-browser"), \
-             patch.object(screenshot_mod.subprocess, "run", side_effect=_fake_run), \
+             patch.object(screenshot_mod.subprocess, "run", side_effect=fake), \
              patch.dict("os.environ", env, clear=False):
             # Ensure unset case truly removes the var even if the host has it.
             if env_value is None:
@@ -1010,14 +1292,14 @@ class TestAgentBrowserArgsEnv(unittest.TestCase):
                 "https://example.com", 1440, 900, out_path
             )
 
-        return result, run_calls
+        return result, fake.calls
 
     def test_env_unset_emits_no_args_flag(self):
         """A. env unset -> no --args emitted anywhere in the flow."""
         with tempfile.TemporaryDirectory() as tmpdir:
             ok, calls = self._run_capture(None, tmpdir)
-        self.assertTrue(ok)
-        self.assertEqual(len(calls), 4)  # open, set viewport, screenshot, close
+        self.assertTrue(ok.captured)
+        self.assertEqual(len(calls), 5)  # open, set viewport, eval, screenshot, close
         for argv in calls:
             self.assertNotIn("--args", argv)
 
@@ -1025,7 +1307,7 @@ class TestAgentBrowserArgsEnv(unittest.TestCase):
         """A2. env set but empty/whitespace -> treated as unset."""
         with tempfile.TemporaryDirectory() as tmpdir:
             ok, calls = self._run_capture("   ", tmpdir)
-        self.assertTrue(ok)
+        self.assertTrue(ok.captured)
         for argv in calls:
             self.assertNotIn("--args", argv)
 
@@ -1033,7 +1315,7 @@ class TestAgentBrowserArgsEnv(unittest.TestCase):
         """B. AGENT_BROWSER_ARGS='--no-sandbox' -> open argv contains --args '--no-sandbox'."""
         with tempfile.TemporaryDirectory() as tmpdir:
             ok, calls = self._run_capture("--no-sandbox", tmpdir)
-        self.assertTrue(ok)
+        self.assertTrue(ok.captured)
         open_argv = calls[0]
         self.assertIn("open", open_argv)
         self.assertIn("--args", open_argv)
@@ -1046,7 +1328,7 @@ class TestAgentBrowserArgsEnv(unittest.TestCase):
             ok, calls = self._run_capture(
                 "--no-sandbox --disable-dev-shm-usage", tmpdir
             )
-        self.assertTrue(ok)
+        self.assertTrue(ok.captured)
         open_argv = calls[0]
         idx = open_argv.index("--args")
         self.assertEqual(
@@ -1059,10 +1341,10 @@ class TestAgentBrowserArgsEnv(unittest.TestCase):
             ok_noenv, calls_noenv = self._run_capture(None, tmpdir)
             ok_env, calls_env = self._run_capture("--no-sandbox", tmpdir)
 
-        self.assertTrue(ok_noenv)
-        self.assertTrue(ok_env)
-        self.assertEqual(len(calls_noenv), 4)
-        self.assertEqual(len(calls_env), 4)
+        self.assertTrue(ok_noenv.captured)
+        self.assertTrue(ok_env.captured)
+        self.assertEqual(len(calls_noenv), 5)
+        self.assertEqual(len(calls_env), 5)
 
         # Strip the open call's optional --args tail, then the flows must match
         # command-for-command (same tmpdir + same inputs -> same session name
@@ -1082,66 +1364,52 @@ class TestAgentBrowserArgsEnv(unittest.TestCase):
 
 
 class TestCaptureTimeoutHandling(unittest.TestCase):
-    """Regression: VPS mobile-capture hang (subprocess.TimeoutExpired) must
-    be converted to a controlled capture failure (False), never propagate
-    as an uncaught exception — per _default_capture_fn's documented
-    contract ("Returns False (never raises) on any failure")."""
+    """Regression: VPS mobile-capture hangs become structured capture failures
+    and never propagate as uncaught exceptions from the browser seam."""
 
-    def test_open_timeout_returns_false_not_raises(self):
+    def test_open_timeout_returns_structured_failure_not_raises(self):
         import app.qa.screenshot as screenshot_mod
 
-        def _fake_run(argv, **kwargs):
-            if "open" in argv:
-                raise subprocess.TimeoutExpired(cmd=argv, timeout=30)
-            return MagicMock(returncode=0)
-
+        fake = _FakeBrowserRun(metrics=_metrics(1440, 900), fail_on=("open",))
         with tempfile.TemporaryDirectory() as tmpdir:
             out_path = Path(tmpdir) / "shot.png"
             with patch.object(screenshot_mod.shutil, "which", return_value="/usr/bin/agent-browser"), \
-                 patch.object(screenshot_mod.subprocess, "run", side_effect=_fake_run):
+                 patch.object(screenshot_mod.subprocess, "run", side_effect=fake):
                 result = screenshot_mod._default_capture_fn(
                     "https://example.com", 1440, 900, out_path
                 )
-        self.assertFalse(result)
+        self.assertFalse(result.captured)
+        self.assertEqual(result.status, "capture_failed")
 
-    def test_screenshot_timeout_returns_false_not_raises(self):
+    def test_screenshot_timeout_returns_structured_failure_not_raises(self):
         import app.qa.screenshot as screenshot_mod
 
-        def _fake_run(argv, **kwargs):
-            if "screenshot" in argv:
-                raise subprocess.TimeoutExpired(cmd=argv, timeout=30)
-            return MagicMock(returncode=0)
-
+        fake = _FakeBrowserRun(metrics=_metrics(1440, 900), fail_on=("screenshot",))
         with tempfile.TemporaryDirectory() as tmpdir:
             out_path = Path(tmpdir) / "shot.png"
             with patch.object(screenshot_mod.shutil, "which", return_value="/usr/bin/agent-browser"), \
-                 patch.object(screenshot_mod.subprocess, "run", side_effect=_fake_run):
+                 patch.object(screenshot_mod.subprocess, "run", side_effect=fake):
                 result = screenshot_mod._default_capture_fn(
                     "https://example.com", 1440, 900, out_path
                 )
-        self.assertFalse(result)
+        self.assertFalse(result.captured)
+        self.assertEqual(result.status, "capture_failed")
 
     def test_close_timeout_does_not_mask_successful_result(self):
         """A hung cleanup `close` call must not raise past the function or
         override an otherwise-successful capture result."""
         import app.qa.screenshot as screenshot_mod
 
+        fake = _FakeBrowserRun(metrics=_metrics(1440, 900), fail_on=("close",))
         with tempfile.TemporaryDirectory() as tmpdir:
             out_path = Path(tmpdir) / "shot.png"
-
-            def _fake_run(argv, **kwargs):
-                if "close" in argv:
-                    raise subprocess.TimeoutExpired(cmd=argv, timeout=10)
-                if "screenshot" in argv:
-                    out_path.write_bytes(b"fake-png")
-                return MagicMock(returncode=0)
-
             with patch.object(screenshot_mod.shutil, "which", return_value="/usr/bin/agent-browser"), \
-                 patch.object(screenshot_mod.subprocess, "run", side_effect=_fake_run):
+                 patch.object(screenshot_mod.subprocess, "run", side_effect=fake):
                 result = screenshot_mod._default_capture_fn(
                     "https://example.com", 1440, 900, out_path
                 )
-        self.assertTrue(result)
+        self.assertTrue(result.captured)
+        self.assertEqual(result.metrics, _metrics(1440, 900))
 
     def test_capture_timeout_does_not_consume_frontend_repair_budget(self):
         """A capture-layer TimeoutExpired surfaces as a deterministic
@@ -1211,32 +1479,22 @@ class TestBrowserOpenFailureCannotProceed(unittest.TestCase):
     def test_failed_open_short_circuits_before_screenshot(self):
         import app.qa.screenshot as screenshot_mod
 
-        run_calls = []
-
-        def _fake_run(argv, **kwargs):
-            run_calls.append(list(argv))
-            if "open" in argv:
-                return MagicMock(returncode=1)
-            if "screenshot" in argv:
-                # Must never be reached.
-                run_calls.append(["SHOULD_NOT_RUN"])
-                return MagicMock(returncode=0)
-            return MagicMock(returncode=0)
+        fake = _FakeBrowserRun(metrics=_metrics(1440, 900), returncodes={"open": 1})
 
         with tempfile.TemporaryDirectory() as tmpdir:
             out_path = Path(tmpdir) / "shot.png"
             with patch.object(screenshot_mod.shutil, "which", return_value="/usr/bin/agent-browser"), \
-                 patch.object(screenshot_mod.subprocess, "run", side_effect=_fake_run):
+                 patch.object(screenshot_mod.subprocess, "run", side_effect=fake):
                 ok = screenshot_mod._default_capture_fn(
                     "https://example.com", 1440, 900, out_path
                 )
 
-        self.assertFalse(ok)
+        self.assertFalse(ok.captured)
         self.assertFalse(out_path.exists())
         # screenshot command must never have run.
-        self.assertFalse(any("screenshot" in c for c in run_calls if c != ["SHOULD_NOT_RUN"]))
+        self.assertFalse(any("screenshot" in c for c in fake.calls))
         # close must still run for cleanup.
-        self.assertTrue(any("close" in c for c in run_calls))
+        self.assertTrue(any("close" in c for c in fake.calls))
 
 
 class TestViewportAppliedBeforeScreenshot(unittest.TestCase):
@@ -1255,28 +1513,41 @@ class TestViewportAppliedBeforeScreenshot(unittest.TestCase):
         import app.qa.screenshot as screenshot_mod
 
         out_path = Path(tmpdir) / "shot.png"
-        run_calls = []
-
-        def _fake_run(argv, **kwargs):
-            run_calls.append(list(argv))
-            if "screenshot" in argv:
-                out_path.write_bytes(b"fake-png")
-            return MagicMock(returncode=viewport_returncode if "viewport" in argv else 0)
+        fake = _FakeBrowserRun(
+            metrics=_metrics(*viewport),
+            returncodes={"viewport": viewport_returncode},
+        )
 
         with patch.object(screenshot_mod.shutil, "which", return_value="/usr/bin/agent-browser"), \
-             patch.object(screenshot_mod.subprocess, "run", side_effect=_fake_run):
+             patch.object(screenshot_mod.subprocess, "run", side_effect=fake):
             ok = screenshot_mod._default_capture_fn(
                 "https://example.com", *viewport, out_path
             )
 
-        return ok, run_calls, out_path
+        return ok, fake.calls, out_path
 
-    def test_set_viewport_runs_between_open_and_screenshot(self):
+    def test_commands_run_in_required_order_on_one_session(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             ok, calls, _ = self._run_capture(tmpdir)
 
-        self.assertTrue(ok)
-        self.assertEqual(len(calls), 4)  # open, set viewport, screenshot, close
+        self.assertTrue(ok.captured)
+        self.assertEqual(len(calls), 5)
+        command_names = [
+            "open" if "open" in call else
+            "viewport" if "viewport" in call else
+            "eval" if "eval" in call else
+            "screenshot" if "screenshot" in call else
+            "close" if "close" in call else "unknown"
+            for call in calls
+        ]
+        self.assertEqual(command_names, ["open", "viewport", "eval", "screenshot", "close"])
+        sessions = {call[call.index("--session") + 1] for call in calls}
+        self.assertEqual(len(sessions), 1)
+        screenshot_argv = next(call for call in calls if "screenshot" in call)
+        self.assertEqual(
+            screenshot_argv[screenshot_argv.index("screenshot") + 1:],
+            ["--full", str(Path(tmpdir) / "shot.png")],
+        )
 
         open_idx = next(i for i, c in enumerate(calls) if "open" in c)
         viewport_idx = next(i for i, c in enumerate(calls) if "viewport" in c)
@@ -1289,26 +1560,22 @@ class TestViewportAppliedBeforeScreenshot(unittest.TestCase):
         self.assertIn("viewport", viewport_argv)
         w_idx = viewport_argv.index("viewport")
         self.assertEqual(viewport_argv[w_idx + 1 : w_idx + 3], ["1440", "900"])
-        # Same session as the open call — viewport applies to that session.
-        self.assertEqual(
-            viewport_argv[viewport_argv.index("--session") + 1],
-            calls[open_idx][calls[open_idx].index("--session") + 1],
-        )
 
     def test_mobile_capture_uses_mobile_viewport(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             ok, calls, _ = self._run_capture(tmpdir, viewport=(390, 844))
 
-        self.assertTrue(ok)
+        self.assertTrue(ok.captured)
         viewport_argv = next(c for c in calls if "viewport" in c)
         w_idx = viewport_argv.index("viewport")
         self.assertEqual(viewport_argv[w_idx + 1 : w_idx + 3], ["390", "844"])
+        self.assertEqual(ok.metrics, _metrics(390, 844))
 
     def test_open_no_longer_passes_width_height_flags(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             ok, calls, _ = self._run_capture(tmpdir)
 
-        self.assertTrue(ok)
+        self.assertTrue(ok.captured)
         open_argv = next(c for c in calls if "open" in c)
         self.assertNotIn("--width", open_argv)
         self.assertNotIn("--height", open_argv)
@@ -1317,7 +1584,7 @@ class TestViewportAppliedBeforeScreenshot(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             ok, calls, out_path = self._run_capture(tmpdir, viewport_returncode=1)
 
-        self.assertFalse(ok)
+        self.assertFalse(ok.captured)
         self.assertFalse(out_path.exists())
         self.assertFalse(any("screenshot" in c for c in calls))
         # close must still run for cleanup.
@@ -1348,8 +1615,9 @@ class _ResponsivePageServer:
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
         page = (
-            "<!doctype html><html><head><title>qa</title></head>"
-            "<body style='margin:0'>"
+            "<!doctype html><html><head><title>qa</title>"
+            "<style>body{margin:0}@media(max-width:500px){body{width:411px}}</style>"
+            "</head><body>"
             "<div id='vp' style='height:2000px'></div>"
             "<script>document.title = window.innerWidth + 'x' + window.innerHeight;</script>"
             "</body></html>"
@@ -1376,19 +1644,17 @@ class _ResponsivePageServer:
         self._httpd.server_close()
 
 
-@unittest.skipIf(shutil.which("agent-browser") is None, "agent-browser CLI not installed")
 class TestRealViewportDimensions(unittest.TestCase):
-    """E2E: the real agent-browser capture path must produce PNGs at the
-    intended viewport widths (desktop 1440, mobile 390). This is the
-    pixel-level regression the mocked tests could never catch — the
-    tg-6329821361 incident produced valid PNGs at the wrong width.
+    """E2E: real agent-browser live metrics prove a 390px viewport even when
+    the 411px document makes the accepted full-page PNG wider than the viewport.
     """
 
-    def test_desktop_and_mobile_widths_match_viewport_constants(self):
+    def test_390_viewport_and_411_overflow_are_classified_exactly(self):
         from app.qa.screenshot import (
             DESKTOP_VIEWPORT,
             MOBILE_VIEWPORT,
             ScreenshotCapture,
+            validate_screenshot_dimensions,
         )
 
         server = _ResponsivePageServer()
@@ -1399,13 +1665,33 @@ class TestRealViewportDimensions(unittest.TestCase):
                     f"http://127.0.0.1:{server.port}/", qa_dir, attempt=1
                 )
                 self.assertTrue(screenshots.complete, "both screenshots must be captured")
+                validate_screenshot_dimensions(screenshots)
                 desktop_w, _ = _png_dimensions(screenshots.desktop)
                 mobile_w, _ = _png_dimensions(screenshots.mobile)
+                workspace = _make_workspace(Path(tmpdir), "live")
+                from app.qa.deterministic import run_deterministic_checks
+                findings = run_deterministic_checks(
+                    workspace, screenshots, render_ok=True, build_ok=True, typecheck_ok=True
+                )
+                metrics = screenshots.mobile_metrics
         finally:
             server.shutdown()
 
+        self.assertEqual(screenshots.desktop_metrics.inner_width, DESKTOP_VIEWPORT[0])
+        self.assertEqual(screenshots.desktop_metrics.inner_height, DESKTOP_VIEWPORT[1])
+        self.assertEqual(metrics.inner_width, MOBILE_VIEWPORT[0])
+        self.assertEqual(metrics.inner_height, MOBILE_VIEWPORT[1])
+        self.assertEqual(metrics.document_client_width, MOBILE_VIEWPORT[0])
+        self.assertEqual(metrics.document_scroll_width, 411)
+        self.assertEqual(metrics.body_scroll_width, 411)
         self.assertEqual(desktop_w, DESKTOP_VIEWPORT[0])
-        self.assertEqual(mobile_w, MOBILE_VIEWPORT[0])
+        self.assertEqual(mobile_w, 411)
+        self.assertEqual(
+            findings.failures.count(
+                "mobile horizontal overflow: 411px document width exceeds 390px viewport"
+            ),
+            1,
+        )
 
 
 class TestRenderLocalhostBind(unittest.TestCase):
@@ -1455,7 +1741,12 @@ class TestRepairAttemptNumbering(unittest.TestCase):
                 mobile = qa_dir / "mobile.png"
                 desktop.write_bytes(_png_bytes(1440, 900))
                 mobile.write_bytes(_png_bytes(390, 844))
-                return ScreenshotSet(desktop=desktop, mobile=mobile)
+                return ScreenshotSet(
+                    desktop=desktop,
+                    mobile=mobile,
+                    desktop_metrics=_metrics(1440, 900),
+                    mobile_metrics=_metrics(390, 844),
+                )
 
             handle = RenderHandle(project_id="proj", port=5100, process=MagicMock(), url="http://127.0.0.1:5100/")
             mock_renderer.start.return_value = handle
