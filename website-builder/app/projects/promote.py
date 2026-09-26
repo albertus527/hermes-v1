@@ -26,6 +26,7 @@ constructed and passed in explicitly by the caller, matching the Phase 9
 """
 from __future__ import annotations
 
+import logging
 import re
 import time
 from dataclasses import dataclass, field
@@ -37,6 +38,43 @@ from app.core.contracts import OperationResult, StaleOperationIntent
 from app.core.lifecycle import LifecycleError, ProjectLifecycle
 from app.core.state import ProjectStateStore
 from app.sandbox.runner import ProjectRunner
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Previous-production classification
+# ---------------------------------------------------------------------------
+# "Is there a previous production deployment?" has FOUR honest answers, not
+# two. Collapsing KNOWN_BOOTSTRAP into either of the old answers is what made
+# the first real publish of a project fail closed forever: the bootstrap
+# placeholder consumes Vercel's unavoidable first-deployment auto-promotion,
+# so EVERY new project publishes against a production deployment that carries
+# no content identity -- which the old code could only read as "unknown".
+#
+#   NO_PRODUCTION
+#       No production deployment exists. No rollback target.
+#   KNOWN_BOOTSTRAP
+#       Provider state positively proves the production deployment is this
+#       project's own content-free bootstrap placeholder (see
+#       ``VercelAdapter._is_proven_bootstrap``). It is not a user website, so
+#       it is not a meaningful rollback target. First real publish may proceed
+#       with previous_production = null.
+#   REAL_PRODUCTION
+#       A previously published user deployment with a COMPLETE, re-promotable
+#       identity. Rollback semantics are mandatory and unchanged.
+#   UNKNOWN_OR_INCOMPLETE_PRODUCTION
+#       A production deployment exists but cannot be positively identified --
+#       an unknown or incomplete identity. FAIL CLOSED with INCOMPLETE_LOOKUP.
+#       Never guess which deployment was live.
+#
+# Classification is additive and backward compatible: a collaborator that
+# returns no classification at all is treated as UNKNOWN (fail closed), and the
+# two previously-meaningful shapes (no deployment_id, or a complete identity)
+# keep their exact previous meaning.
+PREVIOUS_PRODUCTION_NONE = "NO_PRODUCTION"
+PREVIOUS_PRODUCTION_BOOTSTRAP = "KNOWN_BOOTSTRAP"
+PREVIOUS_PRODUCTION_REAL = "REAL_PRODUCTION"
+PREVIOUS_PRODUCTION_UNKNOWN = "UNKNOWN_OR_INCOMPLETE_PRODUCTION"
 
 
 def _safe_identity(identity) -> Optional[dict]:
@@ -74,25 +112,49 @@ def _previous_identity_complete(identity) -> bool:
     )
 
 
-def _previous_identity_from_result(result) -> Optional[dict]:
-    """Normalize ``find_production_deployment``'s result into a full identity
-    dict, or ``None`` when there is no previous production deployment.
+def _classify_previous_production(result):
+    """Classify the current production deployment as
+    ``(kind, rollback_identity)``.
 
-    ``find_production_deployment`` already fails closed when the deployment's
-    stored metadata is incomplete, so any non-empty ``deployment_id`` here is
-    guaranteed to carry the matching ``wbOperation``/``wbRevision``/
-    ``wbArtifact`` fields. A ``None`` deployment_id means no prior production.
+    ``rollback_identity`` is the full, re-promotable identity for a REAL
+    production deployment and ``None`` for NO_PRODUCTION, KNOWN_BOOTSTRAP and
+    UNKNOWN_OR_INCOMPLETE_PRODUCTION -- in the last case because there is
+    provably no safe rollback target, which is precisely why the caller must
+    fail closed rather than promote.
+
+    Classification is derived only from the adapter's provider-truth result.
+    An absent discriminator is UNKNOWN, never a guess: a collaborator that
+    cannot distinguish a bootstrap from an unknown deployment has not proven
+    anything.
     """
-    data = result.data or {}
-    if not data.get("deployment_id"):
-        return None
+    data = (getattr(result, "data", None) or {}) if result is not None else {}
+    if not isinstance(data, dict):
+        return PREVIOUS_PRODUCTION_UNKNOWN, None
+    if not getattr(result, "success", False):
+        # A FAILED lookup proves nothing -- not even that there is no
+        # production. The caller returns the failure unchanged; classifying it
+        # as "no production" would be reading a failed read as a fact.
+        return PREVIOUS_PRODUCTION_UNKNOWN, None
+    identifier = data.get("deployment_id")
+    if not identifier:
+        return PREVIOUS_PRODUCTION_NONE, None
     identity = {
-        "deployment_id": data["deployment_id"],
+        "deployment_id": identifier,
         "operation_id": data.get("operation_id"),
         "source_revision": data.get("source_revision"),
         "artifact_sha256": data.get("artifact_sha256"),
     }
-    return identity if _previous_identity_complete(identity) else None
+    if _previous_identity_complete(identity):
+        return PREVIOUS_PRODUCTION_REAL, identity
+    proof = data.get("bootstrap_proof")
+    if (
+        isinstance(proof, dict)
+        and proof.get("deployment_id") == identifier
+        and isinstance(proof.get("bootstrap_operation_id"), str)
+        and bool(proof.get("bootstrap_operation_id"))
+    ):
+        return PREVIOUS_PRODUCTION_BOOTSTRAP, None
+    return PREVIOUS_PRODUCTION_UNKNOWN, None
 
 
 @dataclass
@@ -208,6 +270,10 @@ class PromotionOrchestrator:
             state.deployment["approval"] = approval
             state.revisions.approved_revision = shown["source_revision"]
             self.store.save(state)
+        logger.info(
+            "Approval accepted project=%s revision=%s deployment=%s",
+            project_id, approval["source_revision"], approval["deployment_id"],
+        )
         return OperationResult.ok(approval)
 
     # ------------------------------------------------------------------
@@ -306,6 +372,9 @@ class PromotionOrchestrator:
         source_revision = approval["source_revision"]
         artifact_sha256 = approval["artifact_sha256"]
         deployment_id = approval["deployment_id"]
+        logger.info(
+            "Publish starting project=%s revision=%s", project_id, source_revision,
+        )
 
         # Idempotent no-op: already LIVE with this EXACT approved identity
         # (e.g. a duplicate/retried promote call). Nothing to do — do not
@@ -346,13 +415,28 @@ class PromotionOrchestrator:
             return project_result
         vercel_project = project_result.data["project"]
 
-        # ---- Capture last-known-good production identity BEFORE
-        # promoting, so a failed post-promotion smoke check can roll back.
+        # ---- Classify the CURRENT production BEFORE promoting, so a failed
+        # post-promotion smoke check knows whether it has a real rollback
+        # target at all. Classification is explicit (four kinds) because
+        # "a deployment exists" and "we know which deployment was live" are
+        # different facts, and only the second one licenses a rollback.
         previous_result = self.deps.vercel.find_production_deployment(
             app_id, vercel_project, expected_name=expected_name)
         if not previous_result.success:
             return previous_result
-        fresh_previous = _previous_identity_from_result(previous_result)
+        previous_class, fresh_previous = _classify_previous_production(previous_result)
+        logger.info(
+            "Previous production classified=%s project=%s deployment=%s",
+            previous_class,
+            project_id,
+            (fresh_previous or {}).get("deployment_id")
+            or (previous_result.data or {}).get("deployment_id"),
+        )
+        if previous_class == PREVIOUS_PRODUCTION_UNKNOWN:
+            # A production deployment exists but cannot be positively
+            # identified. We can never guess a rollback target, so we refuse
+            # to promote at all -- the first, pre-side-effect fail-closed gate.
+            return OperationResult.fail("INCOMPLETE_LOOKUP", error_code="INCOMPLETE_LOOKUP")
 
         # ---- Transition PREVIEW_READY/LIVE -> PUBLISHING before any
         # external side effect, mirroring the durable-intent pattern used
@@ -399,11 +483,13 @@ class PromotionOrchestrator:
                     "operation_id": operation_id,
                     "deployment_id": deployment_id,
                     # Full trusted previous-production identity, persisted
-                    # BEFORE any remote side effect. None means "no prior
-                    # production deployment" -- distinct from an incomplete
-                    # identity (which find_production_deployment already
-                    # fails closed on).
+                    # BEFORE any remote side effect. None means "no rollback
+                    # target" -- either no production deployment at all, or a
+                    # proven bootstrap placeholder. The explicit classification
+                    # keeps those two cases distinguishable on a resume
+                    # instead of collapsing them.
                     "previous_production": previous_identity,
+                    "previous_production_class": previous_class,
                     "previous_production_deployment_id": (
                         previous_identity.get("deployment_id")
                         if previous_identity else None
@@ -412,6 +498,15 @@ class PromotionOrchestrator:
                     "created_at": time.time(),
                 }
             self.store.save(locked)
+            # Report the classification this intent ACTUALLY carries: on a
+            # same-operation resume the persisted one is authoritative, because
+            # the fresh lookup describes post-crash remote state, not the
+            # rollback target the operation was started against.
+            intent_class = (
+                (locked.deployment.get("promotion_intent") or {}).get(
+                    "previous_production_class"
+                ) or previous_class
+            )
 
             # The exact trusted identity of the deployment we intended to
             # promote. Reconciliation compares the COMPLETE tuple -- never a
@@ -433,6 +528,10 @@ class PromotionOrchestrator:
         # The durable intent above is exactly what makes releasing it safe:
         # a crash at any point from here is recovered by the same-operation
         # resume, which reconciles remote truth before acting again.
+        logger.info(
+            "Promotion intent persisted project=%s operation=%s class=%s",
+            project_id, operation_id, intent_class,
+        )
 
         # ---- Same-operation resume after an AMBIGUOUS remote promote:
         # reconcile remote truth BEFORE re-issuing any promote request.
@@ -451,6 +550,7 @@ class PromotionOrchestrator:
             status = (reconcile.data or {}).get("status") if reconcile.success else None
             if status == "PROMOTED":
                 resume_reconciled_url = self._production_url_for(intended_identity)
+                logger.info("Promotion confirmed deployment=%s (reconciled)", deployment_id)
                 self._update_intent(project_id, operation_id,
                                     stage="promoted",
                                     production_url=resume_reconciled_url)
@@ -507,6 +607,7 @@ class PromotionOrchestrator:
                 # Confirmed promoted -> continue the normal post-promote flow
                 # (production smoke, then LIVE persistence).
                 production_url = self._production_url_for(intended_identity)
+                logger.info("Promotion confirmed deployment=%s (reconciled)", deployment_id)
                 self._update_intent(project_id, intended_identity["operation_id"],
                                     stage="promoted", production_url=production_url)
                 return self._post_promote(
@@ -539,6 +640,7 @@ class PromotionOrchestrator:
                 )
 
         production_url = promote_result.data["production_url"]
+        logger.info("Promotion confirmed deployment=%s", deployment_id)
         self._update_intent(project_id, intended_identity["operation_id"],
                             stage="promoted", production_url=production_url)
         return self._post_promote(
@@ -573,6 +675,10 @@ class PromotionOrchestrator:
         self._update_intent(project_id, operation_id, stage="smoked",
                             smoke=smoke_result.data)
         if not smoke_result.success:
+            logger.warning(
+                "Production smoke FAILED project=%s rollback=%s",
+                project_id, (smoke_result.data or {}).get("url") and "see-state",
+            )
             rollback_status = self._rollback_and_fail(
                 project_id, app_id, vercel_project, previous_identity,
                 error_code="SMOKE_FAILED", expected_name=expected_name,
@@ -585,6 +691,9 @@ class PromotionOrchestrator:
                     "production_smoke_failed": True,
                 },
             )
+        # Logged only AFTER the check: a failed smoke must never produce a
+        # "smoke passed" line for an operator to act on.
+        logger.info("Production smoke passed project=%s", project_id)
 
         # ---- Only now transition PUBLISHING -> LIVE.
         with self.store.acquire_writer(project_id) as locked:
@@ -612,6 +721,7 @@ class PromotionOrchestrator:
         # ---- Telegram notification of LIVE promotion (best-effort in the
         # sense that a failed notification does not un-promote; the site
         # is already live and smoke-verified at this point).
+        logger.info("Project LIVE production_url=%s", production_url)
         chat_id = self.deps.chat_id_for(project_id, state)
         if chat_id:
             self.deps.telegram.send_text(

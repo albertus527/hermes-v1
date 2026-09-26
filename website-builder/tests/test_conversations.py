@@ -566,7 +566,11 @@ class TestPreviewFollowUp:
         assert len(text_sends) == 2
         follow = text_sends[1][2]
         assert "webbandung" in follow
-        assert "https://tested.vercel.app" in follow
+        # The protected preview URL is internal state, never a user-facing
+        # message: the user cannot open it, and the smoke flow depends on
+        # Deployment Protection staying enabled.
+        assert "https://tested.vercel.app" not in follow
+        assert "vercel.app" not in follow
         assert "Mau revisi" in follow
         assert "tg-555" not in follow
 

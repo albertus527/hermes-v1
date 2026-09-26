@@ -1028,7 +1028,7 @@ class TestP7RecoveryFlow:
         state = scenario.store.load(pid)
         assert state.revisions.source_revision == 2
         assert state.lifecycle == "PREVIEW_READY"
-        assert len(scenario.telegram.photo_calls) == photos_after_first + 1
+        assert len(scenario.telegram.photo_calls) == photos_after_first + 2
 
     def test_unsupported_external_dependency_blocks_qa_and_preview(
             self, tmp_path, monkeypatch):

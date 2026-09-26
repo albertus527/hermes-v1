@@ -473,7 +473,7 @@ def test_transient_smoke_retries_same_operation_without_duplicate_deploy(tmp_pat
     assert h.vercel_calls["deploy_post"] == 1
     assert h.vercel_calls["create_post"] == 1
     assert h.latest_shown_preview(pid)
-    assert len(h.telegram.photo_calls) == 1
+    assert len(h.telegram.photo_calls) == 2
 
 
 def test_hard_reconciliation_error_never_becomes_smoke_retry(tmp_path):
@@ -514,7 +514,7 @@ def test_revision_smoke_failure_remains_recoverable_for_next_revision(tmp_path, 
     assert successful_revision.success, successful_revision.error
     assert h.current_lifecycle == "PREVIEW_READY"
     assert h.store.load(pid).revisions.source_revision == 3
-    assert len(h.telegram.photo_calls) == 1
+    assert len(h.telegram.photo_calls) == 2
 
 
 def test_process_restart_preserves_blocked_intent(tmp_path):
@@ -595,7 +595,7 @@ def test_repair_revision_creates_new_snapshot_and_delivers(tmp_path, monkeypatch
     # The NEW operation was smoked and delivered exactly once.
     shown = h.latest_shown_preview(pid)
     assert shown, "a passing repaired revision must be delivered"
-    assert len(h.telegram.photo_calls) == 1, "exactly one preview photo per delivery"
+    assert len(h.telegram.photo_calls) == 2, "exactly one delivery per screenshot"
     # The delivered preview is for the NEW operation, not the blocked one.
     assert shown.get("operation_id") != blocked_intent.get("operation_id")
     # The stale blocked marker is gone (new intent/operation).

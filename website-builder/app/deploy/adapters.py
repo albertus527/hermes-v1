@@ -1117,21 +1117,99 @@ class VercelAdapter:
         except Exception:
             return _fail('PRODUCTION_IDENTITY_MISMATCH')
 
+    def _authoritative_deployment_meta(self, identifier, project):
+        """Re-read ONE deployment's stored metadata from the authoritative
+        per-deployment endpoint, or return ``None``.
+
+        The list endpoint (``/v6/deployments``) does not always carry a
+        deployment's ``meta`` block. Absent metadata must not be read as "this
+        deployment has no identity" — that turned a perfectly identifiable
+        production deployment into an unresolvable one. This re-read is
+        read-only, revalidates the same three identity fields
+        ``reconcile_production_deployment`` revalidates (id, project, team),
+        and returns ``None`` on ANY doubt so the caller keeps failing closed.
+        """
+        status, body = self._call('GET', '/v13/deployments/' + quote(identifier, safe=''))
+        if status != 200 or not isinstance(body, dict) or body.get('id') != identifier:
+            return None
+        team = body.get('teamId') or (body.get('team') or {}).get('id')
+        project_id_field = body.get('projectId') or (body.get('project') or {}).get('id')
+        if project_id_field != project['id'] or team != self.team_id:
+            return None
+        meta = body.get('meta')
+        return meta if isinstance(meta, dict) else None
+
+    def _is_proven_bootstrap(self, meta, app_id, identifier, project):
+        """True only when provider state PROVES this deployment is this
+        project's own Hermes bootstrap placeholder.
+
+        The bootstrap is created by ``ensure_bootstrap`` with a deterministic,
+        app-scoped marker pair: ``wbOwner`` (the immutable ownership marker for
+        this ``app_id``) and ``wbBootstrap`` (a dedicated operation id derived
+        from the same namespace + app_id, in its own namespace so it can never
+        collide with a real content operation). A real user-content deployment
+        never carries ``wbBootstrap`` and always carries a complete
+        ``wbOperation``/``wbRevision``/``wbArtifact`` identity.
+
+        Three independent conditions must all hold, so "metadata is missing" is
+        never enough on its own:
+          * the app-scoped owner marker matches,
+          * the bootstrap operation id matches AND no content identity is
+            present (a deployment that has both is ambiguous, not a
+            placeholder),
+          * the project's CURRENT production binding actually points at this
+            deployment (read from the project, never from the deployment body).
+
+        Returns the proof dict, or ``None`` when it is not proven.
+        """
+        if not isinstance(meta, dict):
+            return None
+        if meta.get('wbOwner') != self._marker(app_id):
+            return None
+        if meta.get('wbBootstrap') != self._bootstrap_operation_id(app_id):
+            return None
+        if meta.get('wbOperation') or meta.get('wbRevision') or meta.get('wbArtifact'):
+            # Carries a content identity as well: not a pure placeholder.
+            return None
+        try:
+            if self._current_production_id(project) != identifier:
+                return None
+        except Exception:
+            return None
+        return {
+            'deployment_id': identifier,
+            'bootstrap_operation_id': meta['wbBootstrap'],
+        }
+
     def find_production_deployment(self, app_id, project, *, expected_name=None):
-        """Read-only lookup of the CURRENT production deployment, if any.
+        """Read-only lookup and CLASSIFICATION of the CURRENT production
+        deployment, if any.
 
         Used to capture last-known-good identity before promoting a new
         deployment, so a failed post-promotion smoke check can roll back.
 
-        Returns the FULL trusted identity of the current production
-        deployment -- deployment_id plus the ``wbOperation``/``wbRevision``/
-        ``wbArtifact`` metadata the deployment was created with. A rollback
-        must re-promote that deployment using ITS OWN identity (the same
-        meta the promote path validates); deriving identity from the current
-        promotion operation instead is a guaranteed meta mismatch. When the
-        current production deployment cannot be identified unambiguously, or
-        its stored identity is incomplete, this fails closed rather than
-        returning a partial identity a caller might guess around.
+        Returns one of three shapes, all proven exclusively from provider
+        state:
+
+          * ``{'deployment_id': None}`` — there is no production deployment.
+          * the full trusted identity of a REAL production deployment
+            (deployment_id plus the ``wbOperation``/``wbRevision``/
+            ``wbArtifact`` metadata it was created with). A rollback must
+            re-promote that deployment using ITS OWN identity (the same meta
+            the promote path validates); deriving identity from the current
+            promotion operation instead is a guaranteed meta mismatch.
+          * the same, plus ``bootstrap_proof`` — a POSITIVE proof that the
+            current production deployment is this project's own Hermes
+            bootstrap placeholder, not a real user site (see
+            ``_is_proven_bootstrap``). It carries no content identity, so it
+            is never a meaningful user rollback target.
+
+        When the current production deployment cannot be identified
+        unambiguously, or its stored identity is incomplete, this fails closed
+        with ``INCOMPLETE_LOOKUP`` rather than returning a partial identity a
+        caller might guess around. "Metadata is missing" is not a reason to
+        guess: the metadata is re-read from the authoritative per-deployment
+        endpoint first.
         """
         try:
             if not self._project_valid(project, app_id, expected_name=expected_name):
@@ -1150,27 +1228,53 @@ class VercelAdapter:
             # The deployment metadata carries the exact repository identity
             # the deployment was created with. Absent/incomplete metadata
             # means we cannot safely re-promote this deployment as a
-            # rollback target -- fail closed instead of guessing.
+            # rollback target -- so re-read it authoritatively before
+            # concluding anything, then fail closed if it is still absent.
             meta = item.get('meta')
-            if not isinstance(meta, dict):
+            if not self._content_identity_complete(meta):
+                meta = self._authoritative_deployment_meta(identifier, project)
+            bootstrap_proof = self._is_proven_bootstrap(meta, app_id, identifier, project)
+            if not bootstrap_proof and not self._content_identity_complete(meta):
                 return _fail('INCOMPLETE_LOOKUP')
-            operation_id = meta.get('wbOperation')
+            # A proven bootstrap has no content identity by construction, so its
+            # revision is not a number at all. Never coerce a missing revision.
             revision_raw = meta.get('wbRevision')
-            artifact_sha256 = meta.get('wbArtifact')
-            if (not isinstance(operation_id, str) or not operation_id
-                    or not isinstance(artifact_sha256, str)
-                    or not re.fullmatch('[a-f0-9]{64}', artifact_sha256)
-                    or not isinstance(revision_raw, str) or not revision_raw.isdigit()
-                    or int(revision_raw) < 1):
-                return _fail('INCOMPLETE_LOOKUP')
-            return OperationResult.ok({
+            source_revision = int(revision_raw) if isinstance(revision_raw, str) else None
+            result = {
                 'deployment_id': identifier,
-                'operation_id': operation_id,
-                'source_revision': int(revision_raw),
-                'artifact_sha256': artifact_sha256,
-            })
+                'operation_id': meta.get('wbOperation'),
+                'source_revision': source_revision,
+                'artifact_sha256': meta.get('wbArtifact'),
+            }
+            if bootstrap_proof:
+                # Positive bootstrap identification. The content identity
+                # fields are absent by construction, so they stay None and the
+                # caller can tell "no rollback target" from "unknown target".
+                result['bootstrap_proof'] = bootstrap_proof
+            return OperationResult.ok(result)
         except Exception:
             return _fail('INCOMPLETE_LOOKUP')
+
+    @staticmethod
+    def _content_identity_complete(meta) -> bool:
+        """True when ``meta`` carries the complete, re-promotable content
+        identity (wbOperation + wbRevision >= 1 + a well-formed wbArtifact).
+
+        Anything less is NOT proof of absence -- the caller re-reads the
+        authoritative metadata and, failing that, fails closed.
+        """
+        if not isinstance(meta, dict):
+            return False
+        operation_id = meta.get('wbOperation')
+        revision_raw = meta.get('wbRevision')
+        artifact_sha256 = meta.get('wbArtifact')
+        return bool(
+            isinstance(operation_id, str) and operation_id
+            and isinstance(artifact_sha256, str)
+            and re.fullmatch('[a-f0-9]{64}', artifact_sha256)
+            and isinstance(revision_raw, str) and revision_raw.isdigit()
+            and int(revision_raw) >= 1
+        )
 
     def reconcile_production_deployment(self, app_id, project, expected_identity, *,
                                         expected_name=None):

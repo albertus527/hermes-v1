@@ -120,15 +120,15 @@ class TestPhaseGFullStory:
 
         # Smoke used the project-specific bypass (preview smoke only).
         assert h.smoke.bypass_secrets[-1] == h.bypass_store.get("prj_1")
-        # One preview deployment + one Telegram photo.
+        # One preview deployment + one Telegram delivery (2 screenshots).
         assert h.vercel.deploy_calls == 1
-        assert len(h.telegram.photo_calls) == 1
+        assert len(h.telegram.photo_calls) == 2
 
         # Revision -> revised preview -> approve -> promote -> LIVE.
         rev = h.run_revision("ganti warna jadi lebih lembut, tetap soft")
         assert rev.success, getattr(rev, "error", None)
         assert h.vercel.deploy_calls == 2
-        assert len(h.telegram.photo_calls) == 2
+        assert len(h.telegram.photo_calls) == 4
         # No extra bypass generation on revision (reused).
         assert h.vercel.bypass_generation_calls == 1
         # Still exactly one project create.
@@ -152,12 +152,12 @@ class TestPhaseGFullStory:
         assert h.vercel.bootstrap_calls >= 1            # bootstrap attempt(s)
         assert h.vercel.bypass_generation_calls == 1    # bypass PATCH once
         assert h.vercel.deploy_calls == 1               # preview deploy POST
-        assert len(h.telegram.photo_calls) == 1         # Telegram preview once
+        assert len(h.telegram.photo_calls) == 2         # Telegram preview: 2 screenshots
 
         rev = h.run_revision("ubah hero jadi lebih terang")
         assert rev.success, getattr(rev, "error", None)
         assert h.vercel.deploy_calls == 2               # one more preview deploy
-        assert len(h.telegram.photo_calls) == 2         # one more delivery
+        assert len(h.telegram.photo_calls) == 4         # one more delivery (2 screenshots)
         assert h.vercel.bypass_generation_calls == 1    # no rotation
         assert h.vercel.post_calls == 1                 # no duplicate create
 

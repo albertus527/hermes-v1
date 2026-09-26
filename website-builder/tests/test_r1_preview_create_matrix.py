@@ -97,7 +97,7 @@ class TestPreviewCreateClassificationMatrix:
         second = h.preview.run_owned(pid, ws)
         assert second.success, second.error
         assert h.vercel.post_calls == 1
-        assert len(h.telegram.photo_calls) == 1
+        assert len(h.telegram.photo_calls) == 2
 
     def test_f_lookup_still_inconclusive_fails_closed_no_second_create(self, tmp_path):
         h = LocalR1Scenario(tmp_path)

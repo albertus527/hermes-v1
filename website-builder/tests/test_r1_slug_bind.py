@@ -159,6 +159,7 @@ class TestSlugBindPersistFailure:
         assert h.vercel.post_calls == 1
         # Slug now durably bound.
         assert h.registry_entry(pid).vercel_slug == "kitsunereading"
-        # Preview delivered exactly once (only on the successful attempt).
-        assert len(h.telegram.photo_calls) == 1
+        # Preview delivered exactly once (only on the successful attempt) --
+        # one message per screenshot, desktop then mobile.
+        assert len(h.telegram.photo_calls) == 2
         assert h.vercel.deploy_calls == 1

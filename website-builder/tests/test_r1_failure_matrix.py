@@ -228,14 +228,15 @@ def test_matrix_14_15_revision_crash_after_preview_then_restart(tmp_path):
     # despite the injected post-delivery exception.
     assert h.revision_counters(pid)["revision_seq"] == 1
     assert h.revision_counters(pid)["queued_revision_seq"] == 1
-    assert h.telegram_calls["photo"] == photos0 + 1
+    # A revision delivers both screenshots (desktop + mobile) exactly once.
+    assert h.telegram_calls["photo"] == photos0 + 2
 
     # Restart over the SAME state and re-drive exactly once, no re-send.
     h.restart_components()
     recovered = h.revise.apply(pid, 1, "ganti warna", principal_id=h.principal_id)
     assert not recovered.success
     assert recovered.error_code == "REVISION_ALREADY_APPLIED"
-    assert h.telegram_calls["photo"] == photos0 + 1
+    assert h.telegram_calls["photo"] == photos0 + 2
     seqs = sorted(e["seq"] for e in h.pending_revisions(pid))
     assert seqs == list(range(1, len(seqs) + 1))
 
@@ -252,7 +253,7 @@ def test_matrix_16_happy_path_after_fixes(tmp_path):
     h.run_build_and_preview(pid)
     assert h.current_lifecycle == "PREVIEW_READY"
     assert h.vercel_calls["create_post"] == 1
-    assert h.telegram_calls["photo"] == 1
+    assert h.telegram_calls["photo"] == 2  # desktop + mobile screenshot
     assert h.current_slug == "kitsunereading"
     assert h.latest_shown_preview(pid)["source_revision"] == \
         h.revision_counters(pid)["source_revision"]

@@ -7,6 +7,7 @@ Application code remains authoritative over resulting state transitions.
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 from dataclasses import dataclass
@@ -17,6 +18,8 @@ from app.channels.telegram import NormalizedMessage
 from app.core.authz import require_mutating_role
 from app.core.lifecycle import ProjectLifecycle
 from app.core.state import ProjectStateStore
+
+logger = logging.getLogger(__name__)
 
 
 class Scope(str, Enum):
@@ -34,6 +37,17 @@ class Readiness(str, Enum):
     RESUMED = "RESUMED"
 
 
+# Why a clarification is being asked. MISSING_FIELD is the per-field NAME /
+# WHAT / WHY ladder; SCOPE is the scope gate (MIXED / OUT_OF_SCOPE / UNCLEAR)
+# asking for the smallest question that resolves the scope; GENERIC is the
+# bounded last-resort question that exists only so the
+# "NEEDS_CLARIFICATION implies an actionable question" invariant can never be
+# violated.
+CLARIFICATION_MISSING_FIELD = "MISSING_FIELD"
+CLARIFICATION_SCOPE = "SCOPE"
+CLARIFICATION_GENERIC = "GENERIC"
+
+
 @dataclass
 class IntakeResult:
     """Result of processing an intake message."""
@@ -44,6 +58,15 @@ class IntakeResult:
     clarification_question: Optional[str] = None
     pause_detected: bool = False
     resume_detected: bool = False
+    # Why a clarification is being asked (see the CLARIFICATION_* constants).
+    # None whenever no clarification is outstanding.
+    clarification_reason: Optional[str] = None
+    # The brief field a MISSING_FIELD clarification is about, when known.
+    clarification_field: Optional[str] = None
+    # 1 for the first ask of this question, 2+ when the same question has to be
+    # re-asked. Bounded by the templates in ``_scope_clarification``; never
+    # used to auto-clear the scope gate.
+    clarification_attempt: int = 1
 
 
 # Explicit pause/resume phrases (Indonesian/English)
@@ -129,17 +152,36 @@ class IntakeProcessor:
         state = self.store.load(project_id)
         return dict(state.pause_state) if state is not None else {}
 
-    def _context_messages(self, persisted: Dict[str, Any]) -> Optional[List[Dict[str, str]]]:
-        """Prior accumulated brief, handed to FAST as conversation context.
+    def _persisted_pending_clarification(self, project_id: Optional[str]) -> Dict[str, Any]:
+        """Return the outstanding clarification for this project ({} if none).
+
+        Same load-failure contract as _persisted_brief: only a genuinely
+        missing project yields {}, a real load failure propagates.
+        """
+        if not project_id:
+            return {}
+        state = self.store.load(project_id)
+        return dict(getattr(state, "pending_clarification", None) or {}) if state is not None else {}
+
+    def _context_messages(self, persisted: Dict[str, Any],
+                         pending: Optional[Dict[str, Any]] = None) -> Optional[List[Dict[str, str]]]:
+        """Prior accumulated brief + the outstanding clarification, handed to FAST
+        as conversation context.
 
         The prompt gets the already-collected values so a follow-up turn is
         interpreted as the answer to the outstanding clarification rather
-        than as a brand-new brief.
+        than as a brand-new brief. The outstanding question itself is included
+        because it is the strongest signal that a follow-up sentence is an
+        ANSWER rather than a new brief: without it, a turn that plainly
+        answers "cuma katalog, tidak ada checkout" can be re-read as a
+        brand-new, commerce-flavoured request and re-classified MIXED forever.
         """
-        known = [f"{f}={persisted[f]}" for f in self._BRIEF_FIELDS if persisted.get(f)]
-        if not known:
+        parts = [f"{f}={persisted[f]}" for f in self._BRIEF_FIELDS if persisted.get(f)]
+        if pending and pending.get("question"):
+            parts.append(f"outstanding clarification={pending['question']}")
+        if not parts:
             return None
-        return [{"role": "assistant", "content": "Known brief so far: " + ", ".join(known)}]
+        return [{"role": "assistant", "content": "Known brief so far: " + ", ".join(parts)}]
 
     def _merge_brief(
         self, persisted: Dict[str, Any], extracted: Dict[str, Any],
@@ -188,6 +230,94 @@ class IntakeProcessor:
             return Readiness.DISCOVERY_READY
         return Readiness.NEEDS_CLARIFICATION
 
+    @staticmethod
+    def _missing_brief_field(brief: Dict[str, Any]) -> Optional[str]:
+        """The first genuinely missing NAME / WHAT / WHY, or None when the
+        accumulated brief is complete. Same order the questions are asked in.
+        """
+        for field in ("name", "what", "why"):
+            if not brief.get(field):
+                return field
+        return None
+
+    def _scope_clarification(self, scope: Scope, brief: Dict[str, Any],
+                             attempt: int = 1) -> Optional[str]:
+        """The smallest scope-specific question for a blocked scope.
+
+        Only used when NAME + WHAT + WHY are all present yet scope is still
+        MIXED / OUT_OF_SCOPE / UNCLEAR: in that state the per-field ladder has
+        nothing left to ask, but the user still has to be told what the blocker
+        actually is, otherwise the project sits in WAITING_INPUT and Telegram
+        sends nothing at all.
+
+        Deterministic templates keyed by the blocking scope, built only from
+        the collected NAME. No business fact is ever invented or assumed: the
+        MIXED question asks the user to CHOOSE between a display-only site and
+        transactional features, it never asserts which one they wanted.
+
+        ``attempt`` above 1 escalates to an explicit numbered choice so a
+        repeated scope verdict is answered with a 1/2 instead of another open
+        question. The scope gate is never cleared by this: MIXED / OUT_OF_SCOPE
+        keeps failing closed no matter how many times the user is asked.
+        """
+        name = str(brief.get("name") or "").strip()
+        subject = name or "website ini"
+        repeat = attempt > 1
+        if scope is Scope.MIXED:
+            if repeat:
+                return (
+                    f"{subject} ini butuh konfirmasi satu hal. Jawab 1 atau 2 ya:\n"
+                    "1. Cuma katalog/tampilan produk dengan tombol beli/pesan, "
+                    "tanpa checkout, payment, login, database, atau backend transaksi.\n"
+                    "2. Perlu fitur transaksi (checkout/pembayaran/login/database) — "
+                    "itu belum bisa aku buat."
+                )
+            return (
+                f"Sebelum lanjut, aku mau pastikan dulu: {subject} ini hanya "
+                "katalog/tampilan produk dengan tombol beli atau pesan (tanpa "
+                "checkout, payment, login, database, atau backend transaksi), "
+                "atau memang perlu fitur transaksi juga? Jawab 1 untuk katalog "
+                "saja, 2 untuk butuh transaksi."
+            )
+        if scope is Scope.OUT_OF_SCOPE:
+            if repeat:
+                return (
+                    "Aku baru bisa bikin website statis. Dari yang kamu sebut, "
+                    "bagian mana yang mau dijadikan website? Jawab dengan 1 atau 2 "
+                    "supaya aku lanjut."
+                )
+            return (
+                f"Permintaan itu kayaknya bukan website biasa. Dari yang kamu "
+                f"sebut, bagian mana yang mau dijadiin website {subject}? "
+                "Balikin aja dengan bahasa yang kamu pakai."
+            )
+        if scope is Scope.UNCLEAR:
+            if repeat:
+                return (
+                    "Aku masih belum nangkep mauannya. Jawab 1 atau 2:\n"
+                    f"1. Website {subject} untuk introduce/ibtaro, tanpa fitur transaksi.\n"
+                    "2. Website yang butuh transaksi (checkout/pembayaran/login/database)."
+                )
+            return (
+                f"Bisa jelasin singkat ga, {subject} ini buat siapa dan tujuannya "
+                "apa? Cukup 1-2 kalimat aja."
+            )
+        return None
+
+    def _generic_clarification(self) -> str:
+        """Last-resort bounded question.
+
+        Exists so the invariant
+        ``readiness == NEEDS_CLARIFICATION => an actionable question exists``
+        holds for EVERY input, including a scope the template table does not
+        cover. It asks for the WHAT/WHY in the user's own words and therefore
+        invents nothing.
+        """
+        return (
+            "Boleh jelasin singkat website ini isinya apa dan tujuannya apa? "
+            "Cukup 1-2 kalimat aja."
+        )
+
     def process(
         self, message: NormalizedMessage, project_id: Optional[str] = None
     ) -> IntakeResult:
@@ -205,6 +335,8 @@ class IntakeProcessor:
                 scope=Scope.UNCLEAR,
                 brief={},
                 clarification_question="Please describe the website you want.",
+                clarification_reason=CLARIFICATION_MISSING_FIELD,
+                clarification_field="what",
             )
 
         # Pause/resume detection (deterministic, application-owned)
@@ -212,6 +344,7 @@ class IntakeProcessor:
         resume_detected = _contains_phrase(text, _RESUME_PHRASES)
 
         persisted = self._persisted_brief(project_id)
+        pending_clarification = self._persisted_pending_clarification(project_id)
 
         # Resume is only meaningful when the project is actually paused. A
         # resume phrase on a non-paused project (e.g. "gas" / "lanjut" typed
@@ -231,7 +364,8 @@ class IntakeProcessor:
         if self.hermes_adapter is not None:
             try:
                 fast_result = self.hermes_adapter.fast_interpret(
-                    text, project_id, self._context_messages(persisted)
+                    text, project_id,
+                    self._context_messages(persisted, pending_clarification),
                 )
             except Exception:
                 fast_result = None
@@ -277,12 +411,66 @@ class IntakeProcessor:
         # the smallest question that resolves the still-missing field —
         # unless FAST flagged a specific material ambiguity/correction for
         # THIS turn, in which case FAST's own question is authoritative.
+        clarification_reason: Optional[str] = None
+        clarification_field: Optional[str] = None
+        scope_clarification_attempt = 0
         if readiness == Readiness.DISCOVERY_READY:
             clarification_question = None
         elif fast_ambiguity_question:
             clarification_question = fast_ambiguity_question
+            clarification_reason = CLARIFICATION_MISSING_FIELD
         else:
+            clarification_field = self._missing_brief_field(brief)
             clarification_question = self._fallback_clarification(brief)
+            if clarification_question:
+                clarification_reason = CLARIFICATION_MISSING_FIELD
+            else:
+                # NAME + WHAT + WHY are all present, so the per-field ladder has
+                # nothing to ask, yet the SCOPE gate is still blocking. Without
+                # this branch the result was readiness=NEEDS_CLARIFICATION with
+                # clarification_question=None: the project moved to
+                # WAITING_INPUT and Telegram sent nothing, which is exactly
+                # what "the system looks hung" means. Ask the smallest
+                # scope-specific question instead.
+                previous_attempt = int(
+                    (pending_clarification.get("attempt") or 0)
+                    if (pending_clarification.get("reason") == CLARIFICATION_SCOPE
+                        and pending_clarification.get("question"))
+                    else 0
+                )
+                attempt = previous_attempt + 1
+                scope_clarification_attempt = attempt
+                clarification_question = self._scope_clarification(scope, brief, attempt)
+                if clarification_question:
+                    clarification_reason = CLARIFICATION_SCOPE
+                else:
+                    # Defensive: no template for this scope. Ask rather than
+                    # leave the turn silently unanswerable.
+                    clarification_question = self._generic_clarification()
+                    clarification_reason = CLARIFICATION_GENERIC
+        same_question_as_pending = (
+            clarification_reason == CLARIFICATION_MISSING_FIELD
+            and bool(pending_clarification.get("question"))
+            and pending_clarification.get("question") == clarification_question
+        )
+        clarification_attempt = (
+            int(pending_clarification.get("attempt") or 0) + 1
+            if same_question_as_pending else 1
+        )
+        if scope_clarification_attempt:
+            clarification_attempt = scope_clarification_attempt
+
+        # HARD INVARIANT: an outstanding clarification always carries an
+        # actionable, non-empty question. Asserted here (not merely intended)
+        # so a future template gap can never resurrect the silent WAITING_INPUT
+        # state.
+        if readiness == Readiness.NEEDS_CLARIFICATION and not (
+            isinstance(clarification_question, str) and clarification_question.strip()
+        ):
+            clarification_question = self._generic_clarification()
+            clarification_reason = CLARIFICATION_GENERIC
+            clarification_field = None
+            clarification_attempt = 1
 
         # Application enforces pause/resume regardless of FAST result.
         # Resume only overrides readiness when the project is actually paused
@@ -295,6 +483,11 @@ class IntakeProcessor:
             readiness = Readiness.RESUMED
             clarification_question = None
 
+        # No clarification is outstanding unless one is actually being asked.
+        if clarification_question is None:
+            clarification_reason = None
+            clarification_field = None
+
         return IntakeResult(
             readiness=readiness,
             scope=scope,
@@ -302,6 +495,9 @@ class IntakeProcessor:
             clarification_question=clarification_question,
             pause_detected=pause_detected,
             resume_detected=effective_resume,
+            clarification_reason=clarification_reason,
+            clarification_field=clarification_field,
+            clarification_attempt=clarification_attempt,
         )
 
     def _fallback_scope(self, text: str) -> Scope:
@@ -503,9 +699,39 @@ class IntakeProcessor:
                 if state.pause_state.get("paused"):
                     state.pause_state["paused"] = False
                     state.pause_state["resumed_at"] = time.time()
+                # The brief is complete, so nothing is outstanding. Clearing
+                # the record here is what makes a stale scope question unable
+                # to re-appear as FAST context on a later turn.
+                state.pending_clarification = {}
             elif result.readiness == Readiness.NEEDS_CLARIFICATION:
-                if state.lifecycle == ProjectLifecycle.DISCOVERING.value:
-                    self.store.transition_lifecycle_locked(state, ProjectLifecycle.WAITING_INPUT)
+                # HARD INVARIANT, enforced at the persistence boundary: a
+                # project may only enter WAITING_INPUT while an actionable
+                # clarification is actually recorded. An empty question would
+                # leave the project parked in WAITING_INPUT with nothing sent
+                # to Telegram and nothing durable explaining why — the "hung"
+                # failure mode. Fail closed instead: stay DISCOVERING and make
+                # the defect visible to the operator.
+                question = result.clarification_question
+                if isinstance(question, str) and question.strip():
+                    state.pending_clarification = {
+                        "question": question,
+                        "reason": result.clarification_reason or CLARIFICATION_GENERIC,
+                        "field": result.clarification_field,
+                        "scope": result.scope.value,
+                        "attempt": int(result.clarification_attempt or 1),
+                        "asked_at": time.time(),
+                    }
+                    if state.lifecycle == ProjectLifecycle.DISCOVERING.value:
+                        self.store.transition_lifecycle_locked(
+                            state, ProjectLifecycle.WAITING_INPUT
+                        )
+                else:
+                    logger.error(
+                        "Refusing to persist WAITING_INPUT for project %s: "
+                        "NEEDS_CLARIFICATION with no actionable clarification "
+                        "question (scope=%s).",
+                        project_id, result.scope.value,
+                    )
 
             if event_id is not None:
                 state.processed_events.add(event_id)

@@ -72,7 +72,7 @@ class TestRevisionCrashAfterPreviewDelivery:
         h = LocalR1Scenario(tmp_path)
         pid = _setup_preview_ready(h)
         photos_after_initial = len(h.telegram.photo_calls)
-        assert photos_after_initial == 1
+        assert photos_after_initial == 2
 
         # Arm the crash for the revision's preview delivery.
         h._crash_armed = True
@@ -89,7 +89,7 @@ class TestRevisionCrashAfterPreviewDelivery:
         assert state.revisions.revision_seq == 1
         pending = [e for e in state.pending_revisions if e.get("seq") == 1]
         assert pending and pending[0]["applied"] is True
-        assert len(h.telegram.photo_calls) == photos_after_initial + 1
+        assert len(h.telegram.photo_calls) == photos_after_initial + 2
 
         # ---- Recovery: new runtime/orchestrator over the SAME temp state. ----
         h.restart()
@@ -105,7 +105,7 @@ class TestRevisionCrashAfterPreviewDelivery:
         p = [e for e in recovered.pending_revisions if e.get("seq") == 1]
         assert p and p[0]["applied"] is True
         # Preview NOT re-sent.
-        assert len(h.telegram.photo_calls) == photos_after_initial + 1
+        assert len(h.telegram.photo_calls) == photos_after_initial + 2
         # Revision history gap-free.
         seqs = sorted(e["seq"] for e in recovered.pending_revisions)
         assert seqs == list(range(1, len(seqs) + 1))

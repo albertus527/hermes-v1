@@ -92,6 +92,15 @@ from app.sandbox.runner import ProjectRunner
 
 logger = logging.getLogger(__name__)
 
+# At-most-once acknowledgement outcomes, mirroring the preview delivery state
+# machine: PENDING is written before the send and means "ambiguous, never
+# resend", SENT is a confirmed delivery, NOT_SENT is a proved non-delivery
+# that may be re-driven.
+_ACK_NOT_SENT = "NOT_SENT"
+_ACK_PENDING = "PENDING"
+_ACK_SENT = "SENT"
+
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -981,6 +990,73 @@ ERROR_MESSAGES: Dict[str, str] = {
     "OUTPUT_COMMIT_FAILED": "The preview could not be packaged on this machine. This is a temporary problem on our side.",
     "VISION_REQUIRED": "The visual check could not be completed. Please try again.",
     "TOOLCHAIN_MUTATION_REJECTED": "Build failed due to toolchain policy violation. Please try again.",
+    # ---- publish / promotion -------------------------------------------------
+    # Internal codes stay stable for operators; these are the user-facing
+    # translations. None of them may claim success, or imply a state change,
+    # when the promotion state is ambiguous — the honest answer is that the
+    # preview is untouched and the publish is recorded for an operator.
+    "INCOMPLETE_LOOKUP": (
+        "Publish belum bisa dilanjutkan karena status deployment production "
+        "sebelumnya belum bisa diverifikasi dengan aman. "
+        "Preview kamu tetap aman dan belum berubah."
+    ),
+    "PROMOTION_RECONCILIATION_REQUIRED": (
+        "Publish-nya belum bisa dipastikan selesai, jadi aku tidak mau menebak. "
+        "Preview kamu tetap aman dan belum berubah. "
+        "Coba kirim \"publish\" lagi nanti ya."
+    ),
+    "PROMOTE_FAILED": (
+        "Publish belum berhasil. Preview kamu tetap aman dan belum berubah. "
+        "Coba kirim \"publish\" lagi nanti ya."
+    ),
+    "PROMOTE_NOT_APPLIED": (
+        "Publish belum benar-benar aktif, jadi aku tidak mau menyatakan berhasil. "
+        "Preview kamu tetap aman dan belum berubah. "
+        "Coba kirim \"publish\" lagi nanti ya."
+    ),
+    "PROMOTE_VERIFICATION_FAILED": (
+        "Publish-nya sudah dikirim tapi belum bisa aku verifikasi, jadi statusnya "
+        "aku anggap belum jelas. Preview kamu tetap aman dan belum berubah."
+    ),
+    "INCOMPLETE_PREVIEW_IDENTITY": (
+        "Publish belum bisa dilanjutkan karena preview yang mau ditayangkan "
+        "belum terverifikasi lengkap. Preview kamu tetap aman dan belum berubah."
+    ),
+    "DEPLOYMENT_IDENTITY_MISMATCH": (
+        "Publish belum bisa dilanjutkan karena deployment-nya tidak cocok dengan "
+        "preview yang kamu setujui. Preview kamu tetap aman dan belum berubah."
+    ),
+    "PROJECT_RECONCILIATION_REQUIRED": (
+        "Publish belum bisa dipastikan karena status proyeknya belum terverifikasi. "
+        "Preview kamu tetap aman dan belum berubah."
+    ),
+    "PROJECT_IDENTITY_MISMATCH": (
+        "Publish belum bisa dilanjutkan karena proyeknya tidak cocok dengan "
+        "preview yang kamu setujui. Preview kamu tetap aman dan belum berubah."
+    ),
+    "INVALID_DEPLOYMENT_ID": (
+        "Publish belum bisa dilanjutkan karena deploy yang mau ditayangkan "
+        "tidak valid. Preview kamu tetap aman dan belum berubah."
+    ),
+    "INVALID_PRODUCTION_URL": (
+        "Publish belum bisa diselesaikan karena alamat production-nya tidak valid. "
+        "Preview kamu tetap aman dan belum berubah."
+    ),
+    "ROLLBACK_FAILED": (
+        "Ada kendala saat publish, dan efforts untuk mengembalikan website "
+        "sebelumnya belum berhasil. Aku tidak mau menebak statusnya. "
+        "Preview kamu tetap aman dan belum berubah — sudah dicatat untuk diperiksa."
+    ),
+    "ROLLBACK_RECONCILIATION_REQUIRED": (
+        "Ada kendala saat publish dan status pengembaliannya belum bisa "
+        "dipastikan. Aku tidak mau menebak. "
+        "Preview kamu tetap aman dan belum berubah — sudah dicatat untuk diperiksa."
+    ),
+    "ROLLBACK_TARGET_IDENTITY_INCOMPLETE": (
+        "Ada kendala saat publish, dan website sebelumnya belum bisa diidentifikasi "
+        "dengan aman untuk dikembalikan. "
+        "Preview kamu tetap aman dan belum berubah — sudah dicatat untuk diperiksa."
+    ),
 }
 
 # Codes whose SPECIFIC copy is intentionally unhelpful because the condition is
@@ -1908,6 +1984,16 @@ User message:
             return
         clarification = result.data.get("clarification_question")
         if clarification:
+            # Operator-visible boundary: a project sitting in WAITING_INPUT is
+            # otherwise invisible, which is what made a blocked intake look
+            # like a hung system. Only the reason and the scope are logged --
+            # never the brief text or the question body.
+            logger.info(
+                "Clarification asked project=%s reason=%s scope=%s",
+                project_id,
+                result.data.get("clarification_reason"),
+                result.data.get("scope"),
+            )
             try:
                 send_result = self.telegram_out.send_text(
                     message.conversation_id, clarification
@@ -2003,8 +2089,9 @@ User message:
     ) -> None:
         """Handle APPROVE intent — user accepts the current preview.
 
-        This binds the approval to the exact shown preview identity.
-        It does NOT publish — publication is a separate step.
+        This binds the approval to the exact shown preview identity and
+        acknowledges it. It does NOT publish — publication is a separate step
+        the user has to ask for.
         """
         result = self.dispatcher.dispatch(
             update,
@@ -2022,6 +2109,100 @@ User message:
             self._send_error_reply(
                 state.conversation_id if state else None, result.error_code
             )
+            return
+
+        # A replayed event (same Telegram update_id) is already CLAIMED in
+        # durable state, so the dispatcher short-circuits it. Never acknowledge
+        # it a second time.
+        if (result.data or {}).get("duplicate"):
+            return
+
+        self._send_approval_ack_once(
+            project_id, state.conversation_id if state else None,
+        )
+
+    def _send_approval_ack_once(self, project_id: str, conversation_id) -> None:
+        """Acknowledge a successful approval exactly once per approved identity.
+
+        Approval is otherwise SILENT: the binding succeeded and the user got
+        nothing back, which reads as "the bot is still thinking" (the p9
+        symptom). The acknowledgement is at-most-once per exact
+        (operation_id, deployment_id, source_revision) identity:
+
+          * PENDING is written BEFORE the send, SENT after it is confirmed, so
+            a crash between the two leaves PENDING == ambiguous == never
+            resent -- the same discipline the preview delivery state machine
+            uses.
+          * A *different* Telegram event that re-approves the SAME identity is
+            a duplicate approval and gets no second acknowledgement; a new
+            identity (a newly shown preview) is allowed its own.
+          * A definite rejection (proved not sent) re-arms, because nothing
+            reached the user.
+        """
+        chat_id = str(conversation_id or "").strip() or self.chat_id_for(project_id)
+        if not chat_id:
+            return
+
+        with self.dispatcher.store.acquire_writer(project_id) as locked:
+            approval = locked.deployment.get("approval") or {}
+            identity = {
+                "operation_id": approval.get("operation_id"),
+                "deployment_id": approval.get("deployment_id"),
+                "source_revision": approval.get("source_revision"),
+            }
+            if not all(identity.values()):
+                return
+            existing = dict(locked.deployment.get("approval_ack") or {})
+            if existing.get("identity") == identity and existing.get("outcome") in (
+                    _ACK_SENT, _ACK_PENDING):
+                return
+            locked.deployment["approval_ack"] = {
+                "identity": identity,
+                "outcome": _ACK_PENDING,
+                "asked_at": time.time(),
+            }
+            self.dispatcher.store.save(locked)
+
+        try:
+            send_result = self.telegram_out.send_text(
+                chat_id,
+                '✅ Preview approved.\nKalau sudah siap ditayangkan, bilang "publish".',
+            )
+        except Exception:
+            # Ambiguous: leave PENDING. Never resend a possibly-delivered ack.
+            logger.warning(
+                "Approval acknowledgement send raised for project %s", project_id,
+            )
+            return
+
+        if not getattr(send_result, "success", False):
+            # Definitively not delivered -> re-arm so a later approval can
+            # re-drive the acknowledgement.
+            with self.dispatcher.store.acquire_writer(project_id) as locked:
+                ack = locked.deployment.get("approval_ack") or {}
+                if ack.get("identity") == identity and ack.get("outcome") == _ACK_PENDING:
+                    ack["outcome"] = _ACK_NOT_SENT
+                    self.dispatcher.store.save(locked)
+            return
+
+        with self.dispatcher.store.acquire_writer(project_id) as locked:
+            ack = locked.deployment.get("approval_ack") or {}
+            if ack.get("identity") != identity:
+                return
+            ack["outcome"] = _ACK_SENT
+            # Only a real scalar id is persisted: the durable record is JSON
+            # state, so an unexpected provider shape must not be written
+            # through as-is (it would make the whole project unloadable).
+            raw_message_id = (getattr(send_result, "data", None) or {}).get(
+                "message_id")
+            if isinstance(raw_message_id, int):
+                ack["message_id"] = raw_message_id
+            ack["sent_at"] = time.time()
+            self.dispatcher.store.save(locked)
+        logger.info(
+            "Approval acknowledged project=%s revision=%s",
+            project_id, identity["source_revision"],
+        )
 
     def _handle_publish(
         self,

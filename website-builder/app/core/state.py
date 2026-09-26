@@ -101,6 +101,13 @@ class ProjectState:
     selected_direction: Optional[Dict[str, Any]] = None
     pending_revisions: list = field(default_factory=list)
     pause_state: Dict[str, Any] = field(default_factory=dict)
+    # The clarification question the project is currently blocked on, when
+    # lifecycle is WAITING_INPUT. Durable so an operator can always see WHY a
+    # project is waiting, and so the invariant
+    # ``lifecycle == WAITING_INPUT => pending_clarification["question"]`` is a
+    # checkable property of persisted state rather than of a transient return
+    # value. Never holds user payload beyond the question text itself.
+    pending_clarification: Dict[str, Any] = field(default_factory=dict)
     repository: Dict[str, Any] = field(default_factory=dict)
     deployment: Dict[str, Any] = field(default_factory=dict)
     production_url: Optional[str] = None

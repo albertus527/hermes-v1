@@ -131,7 +131,12 @@ def test_full_preview_flow_marks_latest_shown(tmp_path):
     state = store.load('proj')
     assert state.revisions.preview_revision == 1
     assert state.deployment['latest_shown_preview']['preview_url'] == 'https://tested.vercel.app'
-    assert len(deps.telegram.sent) == 2
+    # Desktop screenshot, mobile screenshot, then the instruction text.
+    assert [kind for kind, *_ in deps.telegram.sent] == ['photo', 'photo', 'text']
+    # Both screenshots are durably accounted for separately.
+    assert state.deployment['preview_intent']['screenshot_outcome'] == {
+        'desktop_screenshot': 'SENT', 'mobile_screenshot': 'SENT',
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +192,20 @@ def _run_with_seeded_intent(tmp_path, fields, **deps_kw):
     return orch, deps, store
 
 
+def _seed_screenshot_outcomes(store, **outcomes):
+    """Seed the PER-SCREENSHOT delivery outcomes for the current intent.
+
+    Delivery is per screenshot (desktop, then mobile); ``photo_outcome`` is
+    only a legacy aggregate derived from these. Seeding a real single-photo
+    outcome while leaving the per-screenshot map at its post-success value
+    would no longer describe the scenario being modelled, so the map is the
+    thing these tests set.
+    """
+    with store.acquire_writer('proj') as state:
+        state.deployment['preview_intent']['screenshot_outcome'] = dict(outcomes)
+        store.save(state)
+
+
 def test_delivery_provably_unsent_photo_redrives(tmp_path):
     """(b)/(i) an explicit Telegram rejection on the photo is provably
     NOT_SENT -> a re-drive may proceed and deliver."""
@@ -201,16 +220,23 @@ def test_delivery_provably_unsent_photo_redrives(tmp_path):
     with store.acquire_writer('proj') as state:
         state.deployment.pop('latest_shown_preview', None)
         state.revisions.preview_revision = 0
-        # Prior delivery provably did not send the photo.
+        # Prior delivery provably did not send the screenshots.
         state.deployment['preview_intent']['photo_attempted'] = True
-        state.deployment['preview_intent']['photo_outcome'] = 'NOT_SENT'
         store.save(state)
+    _seed_screenshot_outcomes(
+        store, desktop_screenshot='NOT_SENT', mobile_screenshot='NOT_SENT',
+    )
     deps.telegram.sent.clear()
 
     result = orch.run_owned('proj', ws)
 
     assert result.success, result.error
-    assert any(kind == 'photo' for kind, *_ in deps.telegram.sent)
+    # Every screenshot is re-driven (both were provably NOT_SENT); the text was
+    # already CONFIRMED SENT by the first run, so it is not repeated.
+    assert [kind for kind, *_ in deps.telegram.sent] == ['photo', 'photo']
+    _seed_screenshot_outcomes(
+        store, desktop_screenshot='SENT', mobile_screenshot='SENT',
+    )
 
 
 def test_delivery_ambiguous_photo_never_duplicates(tmp_path):
@@ -226,8 +252,9 @@ def test_delivery_ambiguous_photo_never_duplicates(tmp_path):
         state.deployment.pop('latest_shown_preview', None)
         state.revisions.preview_revision = 0
         state.deployment['preview_intent']['photo_attempted'] = True
-        state.deployment['preview_intent']['photo_outcome'] = 'PENDING'
         store.save(state)
+    # Desktop is ambiguous; mobile was never attempted.
+    _seed_screenshot_outcomes(store, desktop_screenshot='PENDING')
     deps.telegram.sent.clear()
 
     result = orch.run_owned('proj', ws)
@@ -248,12 +275,12 @@ def test_delivery_ambiguous_text_never_duplicates(tmp_path):
     with store.acquire_writer('proj') as state:
         state.deployment.pop('latest_shown_preview', None)
         state.revisions.preview_revision = 0
-        # Photo already SENT (confirmed), text ambiguous.
-        state.deployment['preview_intent']['photo_attempted'] = True
-        state.deployment['preview_intent']['photo_outcome'] = 'SENT'
-        state.deployment['preview_intent']['photo_message_id'] = 1
-        state.deployment['preview_intent']['text_attempted'] = True
-        state.deployment['preview_intent']['text_outcome'] = 'PENDING'
+        # Screenshots already SENT (confirmed), text ambiguous.
+        store.save(state)
+    with store.acquire_writer('proj') as state:
+        intent = state.deployment['preview_intent']
+        intent['text_attempted'] = True
+        intent['text_outcome'] = 'PENDING'
         store.save(state)
     deps.telegram.sent.clear()
 
@@ -277,8 +304,11 @@ def test_delivery_legacy_attempt_without_outcome_fails_closed(tmp_path):
         state.deployment.pop('latest_shown_preview', None)
         state.revisions.preview_revision = 0
         intent = state.deployment['preview_intent']
+        # Model a row written before per-screenshot outcomes existed.
         intent['photo_attempted'] = True
         intent.pop('photo_outcome', None)
+        intent.pop('screenshot_outcome', None)
+        intent.pop('screenshot_attempted', None)
         intent.pop('text_outcome', None)
         store.save(state)
     deps.telegram.sent.clear()
@@ -336,8 +366,11 @@ def test_delivery_before_remote_send_succeeds_normally(tmp_path):
     result = orch.run_owned('proj', ws)
 
     assert result.success, result.error
-    assert [k for k, *_ in deps.telegram.sent] == ['photo', 'text']
+    assert [k for k, *_ in deps.telegram.sent] == ['photo', 'photo', 'text']
     intent = store.load('proj').deployment['preview_intent']
+    assert intent['screenshot_outcome'] == {
+        'desktop_screenshot': 'SENT', 'mobile_screenshot': 'SENT',
+    }
     assert intent['photo_outcome'] == 'SENT'
     assert intent['text_outcome'] == 'SENT'
 
@@ -388,12 +421,18 @@ class _SentWriteFailTelegram(FakeTelegram):
 
 
 def _inject_post_send_sent_write_failure(orch, fail_outcome):
-    """Wrap orch._update_intent so the first write carrying
-    ``<fail_outcome>_outcome`` AFTER the wrapper is armed raises -- models
-    the crash AFTER remote acceptance but BEFORE the SENT outcome is on
-    disk. The pre-send PENDING write passes through because arming happens
-    only once the corresponding fake send has returned success."""
+    """Wrap the SENT-persistence writes so the first one AFTER the wrapper is
+    armed raises -- models the crash AFTER remote acceptance but BEFORE the
+    SENT outcome is on disk. The pre-send PENDING write passes through because
+    arming happens only once the corresponding fake send has returned success.
+
+    ``fail_outcome='photo'`` targets the per-screenshot SENT write (the write
+    that records one screenshot as delivered); ``'text'`` targets the text
+    write. Either way the injected failure must leave the durable state at
+    PENDING so the re-drive fails closed instead of duplicating a send.
+    """
     real_update = orch._update_intent
+    real_record = orch._record_screenshot_outcome
     state = {'armed': False, 'failed': False}
 
     def wrapped(project_id, operation_id, **fields):
@@ -402,7 +441,15 @@ def _inject_post_send_sent_write_failure(orch, fail_outcome):
             raise OSError(f'simulated crash persisting {fail_outcome} SENT')
         return real_update(project_id, operation_id, **fields)
 
+    def wrapped_record(project_id, operation_id, key, outcome, **kwargs):
+        if (state['armed'] and not state['failed']
+                and fail_outcome == 'photo' and outcome == 'SENT'):
+            state['failed'] = True
+            raise OSError('simulated crash persisting photo SENT')
+        return real_record(project_id, operation_id, key, outcome, **kwargs)
+
     orch._update_intent = wrapped
+    orch._record_screenshot_outcome = wrapped_record
     return state
 
 
@@ -479,10 +526,13 @@ def test_crash_after_text_send_fails_closed_no_duplicate(tmp_path):
     assert not first.success
     # send_text returned success BEFORE the SENT write was forced to fail.
     assert inject['failed'] is True
-    assert [k for k, *_ in telegram.sent] == ['photo', 'text']
+    assert [k for k, *_ in telegram.sent] == ['photo', 'photo', 'text']
 
     intent = store.load('proj').deployment['preview_intent']
-    assert intent['photo_outcome'] == 'SENT'  # photo unaffected
+    assert intent['screenshot_outcome'] == {
+        'desktop_screenshot': 'SENT', 'mobile_screenshot': 'SENT',
+    }  # screenshots unaffected
+    assert intent['photo_outcome'] == 'SENT'
     assert intent['text_attempted'] is True
     assert intent['text_outcome'] == 'PENDING'
 
@@ -495,7 +545,7 @@ def test_crash_after_text_send_fails_closed_no_duplicate(tmp_path):
     assert not second.success
     assert second.error_code == 'DELIVERY_RECONCILIATION_REQUIRED'
     assert telegram.sent == []  # neither photo nor text resent
-    assert photo_calls == 1 and text_calls == 1  # total send counts unchanged
+    assert photo_calls == 2 and text_calls == 1  # total send counts unchanged
 
 
 def test_text_pre_send_persist_failure_means_no_text_send(tmp_path, monkeypatch):
@@ -540,7 +590,7 @@ def test_text_pre_send_persist_failure_means_no_text_send(tmp_path, monkeypatch)
 
 def test_pre_send_persist_failure_means_no_telegram_send(tmp_path, monkeypatch):
     """If the pre-send durable PENDING write itself fails, the remote send
-    MUST NOT happen (send count == 0 for both photo and text)."""
+    MUST NOT happen (send count == 0 for any screenshot or the text)."""
     store = ProjectStateStore(tmp_path / 'state')
     ws = _make_workspace(tmp_path)
     _preview_ready_state(store, 'proj', ws)
@@ -548,13 +598,18 @@ def test_pre_send_persist_failure_means_no_telegram_send(tmp_path, monkeypatch):
     orch = PreviewOrchestrator(store, deps)
 
     real_update = orch._update_intent
+    real_mark = orch._mark_screenshot_pending
 
     def failing_update(project_id, operation_id, **fields):
-        if 'photo_outcome' in fields or 'text_outcome' in fields:
+        if 'text_outcome' in fields:
             raise OSError('simulated durable-write failure')
         return real_update(project_id, operation_id, **fields)
 
+    def failing_mark(project_id, operation_id, key, **kwargs):
+        raise OSError('simulated durable-write failure')
+
     monkeypatch.setattr(orch, '_update_intent', failing_update)
+    monkeypatch.setattr(orch, '_mark_screenshot_pending', failing_mark)
 
     result = orch.run_owned('proj', ws)
 
@@ -578,6 +633,9 @@ def test_explicit_rejection_after_pending_allows_controlled_retry(tmp_path):
     assert not first.success
     intent = store.load('proj').deployment['preview_intent']
     assert intent['photo_attempted'] is True
+    # Nothing is in doubt: the rejection is explicit, so the group is
+    # provably re-drivable.
+    assert intent['screenshot_outcome'] == {'desktop_screenshot': 'NOT_SENT'}
     assert intent['photo_outcome'] == 'NOT_SENT'
 
     # Controlled retry: swap in a healthy adapter and re-drive.
@@ -587,10 +645,16 @@ def test_explicit_rejection_after_pending_allows_controlled_retry(tmp_path):
     second = orch.run_owned('proj', ws)
 
     assert second.success, second.error
-    assert [k for k, *_ in telegram.sent] == ['photo', 'text']
+    assert [k for k, *_ in telegram.sent] == ['photo', 'photo', 'text']
     intent = store.load('proj').deployment['preview_intent']
+    assert intent['screenshot_outcome'] == {
+        'desktop_screenshot': 'SENT', 'mobile_screenshot': 'SENT',
+    }
     assert intent['photo_outcome'] == 'SENT'
     assert intent['photo_message_id'] == 9
+    assert intent['screenshot_message_id'] == {
+        'desktop_screenshot': 9, 'mobile_screenshot': 9,
+    }
 
 
 def test_normal_success_pending_to_sent_with_message_ids(tmp_path):

@@ -10,8 +10,15 @@ app.deploy.adapters. This module owns:
   * reconciling ambiguous/ timed-out provider calls via lookup-by-identity
     rather than blind resend,
   * mandatory anonymous smoke test before any preview is ever shown,
-  * only marking "latest shown preview" after screenshot delivery AND the
-    preview URL text delivery both succeeded.
+  * only marking "latest shown preview" after EVERY delivery -- both
+    screenshots (desktop then mobile) and the instruction text -- has been
+    confirmed sent.
+
+The user-facing preview is SCREENSHOTS ONLY. The protected Vercel preview
+URL is an internal identity artifact: it is persisted (the approval/promotion
+binding and the smoke check both need it) but never included in an outbound
+message, because Deployment Protection makes it unopenable for the user and
+because disabling that protection would undermine the smoke check.
 
 No network call happens here without every prerequisite adapter being
 constructed and passed in explicitly by the caller. There is no default
@@ -64,10 +71,12 @@ from app.deploy.snapshot import TestedSnapshot, source_fingerprint
 FOLLOW_UP_PENDING = "PENDING"
 FOLLOW_UP_SENT = "SENT"
 
-# Per-message delivery outcome for the photo/text preview sends.
-# ``photo_outcome``/``text_outcome`` are persisted BEFORE the corresponding
-# remote send so a crash mid-delivery is reconcilable without inventing
-# certainty about an ambiguous send.
+# Per-message delivery outcome for the screenshot/text preview sends.
+# ``screenshot_outcome`` (per screenshot, keyed by smoke output key) and
+# ``text_outcome`` are persisted BEFORE the corresponding remote send so a
+# crash mid-delivery is reconcilable without inventing certainty about an
+# ambiguous send. ``photo_outcome`` is a derived aggregate kept for legacy
+# single-photo readers; it is never the source of truth (see ``_photo_aggregate``).
 #
 #   NOT_SENT  -> the adapter DEFINITELY did not send (input/validation failure
 #                or an explicit Telegram rejection). Safe to re-drive once.
@@ -79,6 +88,28 @@ FOLLOW_UP_SENT = "SENT"
 _DELIVERY_NOT_SENT = "NOT_SENT"
 _DELIVERY_PENDING = "PENDING"
 _DELIVERY_SENT = "SENT"
+
+# The screenshots a user is shown for a preview, in the FIXED order they are
+# delivered. Both are mandatory: the smoke run produces both, this module
+# validates both, and the preview is only marked shown once BOTH are
+# confirmed sent. The order is durable (a re-drive cannot reorder them) so the
+# delivered pair is reproducible across a crash.
+_SCREENSHOT_KEYS = ("desktop_screenshot", "mobile_screenshot")
+
+# Captions and instruction text shown to the user. Deliberately carry NO URL:
+# the preview deployment sits behind Vercel Deployment Protection, so the URL
+# is not something the user can open, and the smoke/repair flow depends on
+# that protection staying enabled.
+_SCREENSHOT_CAPTIONS = {
+    "desktop_screenshot": "Preview sudah siap — tampilan desktop.",
+    "mobile_screenshot": "Preview sudah siap — tampilan mobile.",
+}
+
+_PREVIEW_READY_TEXT = (
+    "Preview sudah siap.\n"
+    "Kalau ada yang mau diubah, kirim revisinya.\n"
+    'Kalau sudah oke, bilang "approve".'
+)
 
 
 def _delivery_outcome_of(result) -> str:
@@ -292,8 +323,7 @@ class PreviewOrchestrator:
             # never attempted. An attempted-but-unconfirmed send (PENDING)
             # is intentionally NOT retried (it may duplicate).
             self._maybe_send_follow_up(
-                project_id, shown.get('preview_url', ''),
-                operation_id=operation_id, shown=shown,
+                project_id, operation_id=operation_id, shown=shown,
             )
             return OperationResult.ok(shown)
         source_revision = state.revisions.source_revision
@@ -568,12 +598,20 @@ class PreviewOrchestrator:
             )
 
         # ---- 6. Telegram delivery — durable identities, fail closed on ambiguity ----
+        #
+        # WHAT THE USER SEES is screenshots and a short instruction. The preview
+        # URL is an INTERNAL implementation detail: the deployment is protected
+        # by Vercel Deployment Protection, so a user who is not authorized cannot
+        # open it, and publishing it would either be a dead link or an
+        # invitation to disable the protection that the smoke check itself
+        # depends on. The URL therefore stays in durable state (where the
+        # approval identity binding needs it) and out of every outbound message.
         chat_id = self.deps.chat_id_for(project_id, state)
         if not chat_id:
             return OperationResult.fail("NO_DELIVERY_TARGET", error_code="NO_DELIVERY_TARGET")
 
         shots = {}
-        for key in ('desktop_screenshot', 'mobile_screenshot'):
+        for key in _SCREENSHOT_KEYS:
             path = Path(smoke_result.data.get(key, ''))
             if path.is_symlink() or not path.is_file() or not path.resolve().is_relative_to(smoke_dir.resolve()):
                 return OperationResult.fail('NO_SMOKE_SCREENSHOT', error_code='NO_SMOKE_SCREENSHOT')
@@ -582,7 +620,6 @@ class PreviewOrchestrator:
                 return OperationResult.fail('NO_SMOKE_SCREENSHOT', error_code='NO_SMOKE_SCREENSHOT')
             shots[key] = {'path': str(path), 'sha256': hashlib.sha256(png).hexdigest()}
         self._update_intent(project_id, operation_id, screenshots=shots)
-        photo_path = shots['desktop_screenshot']['path']
 
         # ---- Outcome-aware delivery reconciliation --------------------------
         # Legacy rows only carry photo_attempted/text_attempted booleans; the
@@ -592,53 +629,54 @@ class PreviewOrchestrator:
         # BACKWARD COMPATIBILITY: a legacy row with ``*_attempted`` True but
         # no ``*_outcome`` cannot prove whether the send happened -- that is
         # UNKNOWN, and unknown means fail closed (never resend), NOT "safe".
-        photo_outcome = previous.get('photo_outcome')
-        if photo_outcome is None and previous.get('photo_attempted'):
-            photo_outcome = _DELIVERY_PENDING
+        shot_outcomes = self._screenshot_outcomes(previous)
         text_outcome = previous.get('text_outcome')
         if text_outcome is None and previous.get('text_attempted'):
             text_outcome = _DELIVERY_PENDING
 
-        # Photo delivery: a CONFIRMED SENT message is skipped (never resent);
+        # Screenshot delivery, in a FIXED order so a re-drive can never deliver
+        # them in a different order than the first attempt.
+        #
+        # Per screenshot: a CONFIRMED SENT message is skipped (never resent);
         # a provably NOT_SENT message is re-driven once; a PENDING (ambiguous)
         # message fails closed -- never resend a possibly-delivered photo.
-        if photo_outcome == _DELIVERY_PENDING:
-            return OperationResult.fail('DELIVERY_RECONCILIATION_REQUIRED',
-                                        error_code='DELIVERY_RECONCILIATION_REQUIRED')
-
         snapshot.verify(workspace)
-        if photo_outcome in (None, _DELIVERY_NOT_SENT):
+        for key in _SCREENSHOT_KEYS:
+            outcome = shot_outcomes.get(key)
+            if outcome == _DELIVERY_PENDING:
+                return OperationResult.fail('DELIVERY_RECONCILIATION_REQUIRED',
+                                            error_code='DELIVERY_RECONCILIATION_REQUIRED')
+            if outcome == _DELIVERY_SENT:
+                continue
             # CRITICAL ORDERING: durably persist the ATTEMPT (PENDING) BEFORE
             # the first possible Telegram side effect. If this write fails we
             # must NOT send -- a send without durable evidence is exactly the
             # unmarked-send crash window that produces duplicate deliveries.
             try:
-                self._update_intent(
-                    project_id, operation_id,
-                    photo_attempted=True, chat_id=str(chat_id),
-                    photo_outcome=_DELIVERY_PENDING,
+                self._mark_screenshot_pending(
+                    project_id, operation_id, key, chat_id=str(chat_id),
                 )
             except Exception:
                 return OperationResult.fail(
                     'DELIVERY_STATE_PERSIST_FAILED',
                     error_code='DELIVERY_STATE_PERSIST_FAILED',
                 )
+            shot_outcomes[key] = _DELIVERY_PENDING
             photo_result = self.deps.telegram.send_photo(
-                chat_id, photo_path, caption=f"Preview ready: {preview_url}"
+                chat_id, shots[key]['path'], caption=_SCREENSHOT_CAPTIONS[key],
             )
             new_outcome = _delivery_outcome_of(photo_result)
-            self._update_intent(
-                project_id, operation_id,
-                photo_outcome=new_outcome,
-                photo_message_id=(
+            self._record_screenshot_outcome(
+                project_id, operation_id, key, new_outcome,
+                message_id=(
                     photo_result.data.get("message_id")
                     if new_outcome == _DELIVERY_SENT else None
                 ),
+                stage="photos_sent",
             )
             if not photo_result.success:
                 return photo_result
-            self._update_intent(project_id, operation_id, stage="photo_sent")
-            photo_outcome = _DELIVERY_SENT
+            shot_outcomes[key] = new_outcome
 
         # Text delivery: same outcome-aware gate.
         if text_outcome == _DELIVERY_PENDING:
@@ -659,9 +697,7 @@ class PreviewOrchestrator:
                     'DELIVERY_STATE_PERSIST_FAILED',
                     error_code='DELIVERY_STATE_PERSIST_FAILED',
                 )
-            text_result = self.deps.telegram.send_text(
-                chat_id, f"Preview: {preview_url}\nReply with what you'd like changed."
-            )
+            text_result = self.deps.telegram.send_text(chat_id, _PREVIEW_READY_TEXT)
             new_outcome = _delivery_outcome_of(text_result)
             self._update_intent(
                 project_id, operation_id,
@@ -675,7 +711,8 @@ class PreviewOrchestrator:
                 return text_result
             text_outcome = _DELIVERY_SENT
 
-        # ---- 7. Mark latest shown preview only after BOTH sends succeeded ----
+        # ---- 7. Mark latest shown preview only after EVERY delivery
+        # (both screenshots AND the text) is CONFIRMED SENT ----
         snapshot.verify(workspace)
         with self.store.acquire_writer(project_id) as locked:
             if (locked.revisions.source_revision != source_revision
@@ -683,12 +720,13 @@ class PreviewOrchestrator:
                     or locked.lifecycle != 'PREVIEW_READY'
                     or locked.deployment['preview_intent']['operation_id'] != operation_id):
                 return OperationResult.fail('STALE_QA_BINDING', error_code='STALE_QA_BINDING')
-            # Both messages must be CONFIRMED SENT before the preview is shown.
-            # On a re-drive that skipped one send (already SENT), the
+            # Every message must be CONFIRMED SENT before the preview is shown.
+            # On a re-drive that skipped a send (already SENT), the
             # message_id already lives in the durable intent -- never read it
             # from a skipped (un-bound) local result variable.
             prior = locked.deployment["preview_intent"]
-            if (prior.get("photo_outcome") != _DELIVERY_SENT
+            prior_shots = self._screenshot_outcomes(prior)
+            if (any(prior_shots.get(key) != _DELIVERY_SENT for key in _SCREENSHOT_KEYS)
                     or prior.get("text_outcome") != _DELIVERY_SENT):
                 return OperationResult.fail('DELIVERY_RECONCILIATION_REQUIRED',
                                             error_code='DELIVERY_RECONCILIATION_REQUIRED')
@@ -698,6 +736,9 @@ class PreviewOrchestrator:
             locked.deployment["latest_shown_preview"] = {
                 "operation_id": operation_id,
                 "source_revision": source_revision,
+                # INTERNAL ONLY. The protected preview URL is durable state
+                # that binds approval/promotion/smoke identity; it is never
+                # sent to the user (see the delivery block above).
                 "preview_url": preview_url,
                 "deployment_id": deployment.data["deployment_id"],
                 "source_sha256": snapshot.source_sha256,
@@ -715,7 +756,7 @@ class PreviewOrchestrator:
         # UX-only. Never fails the already-delivered preview: every failure
         # path below is log-only and returns normally.
         self._maybe_send_follow_up(
-            project_id, preview_url, operation_id=operation_id,
+            project_id, operation_id=operation_id,
             shown=locked.deployment["latest_shown_preview"],
         )
 
@@ -749,7 +790,6 @@ class PreviewOrchestrator:
     def _maybe_send_follow_up(
         self,
         project_id: str,
-        preview_url: str,
         *,
         operation_id: str,
         shown: Dict[str, Any],
@@ -827,8 +867,7 @@ class PreviewOrchestrator:
             return
 
         follow_up_text = (
-            f"Website {follow_up_name} udah siap \U0001F389\n"
-            f"{preview_url}\n\n"
+            f"Website {follow_up_name} udah siap 🎉\n\n"
             "Mau revisi website ini, atau mau bikin website baru?"
         )
         # From here on the outcome is potentially ambiguous: the request may
@@ -865,6 +904,107 @@ class PreviewOrchestrator:
             logging.getLogger(__name__).exception(
                 "Failed to persist confirmed follow-up for %s", project_id
             )
+
+    @staticmethod
+    def _screenshot_outcomes(intent: Dict[str, Any]) -> Dict[str, str]:
+        """Per-screenshot delivery outcomes from a durable preview intent.
+
+        Reads the ``screenshot_outcome`` map written by this module, and
+        degrades a LEGACY row correctly: a row written when the desktop
+        screenshot was the only photo has ``photo_attempted``/``photo_outcome``
+        and no per-screenshot map. A legacy row with an attempt but no
+        outcome cannot prove whether the send happened, so it is PENDING
+        (unknown = fail closed, never resend). A legacy row with no attempt at
+        all has simply not been sent, which is the one state that is safe to
+        drive.
+        """
+        outcomes: Dict[str, str] = {}
+        raw = intent.get("screenshot_outcome")
+        raw = raw if isinstance(raw, dict) else {}
+        legacy_attempted = bool(intent.get("photo_attempted"))
+        legacy_outcome = intent.get("photo_outcome")
+        if legacy_outcome is None and legacy_attempted:
+            legacy_outcome = _DELIVERY_PENDING
+        for key in _SCREENSHOT_KEYS:
+            value = raw.get(key)
+            if value is None and key == _SCREENSHOT_KEYS[0] and legacy_outcome is not None:
+                value = legacy_outcome
+            if value is not None:
+                outcomes[key] = value
+        return outcomes
+
+    def _mark_screenshot_pending(self, project_id: str, operation_id: str,
+                                 key: str, chat_id: str) -> None:
+        """Persist "this screenshot is being attempted" BEFORE the remote send.
+
+        Writes the per-screenshot PENDING marker and the aggregate in one atomic
+        state write, so a crash between here and the send can never produce a
+        resend of a possibly-delivered photo.
+        """
+        with self.store.acquire_writer(project_id) as state:
+            intent = state.deployment.get("preview_intent")
+            if not intent or intent.get("operation_id") != operation_id:
+                raise StaleOperationIntent(
+                    "preview_intent does not belong to this operation"
+                )
+            outcomes = dict(intent.get("screenshot_outcome") or {})
+            outcomes[key] = _DELIVERY_PENDING
+            attempted = list(intent.get("screenshot_attempted") or [])
+            if key not in attempted:
+                attempted.append(key)
+            intent["screenshot_outcome"] = outcomes
+            intent["screenshot_attempted"] = attempted
+            intent["photo_attempted"] = True
+            intent["chat_id"] = chat_id
+            intent["photo_outcome"] = _DELIVERY_PENDING
+            self.store.save(state)
+
+    @staticmethod
+    def _photo_aggregate(outcomes: Dict[str, str]) -> str:
+        """Aggregate the screenshot group onto the legacy single-photo key.
+
+        Precedence is deliberate:
+          * ANY ambiguous shot  -> PENDING (never optimistically SENT; a
+            possibly-delivered screenshot must never look confirmed).
+          * every shot confirmed -> SENT.
+          * SOME confirmed       -> PENDING. The group is not fully delivered
+            and is not fully retryable either, so a legacy single-photo reader
+            must fail closed rather than conclude "safe to resend".
+          * none confirmed       -> NOT_SENT (nothing is in doubt, so the
+            group is provably re-drivable).
+        """
+        values = [outcomes.get(key) for key in _SCREENSHOT_KEYS]
+        if any(value == _DELIVERY_PENDING for value in values):
+            return _DELIVERY_PENDING
+        if all(value == _DELIVERY_SENT for value in values):
+            return _DELIVERY_SENT
+        if any(value == _DELIVERY_SENT for value in values):
+            return _DELIVERY_PENDING
+        return _DELIVERY_NOT_SENT
+
+    def _record_screenshot_outcome(self, project_id: str, operation_id: str,
+                                   key: str, outcome: str,
+                                   message_id=None, stage: Optional[str] = None) -> None:
+        """Persist the CONFIRMED outcome of one screenshot send."""
+        with self.store.acquire_writer(project_id) as state:
+            intent = state.deployment.get("preview_intent")
+            if not intent or intent.get("operation_id") != operation_id:
+                raise StaleOperationIntent(
+                    "preview_intent does not belong to this operation"
+                )
+            outcomes = dict(intent.get("screenshot_outcome") or {})
+            outcomes[key] = outcome
+            intent["screenshot_outcome"] = outcomes
+            intent["photo_outcome"] = self._photo_aggregate(outcomes)
+            if outcome == _DELIVERY_SENT and message_id is not None:
+                ids = dict(intent.get("screenshot_message_id") or {})
+                ids[key] = message_id
+                intent["screenshot_message_id"] = ids
+                if key == _SCREENSHOT_KEYS[0]:
+                    intent["photo_message_id"] = message_id
+            if stage is not None:
+                intent["stage"] = stage
+            self.store.save(state)
 
     def _update_intent(self, project_id: str, operation_id: str, **fields) -> None:
         """Persist an intent update for *operation_id*, or fail closed.

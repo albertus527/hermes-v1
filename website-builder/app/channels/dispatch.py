@@ -246,6 +246,7 @@ class TelegramDispatcher:
                         "readiness": intake_result.readiness.value,
                         "scope": intake_result.scope.value,
                         "clarification_question": intake_result.clarification_question,
+                        "clarification_reason": intake_result.clarification_reason,
                         "pause_detected": intake_result.pause_detected,
                         "resume_detected": intake_result.resume_detected,
                     })

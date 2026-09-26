@@ -80,18 +80,18 @@ class TestFullLocalStory:
         assert h.vercel.deploy_calls == 1
         # 9-10: smoke ran and exactly one preview photo was delivered.
         assert len(h.smoke.calls) == 1
-        assert len(h.telegram.photo_calls) == 1
+        assert len(h.telegram.photo_calls) == 2
         assert state.revisions.preview_revision == state.revisions.source_revision
 
         # 11-13. A revision applies exactly once and delivers exactly one new
-        # preview (photo count goes 1 -> 2).
+        # preview (two screenshots per delivery, so 2 -> 4).
         rev = h.run_revision("ganti warna jadi lebih lembut, tetap soft")
         assert rev.success, getattr(rev, "error", None)
         state = h.project_state(pid)
         assert state.revisions.revision_seq == 1
         assert state.revisions.source_revision == 2
         assert state.revisions.preview_revision == 2
-        assert len(h.telegram.photo_calls) == 2
+        assert len(h.telegram.photo_calls) == 4
         # Still exactly one project create.
         assert h.vercel.post_calls == 1
 
@@ -124,7 +124,7 @@ class TestFullLocalStory:
         # No duplicate project create / deployment / Telegram preview.
         assert h.vercel.post_calls == 1
         assert h.vercel.deploy_calls == 2  # one per preview-bearing revision
-        assert len(h.telegram.photo_calls) == 2
+        assert len(h.telegram.photo_calls) == 4
         # No skipped revision seq.
         seqs = sorted(e["seq"] for e in state.pending_revisions)
         assert seqs == list(range(1, len(seqs) + 1))

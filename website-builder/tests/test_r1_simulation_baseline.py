@@ -62,7 +62,7 @@ class TestHappyPathBaseline:
         # Exactly one Vercel project create, one preview delivery.
         assert h.vercel.post_calls == 1
         assert h.vercel.created_projects == ["kitsunereading"]
-        assert len(h.telegram.photo_calls) == 1
+        assert len(h.telegram.photo_calls) == 2
         assert entry.vercel_slug == "kitsunereading"
 
     def test_harness_uses_real_persistence(self, tmp_path):

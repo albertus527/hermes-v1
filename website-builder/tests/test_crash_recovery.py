@@ -833,11 +833,31 @@ def test_every_emittable_error_code_has_specific_user_copy():
         # QA preconditions
         "STALE_QA_BINDING",
         "VISION_REQUIRED",
+        # publish / promotion. These are operator-grade codes; the user must
+        # still get a deliberate message that says the publish did not happen
+        # and their preview is untouched, instead of a raw code or a generic
+        # "something went wrong".
+        "INCOMPLETE_LOOKUP",
+        "PROMOTION_RECONCILIATION_REQUIRED",
+        "PROMOTE_FAILED",
+        "PROMOTE_NOT_APPLIED",
+        "PROMOTE_VERIFICATION_FAILED",
+        "INCOMPLETE_PREVIEW_IDENTITY",
+        "DEPLOYMENT_IDENTITY_MISMATCH",
+        "PROJECT_RECONCILIATION_REQUIRED",
+        "PROJECT_IDENTITY_MISMATCH",
+        "INVALID_DEPLOYMENT_ID",
+        "INVALID_PRODUCTION_URL",
+        "ROLLBACK_FAILED",
+        "ROLLBACK_RECONCILIATION_REQUIRED",
+        "ROLLBACK_TARGET_IDENTITY_INCOMPLETE",
     ):
         assert code in ERROR_MESSAGES, f"{code} has no user-facing copy"
         rendered = render_error_message(code)
         assert rendered != _FALLBACK_ERROR_TEXT, f"{code} renders generically"
         assert rendered == ERROR_MESSAGES[code]
+        # The raw code never reaches the user, whatever the condition.
+        assert code not in rendered
 
     # The genuinely-unexplained codes stay generic BY DECISION, and are listed.
     from app.runtime import _INTENTIONALLY_GENERIC_CODES
