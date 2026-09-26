@@ -17,8 +17,11 @@ Two layers, deliberately small:
 
   1. NORMALIZATION -- convert a SUPPORTED external dependency (for Phase 1,
      Google Fonts web fonts) into local assets inside the generated project.
-     Only a deterministic, allowlisted, trusted source is ever fetched; the
-     chosen font families are preserved exactly.
+     The reference is recognized in every carrier a generated project can
+     use: an HTML ``<link>``, a CSS ``@import`` in a stylesheet file, and a
+     CSS ``@import`` in an inline ``<style>`` block. Only a deterministic,
+     allowlisted, trusted source is ever fetched; the chosen font families
+     are preserved exactly.
 
   2. VALIDATION -- reject every remaining unsupported external runtime
      dependency with a sanitized ``EXTERNAL_RUNTIME_DEPENDENCY`` failure.
@@ -242,6 +245,17 @@ _ATTR_IN_TAG_RE = re.compile(
 _CSS_IMPORT_RE = re.compile(
     r"@import\s+(?:url\(\s*(?:\"(?P<dq>[^\"]*)\"|'(?P<sq>[^']*)'|(?P<uq>[^)\s]*))\s*\)"
     r"|(?:\"(?P<dq2>[^\"]*)\"|'(?P<sq2>[^']*)'))",
+    re.IGNORECASE,
+)
+# Normalization needs the statement's TERMINATOR as well. The detector regex
+# above deliberately stops at the URL so the statement is reported, but a
+# rewriter that replaced only that match would leave a dangling ``;`` right
+# after the generated ``@font-face`` block, which can make the CSS parser drop
+# the remainder of the stylesheet. The terminator is optional because a final
+# statement in a sheet may legally omit it.
+_CSS_IMPORT_NORM_RE = re.compile(
+    r"@import\s+(?:url\(\s*(?:\"(?P<dq>[^\"]*)\"|'(?P<sq>[^']*)'|(?P<uq>[^)\s]*))\s*\)"
+    r"|(?:\"(?P<dq2>[^\"]*)\"|'(?P<sq2>[^']*)'))[ \t]*;?",
     re.IGNORECASE,
 )
 _CSS_URL_RE = re.compile(
@@ -548,6 +562,27 @@ def _source_scan_files(workspace: Path) -> List[Tuple[str, Path]]:
             if path.suffix.lower() not in _DEPLOYED_SUFFIXES:
                 continue
             results.append((path.relative_to(workspace).as_posix(), path))
+    return results
+
+
+def _css_normalization_targets(workspace: Path) -> List[Tuple[str, Path]]:
+    """Every ``.css`` file whose Google Fonts reference must be rewritten.
+
+    A generated Vite project carries the same stylesheet in two places, and a
+    rebuild can regenerate one from the other, so BOTH are candidates: the
+    built bundle under ``dist/`` (deployed-relative name, exactly what
+    ``_deployed_files`` reports) and the generated source under ``src/`` and
+    ``public/`` (workspace-relative name, exactly what ``_source_scan_files``
+    reports). Duplicates are collapsed once, by resolved path, over the whole
+    assembled target list in :func:`normalize_artifact` — a bundle file
+    already contributed by ``_deployed_files`` keeps that (deployed-relative)
+    name.
+    """
+    workspace = Path(workspace)
+    results: List[Tuple[str, Path]] = []
+    for name, path in list(_deployed_files(workspace)) + list(_source_scan_files(workspace)):
+        if path.suffix.lower() == ".css":
+            results.append((name, path))
     return results
 
 
@@ -990,9 +1025,11 @@ def normalize_artifact(workspace: Path, *, vendored: Optional[VendoredFonts] = N
     """Layers 1: convert supported external dependencies into local assets.
 
     Phase 1 support: Google Fonts web fonts. Every Google Fonts stylesheet
-    ``<link>`` found in a DEPLOYED artifact file is (a) parsed for the chosen
-    families and (b) replaced by local ``@font-face`` rules backed by local
-    font bytes, preserving the exact font families and weights.
+    reference found in a DEPLOYED artifact file -- an HTML ``<link>``, a CSS
+    ``@import`` in a stylesheet file, or a CSS ``@import`` in an inline
+    ``<style>`` block -- is (a) parsed for the chosen families and (b) replaced
+    by local ``@font-face`` rules backed by local font bytes, preserving the
+    exact font families and weights.
 
     Deterministic: the same input always produces the same asset names,
     the same bytes, and the same file contents.
@@ -1011,8 +1048,10 @@ def normalize_artifact(workspace: Path, *, vendored: Optional[VendoredFonts] = N
 
     # Normalization must rewrite EVERY document that can reintroduce the
     # external reference: the deployed ``dist/`` artifact, the Vite template
-    # ``index.html`` (which regenerates dist/index.html on the next build) and
-    # any ``public/`` root document (copied verbatim into dist/).
+    # ``index.html`` (which regenerates dist/index.html on the next build),
+    # any ``public/`` root document (copied verbatim into dist/), and every
+    # stylesheet in the bundle AND its source (so a rebuild cannot regenerate
+    # the reference from ``src/``).
     targets: List[Tuple[str, Path]] = []
     deployed = _deployed_files(workspace)
     if deployed:
@@ -1028,18 +1067,49 @@ def normalize_artifact(workspace: Path, *, vendored: Optional[VendoredFonts] = N
             if path.suffix.lower() not in (".html", ".htm"):
                 continue
             targets.append((path.relative_to(public).as_posix(), path))
+    targets.extend(_css_normalization_targets(workspace))
+    # One file, one rewrite: a bundle file is contributed by both iterators
+    # above. The first (deployed-relative) name wins, so the diagnostic names
+    # stay the ones the deployed artifact is known by.
+    deduped: List[Tuple[str, Path]] = []
+    seen_paths = set()
+    for rel_name, path in targets:
+        resolved = path.resolve()
+        if resolved in seen_paths:
+            continue
+        seen_paths.add(resolved)
+        deduped.append((rel_name, path))
+    targets = deduped
 
     changed = False
     for rel_name, path in targets:
-        if Path(rel_name).suffix.lower() not in (".html", ".htm"):
+        suffix = Path(rel_name).suffix.lower()
+        if suffix not in (".html", ".htm", ".css"):
             continue
         text = _read_text(path)
         if text is None or "fonts.googleapis.com" not in text:
             continue
-        updated, result = _normalize_html_font_links(
-            text, rel_name, vendored=vendored, resolver=resolver,
-            connection_factory=connection_factory or PinnedFontHTTPSConnection,
-        )
+        connection = connection_factory or PinnedFontHTTPSConnection
+        if suffix == ".css":
+            updated, result = _normalize_css_font_imports(
+                text, rel_name, vendored=vendored, resolver=resolver,
+                connection_factory=connection,
+            )
+        else:
+            updated, result = _normalize_html_font_links(
+                text, rel_name, vendored=vendored, resolver=resolver,
+                connection_factory=connection,
+            )
+            # An inline ``<style>`` block is CSS text too, and the validator
+            # already scans it, so the same rewriter serves it. Ranges are
+            # recomputed on the link-normalized text because that pass changes
+            # offsets.
+            style_updated, style_result = _normalize_html_style_blocks(
+                updated, rel_name, vendored=vendored, resolver=resolver,
+                connection_factory=connection,
+            )
+            updated = style_updated
+            result = _merge_css_result(result, style_result)
         diagnostics["stylesheets"] += result["stylesheets"]
         diagnostics["unsupported_stylesheets"] += result["unsupported_stylesheets"]
         diagnostics["vendor_failures"] += result["vendor_failures"]
@@ -1148,6 +1218,118 @@ def _normalize_html_font_links(text: str, rel_name: str, *, vendored,
     else:
         updated = style_block + updated
     return updated, result
+
+
+def _new_css_result() -> Dict:
+    """Result-dict shape shared by every CSS-text normalizer.
+
+    Identical key names and types to ``_normalize_html_font_links`` so
+    ``NormalizationResult``, ``to_dict()`` and the
+    ``normalize_self_contained`` log line stay unchanged no matter which
+    carrier carried the reference.
+    """
+    return {
+        "stylesheets": 0, "unsupported_stylesheets": 0, "vendor_failures": 0,
+        "families": [], "assets": {}, "stylesheets_list": [], "removed_list": [],
+    }
+
+
+def _merge_css_result(target: Dict, source: Dict) -> Dict:
+    """Accumulate one carrier's result into another (counters + de-duped families)."""
+    target["stylesheets"] += source["stylesheets"]
+    target["unsupported_stylesheets"] += source["unsupported_stylesheets"]
+    target["vendor_failures"] += source["vendor_failures"]
+    for family in source["families"]:
+        if family not in target["families"]:
+            target["families"].append(family)
+    target["assets"].update(source["assets"])
+    target["stylesheets_list"].extend(source["stylesheets_list"])
+    target["removed_list"].extend(source["removed_list"])
+    return target
+
+
+def _normalize_css_font_imports(text: str, rel_name: str, *, vendored,
+                                resolver, connection_factory) -> Tuple[str, Dict]:
+    """Rewrite allowlisted Google Fonts ``@import`` statements in CSS text.
+
+    Sibling of :func:`_normalize_html_font_links` for the CSS carriers: a
+    ``.css`` file, and (via :func:`_normalize_html_style_blocks`) the body of
+    an inline ``<style>`` element. The generated ``@font-face`` blocks replace
+    the statement IN PLACE, so cascade order is preserved, output is
+    deterministic, and a second pass has nothing left to match.
+    """
+    result = _new_css_result()
+
+    def _replace_statement(match: re.Match) -> str:
+        original = match.group(0)
+        url = _css_group_value(match)
+        if not is_external_runtime_url(url):
+            # Local / bundler-resolved import (e.g. ``@import 'tailwindcss';``).
+            return original
+        try:
+            _validate_google_fonts_url(url)
+        except FontVendorError:
+            # Not an allowlisted Google Fonts CSS2 stylesheet. Leave the
+            # statement untouched so preflight still reports it explicitly.
+            result["unsupported_stylesheets"] += 1
+            return original
+
+        result["stylesheets"] += 1
+        try:
+            faces, asset_payload, unsupported = _vendor_google_fonts(
+                url, vendored=vendored, resolver=resolver,
+                connection_factory=connection_factory,
+            )
+        except FontVendorError as exc:
+            result["vendor_failures"] += 1
+            result["unsupported_stylesheets"] += 1
+            logger.warning(
+                "Font vendoring skipped for %s (%s): %s", rel_name, exc.code, exc.detail
+            )
+            # Keep the ORIGINAL external reference so the deterministic
+            # preflight surfaces it as an explicit failure rather than
+            # silently shipping a font-less artifact.
+            return original
+
+        blocks: List[str] = []
+        for face, asset_name in faces:
+            blocks.append(_font_face_css(face, "/" + asset_name))
+            result["assets"][asset_name] = asset_payload[asset_name]
+        for family in _extract_families(url):
+            if family not in result["families"]:
+                result["families"].append(family)
+        result["stylesheets_list"].append((url, rel_name))
+        result["removed_list"].append((rel_name, "stylesheet"))
+        logger.info(
+            "Vendored Google Fonts stylesheet for %s (%d files, %d unsupported variants)",
+            rel_name, len(result["assets"]), unsupported,
+        )
+        return "\n".join(blocks)
+
+    updated = _CSS_IMPORT_NORM_RE.sub(_replace_statement, text)
+    return updated, result
+
+
+def _normalize_html_style_blocks(text: str, rel_name: str, *, vendored,
+                                 resolver, connection_factory) -> Tuple[str, Dict]:
+    """Rewrite Google Fonts ``@import`` statements inside inline ``<style>`` blocks.
+
+    Reuses the bounded ``_style_body_ranges`` helper the validator already
+    scans with, and splices bodies in REVERSE range order so every earlier
+    offset stays valid while later bodies are replaced.
+    """
+    merged = _new_css_result()
+    ranges = _style_body_ranges(text)
+    for start, end in reversed(ranges):
+        body = text[start:end]
+        updated, result = _normalize_css_font_imports(
+            body, rel_name, vendored=vendored, resolver=resolver,
+            connection_factory=connection_factory,
+        )
+        _merge_css_result(merged, result)
+        if updated != body:
+            text = text[:start] + updated + text[end:]
+    return text, merged
 
 
 def _vendor_google_fonts(css_url: str, *, vendored: Optional[VendoredFonts],

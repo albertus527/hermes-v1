@@ -1723,6 +1723,96 @@ class TestPhase7CompileRepair(unittest.TestCase):
         state = self.store.load("proj-repair-x")
         self.assertEqual(state.failure["compile_repair_attempts"], 1)
         self.assertEqual(state.failure["final_stage"], "repair_execution_failed")
+        # The reason the REPAIR failed is persisted, not dropped.
+        self.assertEqual(state.failure["repair"]["error"], "FRONTEND repair failed")
+        self.assertEqual(state.failure["repair"]["error_code"],
+                         "FRONTEND repair failed")
+        self.assertNotIn("invocation", state.failure["repair"])
+
+    def test_repair_failure_reason_prefers_the_adapter_supervision_code(self):
+        self.adapter.frontend_build.side_effect = [
+            {
+                "success": True,
+                "design_dna": {"version": 1, "brand_personality": "premium"},
+            },
+            {"success": False, "error": "child exited 1", "error_code":
+                "FRONTEND_IDLE_TIMEOUT"},
+        ]
+        _queue_project(self.store, "proj-repair-code")
+
+        with patch.object(self.builder, "_run_fixed_checks") as mock_checks:
+            mock_checks.return_value = self._ts6133_npm_build_failure()
+            result = self.builder.build("proj-repair-code", self.brief)
+
+        self.assertFalse(result.success)
+        # The user-facing contract is unchanged.
+        self.assertEqual(result.error, "CHEAP_CHECKS_FAILED:npm_build")
+        state = self.store.load("proj-repair-code")
+        self.assertEqual(state.failure["repair"]["error_code"],
+                         "FRONTEND_IDLE_TIMEOUT")
+        self.assertEqual(state.failure["repair"]["error"], "child exited 1")
+
+    def test_repair_returning_invalid_design_dna_is_reported_not_dropped(self):
+        self.adapter.frontend_build.side_effect = [
+            {
+                "success": True,
+                "design_dna": {"version": 1, "brand_personality": "premium"},
+            },
+            {"success": True, "design_dna": {}},
+        ]
+        _queue_project(self.store, "proj-repair-bad-dna")
+
+        with patch.object(self.builder, "_run_fixed_checks") as mock_checks:
+            mock_checks.return_value = self._ts6133_npm_build_failure()
+            result = self.builder.build("proj-repair-bad-dna", self.brief)
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error, "CHEAP_CHECKS_FAILED:npm_build")
+        self.assertEqual(mock_checks.call_count, 1)
+        state = self.store.load("proj-repair-bad-dna")
+        self.assertEqual(state.failure["final_stage"], "repair_execution_failed")
+        self.assertEqual(state.failure["repair"]["error"], "MISSING_DESIGN_DNA")
+        self.assertEqual(state.failure["repair"]["error_code"],
+                         "MISSING_DESIGN_DNA")
+        self.assertNotIn("invocation", state.failure["repair"])
+
+    def test_repair_failure_persists_bounded_invocation_forensics(self):
+        receipt = {
+            "schema": "frontend_forensics/1",
+            "returncode": 1,
+            "elapsed_seconds": 12.0,
+            "counters": {"model_started": 0, "tool_started": 0},
+            "activity": {"last_phase": "startup"},
+        }
+        # A long child stderr, with a sentinel deep inside the middle: the
+        # bounded capture must keep head+tail and drop the middle.
+        noise = "x" * 6000
+        self.adapter.frontend_build.side_effect = [
+            {
+                "success": True,
+                "design_dna": {"version": 1, "brand_personality": "premium"},
+            },
+            {"success": False, "error": f"head-marker{noise}tail-marker",
+             "error_code": "FRONTEND_CHILD_FAILED", "invocation": receipt},
+        ]
+        _queue_project(self.store, "proj-repair-receipt")
+
+        with patch.object(self.builder, "_run_fixed_checks") as mock_checks:
+            mock_checks.return_value = self._ts6133_npm_build_failure()
+            result = self.builder.build("proj-repair-receipt", self.brief)
+
+        self.assertFalse(result.success)
+        state = self.store.load("proj-repair-receipt")
+        repair = state.failure["repair"]
+        self.assertEqual(repair["error_code"], "FRONTEND_CHILD_FAILED")
+        self.assertLess(len(repair["error"]), 2100)
+        self.assertIn("head-marker", repair["error"])
+        self.assertIn("tail-marker", repair["error"])
+        # The persisted invocation is the bounded forensics receipt verbatim.
+        self.assertEqual(repair["invocation"], receipt)
+        # Nothing unbounded leaked into the serialized failure.
+        serialized = json.dumps(state.failure)
+        self.assertNotIn(noise, serialized)
 
     # -- H: persisted diagnostics distinguish the two failures -------------
 

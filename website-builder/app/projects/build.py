@@ -290,6 +290,34 @@ def classify_cheap_check_failure(checks: Dict[str, Any]) -> CompileRepairDecisio
     )
 
 
+def _frontend_failure_reason(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Bounded, sanitized reason a FRONTEND invocation failed.
+
+    Derivation mirrors the initial-generation path in ``build()``: prefer the
+    adapter's stable supervision code (e.g. ``FRONTEND_IDLE_TIMEOUT`` /
+    ``FRONTEND_HARD_TIMEOUT``) over re-deriving one from free text, and keep
+    the ``TOOLCHAIN_MUTATION_REJECTED`` substring test as the fallback for
+    results that carry no code. Unlike the initial path (whose ``error`` is
+    surfaced verbatim to the caller), the reason is bounded here because it is
+    PERSISTED, not rendered.
+
+    ``invocation`` is the adapter's bounded ``frontend_forensics/1`` receipt:
+    activity counters, timestamps, normalized descriptions and hashes. It
+    never contains prompts, source, model output, tool arguments, or URLs.
+    """
+    raw_error = result.get("error") or "Unknown FRONTEND error"
+    reason = {
+        "error": _bounded_output(raw_error),
+        "error_code": result.get("error_code")
+        or ("TOOLCHAIN_MUTATION_REJECTED"
+            if "TOOLCHAIN_MUTATION_REJECTED" in raw_error
+            else _bounded_output(raw_error)),
+    }
+    if result.get("invocation"):
+        reason["invocation"] = result["invocation"]
+    return reason
+
+
 def _file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -490,7 +518,8 @@ Respond with a JSON summary:
         """Invoke FRONTEND exactly once for the minimum compile fix.
 
         Returns {"executed": bool, "toolchain_violation": Optional[str],
-        "design_dna": Optional[dict]}:
+        "design_dna": Optional[dict], "error": Optional[str],
+        "error_code": Optional[str], "invocation": Optional[dict]}:
         - executed=True only when the repair call itself succeeded and any
           returned Design DNA passed the composed-policy validation. The
           deterministic checks are ALWAYS the authority after this; the
@@ -498,9 +527,15 @@ Respond with a JSON summary:
         - toolchain_violation is set when a protected starter/toolchain
           identity file was mutated/removed during the repair — a
           deterministic TOOLCHAIN_MUTATION_REJECTED policy rejection.
+        - error/error_code/invocation carry the BOUNDED, sanitized reason a
+          non-executed repair failed, so the answer survives in persisted
+          state instead of being dropped. They are None when the repair was
+          never invoked (no adapter) or was rejected by toolchain policy.
         """
         if self.hermes_adapter is None:
-            return {"executed": False, "toolchain_violation": None, "design_dna": None}
+            return {"executed": False, "toolchain_violation": None,
+                    "design_dna": None, "error": None, "error_code": None,
+                    "invocation": None}
 
         # Invalidate before invoking the mutating repair call: even a failed
         # or timed-out invocation may have changed source on disk. Compose
@@ -539,26 +574,33 @@ Respond with a JSON summary:
                 project_id,
                 violation,
             )
-            return {"executed": False, "toolchain_violation": violation, "design_dna": None}
+            return {"executed": False, "toolchain_violation": violation,
+                    "design_dna": None, "error": None, "error_code": None,
+                    "invocation": None}
 
         if not repair_result.get("success"):
-            return {"executed": False, "toolchain_violation": None, "design_dna": None}
+            return {"executed": False, "toolchain_violation": None,
+                    "design_dna": None, **_frontend_failure_reason(repair_result)}
 
         dna = repair_result.get("design_dna")
         if dna is None:
             # The repair did not return/persist a readable Design DNA —
             # fine: keep the generation-time DNA and let the deterministic
             # checks judge the workspace.
-            return {"executed": True, "toolchain_violation": None, "design_dna": None}
+            return {"executed": True, "toolchain_violation": None,
+                    "design_dna": None, "error": None, "error_code": None,
+                    "invocation": None}
 
         try:
             validate_composed_dna(dna, policy_state)
-        except ValueError:
+        except ValueError as exc:
             logger.warning(
                 "Phase-7 compile repair of %s returned invalid Design DNA",
                 project_id,
             )
-            return {"executed": False, "toolchain_violation": None, "design_dna": None}
+            return {"executed": False, "toolchain_violation": None,
+                    "design_dna": None,
+                    **_frontend_failure_reason({"error": str(exc)})}
 
         with self.store.acquire_writer(project_id) as locked:
             locked.design_dna = dna
@@ -567,7 +609,8 @@ Respond with a JSON summary:
             )
             self.store.save(locked)
 
-        return {"executed": True, "toolchain_violation": None, "design_dna": dna}
+        return {"executed": True, "toolchain_violation": None, "design_dna": dna,
+                "error": None, "error_code": None, "invocation": None}
 
     def build(
         self,
@@ -771,6 +814,10 @@ Respond with a JSON summary:
             compile_repair_attempts = 0
             final_stage = "initial"
             rejection_error: Optional[str] = None
+            # Bounded, sanitized reason the repair invocation itself failed.
+            # Persisted so the answer is recoverable from state; the reason was
+            # previously dropped, leaving `repair_execution_failed` undiagnosable.
+            repair_failure: Optional[Dict[str, Any]] = None
 
             if not build_success:
                 decision = classify_cheap_check_failure(checks)
@@ -858,10 +905,17 @@ Respond with a JSON summary:
                         # fail closed. The attempt is consumed.
                         final_stage = "repair_execution_failed"
                         checks = initial_checks
+                        repair_failure = {
+                            "error": repair_outcome.get("error"),
+                            "error_code": repair_outcome.get("error_code"),
+                        }
+                        if repair_outcome.get("invocation"):
+                            repair_failure["invocation"] = repair_outcome["invocation"]
                         logger.warning(
-                            "Phase-7 compile repair for %s did not execute; "
-                            "preserving initial cheap-check failure",
+                            "Phase-7 compile repair for %s did not execute "
+                            "(error_code=%s); preserving initial cheap-check failure",
                             project_id,
+                            repair_failure["error_code"],
                         )
 
             # Update state with results
@@ -882,6 +936,11 @@ Respond with a JSON summary:
                     }
                     if rejection_error is not None:
                         failure["error"] = rejection_error
+                    # Why the repair invocation itself failed, bounded and
+                    # sanitized. Only the compile-repair path persists it; the
+                    # QA-repair and revision paths keep their own reporting.
+                    if repair_failure is not None:
+                        failure["repair"] = repair_failure
                     # Persist BOTH the initial cheap-check failure and the
                     # post-repair cheap-check failure whenever a repair ran,
                     # so operators can diagnose each independently.
