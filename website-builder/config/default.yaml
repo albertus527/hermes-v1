@@ -40,3 +40,34 @@ website_builder:
   # Build
   build:
     timeout_seconds: 300
+
+  # FRONTEND supervision (app/hermes/watchdog.py).
+  #
+  # A FRONTEND invocation is supervised by an activity-aware watchdog, not a
+  # fixed wall-clock timeout. The supervisor terminates an invocation only when
+  # that EXACT invocation stops making progress (idle) or hits an independent
+  # hard ceiling (pathological run). Activity from any other project or build
+  # can never refresh it.
+  frontend_watchdog:
+    # No progress for this long with nothing in flight => FRONTEND_IDLE_TIMEOUT.
+    # A long provider request is NOT idle: it is an in-flight operation.
+    idle_timeout_seconds: 180
+
+    # Independent upper bound for a run that never stops making progress =>
+    # FRONTEND_HARD_TIMEOUT. Pathological behaviour only, never quality control.
+    hard_max_runtime_seconds: 2700
+
+    # No-progress backstop that applies even while an operation is in flight.
+    # Measured from the last progress event, so legitimate streaming keeps an
+    # operation protected; only a genuinely silent operation is cut off.
+    max_single_operation_seconds: 900
+
+    # Wall-clock bound used only when the child never announces a progress
+    # channel, so liveness is unknowable. Matches the pre-watchdog behaviour
+    # so a degraded supervisor is never more permissive than what it replaced.
+    legacy_wallclock_seconds: 900
+
+    # The child must announce its progress channel within this grace
+    # (Hermes runtime import is slow). Purely observational: a late handshake
+    # degrades to legacy_wallclock_seconds, it never fails the run.
+    startup_grace_seconds: 60

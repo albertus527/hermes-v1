@@ -337,6 +337,9 @@ class RevisionOrchestrator:
                 locked.deployment.pop("tested_snapshot", None)
                 locked.deployment.pop("latest_shown_preview", None)
                 locked.deployment.pop("preview_intent", None)
+                # Operation id for the supervised FRONTEND invocation below, so
+                # this revision's watchdog is isolated from any other build's.
+                revision_operation_id = str(locked.revisions.source_revision)
                 self.store.save(locked)
 
                 # Authorization and first external mutation share the writer.
@@ -360,6 +363,7 @@ class RevisionOrchestrator:
                         self.hermes_adapter.frontend_build(
                             project_id=project_id, brief=brief, workspace=workspace,
                             design_dna_instructions=instructions,
+                            build_operation_id=revision_operation_id,
                         ) if self.hermes_adapter is not None else
                         {"success": False, "error": "Hermes adapter not configured"}
                     )

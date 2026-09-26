@@ -582,6 +582,13 @@ def init_agent(
     notice_callback: callable = None,
     notice_clear_callback: callable = None,
     event_callback: Optional[Callable[[str, dict], None]] = None,
+    # Coarse liveness channel, notified from the agent activity clock
+    # (``_touch_activity``) on every progress point: model request start/complete,
+    # tool execution, streaming responses, terminal activity. Distinct from
+    # ``event_callback`` (lifecycle milestones) because it is high-frequency and
+    # must never fan out to lifecycle consumers. See
+    # ``agent/progress_events.py`` for the payload contract.
+    progress_callback: Optional[Callable[[str, dict], None]] = None,
     reaction_callback: Optional[Callable[[str], None]] = None,
     max_tokens: int = None,
     reasoning_config: Dict[str, Any] = None,
@@ -880,6 +887,7 @@ def init_agent(
     agent.notice_callback = notice_callback
     agent.notice_clear_callback = notice_clear_callback
     agent.event_callback = event_callback
+    agent.progress_callback = progress_callback
     agent.reaction_callback = reaction_callback
     agent.tool_gen_callback = tool_gen_callback
 

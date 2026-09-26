@@ -421,6 +421,9 @@ class QAOrchestrator:
             # validate against stale references.
             design_references = dict(state.design_references or {})
             state.revisions.source_revision += 1
+            # Operation id for the supervised FRONTEND invocation, so a QA
+            # repair's watchdog is never refreshed by the build's activity.
+            repair_operation_id = str(state.revisions.source_revision)
             invalidate_artifact(state)
             self.store.save(state)
         result = self.hermes_adapter.frontend_build(
@@ -428,6 +431,7 @@ class QAOrchestrator:
             brief=brief,
             workspace=workspace,
             design_dna_instructions=instructions,
+            build_operation_id=repair_operation_id,
         )
 
         # MEDIUM-5: verify protected starter/toolchain files after EVERY

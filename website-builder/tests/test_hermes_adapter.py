@@ -407,11 +407,12 @@ class TestHermesAdapter(unittest.TestCase):
         self.assertEqual(call_kwargs["toolsets"], ["file", "terminal", "skills"])
         self.assertEqual(call_kwargs["cwd"], workspace)
 
-    def test_frontend_build_requests_extended_timeout(self):
-        """FRONTEND build requests the longer 900s timeout.
+    def test_frontend_build_is_supervised_not_wall_clock_limited(self):
+        """FRONTEND runs under the activity-aware watchdog, not a fixed timer.
 
-        Real FRONTEND design + implementation calls exceed the generic 300s
-        default; the build must explicitly request the extended budget.
+        Regression lock for the p10 failure: a fixed 900s wall clock killed a
+        build that was still actively working. FRONTEND must now be supervised
+        on activity, and must not request a fixed timeout at all.
         """
         workspace = Path(self.tmpdir) / "workspaces" / "proj-timeout"
         workspace.mkdir(parents=True)
@@ -428,7 +429,39 @@ class TestHermesAdapter(unittest.TestCase):
             )
 
         call_kwargs = mock_cli.call_args[1]
-        self.assertEqual(call_kwargs["timeout_seconds"], 900)
+        self.assertTrue(call_kwargs["supervise"])
+        self.assertNotIn("timeout_seconds", call_kwargs)
+        self.assertEqual(call_kwargs["project_id"], "proj-timeout")
+        # Unchanged capability: FRONTEND keeps its tools and profile skills.
+        self.assertEqual(call_kwargs["toolsets"], ["file", "terminal", "skills"])
+        self.assertEqual(
+            call_kwargs["skills"],
+            [
+                "website-builder-environment",
+                "website-builder-product-scope",
+                "website-builder-design-dna",
+            ],
+        )
+
+    def test_frontend_build_forwards_build_operation_id(self):
+        """The build operation id reaches the supervised invocation.
+
+        Two invocations of the same project must be distinguishable, or one
+        could refresh the other's watchdog.
+        """
+        workspace = Path(self.tmpdir) / "workspaces" / "proj-op"
+        workspace.mkdir(parents=True)
+
+        with patch.object(self.adapter, "_run_hermes_cli") as mock_cli:
+            mock_cli.return_value = HermesResult(success=True, response="{}")
+            self.adapter.frontend_build(
+                project_id="proj-op",
+                brief={"name": "Northcut"},
+                workspace=workspace,
+                build_operation_id="7",
+            )
+
+        self.assertEqual(mock_cli.call_args[1]["build_operation_id"], "7")
 
     def test_run_hermes_cli_default_timeout_is_300(self):
         """Generic _run_hermes_cli retains the 300s default timeout."""
@@ -633,6 +666,85 @@ class TestFrontendTimeoutRecovery(unittest.TestCase):
             json.dumps(data), encoding="utf-8"
         )
 
+    def _invoke(self, result: HermesResult) -> dict:
+        with patch.object(self.adapter, "_run_hermes_cli") as mock_cli:
+            mock_cli.return_value = result
+            return self.adapter.frontend_build(
+                project_id="proj-timeout",
+                brief={"name": "Northcut"},
+                workspace=self.workspace,
+            )
+
+    def test_every_supervision_timeout_recovers_from_complete_artifacts(self):
+        """Idle, hard-fuse, and degraded-legacy timeouts all recover.
+
+        The artifact-recovery path is keyed on "this was a supervision
+        timeout", not on one specific code, so replacing the fixed wall clock
+        did not narrow it.
+        """
+        for code in (
+            "FRONTEND_IDLE_TIMEOUT",
+            "FRONTEND_HARD_TIMEOUT",
+            "FRONTEND_LEGACY_TIMEOUT",
+        ):
+            with self.subTest(code=code):
+                self.setUp()
+                try:
+                    self._write_workspace_dna({"version": 1, "brand_personality": "premium"})
+                    self._write_workspace_app("// generated implementation\n")
+                    result = self._invoke(
+                        HermesResult(
+                            success=False,
+                            error=f"FRONTEND invocation {code}",
+                            exit_code=124,
+                            error_code=code,
+                            timed_out=True,
+                        )
+                    )
+                    self.assertTrue(result["success"], code)
+                    self.assertEqual(
+                        result["design_dna"]["brand_personality"], "premium"
+                    )
+                finally:
+                    self.tearDown()
+
+    def test_normal_nonzero_exit_does_not_recover_from_artifacts(self):
+        """A plain nonzero exit is a different failure class from a timeout.
+
+        Complete artifacts on disk must not launder a genuine FRONTEND failure
+        into a success; only a supervision timeout may do that.
+        """
+        self._write_workspace_dna({"version": 1, "brand_personality": "premium"})
+        self._write_workspace_app("// generated implementation\n")
+
+        result = self._invoke(
+            HermesResult(
+                success=False,
+                error="provider returned 500",
+                exit_code=1,
+            )
+        )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error"], "provider returned 500")
+
+    def test_timeout_with_incomplete_artifacts_fails_with_its_code(self):
+        """Incomplete artifacts + timeout -> failure carrying the timeout code."""
+        self._write_workspace_app("// generated implementation\n")  # no design-dna.json
+
+        result = self._invoke(
+            HermesResult(
+                success=False,
+                error="FRONTEND invocation FRONTEND_HARD_TIMEOUT after 2700.0s",
+                exit_code=124,
+                error_code="FRONTEND_HARD_TIMEOUT",
+                timed_out=True,
+            )
+        )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_code"], "FRONTEND_HARD_TIMEOUT")
+
     def test_timeout_recovery_success(self):
         """Timeout + valid artifacts -> recoverable FRONTEND completion."""
         self._write_workspace_dna({"version": 1, "brand_personality": "premium"})
@@ -641,8 +753,10 @@ class TestFrontendTimeoutRecovery(unittest.TestCase):
         with patch.object(self.adapter, "_run_hermes_cli") as mock_cli:
             mock_cli.return_value = HermesResult(
                 success=False,
-                error="Hermes oneshot timed out after 900s",
+                error="FRONTEND invocation FRONTEND_IDLE_TIMEOUT after 180.0s",
                 exit_code=124,
+                error_code="FRONTEND_IDLE_TIMEOUT",
+                timed_out=True,
             )
             result = self.adapter.frontend_build(
                 project_id="proj-timeout",
@@ -662,8 +776,10 @@ class TestFrontendTimeoutRecovery(unittest.TestCase):
         with patch.object(self.adapter, "_run_hermes_cli") as mock_cli:
             mock_cli.return_value = HermesResult(
                 success=False,
-                error="Hermes oneshot timed out after 900s",
+                error="FRONTEND invocation FRONTEND_IDLE_TIMEOUT after 180.0s",
                 exit_code=124,
+                error_code="FRONTEND_IDLE_TIMEOUT",
+                timed_out=True,
             )
             result = self.adapter.frontend_build(
                 project_id="proj-timeout",
@@ -672,7 +788,8 @@ class TestFrontendTimeoutRecovery(unittest.TestCase):
             )
 
         self.assertFalse(result["success"])
-        self.assertIn("timed out", result["error"])
+        self.assertIn("FRONTEND_IDLE_TIMEOUT", result["error"])
+        self.assertEqual(result["error_code"], "FRONTEND_IDLE_TIMEOUT")
 
     def test_timeout_recovery_unchanged_starter(self):
         """Timeout + App.tsx identical to starter -> FAILED."""
@@ -682,8 +799,10 @@ class TestFrontendTimeoutRecovery(unittest.TestCase):
         with patch.object(self.adapter, "_run_hermes_cli") as mock_cli:
             mock_cli.return_value = HermesResult(
                 success=False,
-                error="Hermes oneshot timed out after 900s",
+                error="FRONTEND invocation FRONTEND_IDLE_TIMEOUT after 180.0s",
                 exit_code=124,
+                error_code="FRONTEND_IDLE_TIMEOUT",
+                timed_out=True,
             )
             result = self.adapter.frontend_build(
                 project_id="proj-timeout",
@@ -692,7 +811,8 @@ class TestFrontendTimeoutRecovery(unittest.TestCase):
             )
 
         self.assertFalse(result["success"])
-        self.assertIn("timed out", result["error"])
+        self.assertIn("FRONTEND_IDLE_TIMEOUT", result["error"])
+        self.assertEqual(result["error_code"], "FRONTEND_IDLE_TIMEOUT")
 
     def test_timeout_recovery_invalid_design_dna_json(self):
         """Timeout + malformed design-dna.json -> FAILED."""
@@ -704,8 +824,10 @@ class TestFrontendTimeoutRecovery(unittest.TestCase):
         with patch.object(self.adapter, "_run_hermes_cli") as mock_cli:
             mock_cli.return_value = HermesResult(
                 success=False,
-                error="Hermes oneshot timed out after 900s",
+                error="FRONTEND invocation FRONTEND_IDLE_TIMEOUT after 180.0s",
                 exit_code=124,
+                error_code="FRONTEND_IDLE_TIMEOUT",
+                timed_out=True,
             )
             result = self.adapter.frontend_build(
                 project_id="proj-timeout",
@@ -714,7 +836,8 @@ class TestFrontendTimeoutRecovery(unittest.TestCase):
             )
 
         self.assertFalse(result["success"])
-        self.assertIn("timed out", result["error"])
+        self.assertIn("FRONTEND_IDLE_TIMEOUT", result["error"])
+        self.assertEqual(result["error_code"], "FRONTEND_IDLE_TIMEOUT")
 
     def test_non_timeout_failure_not_recovered(self):
         """Non-timeout Hermes failure must NOT enter timeout recovery."""

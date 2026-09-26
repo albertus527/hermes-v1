@@ -31,11 +31,15 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from app.core.state import ProjectStateStore
+
+logger = logging.getLogger(__name__)
 
 # Hermes runtime seams. These are the exact helpers the Hermes oneshot path
 # (`hermes_cli.oneshot._run_agent`) itself uses — no new provider client,
@@ -80,6 +84,17 @@ class HermesResult:
     response: str = ""
     error: Optional[str] = None
     exit_code: int = 0
+    # Stable application error code when one applies (e.g. FRONTEND_IDLE_TIMEOUT,
+    # FRONTEND_HARD_TIMEOUT, FRONTEND_LEGACY_TIMEOUT). Absent for a normal
+    # nonzero exit, which is a different failure class from a supervision
+    # timeout.
+    error_code: Optional[str] = None
+    # True only for a supervision timeout, so the artifact-recovery path can
+    # admit watchdog timeouts while continuing to reject a normal nonzero exit.
+    timed_out: bool = False
+    # Bounded supervision metadata (ids, pid, elapsed, counters). Never contains
+    # prompts, source, credentials, or model output bodies.
+    invocation: Optional[Dict[str, Any]] = None
 
 
 class HermesAdapter:
@@ -398,11 +413,20 @@ class HermesAdapter:
         env_extra: Optional[Dict[str, str]] = None,
         timeout_seconds: int = 300,
         role: Optional[str] = None,
+        project_id: Optional[str] = None,
+        build_operation_id: Optional[str] = None,
+        supervise: bool = False,
     ) -> HermesResult:
         """Run a single Hermes oneshot turn via the scripted CLI boundary.
 
         Uses `hermes -z` (or `python -m hermes_cli.main -z`) with explicit
         toolsets and skills. stdout is the final response text.
+
+        When *supervise* is set (FRONTEND only), execution runs under the
+        activity-aware watchdog instead of a fixed wall-clock timeout: the run
+        is killed for going idle or for hitting the hard fuse, never simply for
+        taking a long time. The non-supervised path is unchanged and keeps its
+        fixed ``timeout_seconds`` behaviour for every other role.
         """
         if role is not None:
             try:
@@ -465,6 +489,15 @@ class HermesAdapter:
         # Run in the specified working directory
         cwd = cwd or self.repo_root
 
+        if supervise:
+            return self._run_hermes_cli_supervised(
+                cmd,
+                cwd=cwd,
+                env=env,
+                project_id=project_id or "",
+                build_operation_id=build_operation_id or "",
+            )
+
         try:
             proc = subprocess.run(
                 cmd,
@@ -485,10 +518,134 @@ class HermesAdapter:
                 exit_code=proc.returncode,
             )
         except subprocess.TimeoutExpired:
+            # timed_out is a true invariant: every 124 this method returns is a
+            # timeout, on the supervised and legacy paths alike.
             return HermesResult(
                 success=False,
                 error=f"Hermes oneshot timed out after {timeout_seconds}s",
                 exit_code=124,
+                timed_out=True,
+            )
+        except Exception as exc:
+            return HermesResult(
+                success=False,
+                error=str(exc),
+                exit_code=1,
+            )
+
+    def _run_hermes_cli_supervised(
+        self,
+        cmd: List[str],
+        *,
+        cwd: Path,
+        env: Dict[str, str],
+        project_id: str,
+        build_operation_id: str,
+    ) -> HermesResult:
+        """Run one FRONTEND invocation under the activity-aware watchdog.
+
+        The invocation gets its own identity, its own progress file, and its own
+        watchdog. Nothing is shared with any other project or build, so activity
+        elsewhere can never keep this run alive.
+        """
+        # Imported lazily: the watchdog pulls in agent.deadline, and the
+        # non-supervised path must stay usable in environments where the Hermes
+        # tree is only partially available.
+        from app.hermes import watchdog as wd
+
+        invocation_id = uuid.uuid4().hex
+        runs_dir = self.hermes_home / "runs" / invocation_id
+        try:
+            runs_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            runs_dir = Path(tempfile.gettempdir()) / f"wb-run-{invocation_id}"
+            runs_dir.mkdir(parents=True, exist_ok=True)
+        progress_path = runs_dir / "progress.jsonl"
+
+        try:
+            run = wd.supervise_frontend_run(
+                cmd,
+                cwd=cwd,
+                env=env,
+                project_id=project_id,
+                invocation_id=invocation_id,
+                build_operation_id=build_operation_id or invocation_id,
+                progress_path=progress_path,
+            )
+        except wd.WatchdogUnavailable as exc:
+            # Without whole-tree termination we must not supervise: killing only
+            # the direct child is what orphans descendants. Fall back to exactly
+            # the pre-watchdog behaviour instead of degrading supervision.
+            logger.error(
+                "FRONTEND supervision unavailable for project=%s invocation=%s "
+                "- falling back to the legacy wall-clock timeout (%s)",
+                project_id, invocation_id, exc,
+            )
+            return self._run_hermes_cli_legacy(
+                cmd, cwd=cwd, env=env,
+                timeout_seconds=wd.resolve_watchdog_policy().legacy_wallclock_seconds,
+            )
+        except Exception as exc:
+            return HermesResult(
+                success=False,
+                error=str(exc),
+                exit_code=1,
+                invocation={"invocation_id": invocation_id, "project_id": project_id},
+            )
+        finally:
+            try:
+                runs_dir.rmdir()
+            except OSError:
+                pass
+
+        if run.outcome is not None:
+            return HermesResult(
+                success=False,
+                error=f"FRONTEND invocation {run.outcome} after {run.diagnostics.get('elapsed_seconds')}s",
+                exit_code=124,
+                error_code=run.outcome,
+                timed_out=True,
+                invocation=run.diagnostics,
+            )
+
+        return HermesResult(
+            success=run.returncode == 0,
+            response=run.stdout.strip(),
+            error=run.stderr if run.returncode != 0 else None,
+            exit_code=run.returncode,
+            invocation=run.diagnostics,
+        )
+
+    def _run_hermes_cli_legacy(
+        self,
+        cmd: List[str],
+        cwd: Path,
+        env: Dict[str, str],
+        timeout_seconds: int,
+    ) -> HermesResult:
+        """Pre-watchdog fixed-timeout execution, used only as a fail-safe."""
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(cwd),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+            )
+            return HermesResult(
+                success=proc.returncode == 0,
+                response=proc.stdout.strip(),
+                error=proc.stderr if proc.returncode != 0 else None,
+                exit_code=proc.returncode,
+            )
+        except subprocess.TimeoutExpired:
+            return HermesResult(
+                success=False,
+                error="FRONTEND invocation FRONTEND_LEGACY_TIMEOUT",
+                exit_code=124,
+                error_code="FRONTEND_LEGACY_TIMEOUT",
+                timed_out=True,
             )
         except Exception as exc:
             return HermesResult(
@@ -985,17 +1142,27 @@ Respond in this exact JSON format:
         brief: Dict[str, Any],
         workspace: Path,
         design_dna_instructions: Optional[str] = None,
+        build_operation_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Use Hermes FRONTEND role to derive design direction and build the site.
 
         FRONTEND owns design/build decisions. Application owns workspace/lifecycle.
         FRONTEND does NOT run npm cheap checks — application code does.
+
+        The run is supervised by the activity-aware watchdog, NOT a fixed
+        wall-clock timeout: a FRONTEND invocation is killed for going idle or for
+        hitting the hard safety fuse, never merely for taking a long time.
+
+        *build_operation_id* distinguishes two invocations of the SAME project so
+        neither can refresh the other's watchdog.
         """
         # Build the FRONTEND prompt
         prompt = self._build_frontend_prompt(brief, workspace, design_dna_instructions)
 
         # FRONTEND uses explicit toolsets: file, terminal, skills
         # It does NOT silently inherit the broader default hermes-cli toolset.
+        # These three toolsets and the three profile skills are unchanged: this
+        # change is timeout supervision only.
         result = self._run_hermes_cli(
             prompt=prompt,
             role="FRONTEND",
@@ -1010,21 +1177,31 @@ Respond in this exact JSON format:
                 "PROJECT_ID": project_id,
                 "WORKSPACE_ROOT": str(workspace),
             },
-            timeout_seconds=900,
+            supervise=True,
+            project_id=project_id,
+            build_operation_id=build_operation_id,
         )
 
         if not result.success:
             # Recoverable timeout: Hermes produced the required artifacts but
-            # missed its final response / exit before the subprocess timeout.
+            # missed its final response / exit before its watchdog bound fired.
             # The generated workspace artifacts and deterministic checks are
-            # authoritative for this recovery path.
-            if result.exit_code == 124 and self._has_complete_frontend_artifacts(workspace):
+            # authoritative for this recovery path. ``timed_out`` admits every
+            # supervision timeout (idle, hard fuse, degraded legacy) and still
+            # excludes a normal nonzero exit. The completeness check itself is
+            # unchanged.
+            if result.timed_out and self._has_complete_frontend_artifacts(workspace):
                 return self._parse_frontend_response("", workspace)
-            return {
+            failure = {
                 "success": False,
                 "error": result.error or "FRONTEND build failed",
                 "design_dna": None,
             }
+            if result.error_code:
+                failure["error_code"] = result.error_code
+            if result.invocation:
+                failure["invocation"] = result.invocation
+            return failure
 
         # Parse FRONTEND response for Design DNA
         return self._parse_frontend_response(result.response, workspace)

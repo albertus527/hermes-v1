@@ -199,6 +199,152 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
         pass
 
 
+# ---------------------------------------------------------------------------
+# Progress channel (liveness) for supervised oneshot runs.
+# ---------------------------------------------------------------------------
+#
+# A supervisor cannot distinguish "hung" from "mid-way through a long model
+# request" by looking at the clock, so it needs the agent's own activity
+# stream.  When ``HERMES_ONESHOT_PROGRESS_FILE`` names a path, oneshot emits
+# one bounded JSON line per progress event there and wires
+# ``AIAgent.progress_callback`` to it.  With the variable unset this is a
+# strict no-op and oneshot behaves exactly as before.
+#
+# Transport notes:
+#   * JSONL on a file, not stdout.  ``run_oneshot`` redirects stdout AND stderr
+#     to devnull for the whole call tree and disables stdlib logging, so
+#     neither can carry liveness.
+#   * One ``os.write`` per event on an ``O_APPEND`` descriptor.  A single
+#     append-mode write is the strongest atomicity guarantee available for a
+#     shared append-only file, so a supervisor tailing this stream can never
+#     observe a half-written or interleaved line.
+#   * The first line is a ``channel_ready`` handshake, written before the agent
+#     is built.  A supervisor that never sees it knows the child has no
+#     progress channel and must fall back instead of assuming a live build is
+#     idle.
+#   * Payload is bounded by construction: kind, phase, and the activity
+#     description (already clamped to ACTIVITY_DESCRIPTION_MAX).  No prompt,
+#     no tool arguments, no model output, no credentials.
+#
+# Both variables are an internal supervisor mechanism, not user-facing
+# configuration; the supervisor's *timeouts* belong in the caller's own config.
+
+PROGRESS_FILE_ENV = "HERMES_ONESHOT_PROGRESS_FILE"
+PROGRESS_ID_ENV = "HERMES_ONESHOT_PROGRESS_ID"
+
+#: Defensive cap on a single serialized event. The real bound is far smaller
+#: (kind + phase + a <=120 char description), so this only guards against a
+#: future field being added without a bound.
+_PROGRESS_MAX_EVENT_BYTES = 1024
+
+#: Minimum gap between coalesced ``active`` events for the same kind. Boundary
+#: events (``started``/``completed``) are never coalesced — they are what let a
+#: supervisor tell "request in flight" from "hung". Streaming can fire this
+#: clock thousands of times a minute, so the file must not grow unbounded.
+_PROGRESS_ACTIVE_COALESCE_S = 5.0
+
+
+class _OneshotProgressEmitter:
+    """Append-only JSONL liveness stream. Never raises, never blocks."""
+
+    __slots__ = ("_fd", "_run_id", "_last_active_mono", "_closed")
+
+    def __init__(self, path: str, run_id: str = "") -> None:
+        self._fd = os.open(
+            path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600
+        )
+        self._run_id = run_id or ""
+        # None, not 0.0: time.monotonic() is uptime-derived and can legitimately
+        # be small on a freshly booted host, which would suppress the first
+        # active event against a 0.0 baseline.
+        self._last_active_mono: Optional[float] = None
+        self._closed = False
+
+    def _emit(self, kind: str, phase: str, desc: str = "") -> None:
+        if self._closed:
+            return
+        if phase == "active":
+            import time as _time
+
+            now = _time.monotonic()
+            if (
+                self._last_active_mono is not None
+                and (now - self._last_active_mono) < _PROGRESS_ACTIVE_COALESCE_S
+            ):
+                return
+            self._last_active_mono = now
+        try:
+            import json
+
+            line = json.dumps(
+                {
+                    "run_id": self._run_id,
+                    "event": kind if kind == "channel_ready" else "progress",
+                    "kind": kind,
+                    "phase": phase,
+                    "desc": desc,
+                },
+                separators=(",", ":"),
+            )
+            if not line.endswith("\n"):
+                line += "\n"
+            data = line.encode("utf-8", "replace")
+            if len(data) > _PROGRESS_MAX_EVENT_BYTES:
+                data = data[: _PROGRESS_MAX_EVENT_BYTES - 1] + b"\n"
+            # Single append-mode write: the line lands whole or not at all.
+            os.write(self._fd, data)
+        except Exception:
+            # A broken progress stream must never affect the run. Close the
+            # descriptor so we stop paying for a failing write per event.
+            try:
+                self.close()
+            except Exception:
+                pass
+
+    def on_progress(self, kind: str, payload: dict) -> None:
+        self._emit(
+            str(payload.get("kind") or kind or "UNKNOWN"),
+            str(payload.get("phase") or "active"),
+            str(payload.get("desc") or ""),
+        )
+
+    def announce_ready(self) -> None:
+        # Phase "ready", not "active": the handshake is a capability
+        # announcement, not liveness. Using "active" here would both consume
+        # the coalescing window (suppressing the first real event) and let a
+        # supervisor count the handshake as activity.
+        self._emit("channel_ready", "ready", "")
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            try:
+                os.close(self._fd)
+            except Exception:
+                pass
+
+
+def _build_progress_emitter() -> Optional["_OneshotProgressEmitter"]:
+    """Install the progress emitter when the supervisor asked for one.
+
+    Returns ``None`` when no progress file is configured (the default, and a
+    strict no-op) or when the stream cannot be opened — in which case the
+    supervisor sees no ``channel_ready`` and falls back to its own bound.
+    """
+    path = (os.getenv(PROGRESS_FILE_ENV) or "").strip()
+    if not path:
+        return None
+    try:
+        Path(path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+        emitter = _OneshotProgressEmitter(
+            path, run_id=(os.getenv(PROGRESS_ID_ENV) or "").strip()
+        )
+    except Exception:
+        return None
+    emitter.announce_ready()
+    return emitter
+
+
 def run_oneshot(
     prompt: str,
     model: Optional[str] = None,
@@ -462,6 +608,9 @@ def _run_agent(
     skills_prompt = _build_preloaded_skills_prompt(skills)
 
     session_db = _create_session_db_for_oneshot()
+    # Liveness stream for an external supervisor. None unless
+    # HERMES_ONESHOT_PROGRESS_FILE is set, so the default path is untouched.
+    progress_emitter = _build_progress_emitter()
     # The try spans agent construction (not just ``chat``) so the SQLite store
     # opened above is always closed — including when ``AIAgent(...)`` itself
     # raises on a provider/config error. The one-shot exit path hard-exits via
@@ -499,6 +648,10 @@ def _run_agent(
             #   - dangerous-command approval → bypassed via HERMES_YOLO_MODE=1
             #   - skill secret capture → returns gracefully when no callback set
             clarify_callback=_oneshot_clarify_callback,
+            # Liveness only; None in the default (unsupervised) path.
+            progress_callback=(
+                progress_emitter.on_progress if progress_emitter is not None else None
+            ),
         )
 
         # Belt-and-braces: make sure AIAgent doesn't invoke any streaming
@@ -546,6 +699,11 @@ def _run_agent(
                 session_db.close()
             except Exception:
                 logging.debug("oneshot session store cleanup failed", exc_info=True)
+        if progress_emitter is not None:
+            try:
+                progress_emitter.close()
+            except Exception:
+                pass
 
 
 def _oneshot_clarify_callback(question: str, choices=None, multi_select=False) -> str:

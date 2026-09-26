@@ -514,6 +514,9 @@ Respond with a JSON summary:
             repair_brief = dict(state.brief)
             policy_state = state
             state.revisions.source_revision += 1
+            # Distinct operation id so this repair's watchdog can never be
+            # refreshed by the initial generation's activity.
+            repair_operation_id = str(state.revisions.source_revision)
             invalidate_artifact(state)
             self.store.save(state)
 
@@ -522,6 +525,7 @@ Respond with a JSON summary:
             brief=repair_brief,
             workspace=workspace,
             design_dna_instructions=instructions,
+            build_operation_id=repair_operation_id,
         )
 
         # Toolchain protection stays mandatory: verify protected
@@ -629,6 +633,8 @@ Respond with a JSON summary:
                 # to be atomic.
                 self.store.transition_lifecycle_locked(state, ProjectLifecycle.RUNNING)
                 state.revisions.source_revision += 1
+                # Operation id for the supervised FRONTEND invocation below.
+                frontend_operation_id = str(state.revisions.source_revision)
                 self.store.save(state)
 
             workspace = self.runner.create_workspace(project_id)
@@ -642,6 +648,7 @@ Respond with a JSON summary:
                     brief=brief,
                     workspace=workspace,
                     design_dna_instructions=combined_instructions,
+                    build_operation_id=frontend_operation_id,
                 )
 
                 # MEDIUM-5: verify the protected starter/toolchain identity
@@ -670,14 +677,32 @@ Respond with a JSON summary:
 
                 if not frontend_result.get("success"):
                     err_text = frontend_result.get("error", "Unknown FRONTEND error")
-                    err_code = "TOOLCHAIN_MUTATION_REJECTED" if "TOOLCHAIN_MUTATION_REJECTED" in err_text else err_text
+                    # Prefer the adapter's stable supervision code (e.g.
+                    # FRONTEND_IDLE_TIMEOUT / FRONTEND_HARD_TIMEOUT) over
+                    # re-deriving one from free text. The existing
+                    # TOOLCHAIN_MUTATION_REJECTED substring test stays as the
+                    # fallback for results that carry no code.
+                    err_code = (
+                        frontend_result.get("error_code")
+                        or (
+                            "TOOLCHAIN_MUTATION_REJECTED"
+                            if "TOOLCHAIN_MUTATION_REJECTED" in err_text
+                            else err_text
+                        )
+                    )
                     with self.store.acquire_writer(project_id) as state:
                         self.store.transition_lifecycle_locked(state, ProjectLifecycle.FAILED)
-                        state.failure = {
+                        failure: Dict[str, Any] = {
                             "phase": "frontend_build",
                             "error": err_text,
                             "failed_at": time.time(),
                         }
+                        # Bounded supervision metadata for operators: which
+                        # invocation ran, for how long, and why it ended. Never
+                        # prompts, source, or model output.
+                        if frontend_result.get("invocation"):
+                            failure["invocation"] = frontend_result["invocation"]
+                        state.failure = failure
                         self.store.save(state)
 
                     return BuildResult(
@@ -685,6 +710,7 @@ Respond with a JSON summary:
                         project_id=project_id,
                         workspace=workspace,
                         error=err_code,
+                        error_code=err_code if err_code != err_text else None,
                         duration_seconds=time.time() - start_time,
                     )
 

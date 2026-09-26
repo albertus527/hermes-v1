@@ -492,6 +492,8 @@ class AIAgent:
         notice_callback: callable = None,
         notice_clear_callback: callable = None,
         event_callback: Optional[Callable[[str, dict], None]] = None,
+        # Coarse liveness channel -- see agent/progress_events.py.
+        progress_callback: Optional[Callable[[str, dict], None]] = None,
         reaction_callback: Optional[Callable[[str], None]] = None,
         max_tokens: int = None,
         reasoning_config: Dict[str, Any] = None,
@@ -583,6 +585,7 @@ class AIAgent:
             notice_callback=notice_callback,
             notice_clear_callback=notice_clear_callback,
             event_callback=event_callback,
+            progress_callback=progress_callback,
             reaction_callback=reaction_callback,
             max_tokens=max_tokens,
             reasoning_config=reasoning_config,
@@ -4092,6 +4095,19 @@ class AIAgent:
         self._last_activity_ts = time.time()
         self._last_activity_desc = bound_activity_description(desc)
         self._last_activity_provenance = normalize_activity_provenance(provenance)
+        # Coarse liveness notification for supervised runs. Kept LAST and fully
+        # guarded: this method is the agent's activity clock, called on every
+        # tool call, API call, and stream delta, and a broken consumer must
+        # never be able to break the agent loop.
+        progress_cb = getattr(self, "progress_callback", None)
+        if progress_cb is not None:
+            try:
+                from agent.progress_events import make_progress_payload
+
+                payload = make_progress_payload(self._last_activity_desc)
+                progress_cb(payload["kind"], payload)
+            except Exception:
+                logger.debug("progress_callback notification failed", exc_info=True)
         if os.environ.get("HERMES_KANBAN_TASK"):
             try:
                 from tools.kanban_tools import (
