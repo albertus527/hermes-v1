@@ -112,6 +112,15 @@ def can_transition(current: ProjectLifecycle, target: ProjectLifecycle) -> bool:
     return target in _TRANSITIONS.get(current, set())
 
 
+def has_outgoing_transitions(current: ProjectLifecycle) -> bool:
+    """Return True if *current* permits at least one transition.
+
+    A state with no outgoing edge (CANCELED) can never accept a lifecycle
+    change, so no orchestration layer that drives transitions can act on it.
+    """
+    return bool(_TRANSITIONS.get(current, set()))
+
+
 def transition(current: ProjectLifecycle, target: ProjectLifecycle) -> ProjectLifecycle:
     """Validate and return the target lifecycle state.
 

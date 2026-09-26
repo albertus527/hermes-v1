@@ -32,7 +32,35 @@ from app.core.contracts import OperationResult
 from app.core.lifecycle import ProjectLifecycle
 from app.core.state import ProjectStateStore
 from app.projects.build import FrontendBuilder, BuildResult
+from app.qa.orchestrator import QAResult
 from app.sandbox.runner import ProjectRunner
+
+
+def _valid_dna() -> dict:
+    """A minimal Design DNA that passes the real composition validation."""
+    return {
+        "version": 1,
+        "brand_personality": "premium, minimalist",
+        "palette": {"primary": "#000000"},
+        "typography": {"heading_font": "Inter"},
+        "spacing": {"density": "comfortable"},
+        "page_inventory": ["home"],
+        "layout": {"navigation": "top-bar"},
+        "motion": {"enabled": True},
+        "primary_cta": {"label": "Book Now", "destination": None},
+        "assets": [],
+        "verified_content": {"name": "Northcut", "what": "barbershop"},
+        "unresolved_facts": ["cta_destination"],
+    }
+
+
+def _passing_checks() -> dict:
+    """The cheap-check result shape FrontendBuilder expects when all pass."""
+    return {
+        "npm_ci": {"success": True},
+        "npm_build": {"success": True},
+        "npm_typecheck": {"success": True},
+    }
 
 
 def _queue_project(store: ProjectStateStore, project_id: str) -> None:
@@ -224,7 +252,12 @@ class TestFrontendBuilderWithHermes(unittest.TestCase):
         result = self.builder.build("proj-hermes-6", brief)
 
         self.assertFalse(result.success)
-        self.assertIn("MAX_WORKERS=1", result.error)
+        # A stable, mapped application code, not free text: the dispatcher
+        # forwards `error` to the user, and an unmapped string rendered as the
+        # generic "Something went wrong" with no hint that this is transient.
+        self.assertEqual(result.error, "WORKER_BUSY")
+        self.assertEqual(result.error_code, "WORKER_BUSY")
+        self.assertTrue(result.retryable)
 
     def test_build_result_has_no_qa_artifacts(self):
         """BuildResult does not expose QA-specific artifacts."""
@@ -843,6 +876,132 @@ class TestBuildErrorPropagation(unittest.TestCase):
         state = self.store.load("proj-boom")
         self.assertEqual(state.lifecycle, ProjectLifecycle.FAILED.value)
         self.assertIn("kaboom-internal-detail", state.failure["error"])
+
+    def test_exception_after_a_delivered_preview_does_not_mark_the_project_failed(self):
+        """A preview the user has ALREADY been sent must not be buried.
+
+        PREVIEW_READY -> FAILED is a legal edge, so an exception raised after
+        the preview was deployed, smoke-tested and delivered used to silently
+        contradict state the user can see, and follow-up work was refused.
+        """
+        _queue_project(self.store, "proj-delivered")
+
+        def _pid(args, kwargs):
+            """The project id, whether passed positionally or by keyword."""
+            return args[0] if args else kwargs["project_id"]
+
+        def _qa_succeeds(*args, **kwargs):
+            # Model the REAL QA outcome: a passing run transitions the project
+            # to PREVIEW_READY (that is what _finalize_success does), which is
+            # the lifecycle the outer handler observes in the post-preview
+            # window.
+            pid = _pid(args, kwargs)
+            with self.store.acquire_writer(pid) as state:
+                self.store.transition_lifecycle_locked(
+                    state, ProjectLifecycle.PREVIEW_READY)
+                state.revisions.qa_revision = state.revisions.source_revision
+                self.store.save(state)
+            return QAResult(project_id=pid, success=True, attempts=[],
+                            repair_attempts=0)
+
+        def _delivered_then_raises(*args, **kwargs):
+            pid = _pid(args, kwargs)
+            # The preview was already delivered for THIS revision...
+            with self.store.acquire_writer(pid) as state:
+                state.deployment["latest_shown_preview"] = {
+                    "operation_id": "op-1",
+                    "source_revision": state.revisions.source_revision,
+                    "preview_url": "https://x.vercel.app",
+                    "photo_attempted": True, "photo_outcome": "SENT",
+                    "text_attempted": True, "text_outcome": "SENT",
+                }
+                self.store.save(state)
+            # ...and only then does something go wrong.
+            raise RuntimeError("raised after delivery")
+
+        self.adapter.frontend_build.return_value = {
+            "success": True, "design_dna": _valid_dna()}
+        # Use the same builder shape as the passing-build tests in this file so
+        # the run reaches Phase 9 instead of failing earlier in Phase 7.
+        builder = FrontendBuilder(
+            self.runner, self.store, hermes_adapter=self.adapter)
+        builder.preview_orchestrator = MagicMock()
+        builder.preview_orchestrator.run_owned.side_effect = _delivered_then_raises
+
+        with patch.object(builder, "_run_fixed_checks",
+                          return_value=_passing_checks()), \
+             patch("app.projects.build.QAOrchestrator") as qa_cls:
+            qa_cls.return_value.run.side_effect = _qa_succeeds
+            result = builder.build("proj-delivered", self.brief)
+
+        self.assertFalse(result.success)
+        state = self.store.load("proj-delivered")
+        self.assertEqual(state.lifecycle, ProjectLifecycle.PREVIEW_READY.value)
+        self.assertIsNotNone(state.failure)
+        self.assertEqual(state.failure["phase"], "post_preview")
+        # The delivered preview is untouched and still the latest one.
+        self.assertEqual(state.deployment["latest_shown_preview"]["preview_url"],
+                         "https://x.vercel.app")
+
+    def test_exception_with_a_stale_preview_still_marks_failed(self):
+        """A shown preview for a DIFFERENT revision is not a delivered preview
+        for this build, so the project must still fail closed."""
+        _queue_project(self.store, "proj-stale-preview")
+
+        def _pid(args, kwargs):
+            return args[0] if args else kwargs["project_id"]
+
+        def _qa_succeeds(*args, **kwargs):
+            pid = _pid(args, kwargs)
+            with self.store.acquire_writer(pid) as state:
+                self.store.transition_lifecycle_locked(
+                    state, ProjectLifecycle.PREVIEW_READY)
+                self.store.save(state)
+            return QAResult(project_id=pid, success=True, attempts=[],
+                            repair_attempts=0)
+
+        def _delivered_then_raises(*args, **kwargs):
+            pid = _pid(args, kwargs)
+            with self.store.acquire_writer(pid) as state:
+                # Shown for an EARLIER revision than the one being built.
+                state.deployment["latest_shown_preview"] = {
+                    "operation_id": "op-old",
+                    "source_revision": state.revisions.source_revision - 1,
+                    "preview_url": "https://old.vercel.app",
+                }
+                self.store.save(state)
+            raise RuntimeError("boom")
+
+        self.adapter.frontend_build.return_value = {
+            "success": True, "design_dna": _valid_dna()}
+        builder = FrontendBuilder(
+            self.runner, self.store, hermes_adapter=self.adapter)
+        builder.preview_orchestrator = MagicMock()
+        builder.preview_orchestrator.run_owned.side_effect = _delivered_then_raises
+
+        with patch.object(builder, "_run_fixed_checks",
+                          return_value=_passing_checks()), \
+             patch("app.projects.build.QAOrchestrator") as qa_cls:
+            qa_cls.return_value.run.side_effect = _qa_succeeds
+            result = builder.build("proj-stale-preview", self.brief)
+
+        self.assertFalse(result.success)
+        state = self.store.load("proj-stale-preview")
+        self.assertEqual(state.lifecycle, ProjectLifecycle.FAILED.value)
+        self.assertEqual(state.failure["phase"], "build")
+
+    def test_exception_before_any_preview_still_marks_failed(self):
+        """Regression: with no delivered preview, the handler must still fail
+        the project closed."""
+        _queue_project(self.store, "proj-nopreview")
+        self.adapter.frontend_build.side_effect = RuntimeError("boom")
+
+        result = self.builder.build("proj-nopreview", self.brief)
+
+        self.assertFalse(result.success)
+        state = self.store.load("proj-nopreview")
+        self.assertEqual(state.lifecycle, ProjectLifecycle.FAILED.value)
+        self.assertEqual(state.failure["phase"], "build")
 
 
 # ---------------------------------------------------------------------------

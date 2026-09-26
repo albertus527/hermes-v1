@@ -159,9 +159,21 @@ class ProjectAccess:
             return found
 
     def read(self, project_id, principal_id=None, reference_token=None):
-        with self.store.acquire_writer(project_id) as state:
-            if not can_view(state, principal_id, reference_token):
-                raise AuthzError()
-            # No internal paths, ACLs, identities, tokens, briefs or adapter metadata.
-            return {"project_id": state.project_id, "lifecycle": state.lifecycle,
-                    "source_revision": state.revisions.source_revision}
+        """Read the public view of a project.
+
+        Deliberately lock-FREE. This is a pure read of three fields and it is
+        reachable on the ``read`` action ahead of the dispatcher claim block;
+        taking the exclusive writer lock made a status query block every
+        build/revise/preview writer on that project and could exceed the 30s
+        lock timeout. ``load`` reads a document that ``save`` replaces
+        atomically, so a lock-free read observes either the old or the new
+        state, never a partial one.
+        """
+        state = self.store.load(project_id)
+        if state is None:
+            raise AuthzError("NO_PROJECT_STATE")
+        if not can_view(state, principal_id, reference_token):
+            raise AuthzError()
+        # No internal paths, ACLs, identities, tokens, briefs or adapter metadata.
+        return {"project_id": state.project_id, "lifecycle": state.lifecycle,
+                "source_revision": state.revisions.source_revision}

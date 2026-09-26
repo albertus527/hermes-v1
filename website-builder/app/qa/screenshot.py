@@ -23,6 +23,10 @@ from typing import Callable, List, Optional
 # Fixed viewport sizes per canonical Phase 8 spec.
 DESKTOP_VIEWPORT = (1440, 900)
 MOBILE_VIEWPORT = (390, 844)
+# Maximum horizontal space a browser may reserve for a vertical scrollbar.
+# Used only for ``documentElement.clientWidth``, which is innerWidth minus this
+# reservation; innerWidth/innerHeight remain exact.
+SCROLLBAR_ALLOWANCE_PX = 32
 
 
 class ScreenshotError(RuntimeError):
@@ -314,16 +318,34 @@ def validate_screenshot_dimensions(screenshots: ScreenshotSet) -> None:
             "innerHeight": metrics.inner_height,
             "documentElement.clientWidth": metrics.document_client_width,
         }
+        # innerWidth/innerHeight are what ``set viewport`` sets, and the
+        # browser guarantees them exactly -> exact equality is correct.
         for metric_name, expected in (
             ("innerWidth", expected_width),
             ("innerHeight", expected_height),
-            ("documentElement.clientWidth", expected_width),
         ):
             if actual_viewport[metric_name] != expected:
                 raise ScreenshotError(
                     f"screenshot evidence integrity failure: {label} {metric_name} is "
                     f"{actual_viewport[metric_name]}, expected {expected}; evidence rejected before VISION"
                 )
+        # documentElement.clientWidth is the CONTENT width: it is innerWidth
+        # minus any space the browser reserves for a vertical scrollbar. A
+        # marketing page is virtually always taller than the viewport, so a
+        # browser that reserves scrollbar space reports clientWidth < viewport
+        # on a capture that is perfectly valid. Requiring exact equality here
+        # rejected correct evidence as an infrastructure failure, which does not
+        # consume a repair attempt and lands the project in FAILED with nothing
+        # actionable. Allow a scrollbar's worth of slack; still reject a real
+        # mismatch (a viewport that was not applied).
+        client_width = actual_viewport["documentElement.clientWidth"]
+        if not (expected_width - SCROLLBAR_ALLOWANCE_PX <= client_width <= expected_width):
+            raise ScreenshotError(
+                f"screenshot evidence integrity failure: {label} "
+                f"documentElement.clientWidth is {client_width}, expected "
+                f"{expected_width} (within {SCROLLBAR_ALLOWANCE_PX}px scrollbar "
+                f"tolerance); evidence rejected before VISION"
+            )
 
         png_width, _png_height = _png_dimensions(path)
         if png_width < expected_width:

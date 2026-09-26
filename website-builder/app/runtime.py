@@ -68,7 +68,7 @@ def _diag_log(tag: str) -> None:
 from app.channels.dispatch import AuthenticatedTelegramContext, TelegramDispatcher
 from app.channels.telegram import NormalizedMessage, TelegramNormalizer
 from app.core.intake import IntakeProcessor
-from app.core.state import ProjectStateStore
+from app.core.state import ProjectStateStore, reconcile_stranded_projects
 from app.core.registry import ConversationRegistryStore, DuplicateProjectName, slugify_display_name
 from app.core.secrets import BypassSecretStore
 from app.conversations import ConversationRoute, ConversationRouter
@@ -923,6 +923,102 @@ _HARD_PREVIEW_ERRORS = frozenset({
     "EVENT_RECONCILIATION_REQUIRED",
     "EVENT_ACTION_MISMATCH",
 })
+
+
+# ---------------------------------------------------------------------------
+# User-facing error copy
+# ---------------------------------------------------------------------------
+#
+# Every code an operation can surface needs deliberate, specific copy. A code
+# that silently falls through to the generic fallback hides the real cause from
+# the user and from the operator reading the chat transcript: the two worst
+# offenders were WORKER_BUSY ("busy, retry shortly") and
+# OUTPUT_COMMIT_FAILED (a broken local git repo), both of which rendered as
+# "Something went wrong", inviting a retry that could not help.
+#
+# When adding an error code, add it here. ``render_error_message`` is a pure
+# function precisely so that coverage is unit-testable without a receive loop.
+
+ERROR_MESSAGES: Dict[str, str] = {
+    "UNAUTHORIZED_ROLE": "You are not authorized to modify this project.",
+    "BUILD_NOT_ALLOWED_IN_LIFECYCLE": "The project is not ready to build yet.",
+    "DIRECTION_CHOICE_PENDING": "Please choose a design direction first.",
+    "EVENT_RECONCILIATION_REQUIRED": "A previous operation needs reconciliation. Please try again.",
+    "UNSUPPORTED_ACTION": "That action is not supported.",
+    "REVISION_NOT_ALLOWED_IN_LIFECYCLE": "Revisions are not allowed right now.",
+    "APPROVAL_NOT_ALLOWED_IN_LIFECYCLE": "Approval is not allowed right now.",
+    "PROMOTION_NOT_ALLOWED_IN_LIFECYCLE": "Publication is not allowed right now.",
+    "NO_SHOWN_PREVIEW": "No preview has been shown yet.",
+    "STALE_APPROVAL": "The approval is stale. Please review the latest preview.",
+    "STALE_QA_BINDING": "The preview is outdated. Please wait for the latest build.",
+    "NOT_APPROVED": "The preview must be approved before publication.",
+    "OUT_OF_ORDER_REVISION": "Revision is out of order. Please try again.",
+    "REVISION_ALREADY_APPLIED": "This revision has already been applied.",
+    "SLUG_COLLISION": (
+        "Nama itu sudah dipakai untuk link preview. Mau pakai nama "
+        "lain, atau aku kasih beberapa pilihan?"
+    ),
+    "DEPLOYMENT_ALREADY_LIVE": "This deployment is already live in production.",
+    "SMOKE_FAILED": (
+        "Preview-nya belum lolos pemeriksaan. Aku akan coba benerin dan "
+        "bikin preview baru — kirim aja perubahan yang kamu mau."
+    ),
+    "VERCEL_BYPASS_AUTH_FAILED": (
+        "Preview-nya belum bisa diakses untuk dicek. Aku akan coba lagi; "
+        "kalau tetap gagal aku akan bikin preview baru."
+    ),
+    # Contention: the single worker slot is busy with ANOTHER project. This is
+    # transient and explicitly retryable, so the copy says so.
+    "PREVIEW_BUSY": "The project is busy with another build/preview operation. Please try again shortly.",
+    "WORKER_BUSY": "Another project is being built right now. Please try again shortly.",
+    # A lifecycle / storage precondition rejected the turn. Nothing external was
+    # touched, so the copy must not imply an ambiguous operation.
+    "PROJECT_NOT_ACCEPTING_INPUT": "This project is closed and is not accepting changes right now. Send a new request to start a fresh project.",
+    "WRITER_LOCK_TIMEOUT": "The project is busy handling another request. Please try again in a moment.",
+    "DISPATCH_INTERNAL_ERROR": "Something went wrong handling your request. Please try again.",
+    # Local artifact commit failed: this is an environment problem, not a user
+    # mistake, and retrying the same request will hit it again.
+    "OUTPUT_COMMIT_FAILED": "The preview could not be packaged on this machine. This is a temporary problem on our side.",
+    "VISION_REQUIRED": "The visual check could not be completed. Please try again.",
+    "TOOLCHAIN_MUTATION_REJECTED": "Build failed due to toolchain policy violation. Please try again.",
+}
+
+# Codes whose SPECIFIC copy is intentionally unhelpful because the condition is
+# by definition an unexplained internal surprise. They are listed explicitly so
+# that "we have no better message" is a recorded decision rather than an
+# accident of dict membership.
+_INTENTIONALLY_GENERIC_CODES = frozenset({
+    "UNEXPECTED_BUILD_ERROR",
+    "UNEXPECTED_QA_ERROR",
+})
+
+_GENERIC_ERROR_TEXT = "An unexpected error occurred. Please try again."
+_FALLBACK_ERROR_TEXT = "Something went wrong. Please try again."
+
+# Prefixed codes carry a detail suffix after ':'.
+_PREFIXED_ERROR_RENDERERS = (
+    ("CHEAP_CHECKS_FAILED:", lambda detail: f"Build verification failed ({detail}). Please try again."),
+    ("INFRASTRUCTURE_ERROR:", lambda detail: "An infrastructure error occurred during verification. Please try again."),
+)
+
+
+def render_error_message(error_code: Optional[str]) -> str:
+    """Map a stable application error code to user-facing copy.
+
+    Pure so coverage is directly unit-testable. Never returns an internal
+    detail beyond the code's own suffix.
+    """
+    if not error_code:
+        return _FALLBACK_ERROR_TEXT
+    specific = ERROR_MESSAGES.get(error_code)
+    if specific is not None:
+        return specific
+    if error_code in _INTENTIONALLY_GENERIC_CODES:
+        return _GENERIC_ERROR_TEXT
+    for prefix, render in _PREFIXED_ERROR_RENDERERS:
+        if error_code.startswith(prefix):
+            return render(error_code[len(prefix):])
+    return _FALLBACK_ERROR_TEXT
 
 
 def _smoke_recovery_message(classification: Optional[str], failures) -> str:
@@ -1924,7 +2020,7 @@ User message:
                 result.error_code,
             )
             self._send_error_reply(
-                state.conversation_id if state else "unknown", result.error_code
+                state.conversation_id if state else None, result.error_code
             )
 
     def _handle_publish(
@@ -1941,7 +2037,7 @@ User message:
         if approval succeeds, promotes that exact approved preview. One
         Telegram event = one dispatch claim, so replay is idempotent.
         """
-        conversation_id = state.conversation_id if state else "unknown"
+        conversation_id = state.conversation_id if state else None
 
         result = self.dispatcher.dispatch(
             update,
@@ -1999,52 +2095,19 @@ User message:
                 self.dispatcher.store.save(state)
         return outcome == 'SENT'
 
-    def _send_error_reply(self, chat_id: str, error_code: Optional[str]) -> None:
+    def _send_error_reply(self, chat_id: Optional[str], error_code: Optional[str]) -> None:
         """Send a sanitized error reply to the user. Never leaks internals."""
-        messages = {
-            "UNAUTHORIZED_ROLE": "You are not authorized to modify this project.",
-            "BUILD_NOT_ALLOWED_IN_LIFECYCLE": "The project is not ready to build yet.",
-            "DIRECTION_CHOICE_PENDING": "Please choose a design direction first.",
-            "EVENT_RECONCILIATION_REQUIRED": "A previous operation needs reconciliation. Please try again.",
-            "UNSUPPORTED_ACTION": "That action is not supported.",
-            "REVISION_NOT_ALLOWED_IN_LIFECYCLE": "Revisions are not allowed right now.",
-            "APPROVAL_NOT_ALLOWED_IN_LIFECYCLE": "Approval is not allowed right now.",
-            "PROMOTION_NOT_ALLOWED_IN_LIFECYCLE": "Publication is not allowed right now.",
-            "NO_SHOWN_PREVIEW": "No preview has been shown yet.",
-            "STALE_APPROVAL": "The approval is stale. Please review the latest preview.",
-            "STALE_QA_BINDING": "The preview is outdated. Please wait for the latest build.",
-            "NOT_APPROVED": "The preview must be approved before publication.",
-            "OUT_OF_ORDER_REVISION": "Revision is out of order. Please try again.",
-            "REVISION_ALREADY_APPLIED": "This revision has already been applied.",
-            "SLUG_COLLISION": (
-                "Nama itu sudah dipakai untuk link preview. Mau pakai nama "
-                "lain, atau aku kasih beberapa pilihan?"
-            ),
-            "DEPLOYMENT_ALREADY_LIVE": "This deployment is already live in production.",
-            "SMOKE_FAILED": (
-                "Preview-nya belum lolos pemeriksaan. Aku akan coba benerin dan "
-                "bikin preview baru — kirim aja perubahan yang kamu mau."
-            ),
-            "VERCEL_BYPASS_AUTH_FAILED": (
-                "Preview-nya belum bisa diakses untuk dicek. Aku akan coba lagi; "
-                "kalau tetap gagal aku akan bikin preview baru."
-            ),
-        }
-        if error_code and error_code.startswith("CHEAP_CHECKS_FAILED:"):
-            check_name = error_code.split(":", 1)[1]
-            text = f"Build verification failed ({check_name}). Please try again."
-        elif error_code == "TOOLCHAIN_MUTATION_REJECTED":
-            text = "Build failed due to toolchain policy violation. Please try again."
-        elif error_code and error_code.startswith("INFRASTRUCTURE_ERROR:"):
-            text = "An infrastructure error occurred during verification. Please try again."
-        elif error_code == "PREVIEW_BUSY":
-            text = "The project is busy with another build/preview operation. Please try again shortly."
-        elif error_code in ("UNEXPECTED_BUILD_ERROR", "UNEXPECTED_QA_ERROR"):
-            text = "An unexpected error occurred. Please try again."
-        else:
-            text = messages.get(error_code, "Something went wrong. Please try again.")
+        if not chat_id:
+            # No resolvable conversation: sending to a placeholder like
+            # "unknown" is silently rejected by the transport, so the user
+            # would get no reply at all. Log it operator-side instead.
+            logger.warning(
+                "Cannot deliver error reply for code %r: no chat id resolved",
+                error_code,
+            )
+            return
         try:
-            send_result = self.telegram_out.send_text(chat_id, text)
+            send_result = self.telegram_out.send_text(chat_id, render_error_message(error_code))
         except Exception:
             logger.exception("Failed to send error reply to chat %s", chat_id)
             return
@@ -2133,6 +2196,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     except Exception:
         logger.exception("Failed to compose runtime")
         return 1
+
+    # Resolve any project stranded in an in-flight lifecycle by a previous
+    # process death. MUST run before the receive loop starts, while no worker
+    # in this process holds a project. QUEUED/RUNNING have no other exit.
+    try:
+        _recovered = reconcile_stranded_projects(composition.store)
+    except Exception:
+        logger.exception("Stranded-project recovery failed; continuing startup")
+        _recovered = {}
+    if _recovered:
+        logger.warning(
+            "Recovered %d project(s) stranded by an interrupted operation: %s",
+            len(_recovered),
+            ", ".join(f"{pid} (was {lc})" for pid, lc in sorted(_recovered.items())),
+        )
 
     loop = TelegramReceiveLoop(
         bot_token=config.telegram_bot_token,

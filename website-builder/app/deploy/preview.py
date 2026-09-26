@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from app.core.contracts import OperationResult
+from app.core.contracts import OperationResult, StaleOperationIntent
 from app.core.state import ProjectStateStore
 from app.deploy.git_output import OutputGitRepository
 from app.deploy.snapshot import TestedSnapshot, source_fingerprint
@@ -249,9 +249,6 @@ class PreviewOrchestrator:
                 data=legacy_smoke,
             )
         shown = state.deployment.get('latest_shown_preview', {})
-        # The owned Vercel project, once resolved below; None on the
-        # already-delivered recovery path until it is resolved read-only.
-        resolved_project = None
         expected_name = None
         if shown.get('operation_id') == operation_id:
             # Local bypass durability check (READ-ONLY when the store already
@@ -263,27 +260,31 @@ class PreviewOrchestrator:
             # project lifecycle, NOT a per-preview rotation.
             if (self.deps.ensure_bypass is not None
                     and not self.deps.bypass_is_stored(project_id, state)):
-                with self.store.acquire_writer(project_id) as locked:
-                    app_id_l = self.deps.app_id_for(project_id)
-                    project_l = resolved_project
-                    if project_l is None:
-                        # Resolve the owned project READ-ONLY (no create).
-                        try:
-                            slug_l = (self.deps.slug_for(project_id, locked)
-                                      if self.deps.slug_for is not None else None)
-                        except Exception:
-                            slug_l = None
-                        expected_l = slug_l if slug_l else None
-                        lookup = self.deps.vercel.lookup_project(
-                            app_id_l, expected_name=expected_l
-                        )
-                        if not lookup.success:
-                            return lookup
-                        project_l = lookup.data["project"]
-                    bypass_result = self.deps.ensure_bypass(
-                        app_id_l, project_l, expected_name=expected_l)
-                    if not bypass_result.success:
-                        return bypass_result
+                # Resolve the owned project and provision the bypass OUTSIDE
+                # the writer lock: both are remote calls, and the exclusive
+                # cross-process lock has a bounded wait that a network round
+                # trip (possibly several, plus retries) can exhaust. The lock
+                # is only needed to READ the slug, and that read happens first
+                # and cheaply.
+                app_id_l = self.deps.app_id_for(project_id)
+                try:
+                    with self.store.acquire_writer(project_id) as locked:
+                        slug_l = (self.deps.slug_for(project_id, locked)
+                                  if self.deps.slug_for is not None else None)
+                except Exception:
+                    slug_l = None
+                expected_l = slug_l if slug_l else None
+                # Resolve the owned project READ-ONLY (no create).
+                lookup = self.deps.vercel.lookup_project(
+                    app_id_l, expected_name=expected_l
+                )
+                if not lookup.success:
+                    return lookup
+                project_l = lookup.data["project"]
+                bypass_result = self.deps.ensure_bypass(
+                    app_id_l, project_l, expected_name=expected_l)
+                if not bypass_result.success:
+                    return bypass_result
             # Short-circuit: this exact preview was durably delivered. The
             # follow-up is re-evaluated here so a crash between "preview
             # marked shown" and "follow-up attempted" is recoverable — but
@@ -357,13 +358,15 @@ class PreviewOrchestrator:
         self._update_intent(project_id, operation_id, project_attempted=True)
 
         _mark_remote_boundary()
-        if slug and not attempted and (
-            state.deployment.get('vercel_project_id')
-            or previous.get('legacy_project')
-        ):
-            # A legacy project may already exist under the opaque name. Check
-            # it before creating a friendly project, then create only on a
-            # proven absence.
+        if slug and not attempted and previous.get('vercel_project_id'):
+            # A Vercel project may already have been resolved for this website
+            # under the older opaque (hash-derived) name, before the friendly
+            # slug was bound. Read the id from ``preview_intent`` -- the one
+            # place the real code records it. Reading
+            # ``state.deployment['vercel_project_id']`` (a key no production
+            # path ever writes) or a ``legacy_project`` marker (never written
+            # at all) made this duplicate-project guard dead code, so a second
+            # Vercel project could be created for the same website.
             legacy_result = self.deps.vercel.lookup_project(app_id)
             if legacy_result.success:
                 vercel_project = legacy_result.data['project']
@@ -419,7 +422,6 @@ class PreviewOrchestrator:
             if not project_result.success:
                 return project_result
             vercel_project = project_result.data['project']
-        resolved_project = vercel_project
         if isinstance(vercel_project, dict) and vercel_project.get('id'):
             self._update_intent(
                 project_id, operation_id,
@@ -865,11 +867,23 @@ class PreviewOrchestrator:
             )
 
     def _update_intent(self, project_id: str, operation_id: str, **fields) -> None:
+        """Persist an intent update for *operation_id*, or fail closed.
+
+        A mismatch is NOT a no-op. The caller is about to perform (or has just
+        performed) an external side effect whose only durable evidence is this
+        write; silently doing nothing would let that side effect happen
+        unrecorded and re-create the duplicate-delivery window this module
+        exists to prevent. Raising lets ``run_owned`` convert it into
+        PREVIEW_RECONCILIATION_REQUIRED.
+        """
         with self.store.acquire_writer(project_id) as state:
             intent = state.deployment.get("preview_intent")
-            if intent and intent.get("operation_id") == operation_id:
-                intent.update(fields)
-                self.store.save(state)
+            if not intent or intent.get("operation_id") != operation_id:
+                raise StaleOperationIntent(
+                    "preview_intent does not belong to this operation"
+                )
+            intent.update(fields)
+            self.store.save(state)
 
     def _run_smoke(self, preview_url, smoke_dir, bypass_secret):
         """Run the mandatory preview smoke, injecting the project-specific

@@ -17,7 +17,12 @@ logger = logging.getLogger(__name__)
 
 from app.deploy.snapshot import TestedSnapshot, source_fingerprint, record_checks
 from app.core.lifecycle import ProjectLifecycle
-from app.core.composition import compose_project_instructions, validate_composed_dna, invalidate_artifact
+from app.core.composition import (
+    ReferenceSnapshot,
+    compose_project_instructions,
+    invalidate_artifact,
+    validate_composed_dna,
+)
 from app.core.selfcontained import (
     EXTERNAL_RUNTIME_DEPENDENCY,
     normalize_and_check_self_contained,
@@ -37,21 +42,18 @@ from app.sandbox.runner import ProjectRunner
 MAX_REPAIR_ATTEMPTS = 2
 
 
-class _ReferenceSnapshot:
-    """Immutable view of ``state.design_references`` captured under the lock.
+class QABlockingError(Exception):
+    """A deliberate, named QA precondition rejected this run.
 
-    ``validate_composed_dna`` only reads ``.design_references`` from its state
-    argument. Passing the live ``ProjectState`` after the writer lock has been
-    released validates against whatever is current at call time rather than
-    the reference set the repair instructions were composed against.
+    Distinct from an unexpected exception: the code is already the correct
+    user-facing action ("the preview is outdated", "vision did not run"), so
+    it must survive to ``QAResult.error`` and to the persisted failure record
+    instead of being erased into the opaque ``UNEXPECTED_QA_ERROR``.
     """
 
-    __slots__ = ("design_references",)
-
-    def __init__(self, design_references):
-        # design_references is a role -> record mapping; shallow-copy it so
-        # later mutation of the live state cannot change the validated set.
-        self.design_references = dict(design_references or {})
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
 
 
 class QAOrchestrator:
@@ -146,17 +148,34 @@ class QAOrchestrator:
                 if qa_attempt.final_pass:
                     state = self.store.load(project_id)
                     checked = state.deployment.get('checked') or {}
+                    tested_snapshot = None
                     if checked:
-                        snapshot = TestedSnapshot.capture(workspace, checked['source_sha256'],
-                                                          checked['artifact_sha256'])
+                        try:
+                            snapshot = TestedSnapshot.capture(workspace, checked['source_sha256'],
+                                                              checked['artifact_sha256'])
+                        except ValueError as exc:
+                            # STALE_SOURCE / STALE_ARTIFACT are the same
+                            # condition as the revision check below -- the
+                            # tested artifact is no longer the current one --
+                            # raised one layer earlier by the snapshot itself.
+                            # Report it as the same honest code instead of
+                            # letting it be erased into UNEXPECTED_QA_ERROR.
+                            if str(exc) in ("STALE_SOURCE", "STALE_ARTIFACT"):
+                                raise QABlockingError('STALE_QA_BINDING') from None
+                            raise
                         if checked['source_revision'] != state.revisions.source_revision:
-                            raise ValueError('STALE_QA_BINDING')
+                            raise QABlockingError('STALE_QA_BINDING')
                         if qa_attempt.vision is None or qa_attempt.vision.pass_ is not True:
-                            raise ValueError('VISION_REQUIRED')
-                        with self.store.acquire_writer(project_id) as locked:
-                            locked.deployment['tested_snapshot'] = snapshot.to_dict()
-                            self.store.save(locked)
-                    self._finalize_success(project_id, qa_attempt)
+                            raise QABlockingError('VISION_REQUIRED')
+                        tested_snapshot = snapshot.to_dict()
+                    # ONE writer block commits the tested snapshot AND the
+                    # RUNNING -> PREVIEW_READY transition together. Writing
+                    # them separately left a window in which a crash left a
+                    # fully passing QA result persisted under a RUNNING
+                    # lifecycle, and nothing ever drove it forward.
+                    self._finalize_success(
+                        project_id, qa_attempt, tested_snapshot=tested_snapshot
+                    )
                     return QAResult(
                         project_id=project_id,
                         success=True,
@@ -240,6 +259,22 @@ class QAOrchestrator:
                 attempts=attempts,
                 repair_attempts=repair_count,
                 error="QA blocking findings remained after repair budget exhausted",
+            )
+
+        except QABlockingError as exc:
+            # A named precondition rejected this run. Its code is already a
+            # stable application code with existing user-facing copy, so it
+            # propagates verbatim instead of being collapsed into
+            # UNEXPECTED_QA_ERROR (which would tell the user to retry a
+            # condition that cannot be retried away).
+            logger.info("Phase 8 QA precondition rejected for %s: %s", project_id, exc.code)
+            self._finalize_failure(project_id, attempts, repair_count, error=exc.code)
+            return QAResult(
+                project_id=project_id,
+                success=False,
+                attempts=attempts,
+                repair_attempts=repair_count,
+                error=exc.code,
             )
 
         except Exception as exc:
@@ -412,7 +447,7 @@ class QAOrchestrator:
             return False
         dna = result.get("design_dna")
         try:
-            validate_composed_dna(dna, _ReferenceSnapshot(design_references))
+            validate_composed_dna(dna, ReferenceSnapshot(design_references))
         except ValueError:
             return False
         with self.store.acquire_writer(project_id) as locked:
@@ -493,8 +528,20 @@ Instructions:
     # Lifecycle finalization
     # ------------------------------------------------------------------
 
-    def _finalize_success(self, project_id: str, qa_attempt: QAAttempt) -> None:
+    def _finalize_success(
+        self, project_id: str, qa_attempt: QAAttempt,
+        *, tested_snapshot: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Commit the passing QA result atomically.
+
+        ``tested_snapshot`` (when present) and the ``RUNNING ->
+        PREVIEW_READY`` transition are written in the SAME writer block, so
+        no crash can leave a passing result persisted under an in-flight
+        lifecycle with nothing left to drive it forward.
+        """
         with self.store.acquire_writer(project_id) as state:
+            if tested_snapshot is not None:
+                state.deployment['tested_snapshot'] = tested_snapshot
             self.store.transition_lifecycle_locked(state, ProjectLifecycle.PREVIEW_READY)
             state.revisions.qa_revision = state.revisions.source_revision
             # External preview identity belongs to Phase 9, not local QA.

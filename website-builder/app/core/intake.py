@@ -480,7 +480,8 @@ class IntakeProcessor:
                         and state.revisions.qa_revision == 0
                         and not state.deployment.get("latest_shown_preview")
                         and state.revisions.approved_revision == 0
-                        and not state.deployment.get("live_url")
+                        and not state.production_url
+                        and not state.revisions.live_revision
                     ):
                         # Initial build failure recovery:
                         # Reset source_revision to 0 and clear failure so auto-build

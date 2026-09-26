@@ -22,7 +22,7 @@ from app.channels.telegram import NormalizedMessage, TelegramNormalizer
 from app.channels.whatsapp import WhatsAppNormalizer
 from app.core.authz import AuthzError, ProjectAccess, require_mutating_role, require_owner_role, valid_principal
 from app.core.contracts import OperationResult
-from app.core.lifecycle import ProjectLifecycle
+from app.core.lifecycle import LifecycleError, ProjectLifecycle, has_outgoing_transitions
 from app.projects.directions import direction_choice_pending
 
 
@@ -179,6 +179,25 @@ class TelegramDispatcher:
                             or state.pause_state.get("paused")):
                         return OperationResult.fail("BUILD_NOT_ALLOWED_IN_LIFECYCLE", error_code="BUILD_NOT_ALLOWED_IN_LIFECYCLE")
                     self.store.transition_lifecycle_locked(state, ProjectLifecycle.QUEUED)
+                if action == "intake":
+                    # Intake drives lifecycle transitions internally (pause,
+                    # resume, ready, clarification). A state with no outgoing
+                    # edge can never accept any of them, so reject it HERE —
+                    # before the claim write — with an honest code. Letting
+                    # apply_to_project raise instead produced a
+                    # LifecycleError that the generic handler below reported
+                    # as EVENT_RECONCILIATION_REQUIRED, telling the user a
+                    # previous operation was ambiguous when nothing had
+                    # happened at all.
+                    try:
+                        _lc = ProjectLifecycle(state.lifecycle)
+                    except ValueError:
+                        _lc = None
+                    if _lc is None or not has_outgoing_transitions(_lc):
+                        return OperationResult.fail(
+                            "PROJECT_NOT_ACCEPTING_INPUT",
+                            error_code="PROJECT_NOT_ACCEPTING_INPUT",
+                        )
                 persisted_brief = dict(state.brief)
                 # H-6: ALL build entry paths must use the same remote-boundary
                 # semantics. The build claim starts with reached_remote=False
@@ -193,6 +212,10 @@ class TelegramDispatcher:
                     }
                 else:
                     state.dispatch_events[key] = {"action": action, "status": "CLAIMED"}
+                # Bound the ledger atomically with this append, so a crash can
+                # never leave it half-pruned. Pruning never drops a CLAIMED
+                # entry, so the claim just written here is always kept.
+                state.prune_bounded_ledgers()
                 self.store.save(state)
             # H-6: ONE shared remote-boundary helper used by BOTH build entry
             # paths (explicit "build" and the intake auto-build sub-claim). It
@@ -318,24 +341,56 @@ class TelegramDispatcher:
                                     "EVENT_RECONCILIATION_REQUIRED",
                                     error_code="EVENT_RECONCILIATION_REQUIRED",
                                 )
-                            with self.store.acquire_writer(project_id) as bstate:
-                                bstate.dispatch_events[build_key]["status"] = (
-                                    "DONE" if getattr(build_result, "success", False) else "FAILED"
+                            # Record the build sub-claim's terminal status in
+                            # its OWN protected block. Previously unguarded, so a
+                            # lock timeout or a vanished sub-claim raised here
+                            # and was caught by the OUTER handler, which
+                            # finalizes the INTAKE claim and reported
+                            # EVENT_RECONCILIATION_REQUIRED — telling the user
+                            # that an operation needed reconciliation when the
+                            # intake had in fact succeeded. A failure to write
+                            # this bookkeeping must never overwrite a real
+                            # intake outcome; the sub-claim stays CLAIMED and
+                            # fails closed on its own replay.
+                            build_success = bool(getattr(build_result, "success", False))
+                            try:
+                                with self.store.acquire_writer(project_id) as bstate:
+                                    sub_claim = bstate.dispatch_events.get(build_key)
+                                    if sub_claim is not None:
+                                        sub_claim["status"] = (
+                                            "DONE" if build_success else "FAILED"
+                                        )
+                                        sub_claim["build_diagnostics"] = dict(
+                                            getattr(build_result, "diagnostics", {}) or {}
+                                        )
+                                        self.store.save(bstate)
+                            except Exception:
+                                logging.getLogger(__name__).exception(
+                                    "Failed to persist auto-build sub-claim for "
+                                    "project '%s'; sub-claim left unchanged",
+                                    project_id,
                                 )
-                                bstate.dispatch_events[build_key]["build_diagnostics"] = dict(
-                                    getattr(build_result, "diagnostics", {}) or {}
-                                )
-                                self.store.save(bstate)
                             result.data["build_triggered"] = True
-                            result.data["build_success"] = bool(getattr(build_result, "success", False))
+                            result.data["build_success"] = build_success
                             result.data["build_reached_remote"] = bool(
                                 getattr(build_result, "reached_remote", False)
                             )
                             result.data["build_diagnostics"] = dict(
                                 getattr(build_result, "diagnostics", {}) or {}
                             )
-                            if not getattr(build_result, "success", False):
-                                result.data["build_error"] = getattr(build_result, "error", None)
+                            if not build_success:
+                                # Prefer a real string error_code so the reply
+                                # can be mapped to specific copy; fall back to
+                                # `error` (which may be free text, and is
+                                # already a stable code in every real result).
+                                # The isinstance guard matters: a collaborator
+                                # that omits the attribute would otherwise
+                                # surface an auto-created sentinel here.
+                                _code = getattr(build_result, "error_code", None)
+                                result.data["build_error"] = (
+                                    _code if isinstance(_code, str) and _code
+                                    else getattr(build_result, "error", None)
+                                )
                 elif action == "reference_upload":
                     result = self.reference_intake.add_upload(project_id, data, role, **auth)
                 elif action == "reference_url":
@@ -411,6 +466,33 @@ class TelegramDispatcher:
                     result = self.preview.run_owned(project_id, self.workspace_for(project_id))
                 else:
                     result = self.promote.promote(project_id, self.workspace_for(project_id), principal_id=principal)
+            except LifecycleError:
+                # A lifecycle precondition rejected this turn. No remote side
+                # effect was attempted and none can have been partially
+                # applied, so this is definitively NOT an ambiguous operation.
+                # Finalize the claim FAILED (so nothing stays CLAIMED) but
+                # report the honest code instead of
+                # EVENT_RECONCILIATION_REQUIRED, which would invite a retry
+                # that can never succeed.
+                logger.info(
+                    "Lifecycle precondition rejected action '%s' on project '%s'",
+                    action, project_id,
+                )
+                try:
+                    with self.store.acquire_writer(project_id) as state:
+                        claim = state.dispatch_events.get(key)
+                        if claim is not None and claim.get("status") == "CLAIMED":
+                            claim["status"] = "FAILED"
+                        self.store.save(state)
+                except Exception:
+                    logger.exception(
+                        "Failed to finalize dispatch claim for action '%s' on project '%s'",
+                        action, project_id,
+                    )
+                return OperationResult.fail(
+                    "PROJECT_NOT_ACCEPTING_INPUT",
+                    error_code="PROJECT_NOT_ACCEPTING_INPUT",
+                )
             except Exception as exc:
                 # H-5: EVERY dispatch attempt must leave its durable claim in a
                 # meaningful terminal or recoverable state. A collaborator
@@ -475,3 +557,30 @@ class TelegramDispatcher:
             return result
         except AuthzError as exc:
             return OperationResult.fail(exc.error_code, error_code=exc.error_code)
+        except TimeoutError:
+            # The exclusive writer lock could not be acquired (a concurrent
+            # writer held it past the timeout). This is a transient
+            # contention outcome, not an ambiguous remote operation, and it
+            # must not be reported as EVENT_RECONCILIATION_REQUIRED: nothing
+            # external was touched. No claim was written on the paths that
+            # can reach here before the claim block, so none is left stale.
+            logger.warning(
+                "Writer lock timeout during dispatch of action '%s' on project '%s'",
+                action, project_id,
+            )
+            return OperationResult.fail(
+                "WRITER_LOCK_TIMEOUT", error_code="WRITER_LOCK_TIMEOUT"
+            )
+        except Exception:
+            # dispatch() is the single mutation authority: it must never raise
+            # into the receive loop, and it must never leave a durable claim
+            # behind in a state that is neither terminal nor recoverable. The
+            # per-action handlers above already finalized their own claims;
+            # anything arriving here did so before or outside a claim.
+            logger.exception(
+                "Unhandled error during dispatch of action '%s' on project '%s'",
+                action, project_id,
+            )
+            return OperationResult.fail(
+                "DISPATCH_INTERNAL_ERROR", error_code="DISPATCH_INTERNAL_ERROR"
+            )

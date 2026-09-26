@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 from app.deploy.snapshot import source_fingerprint, record_checks
 from app.core.composition import (
+    ReferenceSnapshot,
     compose_project_instructions,
     invalidate_artifact,
     prebuild_error,
@@ -341,6 +342,13 @@ class BuildResult:
     # fail-closed.
     reached_remote: bool = False
     diagnostics: Optional[Dict[str, Any]] = None
+    # Stable application error code, when one applies. ``error`` may be free
+    # text for genuinely variable failures; the dispatcher prefers this so the
+    # user-facing reply can be mapped to specific copy. Absent == ``error`` is
+    # already a stable code.
+    error_code: Optional[str] = None
+    # True when a NEW request may plausibly succeed (transient contention).
+    retryable: bool = False
 
 
 class FrontendBuilder:
@@ -581,10 +589,15 @@ Respond with a JSON summary:
 
         # Acquire the single worker slot
         if not self.runner.acquire_project(project_id):
+            # A dedicated, mapped code (not free text): the dispatcher forwards
+            # `error` to the user, and an unmapped string rendered as the
+            # generic "Something went wrong" with no hint to retry.
             return BuildResult(
                 success=False,
                 project_id=project_id,
-                error="Another project is currently being built (MAX_WORKERS=1)",
+                error="WORKER_BUSY",
+                error_code="WORKER_BUSY",
+                retryable=True,
             )
 
         try:
@@ -601,13 +614,26 @@ Respond with a JSON summary:
                 combined_instructions = compose_project_instructions(
                     state, access_key=self.web3forms_access_key
                 )
-                policy_state = state
-                workspace = self.runner.create_workspace(project_id)
-                self._copy_starter(workspace)
-                toolchain_hashes = _capture_toolchain_hashes(workspace)
+                # Validate Phase 7's Design DNA against the reference set the
+                # instructions were composed from — NOT the live state, which
+                # by now is post-lock-release and possibly mutated by a
+                # concurrent reference upload. Same hazard the Phase 8 repair
+                # path already guards; see app.core.composition.ReferenceSnapshot.
+                policy_state = ReferenceSnapshot(state.design_references)
+                # The workspace is created and the starter copied OUTSIDE the
+                # lock: that is filesystem work proportional to the template
+                # size, and the exclusive cross-process lock has a bounded
+                # wait that it can exhaust for every other operation on this
+                # project. Admission (prebuild_error) and the lifecycle
+                # transition stay under the lock, which is what actually needs
+                # to be atomic.
                 self.store.transition_lifecycle_locked(state, ProjectLifecycle.RUNNING)
                 state.revisions.source_revision += 1
                 self.store.save(state)
+
+            workspace = self.runner.create_workspace(project_id)
+            self._copy_starter(workspace)
+            toolchain_hashes = _capture_toolchain_hashes(workspace)
 
             # Use Hermes FRONTEND to derive design and build
             if self.hermes_adapter is not None:
@@ -948,10 +974,29 @@ Respond with a JSON summary:
                 project_id, type(exc).__name__,
             )
             with self.store.acquire_writer(project_id) as state:
-                self.store.transition_lifecycle_locked(state, ProjectLifecycle.FAILED)
+                # A preview may already have been DEPLOYED, SMOKE-TESTED and
+                # SENT to the user by the time something raises here (the
+                # success return is still inside this try). Transitioning to
+                # FAILED in that case contradicts durable state the user can
+                # already see: PREVIEW_READY -> FAILED is a legal edge, so it
+                # would silently bury a working preview and refuse follow-up
+                # work. Record the failure for operators and keep the lifecycle
+                # at PREVIEW_READY.
+                shown = state.deployment.get("latest_shown_preview") or {}
+                preview_delivered = (
+                    state.lifecycle == ProjectLifecycle.PREVIEW_READY.value
+                    and bool(shown)
+                    and shown.get("source_revision") == state.revisions.source_revision
+                )
+                if not preview_delivered:
+                    self.store.transition_lifecycle_locked(state, ProjectLifecycle.FAILED)
+                # ``error`` keeps the raw exception text operator-side on
+                # purpose (asserted by test_build.py); ``error_code`` is the
+                # stable, sanitized code for anything that surfaces a code.
                 state.failure = {
-                    "phase": "build",
+                    "phase": "post_preview" if preview_delivered else "build",
                     "error": str(exc),
+                    "error_code": "UNEXPECTED_BUILD_ERROR",
                     "failed_at": time.time(),
                 }
                 self.store.save(state)

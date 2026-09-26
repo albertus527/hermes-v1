@@ -21,6 +21,14 @@ from typing import Any, Dict, Generator, Optional, Set
 from .lifecycle import ProjectLifecycle, transition as lifecycle_transition
 
 
+# Retention bounds for the two per-project ledgers that would otherwise grow
+# without limit. Both are far larger than any realistic burst, and both are
+# applied atomically with the append that triggers them.
+# See ProjectState.prune_bounded_ledgers.
+DISPATCH_EVENT_RETENTION = 500
+PENDING_REVISION_RETENTION = 50
+
+
 @dataclass
 class RevisionState:
     """Revision tracking per canonical spec §20."""
@@ -117,6 +125,44 @@ class ProjectState:
         data = asdict(self)
         data["processed_events"] = sorted(self.processed_events)
         return data
+
+    def prune_bounded_ledgers(self) -> None:
+        """Bound the two collections that would otherwise grow forever.
+
+        ``dispatch_events`` gains one entry per dispatch and ``pending_revisions``
+        one per revision; neither was ever trimmed, and every ``save`` rewrites
+        and fsyncs the whole document, so an active long-lived project made
+        every state write progressively more expensive.
+
+        Pruning rules, both chosen to be safe:
+
+        * ``pending_revisions`` keeps only unapplied reservations plus the most
+          recent applied ones. An unapplied entry is what the revision
+          re-drive path looks for, so it must never be dropped.
+        * ``dispatch_events`` is keyed by a digest of the Telegram update id, so
+          ordering is insertion order. Only the newest ``DISPATCH_EVENT_RETENTION``
+          are kept, and CLAIMED entries are ALWAYS kept regardless of age: a
+          CLAIMED entry is a possibly-remote in-flight operation whose evidence
+          must survive until it reaches a terminal state.
+
+        Call this from inside the writer block that appends, so pruning is
+        atomic with the append it accompanies and a crash cannot leave a
+        half-pruned ledger.
+        """
+        if len(self.pending_revisions) > PENDING_REVISION_RETENTION:
+            unapplied = [e for e in self.pending_revisions if not e.get("applied")]
+            applied = [e for e in self.pending_revisions if e.get("applied")]
+            keep = PENDING_REVISION_RETENTION - len(unapplied)
+            self.pending_revisions = unapplied + (applied[-keep:] if keep > 0 else [])
+
+        if len(self.dispatch_events) > DISPATCH_EVENT_RETENTION:
+            entries = list(self.dispatch_events.items())
+            claimed = [(k, v) for k, v in entries if v.get("status") == "CLAIMED"]
+            terminal = [(k, v) for k, v in entries if v.get("status") != "CLAIMED"]
+            keep = DISPATCH_EVENT_RETENTION - len(claimed)
+            self.dispatch_events = dict(
+                claimed + (terminal[-keep:] if keep > 0 else [])
+            )
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ProjectState":
@@ -338,3 +384,79 @@ class ProjectStateStore:
         with self.acquire_writer(project_id) as state:
             state.processed_events.add(event_id)
             self.save(state)
+
+
+# ---------------------------------------------------------------------------
+# Crash recovery for in-flight lifecycles
+# ---------------------------------------------------------------------------
+
+# Lifecycles whose ONLY exit is code running inside the process that entered
+# them. QUEUED exits only via build.py's QUEUED -> RUNNING; RUNNING exits only
+# via a QA success/failure or an exception handler. A crash therefore leaves
+# the project wedged: no user turn can re-admit it, because
+# ``IntakeProcessor.apply_to_project`` can only reach READY from FAILED.
+#
+# PUBLISHING and REVISION_REQUESTED are deliberately NOT listed. Both have
+# explicit same-operation resume paths (promote.py ``is_resume``, revise.py
+# F6 re-drive) and are supposed to survive a crash.
+STRANDED_LIFECYCLES = (
+    ProjectLifecycle.QUEUED.value,
+    ProjectLifecycle.RUNNING.value,
+)
+
+
+def reconcile_stranded_projects(
+    store: "ProjectStateStore", *, active_projects: Optional[Set[str]] = None
+) -> Dict[str, str]:
+    """Fail closed every project stranded in an in-flight lifecycle.
+
+    Intended to run ONCE at startup, before the receive loop begins, when no
+    worker in this process holds a project. A stranded project is transitioned
+    to FAILED with an explicit ``interrupted`` record; FAILED is a legal target
+    from both states and is already a state the intake layer knows how to
+    re-admit to READY, so this adds no new recovery semantics of its own.
+
+    A project file modified at or after the scan began is left untouched: that
+    is another live writer, not a stranded project. This keeps the pass safe
+    if a second runtime process ever shares the state root.
+
+    Returns ``{project_id: recovered_from_lifecycle}`` for operator logging.
+    """
+    scan_started = time.time()
+    active = set(active_projects or ())
+    recovered: Dict[str, str] = {}
+    for path in sorted(store.root.glob("*.json")):
+        if path.is_symlink():
+            continue
+        try:
+            if path.stat().st_mtime >= scan_started:
+                continue
+        except OSError:
+            continue
+        project_id = path.stem
+        try:
+            store._validate_id(project_id)
+        except ValueError:
+            continue
+        if project_id in active:
+            continue
+        try:
+            with store.acquire_writer(project_id, timeout=5.0) as state:
+                if state.lifecycle not in STRANDED_LIFECYCLES:
+                    continue
+                stranded_from = state.lifecycle
+                store.transition_lifecycle_locked(state, ProjectLifecycle.FAILED)
+                state.failure = {
+                    "phase": "interrupted",
+                    "error": "OPERATION_INTERRUPTED",
+                    "error_code": "OPERATION_INTERRUPTED",
+                    "interrupted_from": stranded_from,
+                    "failed_at": time.time(),
+                }
+                store.save(state)
+                recovered[project_id] = stranded_from
+        except (TimeoutError, OSError, ValueError) as exc:
+            logging.getLogger(__name__).warning(
+                "Stranded-state recovery skipped for %s (%s)", project_id, type(exc).__name__
+            )
+    return recovered

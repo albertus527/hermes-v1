@@ -32,6 +32,28 @@ def compose_project_instructions(state, *, access_key=None, task=None):
     ) if part)
 
 
+class ReferenceSnapshot:
+    """Immutable view of ``state.design_references`` captured under the lock.
+
+    ``validate_composed_dna`` only reads ``.design_references`` from its state
+    argument. Passing the live ``ProjectState`` after the writer lock has been
+    released validates against whatever is current at call time rather than the
+    reference set the instructions were composed against.
+
+    Lives here, next to ``validate_composed_dna``, because BOTH callers that
+    compose instructions under the lock and validate afterwards long after the
+    lock is released need it: the Phase 7 build and the Phase 8 repair. A
+    per-module copy is how one of them got left behind.
+    """
+
+    __slots__ = ("design_references",)
+
+    def __init__(self, design_references):
+        # design_references is a role -> record mapping; shallow-copy it so
+        # later mutation of the live state cannot change the validated set.
+        self.design_references = dict(design_references or {})
+
+
 def validate_composed_dna(dna, state):
     if not isinstance(dna, dict) or not dna:
         raise ValueError("MISSING_DESIGN_DNA")

@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from app.core.authz import AuthzError, require_mutating_role, require_owner_role
-from app.core.contracts import OperationResult
+from app.core.contracts import OperationResult, StaleOperationIntent
 from app.core.lifecycle import LifecycleError, ProjectLifecycle
 from app.core.state import ProjectStateStore
 from app.sandbox.runner import ProjectRunner
@@ -238,8 +238,9 @@ class PromotionOrchestrator:
 
         if not self.runner.acquire_project(project_id):
             return OperationResult.fail(
-                "Another project is currently being built (MAX_WORKERS=1)",
+                "WORKER_BUSY",
                 error_code="WORKER_BUSY",
+                retryable=True,
             )
         try:
             return self._promote(project_id, workspace, principal_id, reference_token)
@@ -422,51 +423,57 @@ class PromotionOrchestrator:
                 "artifact_sha256": artifact_sha256,
             }
 
-            # ---- Same-operation resume after an AMBIGUOUS remote promote:
-            # reconcile remote truth BEFORE re-issuing any promote request.
-            # If Vercel already promoted this exact deployment, adopt that
-            # truth (never a second promote POST). If remote truth says it was
-            # NOT promoted, the normal promote below is safe (it will fail
-            # closed on any residual ambiguity without duplicating a
-            # side effect). If truth is still ambiguous, stop here -- fail
-            # closed, keep PUBLISHING, and do not send a second promote.
-            #
-            # The confirmations here only decide WHICH path to take; the
-            # actual post-promote flow runs AFTER the writer lock is released
-            # (the writer lock is a file lock, not reentrant).
-            resume_reconciled_url = None
-            resume_fail_closed = False
-            if is_same_operation:
-                reconcile = self.deps.vercel.reconcile_production_deployment(
-                    app_id, vercel_project, intended_identity, expected_name=expected_name,
-                )
-                status = (reconcile.data or {}).get("status") if reconcile.success else None
-                if status == "PROMOTED":
-                    resume_reconciled_url = self._production_url_for(intended_identity)
-                    locked.deployment["promotion_intent"]["stage"] = "promoted"
-                    locked.deployment["promotion_intent"]["production_url"] = resume_reconciled_url
-                    self.store.save(locked)
-                elif status == "NOT_PROMOTED":
-                    # Conclusively not promoted: fall through to the normal
-                    # promote below (safe -- the intended deployment is not
-                    # the live target).
-                    pass
-                else:
-                    # Ambiguous resume: do NOT blindly re-promote.
-                    self._fail_reconciliation_required_locked(
-                        locked, "PROMOTION_RECONCILIATION_REQUIRED",
-                        intended_identity, "promote",
-                    )
-                    resume_fail_closed = True
+        # ---- Writer lock RELEASED. Every remote call happens from here on.
+        #
+        # The exclusive writer lock is a cross-process file lock with a
+        # bounded wait; holding it across a production-mutating POST (and
+        # across the reconcile reads that decide whether to send it) blocked
+        # every other operation on this project for the duration of a network
+        # round trip that can stall under latency, 5xx or rate limiting.
+        # The durable intent above is exactly what makes releasing it safe:
+        # a crash at any point from here is recovered by the same-operation
+        # resume, which reconciles remote truth before acting again.
 
-            # Writer remains held through the first mutating adapter call.
-            if resume_reconciled_url is not None or resume_fail_closed:
-                promote_result = None
+        # ---- Same-operation resume after an AMBIGUOUS remote promote:
+        # reconcile remote truth BEFORE re-issuing any promote request.
+        # If Vercel already promoted this exact deployment, adopt that
+        # truth (never a second promote POST). If remote truth says it was
+        # NOT promoted, the normal promote below is safe (it will fail
+        # closed on any residual ambiguity without duplicating a
+        # side effect). If truth is still ambiguous, stop here -- fail
+        # closed, keep PUBLISHING, and do not send a second promote.
+        resume_reconciled_url = None
+        resume_fail_closed = False
+        if is_same_operation:
+            reconcile = self.deps.vercel.reconcile_production_deployment(
+                app_id, vercel_project, intended_identity, expected_name=expected_name,
+            )
+            status = (reconcile.data or {}).get("status") if reconcile.success else None
+            if status == "PROMOTED":
+                resume_reconciled_url = self._production_url_for(intended_identity)
+                self._update_intent(project_id, operation_id,
+                                    stage="promoted",
+                                    production_url=resume_reconciled_url)
+            elif status == "NOT_PROMOTED":
+                # Conclusively not promoted: fall through to the normal
+                # promote below (safe -- the intended deployment is not
+                # the live target).
+                pass
             else:
-                promote_result = self.deps.vercel.promote_deployment(
-                    app_id, vercel_project, deployment_id, operation_id,
-                    source_revision, artifact_sha256, expected_name=expected_name,
+                # Ambiguous resume: do NOT blindly re-promote.
+                self._fail_reconciliation_required(
+                    project_id, "PROMOTION_RECONCILIATION_REQUIRED",
+                    intended_identity, "promote",
                 )
+                resume_fail_closed = True
+
+        if resume_reconciled_url is not None or resume_fail_closed:
+            promote_result = None
+        else:
+            promote_result = self.deps.vercel.promote_deployment(
+                app_id, vercel_project, deployment_id, operation_id,
+                source_revision, artifact_sha256, expected_name=expected_name,
+            )
 
         if resume_fail_closed:
             return OperationResult.fail(
@@ -500,7 +507,8 @@ class PromotionOrchestrator:
                 # Confirmed promoted -> continue the normal post-promote flow
                 # (production smoke, then LIVE persistence).
                 production_url = self._production_url_for(intended_identity)
-                self._update_intent(project_id, stage="promoted", production_url=production_url)
+                self._update_intent(project_id, intended_identity["operation_id"],
+                                    stage="promoted", production_url=production_url)
                 return self._post_promote(
                     project_id, workspace, app_id, vercel_project,
                     previous_identity, production_url=production_url,
@@ -531,7 +539,8 @@ class PromotionOrchestrator:
                 )
 
         production_url = promote_result.data["production_url"]
-        self._update_intent(project_id, stage="promoted", production_url=production_url)
+        self._update_intent(project_id, intended_identity["operation_id"],
+                            stage="promoted", production_url=production_url)
         return self._post_promote(
             project_id, workspace, app_id, vercel_project, previous_identity,
             production_url=production_url, intended_identity=intended_identity,
@@ -561,7 +570,8 @@ class PromotionOrchestrator:
             production_url, smoke_dir,
             (vercel_project or {}).get("id"),
         )
-        self._update_intent(project_id, stage="smoked", smoke=smoke_result.data)
+        self._update_intent(project_id, operation_id, stage="smoked",
+                            smoke=smoke_result.data)
         if not smoke_result.success:
             rollback_status = self._rollback_and_fail(
                 project_id, app_id, vercel_project, previous_identity,
@@ -619,12 +629,23 @@ class PromotionOrchestrator:
     # Internals
     # ------------------------------------------------------------------
 
-    def _update_intent(self, project_id: str, **fields) -> None:
+    def _update_intent(self, project_id: str, operation_id: str, **fields) -> None:
+        """Persist an intent update for *operation_id*, or fail closed.
+
+        A mismatch (or a missing intent) is NOT a no-op. The caller has just
+        driven, or is about to drive, a production-altering remote call whose
+        only durable evidence is this record; silently doing nothing would let
+        that happen unrecorded and defeat the same-operation resume design.
+        Raising propagates to the dispatcher's fail-closed handler.
+        """
         with self.store.acquire_writer(project_id) as state:
             intent = state.deployment.get("promotion_intent")
-            if intent:
-                intent.update(fields)
-                self.store.save(state)
+            if not intent or intent.get("operation_id") != operation_id:
+                raise StaleOperationIntent(
+                    "promotion_intent does not belong to this operation"
+                )
+            intent.update(fields)
+            self.store.save(state)
 
     @staticmethod
     def _production_url_for(identity: dict) -> Optional[str]:

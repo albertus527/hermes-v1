@@ -10,6 +10,23 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 
+class StaleOperationIntent(Exception):
+    """A durable operation-intent write targeted the wrong operation.
+
+    Every external side effect in this system is preceded by a durable intent
+    write that records "this operation is about to happen". If that write is
+    asked to update an intent that is no longer the one on disk, it MUST NOT
+    silently succeed: the caller would then perform the side effect with no
+    durable evidence that it was attempted, and a crash at that moment
+    reproduces the exact duplicate-delivery / duplicate-resource outcome the
+    intent exists to prevent.
+
+    Raising is deliberate. Both preview and promotion already convert an
+    escaping exception into a fail-closed reconciliation outcome, so raising
+    cannot be forgotten at a call site and cannot produce a wrong success.
+    """
+
+
 @dataclass
 class OperationResult:
     """Structured result for an external operation."""

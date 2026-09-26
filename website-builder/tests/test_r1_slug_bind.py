@@ -35,25 +35,51 @@ def _ready_project(h: LocalR1Scenario, name: str = "kitsunereading") -> str:
     return pid
 
 
-def test_legacy_opaque_project_is_reconciled_before_friendly_create(tmp_path):
+def test_slug_binding_never_creates_a_second_vercel_project(tmp_path):
+    """One website must never end up with two Vercel projects.
+
+    This is the invariant that actually holds, and it is enforced by the
+    adapter's GET-then-POST-only-on-404 plus the WEBSITE_BUILDER_OWNER marker
+    — not by the preview-level "legacy project" guard, which is
+    defence-in-depth that cannot fire (``project_attempted`` and
+    ``vercel_project_id`` are always written together, so
+    ``not attempted and vercel_project_id`` never both hold).
+
+    Driving the real production path: no slug bound -> first preview resolves
+    the opaque identity; then a slug is bound and a new revision forces a new
+    operation id -> the second preview must reconcile, never re-create.
+    """
     h = LocalR1Scenario(tmp_path)
     pid = _ready_project(h)
     registry = h.registry.load_or_create(h.chat_id)
-    entry = registry.find_by_id(pid)
-    entry.vercel_slug = None
+    registry.find_by_id(pid).vercel_slug = None
     h.registry.save(registry)
-    with h.store.acquire_writer(pid) as state:
-        state.deployment["vercel_project_id"] = "prj_1"
-        h.store.save(state)
-    h.vercel.get_status = 200
+
+    h.vercel.get_status = 404
     h.vercel.post_status = 201
+    first = h.preview.run_owned(pid, h.runner.create_workspace(pid))
+    assert first.success, first.error
+    creates_after_first = len(h.vercel.created_projects)
 
-    result = h.preview.run_owned(pid, h.runner.create_workspace(pid))
+    # Bind a friendly slug and force a brand-new operation, the way a revision
+    # does: the tested artifact is re-established and preview_intent is dropped
+    # so the next run mints a different operation id.
+    registry = h.registry.load_or_create(h.chat_id)
+    registry.find_by_id(pid).vercel_slug = "kitsunereading"
+    h.registry.save(registry)
+    h.vercel.get_status = 200  # the project now exists remotely
+    with h.store.acquire_writer(pid) as state:
+        from app.core.composition import invalidate_artifact
+        invalidate_artifact(state)
+        h.store.save(state)
+    make_preview_ready(h.store, pid, h.runner.create_workspace(pid), source_revision=2)
 
-    assert result.success, result.error
-    assert h.vercel.post_calls == 0
-    assert h.vercel.deploy_calls == 1
-    assert h.registry_entry(pid).vercel_slug is None
+    h.restart()
+    second = h.preview.run_owned(pid, h.runner.create_workspace(pid))
+
+    assert second.success, second.error
+    # No second create in the second phase, and one overall.
+    assert len(h.vercel.created_projects) == creates_after_first == 1
 
 
 def test_slug_resolver_failure_does_not_switch_to_opaque_identity(tmp_path):

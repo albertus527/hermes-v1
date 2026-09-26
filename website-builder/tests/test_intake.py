@@ -409,9 +409,18 @@ class TestInitialBuildFailureRecovery(unittest.TestCase):
         approved_revision: int = 0,
         shown_preview=None,
         live_url=None,
+        live_revision=None,
     ) -> None:
         """Put a project into FAILED lifecycle as a never-successful initial
-        build (or with whichever success markers the caller passes)."""
+        build (or with whichever success markers the caller passes).
+
+        ``live_url``/``live_revision`` write the REAL production markers
+        (``ProjectState.production_url`` and
+        ``RevisionState.live_revision``, both set by the promotion path).
+        The previous ``state.deployment["live_url"]`` key was written only by
+        this test and read by nothing in production, so the "was ever live"
+        guard it was meant to cover was never actually exercised.
+        """
         self.access.create(project_id, "owner")
         with self.store.acquire_writer(project_id) as state:
             state.lifecycle = ProjectLifecycle.FAILED.value
@@ -419,6 +428,7 @@ class TestInitialBuildFailureRecovery(unittest.TestCase):
             state.revisions.source_revision = source_revision
             state.revisions.qa_revision = qa_revision
             state.revisions.approved_revision = approved_revision
+            state.revisions.live_revision = live_revision or 0
             state.revisions.requirements_version = 1
             state.failure = {
                 "phase": "frontend_build",
@@ -428,7 +438,7 @@ class TestInitialBuildFailureRecovery(unittest.TestCase):
             if shown_preview is not None:
                 state.deployment["latest_shown_preview"] = shown_preview
             if live_url is not None:
-                state.deployment["live_url"] = live_url
+                state.production_url = live_url
             self.store.save(state)
 
     def test_failed_initial_build_recovery_resets_source_revision(self):
@@ -453,12 +463,19 @@ class TestInitialBuildFailureRecovery(unittest.TestCase):
         self.assertEqual(state.revisions.requirements_version, 2)  # seeded 1 + accepted intake
 
     def test_failed_project_that_was_live_never_resets(self):
-        """A project that has EVER been live keeps its revision and failure."""
+        """A project that has EVER been live keeps its revision and failure.
+
+        Every OTHER guard condition is satisfied here (qa_revision == 0,
+        approved_revision == 0, no shown preview) so that the production URL is
+        the single thing preventing the reset. The previous version also set
+        qa_revision/approved_revision to 3, so it passed no matter what the
+        live check did.
+        """
         self._seed_failed(
             "proj-live",
             source_revision=3,
-            qa_revision=3,
-            approved_revision=3,
+            qa_revision=0,
+            approved_revision=0,
             live_url="https://proj.vercel.app",
         )
 
@@ -470,7 +487,19 @@ class TestInitialBuildFailureRecovery(unittest.TestCase):
         self.assertEqual(state.lifecycle, ProjectLifecycle.READY.value)
         self.assertEqual(state.revisions.source_revision, 3)
         self.assertIsNotNone(state.failure)
-        self.assertEqual(state.deployment["live_url"], "https://proj.vercel.app")
+        self.assertEqual(state.production_url, "https://proj.vercel.app")
+
+    def test_failed_project_with_a_live_revision_never_resets(self):
+        """``live_revision`` is the second production 'was ever live' marker."""
+        self._seed_failed("proj-live-rev", source_revision=2, live_revision=2)
+
+        self.processor.apply_to_project(
+            "proj-live-rev", self._ready_result(), principal_id="owner"
+        )
+
+        state = self.store.load("proj-live-rev")
+        self.assertEqual(state.revisions.source_revision, 2)
+        self.assertIsNotNone(state.failure)
 
     def test_failed_project_with_shown_preview_never_resets(self):
         """A project that ever showed a preview keeps its revision."""

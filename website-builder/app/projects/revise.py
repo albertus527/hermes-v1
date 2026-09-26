@@ -163,6 +163,10 @@ class RevisionOrchestrator:
                 "reserved_at": time.time(),
                 "applied": False,
             })
+            # Bound the ledger atomically with this append. Pruning always keeps
+            # unapplied reservations, so the one just added (and any other
+            # awaiting the re-drive path) survives.
+            state.prune_bounded_ledgers()
             self.store.save(state)
         return OperationResult.ok({"seq": seq})
 
