@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -1100,6 +1101,185 @@ class TestSkillSyncToProfile(unittest.TestCase):
         """Fingerprint of a non-existent directory is empty string."""
         fp = HermesAdapter._dir_fingerprint(Path(self.tmpdir) / "nonexistent")
         self.assertEqual(fp, "")
+
+
+class TestFrontendForensicWiring(unittest.TestCase):
+    """The adapter hands the supervisor everything the receipt needs.
+
+    Observation only: this wiring changes no prompt, toolset, skill, timeout, or
+    artifact-recovery behaviour, and it is the reason the next 45-minute run
+    can be classified after the fact.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.store = ProjectStateStore(Path(self.tmpdir) / "state")
+        self.adapter = HermesAdapter(
+            self.store,
+            hermes_home=Path(self.tmpdir) / ".hermes-website",
+            repo_root=Path(self.tmpdir) / "repo",
+        )
+        self.workspace = Path(self.tmpdir) / "workspaces" / "proj-forensics"
+        (self.workspace / "src").mkdir(parents=True)
+        self.starter_app = (
+            self.adapter.repo_root / "templates" / "frontend-starter" / "src" / "App.tsx"
+        )
+        self.starter_app.parent.mkdir(parents=True)
+        self.starter_app.write_text("// starter placeholder\n", encoding="utf-8")
+        self.captured: dict = {}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _supervise(self, run_result=None):
+        """Call the supervised boundary with a stubbed supervisor."""
+        from app.hermes import watchdog as wd
+
+        self.captured.clear()
+
+        def _fake_supervise(cmd, **kwargs):
+            self.captured.update(kwargs)
+            return run_result or wd.SupervisedRun(
+                returncode=0, stdout="{}", stderr="", outcome=None, diagnostics={}
+            )
+
+        with patch.object(wd, "supervise_frontend_run", _fake_supervise):
+            self.adapter._run_hermes_cli_supervised(
+                ["python", "-m", "hermes_cli.main", "-z", "p"],
+                cwd=self.workspace,
+                env={},
+                project_id="proj-forensics",
+                build_operation_id="op-7",
+            )
+        return self.captured
+
+    def test_supervisor_receives_receipt_destination_and_workspace(self):
+        """The destination is a sibling of runs/, and the workspace is the cwd."""
+        from app.hermes import watchdog as wd
+
+        captured = self._supervise()
+
+        self.assertEqual(
+            captured["diagnostics_dir"],
+            self.adapter.hermes_home / "diagnostics" / "proj-forensics",
+        )
+        # A sibling of runs/, not a child: runs_dir is removed by the caller.
+        self.assertNotIn(
+            self.adapter.hermes_home / "runs", captured["diagnostics_dir"].parents
+        )
+        self.assertEqual(captured["workspace"], self.workspace)
+        self.assertEqual(captured["progress_path"].name, "progress.jsonl")
+
+    def test_receipt_directory_is_per_project(self):
+        """Receipts are pruned per project, so the destination must be per project.
+
+        Two projects must not share a directory, or one project's oldest
+        receipts would be pruned away by the other's activity.
+        """
+        from app.hermes import watchdog as wd
+
+        seen = []
+        with patch.object(
+            wd,
+            "supervise_frontend_run",
+            lambda cmd, **kw: seen.append(kw["diagnostics_dir"])
+            or wd.SupervisedRun(0, "", ""),
+        ):
+            for project_id in ("p-one", "p-two"):
+                self.adapter._run_hermes_cli_supervised(
+                    ["x"], cwd=self.workspace, env={}, project_id=project_id,
+                    build_operation_id="1",
+                )
+
+        self.assertEqual(len(set(seen)), 2)
+        self.assertEqual(
+            seen,
+            [
+                self.adapter.hermes_home / "diagnostics" / "p-one",
+                self.adapter.hermes_home / "diagnostics" / "p-two",
+            ],
+        )
+
+    def test_artifacts_probe_reflects_real_completeness(self):
+        """The probe is the existing check, not a second opinion about it."""
+        from app.hermes import watchdog as wd
+
+        captured = self._supervise()
+        probe = captured["artifacts_probe"]
+        self.assertTrue(callable(probe))
+
+        # Nothing produced yet.
+        self.assertFalse(probe())
+
+        # Complete artifacts: real Design DNA, and App.tsx no longer the starter.
+        (self.workspace / "design-dna.json").write_text('{"v": 1}', encoding="utf-8")
+        (self.workspace / "src" / "App.tsx").write_text(
+            "export const App = () => null;", encoding="utf-8"
+        )
+        self.assertTrue(probe())
+
+        # The untouched starter is exactly what the real check rejects.
+        (self.workspace / "src" / "App.tsx").write_text(
+            "// starter placeholder\n", encoding="utf-8"
+        )
+        self.assertFalse(probe())
+
+    def test_artifacts_probe_is_fail_safe(self):
+        """A raising completeness check must not break supervision."""
+        from app.hermes import watchdog as wd
+
+        captured = self._supervise()
+        with patch.object(
+            self.adapter,
+            "_has_complete_frontend_artifacts",
+            side_effect=RuntimeError("boom"),
+        ):
+            self.assertFalse(captured["artifacts_probe"]())
+        self.assertEqual(
+            captured["diagnostics_dir"],
+            self.adapter.hermes_home / "diagnostics" / "proj-forensics",
+        )
+
+    def test_degraded_legacy_timeout_still_records_channel_state(self):
+        """When the watchdog is unavailable, the fallback still leaves a record."""
+        from app.hermes import watchdog as wd
+
+        with patch.object(
+            wd, "supervise_frontend_run", side_effect=wd.WatchdogUnavailable("no kill")
+        ):
+            with patch.object(
+                wd, "resolve_watchdog_policy"
+            ) as policy:
+                policy.return_value = wd.WatchdogPolicy(legacy_wallclock_seconds=1.0)
+                with patch("subprocess.run", side_effect=subprocess.TimeoutExpired("x", 1)):
+                    result = self.adapter._run_hermes_cli_supervised(
+                        ["x"], cwd=self.workspace, env={},
+                        project_id="proj-forensics", build_operation_id="op-7",
+                    )
+
+        self.assertTrue(result.timed_out)
+        self.assertEqual(result.error_code, "FRONTEND_LEGACY_TIMEOUT")
+        self.assertFalse(result.invocation["channel_confirmed"])
+        self.assertEqual(result.invocation["outcome"], "FRONTEND_LEGACY_TIMEOUT")
+        # The user-facing reply is unchanged: no forensics in the error text.
+        self.assertEqual(
+            result.error, "FRONTEND invocation FRONTEND_LEGACY_TIMEOUT"
+        )
+
+    def test_legacy_path_without_a_probe_is_untouched(self):
+        """Non-FRONTEND roles and pre-watchdog callers pass no probe at all."""
+        from app.hermes import watchdog as wd
+
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired("x", 1)):
+            result = self.adapter._run_hermes_cli_legacy(
+                ["x"], self.workspace, {}, timeout_seconds=1
+            )
+
+        self.assertTrue(result.timed_out)
+        self.assertIsNone(result.invocation)
+        self.assertEqual(
+            result.error, "FRONTEND invocation FRONTEND_LEGACY_TIMEOUT"
+        )
 
 
 if __name__ == "__main__":

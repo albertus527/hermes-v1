@@ -562,6 +562,22 @@ class HermesAdapter:
             runs_dir.mkdir(parents=True, exist_ok=True)
         progress_path = runs_dir / "progress.jsonl"
 
+        # Forensic receipts are a SIBLING of runs/, not a child: runs_dir is
+        # rmdir()'d in the finally block below and the progress file is unlinked
+        # by the supervisor, so a receipt written underneath them would not
+        # survive the run that produced it.
+        try:
+            diagnostics_dir = self.hermes_home / "diagnostics" / project_id
+        except Exception:  # pragma: no cover - defensive: forensics only
+            diagnostics_dir = None
+
+        def _artifacts_probe() -> bool:
+            """Completeness, observed only. Never consulted by the timeout decision."""
+            try:
+                return bool(self._has_complete_frontend_artifacts(cwd))
+            except Exception:
+                return False
+
         try:
             run = wd.supervise_frontend_run(
                 cmd,
@@ -571,6 +587,9 @@ class HermesAdapter:
                 invocation_id=invocation_id,
                 build_operation_id=build_operation_id or invocation_id,
                 progress_path=progress_path,
+                diagnostics_dir=diagnostics_dir,
+                workspace=cwd,
+                artifacts_probe=_artifacts_probe,
             )
         except wd.WatchdogUnavailable as exc:
             # Without whole-tree termination we must not supervise: killing only
@@ -584,6 +603,7 @@ class HermesAdapter:
             return self._run_hermes_cli_legacy(
                 cmd, cwd=cwd, env=env,
                 timeout_seconds=wd.resolve_watchdog_policy().legacy_wallclock_seconds,
+                artifacts_probe=_artifacts_probe,
             )
         except Exception as exc:
             return HermesResult(
@@ -622,8 +642,16 @@ class HermesAdapter:
         cwd: Path,
         env: Dict[str, str],
         timeout_seconds: int,
+        artifacts_probe: Optional[Callable[[], bool]] = None,
     ) -> HermesResult:
-        """Pre-watchdog fixed-timeout execution, used only as a fail-safe."""
+        """Pre-watchdog fixed-timeout execution, used only as a fail-safe.
+
+        *artifacts_probe* is observation only. When supplied, a degraded-mode
+        timeout still records what the receipt channel records for a
+        watchdog-issued legacy timeout: ``channel_confirmed: false`` and
+        ``outcome: FRONTEND_LEGACY_TIMEOUT``. The probe is never used to shorten
+        or extend the timeout.
+        """
         try:
             proc = subprocess.run(
                 cmd,
@@ -640,13 +668,30 @@ class HermesAdapter:
                 exit_code=proc.returncode,
             )
         except subprocess.TimeoutExpired:
-            return HermesResult(
+            result = HermesResult(
                 success=False,
                 error="FRONTEND invocation FRONTEND_LEGACY_TIMEOUT",
                 exit_code=124,
                 error_code="FRONTEND_LEGACY_TIMEOUT",
                 timed_out=True,
             )
+            if artifacts_probe is not None:
+                complete = False
+                try:
+                    complete = bool(artifacts_probe())
+                except Exception:
+                    complete = False
+                result.invocation = {
+                    "channel_confirmed": False,
+                    "outcome": "FRONTEND_LEGACY_TIMEOUT",
+                    "artifacts": {
+                        "probe_available": True,
+                        "complete": complete,
+                        "first_complete_offset_seconds": None,
+                        "complete_at_end": complete,
+                    },
+                }
+            return result
         except Exception as exc:
             return HermesResult(
                 success=False,

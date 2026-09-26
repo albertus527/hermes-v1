@@ -11,10 +11,12 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
@@ -82,23 +84,34 @@ class ProgressScript:
             str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600
         )
 
-    def at(self, when: float, run_id: str, kind: str, phase: str) -> "ProgressScript":
-        self.schedule.setdefault(when, []).append((run_id, kind, phase))
+    def at(
+        self,
+        when: float,
+        run_id: str,
+        kind: str,
+        phase: str,
+        desc: Optional[str] = None,
+    ) -> "ProgressScript":
+        # ``desc`` defaults to the old synthetic label so every existing test is
+        # unchanged; forensic tests pass a real emitter description.
+        self.schedule.setdefault(when, []).append(
+            (run_id, kind, phase, f"{kind.lower()}:{phase}" if desc is None else desc)
+        )
         return self
 
     def ready(self, when: float, run_id: str) -> "ProgressScript":
-        return self.at(when, run_id, "channel_ready", "ready")
+        return self.at(when, run_id, "channel_ready", "ready", desc="")
 
     def flush(self) -> None:
         due = self.schedule.pop(self.clock.now, None)
-        for run_id, kind, phase in due or []:
+        for run_id, kind, phase, desc in due or []:
             line = json.dumps(
                 {
                     "run_id": run_id,
                     "event": "channel_ready" if kind == "channel_ready" else "progress",
                     "kind": kind,
                     "phase": phase,
-                    "desc": f"{kind.lower()}:{phase}",
+                    "desc": desc,
                 },
                 separators=(",", ":"),
             ) + "\n"
@@ -114,11 +127,16 @@ class ProgressScript:
 class Harness:
     """Runs ``supervise_frontend_run`` against a fake clock and fake child."""
 
-    def __init__(self, tmp_path: Path, policy: wd.WatchdogPolicy) -> None:
+    def __init__(
+        self,
+        tmp_path: Path,
+        policy: wd.WatchdogPolicy,
+        progress_path: Path = None,
+    ) -> None:
         self.tmp_path = tmp_path
         self.policy = policy
         self.clock = FakeClock()
-        self.progress_path = tmp_path / "progress.jsonl"
+        self.progress_path = progress_path or tmp_path / "progress.jsonl"
         self.script = ProgressScript(self.progress_path, self.clock)
         self.child: FakeChild = None  # type: ignore[assignment]
         self.killed: list = []
@@ -158,6 +176,10 @@ class Harness:
         exit_at=None,
         stdout: str = "",
         stderr: str = "",
+        diagnostics_dir=None,
+        workspace=None,
+        artifacts_probe=None,
+        write_receipt=None,
     ):
         self._exit_at = exit_at
         self._stdout = stdout
@@ -179,6 +201,10 @@ class Harness:
             sleep=self._sleep,
             spawn=self._spawn,
             kill_tree=self._kill_tree,
+            diagnostics_dir=diagnostics_dir,
+            workspace=workspace,
+            artifacts_probe=artifacts_probe,
+            write_receipt=write_receipt,
         )
 
 
@@ -592,6 +618,702 @@ def test_supervisor_propagates_the_progress_env_contract(tmp_path):
     assert seen[real_oneshot.PROGRESS_FILE_ENV].endswith("p.jsonl")
     # Existing child environment is preserved, not replaced.
     assert seen["PROJECT_ID"] == "p1"
+
+
+# ---------------------------------------------------------------------------
+# Forensic receipts (observation only).
+#
+# The point of the receipt is that the NEXT 45-minute run can be classified
+# without a live reproduction. Every test below therefore either pins a
+# counter/discriminator, or locks a property the receipt must NOT have — most
+# importantly that the artifacts probe is never wired into any decision.
+# ---------------------------------------------------------------------------
+
+#: Documented ceiling for one receipt. Nothing here is allowed to grow the file
+#: with the length of a run: 256 samples, 20 ring entries, 32 tool names, 50
+#: mutated paths, and clamped descriptions are all hard bounds.
+RECEIPT_SIZE_CEILING_BYTES = 65536
+
+
+def _read_receipt(diagnostics_dir: Path, invocation_id: str) -> dict:
+    return json.loads((diagnostics_dir / f"{invocation_id}.json").read_text("utf-8"))
+
+
+def _complete_workspace(tmp_path: Path, name: str = "ws") -> Path:
+    """A workspace with the two sampled artifacts present."""
+    ws = tmp_path / name
+    (ws / "src").mkdir(parents=True)
+    (ws / "design-dna.json").write_text('{"v": 1}', encoding="utf-8")
+    (ws / "src" / "App.tsx").write_text("export const A = 1;", encoding="utf-8")
+    (ws / "src" / "main.tsx").write_text("main", encoding="utf-8")
+    return ws
+
+
+# --- counters and ring buffer ---------------------------------------------
+
+
+def test_counters_classify_every_kind_and_phase_exactly(harness):
+    """MODEL/TOOL/STREAM/UNKNOWN each land in their own counter.
+
+    The 45-minute verdict is read off these numbers: a stream-dominant run and
+    a model-dominant run are different failure modes and are currently
+    indistinguishable, because only ``last_progress_kind`` survived.
+    """
+    harness.script.ready(0, "inv-A")
+    for t in (10, 20):
+        harness.script.at(t, "inv-A", "MODEL", "started", desc=f"starting API call #{t}")
+    harness.script.at(30, "inv-A", "MODEL", "completed", desc="API call #20 completed")
+    for t in (40, 50, 60):
+        harness.script.at(
+            t, "inv-A", "TOOL", "started", desc=f"executing tool: write_file"
+        )
+    for t in (70, 80):
+        harness.script.at(
+            t, "inv-A", "TOOL", "completed", desc="tool completed: write_file (0.4s)"
+        )
+    for t in (90, 100, 110, 120):
+        harness.script.at(
+            t, "inv-A", "STREAM", "active", desc="receiving stream response"
+        )
+    for t in (130, 140):
+        harness.script.at(t, "inv-A", "UNKNOWN", "active", desc="provider retry backoff")
+
+    run = harness.run("inv-A", exit_at=200)
+
+    counters = run.diagnostics["forensics"]["counters"]
+    assert counters["model_started"] == 2
+    assert counters["model_completed"] == 1
+    assert counters["tool_started"] == 3
+    assert counters["tool_completed"] == 2
+    assert counters["stream_active"] == 4
+    assert counters["unknown_active"] == 2
+    assert counters["total_progress_events"] == run.diagnostics["progress_event_count"]
+
+
+def test_model_and_tool_boundary_events_are_exact_despite_coalescing(harness):
+    """Boundary events are never coalesced, so these two are not lower bounds.
+
+    The emitter coalesces active-phase events to at most one per 5s, which
+    makes STREAM/UNKNOWN counts lower bounds only. ``started``/``completed``
+    are exact, so the model-vs-tool ratio that separates a request loop from a
+    tool loop is trustworthy.
+    """
+    harness.script.ready(0, "inv-A")
+    for t in range(10, 400, 10):
+        harness.script.at(t, "inv-A", "MODEL", "started", desc="starting API call #1")
+        harness.script.at(t, "inv-A", "MODEL", "completed", desc="API call #1 completed")
+    harness.script.at(410, "inv-A", "MODEL", "completed", desc="API call #1 completed")
+
+    run = harness.run("inv-A", exit_at=450)
+
+    counters = run.diagnostics["forensics"]["counters"]
+    assert counters["model_started"] == 39
+    assert counters["model_completed"] == 40
+
+
+def test_recent_activity_ring_is_bounded_and_evicts_oldest(harness):
+    """20 entries max, oldest evicted, each carrying offset/kind/phase/desc."""
+    harness.script.ready(0, "inv-A")
+    for i in range(40):
+        harness.script.at(
+            i, "inv-A", "TOOL", "started", desc=f"executing tool: tool{i:02d}"
+        )
+
+    run = harness.run("inv-A", exit_at=45)
+
+    ring = run.diagnostics["forensics"]["recent_activity"]
+    assert len(ring) == 20
+    assert set(ring[0]) == {"offset_seconds", "kind", "phase", "desc"}
+    # Oldest 20 evicted: tool00..tool19 gone, tool20..tool39 retained in order.
+    assert [entry["desc"].split()[-1] for entry in ring] == [
+        f"tool{i:02d}" for i in range(20, 40)
+    ]
+    assert [entry["offset_seconds"] for entry in ring] == [
+        pytest.approx(float(i), abs=0.1) for i in range(20, 40)
+    ]
+    assert all(entry["kind"] == "TOOL" and entry["phase"] == "started" for entry in ring)
+
+
+def test_tool_names_are_counted_capped_and_never_arguments(harness):
+    """Tool NAMES are diagnostics; arguments are not."""
+    harness.script.ready(0, "inv-A")
+    for i in range(40):
+        harness.script.at(
+            i, "inv-A", "TOOL", "started", desc=f"executing tool: tool{i:02d}"
+        )
+    harness.script.at(50, "inv-A", "TOOL", "completed", desc="tool completed: tool00 (0.1s)")
+    # An unmapped description must not be mined for a name.
+    harness.script.at(60, "inv-A", "UNKNOWN", "active", desc="executing toolX: secret")
+
+    run = harness.run("inv-A", exit_at=65)
+
+    names = run.diagnostics["forensics"]["tool_names"]
+    assert names["tool00"] == 2
+    assert len(names) == wd.MAX_TOOL_NAME_DISTINCT
+    assert run.diagnostics["forensics"]["tool_names_truncated"] is True
+    assert "secret" not in json.dumps(names)
+
+
+# --- description redaction --------------------------------------------------
+
+
+def test_normalize_forensic_desc_redacts_urls_paths_and_long_runs():
+    """The wire desc is clamped, never trusted: it can carry anything."""
+    hex_run = "a" * 32 + "0123456789abcdef"
+
+    url = wd.normalize_forensic_desc("fetching https://api.example.com/v1/x?k=abc")
+    assert "example.com" not in url and "http" not in url
+
+    win = wd.normalize_forensic_desc(r"wrote C:\Users\Bob\secret\App.tsx")
+    assert "Bob" not in win and "C:" not in win
+
+    posix = wd.normalize_forensic_desc("wrote /home/bob/proj/src/App.tsx")
+    assert "/home" not in posix and "App.tsx" not in posix
+
+    hashed = wd.normalize_forensic_desc(f"blob {hex_run} done")
+    assert hex_run not in hashed
+
+    # The known-good shape survives intact: a name is the diagnostic.
+    assert wd.normalize_forensic_desc("executing tool: write_file") == (
+        "executing tool: write_file"
+    )
+    assert wd.normalize_forensic_desc("tool completed: read_file (12.5s)") == (
+        "tool completed: read_file (12.5s)"
+    )
+    assert wd.normalize_forensic_desc("receiving stream response") == (
+        "receiving stream response"
+    )
+
+
+def test_normalize_forensic_desc_is_bounded_and_total():
+    """Pure, total, and hard-bounded whatever it is handed."""
+    assert wd.normalize_forensic_desc(None) == ""
+    assert wd.normalize_forensic_desc("") == ""
+    assert wd.normalize_forensic_desc("  a \n\t b  ") == "a b"
+    assert len(wd.normalize_forensic_desc("x" * 5000)) <= wd._ACTIVITY_DESCRIPTION_MAX
+    # A description that is only a payload redacts to the placeholder, not to
+    # an empty string that would look like "nothing happened".
+    assert wd.normalize_forensic_desc("b" * 40) == "<redacted>"
+
+
+# --- workspace sampler -----------------------------------------------------
+
+
+def test_unchanged_workspace_yields_a_constant_fingerprint(tmp_path):
+    """No workspace movement must not be reported as mutation."""
+    ws = _complete_workspace(tmp_path)
+    sampler = wd.WorkspaceSampler(ws, None, started_at=0.0)
+
+    sampler.sample(0.0)
+    first = sampler.metadata_fingerprint
+    sampler.sample(30.0)
+
+    assert first
+    assert sampler.metadata_fingerprint == first
+    assert sampler.distinct_fingerprints == 1
+    assert sampler.source_mutation_count == 0
+    assert sampler.unique_source_files_mutated() == 0
+    assert sampler.mutated_paths() == []
+    assert sampler.design_dna_present is True
+    assert sampler.app_tsx_present is True
+
+
+def test_touching_one_file_is_one_mutation_of_one_file(tmp_path):
+    """The A-vs-B split rests on unique-file count, not on event count."""
+    ws = _complete_workspace(tmp_path)
+    sampler = wd.WorkspaceSampler(ws, None, started_at=0.0)
+
+    sampler.sample(0.0)
+    before = sampler.metadata_fingerprint
+    # A different length, not a same-size swap: the fingerprint is metadata, so
+    # a same-size rewrite inside one filesystem mtime tick is deliberately
+    # invisible (asserted separately) and must not be relied on here.
+    (ws / "src" / "App.tsx").write_text(
+        "export const App = () => <main />;", encoding="utf-8"
+    )
+    sampler.sample(30.0)
+
+    assert sampler.metadata_fingerprint != before
+    assert sampler.distinct_fingerprints == 2
+    assert sampler.source_mutation_count == 1
+    assert sampler.unique_source_files_mutated() == 1
+    assert sampler.mutated_paths() == ["src/App.tsx"]
+    assert sampler.first_mutation_offset_seconds == 30.0
+    assert sampler.last_mutation_offset_seconds == 30.0
+
+
+def test_fingerprint_ignores_content_and_never_opens_a_file(tmp_path, monkeypatch):
+    """The fingerprint is (relpath, size, mtime_ns) and nothing else.
+
+    This is the property that makes "no source contents" hold absolutely, so
+    it is asserted two ways: a same-length content swap with a pinned mtime is
+    invisible, and any attempt to read a file during a sample raises.
+    """
+    ws = _complete_workspace(tmp_path)
+    target = ws / "src" / "App.tsx"
+    stat = target.stat()
+    sampler = wd.WorkspaceSampler(ws, None, started_at=0.0)
+    sampler.sample(0.0)
+    before = sampler.metadata_fingerprint
+
+    # A same-length content swap with the mtime pinned back: the fingerprint
+    # must not move, and the scan must not have read the bytes to notice.
+    target.write_text("export const B = 9;", encoding="utf-8")
+    assert target.stat().st_size == stat.st_size
+    os.utime(target, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+    def _no_reads(*_a, **_k):
+        raise AssertionError("the sampler must never read file contents")
+
+    monkeypatch.setattr("builtins.open", _no_reads)
+    monkeypatch.setattr(Path, "open", _no_reads)
+    monkeypatch.setattr(Path, "read_text", _no_reads)
+    monkeypatch.setattr(Path, "read_bytes", _no_reads)
+    sampler.sample(30.0)
+
+    assert sampler.metadata_fingerprint == before
+    assert sampler.source_mutation_count == 0
+    # The scan demonstrably still saw both artifacts, so the pass above was a
+    # real comparison and not a scan that silently failed.
+    assert sampler.app_tsx_present is True
+    assert sampler.design_dna_present is True
+
+
+def test_sampler_marks_truncation_past_the_file_cap_and_still_returns(
+    tmp_path, monkeypatch
+):
+    """A pathological tree must be reported, not walked to the end."""
+    ws = tmp_path / "big"
+    (ws / "src").mkdir(parents=True)
+    for i in range(12):
+        (ws / "src" / f"f{i}.tsx").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(wd, "WORKSPACE_SAMPLE_MAX_FILES", 5)
+
+    sampler = wd.WorkspaceSampler(ws, None, started_at=0.0)
+    sampler.sample(0.0)
+    receipt = sampler.receipt()
+
+    assert receipt["truncated"] is True
+    assert receipt["samples"] == 1
+    assert receipt["app_tsx_present"] is False
+
+
+def test_sampler_excludes_node_modules_and_dot_directories(tmp_path):
+    """Vendored and hidden trees are not the build's source of truth."""
+    ws = _complete_workspace(tmp_path)
+    for excluded in ("node_modules", ".git", ".next"):
+        target = ws / "src" / excluded
+        target.mkdir()
+        (target / "junk.tsx").write_text("junk", encoding="utf-8")
+    (ws / "src" / ".hidden.tsx").write_text("hidden", encoding="utf-8")
+
+    sampler = wd.WorkspaceSampler(ws, None, started_at=0.0)
+    sampler.sample(0.0)
+    (ws / "src" / "App.tsx").write_text("changed", encoding="utf-8")
+    sampler.sample(30.0)
+
+    assert sampler.mutated_paths() == ["src/App.tsx"]
+    assert sampler.unique_source_files_mutated() == 1
+
+
+def test_sample_series_is_capped(tmp_path):
+    """A 45-minute run must not be able to grow the sample series for ever."""
+    ws = _complete_workspace(tmp_path)
+    sampler = wd.WorkspaceSampler(ws, None, started_at=0.0)
+    for t in range(0, 30000, 30):
+        sampler.sample(float(t), force=True)
+
+    assert sampler.samples == wd.MAX_SAMPLE_SERIES
+
+
+# --- artifacts probe is observation only -----------------------------------
+
+
+def test_a_raising_artifacts_probe_cannot_change_the_outcome(harness, tmp_path):
+    """A forensic observation that explodes must not terminate anything."""
+    def _boom():
+        raise RuntimeError("probe exploded")
+
+    harness.script.ready(0, "inv-A")
+    for t in range(30, 300, 30):
+        harness.script.at(t, "inv-A", "MODEL", "started", desc="starting API call #1")
+        harness.script.at(t, "inv-A", "MODEL", "completed", desc="API call #1 completed")
+
+    run = harness.run(
+        "inv-A", exit_at=320, workspace=tmp_path, artifacts_probe=_boom
+    )
+
+    assert run.outcome is None
+    assert run.returncode == 0
+    assert harness.killed == []
+    assert run.diagnostics["forensics"]["artifacts"]["probe_failed"] is True
+
+
+def test_a_raising_sampler_cannot_change_the_outcome(harness, tmp_path, monkeypatch):
+    """Same contract for the workspace scan itself."""
+    def _boom(*_a, **_k):
+        raise RuntimeError("scan exploded")
+
+    monkeypatch.setattr(wd.WorkspaceSampler, "_scan", _boom)
+    harness.script.ready(0, "inv-A")
+    for t in range(30, 300, 30):
+        harness.script.at(t, "inv-A", "MODEL", "started", desc="starting API call #1")
+        harness.script.at(t, "inv-A", "MODEL", "completed", desc="API call #1 completed")
+
+    run = harness.run(
+        "inv-A",
+        exit_at=320,
+        workspace=tmp_path,
+        diagnostics_dir=tmp_path / "diag",
+        artifacts_probe=lambda: True,
+    )
+
+    assert run.outcome is None
+    assert run.returncode == 0
+    assert harness.killed == []
+    assert run.diagnostics["forensics"]["artifacts"]["complete"] is False
+
+
+def test_first_complete_offset_is_recorded_once_and_never_overwritten(harness):
+    """Artifact completeness is a timeline, not a boolean."""
+    harness.script.ready(0, "inv-A")
+    for t in range(0, 700, 30):
+        harness.script.at(t, "inv-A", "MODEL", "started", desc="starting API call #1")
+    # Complete exactly once, at t=300, then (wrongly) report incomplete after.
+    harness.script.at(300, "inv-A", "TOOL", "started", desc="executing tool: write_file")
+
+    run = harness.run(
+        "inv-A",
+        exit_at=700,
+        diagnostics_dir=harness.tmp_path / "diag",
+        artifacts_probe=lambda: harness.clock.now == 300,
+    )
+
+    artifacts = run.diagnostics["forensics"]["artifacts"]
+    assert artifacts["first_complete_offset_seconds"] == 300.0
+    # The end state is the end state: complete, then a regression to incomplete.
+    assert artifacts["complete_at_end"] is False
+
+
+def test_first_complete_offset_stays_null_when_never_complete(harness):
+    """A null means only "not observed before the end" — never "too slow"."""
+    harness.script.ready(0, "inv-A")
+    for t in range(0, 400, 30):
+        harness.script.at(t, "inv-A", "MODEL", "started", desc="starting API call #1")
+
+    run = harness.run(
+        "inv-A",
+        exit_at=420,
+        diagnostics_dir=harness.tmp_path / "diag",
+        artifacts_probe=lambda: False,
+    )
+
+    artifacts = run.diagnostics["forensics"]["artifacts"]
+    assert artifacts["probe_available"] is True
+    assert artifacts["first_complete_offset_seconds"] is None
+    assert artifacts["complete"] is False
+
+
+def test_complete_artifacts_do_not_terminate_a_silent_run(harness):
+    """BOUNDARY LOCK: this is the convergence guard, and it is not implemented.
+
+    The artifacts are complete from the first sample, and the run then goes
+    silent. It MUST still be terminated by the idle bound. If this test ever
+    fails, someone has wired the probe into the supervision decision — which is
+    the deferred change, not this one.
+    """
+    harness.script.ready(0, "inv-A").at(0, "inv-A", "MODEL", "started")
+
+    run = harness.run(
+        "inv-A", exit_at=None, artifacts_probe=lambda: True
+    )
+
+    assert run.outcome == wd.OUTCOME_IDLE_TIMEOUT
+    assert run.terminated is True
+    assert run.diagnostics["forensics"]["artifacts"]["complete"] is True
+
+
+def test_complete_artifacts_do_not_end_a_run_that_is_otherwise_alive(harness):
+    """The mirror image: still no early exit on a converging-shaped run."""
+    harness.script.ready(0, "inv-A")
+    for t in range(0, 700, 30):
+        harness.script.at(t, "inv-A", "TOOL", "started", desc="executing tool: write_file")
+        harness.script.at(t, "inv-A", "TOOL", "completed", desc="tool completed: write_file (1.0s)")
+
+    run = harness.run(
+        "inv-A", exit_at=690, artifacts_probe=lambda: harness.clock.now >= 300
+    )
+
+    assert run.outcome is None
+    assert harness.killed == []
+    assert run.diagnostics["forensics"]["artifacts"]["first_complete_offset_seconds"] == 300.0
+
+
+# --- the predicate the corrected verdict rests on --------------------------
+
+
+def test_in_flight_protection_suppresses_the_idle_bound_and_shows_the_gap(harness):
+    """A hard-timeout run may contain multi-minute silences. The receipt shows it.
+
+    In-flight protection suppresses the 180s idle bound for up to
+    ``max_single_operation_seconds`` (900s), so a run of repeated long
+    operations each under that bound can reach the fuse with real silences
+    between events. ``longest_gap_seconds`` is what separates that pattern from
+    continuously-active work — and nothing else in the record can.
+    """
+    harness.script.ready(0, "inv-A").at(0, "inv-A", "MODEL", "started", desc="starting API call #1")
+    # 800s of true silence, still inside the 900s in-flight bound.
+    harness.script.at(800, "inv-A", "TOOL", "completed", desc="tool completed: write_file (800.0s)")
+    for t in range(860, 1460, 60):
+        harness.script.at(t, "inv-A", "STREAM", "active", desc="receiving stream response")
+
+    run = harness.run("inv-A", exit_at=1500)
+
+    assert run.outcome is None
+    assert run.diagnostics["elapsed_seconds"] > harness.policy.idle_timeout_seconds
+    assert run.diagnostics["forensics"]["activity"]["longest_gap_seconds"] == pytest.approx(
+        800.0, abs=1
+    )
+
+
+def test_continuously_active_run_reports_a_short_longest_gap(harness):
+    """The contrasting signature: real activity has no multi-minute silence."""
+    harness.script.ready(0, "inv-A")
+    for t in range(0, 1500, 30):
+        harness.script.at(t, "inv-A", "TOOL", "started", desc="executing tool: write_file")
+        harness.script.at(t, "inv-A", "TOOL", "completed", desc="tool completed: write_file (0.2s)")
+
+    run = harness.run("inv-A", exit_at=1500)
+
+    gap = run.diagnostics["forensics"]["activity"]["longest_gap_seconds"]
+    assert gap <= harness.policy.idle_timeout_seconds
+
+
+# --- receipt persistence ---------------------------------------------------
+
+
+def test_receipt_is_written_for_every_terminal_path(tmp_path):
+    """Success and all three timeout codes, each with its own outcome recorded.
+
+    Every terminal path writes, because the whole question is "which mode
+    happened" — a run that produced no receipt on one of the four would be the
+    one run we could not classify. Each case drives the distinct bound it
+    names: silence for idle, continuous progress for the hard fuse, and no
+    handshake for degraded mode.
+    """
+    cases = (
+        (None, 25, True, False),
+        (wd.OUTCOME_IDLE_TIMEOUT, None, True, False),
+        (wd.OUTCOME_HARD_TIMEOUT, None, True, True),
+        (wd.OUTCOME_LEGACY_TIMEOUT, None, False, True),
+    )
+    for index, (expected, exit_at, confirmed, busy) in enumerate(cases):
+        made = Harness(
+            tmp_path,
+            fast_policy(),
+            progress_path=tmp_path / f"progress-{index}.jsonl",
+        )
+        try:
+            if confirmed:
+                made.script.ready(0, "inv-x")
+            made.script.at(0, "inv-x", "MODEL", "started", desc="starting API call #1")
+            if busy:
+                for t in range(60, 3000, 60):
+                    made.script.at(t, "inv-x", "TOOL", "started", desc="executing tool: write_file")
+                    made.script.at(t, "inv-x", "TOOL", "completed", desc="tool completed: write_file (0.5s)")
+            diag = tmp_path / f"diag-{index}"
+            run = made.run("inv-x", diagnostics_dir=diag, exit_at=exit_at)
+
+            assert run.outcome == expected, expected
+            receipt = _read_receipt(diag, "inv-x")
+            assert receipt["schema"] == wd.FORENSICS_SCHEMA
+            assert receipt["outcome"] == expected
+            assert receipt["channel_confirmed"] is confirmed
+            assert run.diagnostics["forensics_receipt"].endswith("inv-x.json")
+        finally:
+            made.script.close()
+
+
+def test_receipt_survives_the_runs_directory_being_removed(tmp_path):
+    """A sibling of runs/, so runs_dir.rmdir() + progress unlink cannot take it.
+
+    This is the durability reason the receipt is not written under the
+    per-invocation runs directory the supervisor already cleans up.
+    """
+    hermes = tmp_path / "hermes-home"
+    runs_dir = hermes / "runs" / "inv-durable"
+    runs_dir.mkdir(parents=True)
+    diag = hermes / "diagnostics" / "proj-durable"
+
+    made = Harness(
+        tmp_path, fast_policy(), progress_path=runs_dir / "progress.jsonl"
+    )
+    try:
+        made.script.ready(0, "inv-durable")
+        made.script.at(10, "inv-durable", "TOOL", "started", desc="executing tool: write_file")
+        made.run(
+            "inv-durable", project_id="proj-durable", exit_at=20, diagnostics_dir=diag
+        )
+
+        # The structural property: the receipt directory is a SIBLING of runs/,
+        # so the caller's runs_dir.rmdir() and the supervisor's
+        # progress_path.unlink() cannot reach it. rmtree rather than rmdir so
+        # the test asserts the layout instead of Windows' open-file rules.
+        assert diag != runs_dir
+        assert runs_dir not in diag.parents
+        made.script.close()
+        shutil.rmtree(runs_dir)
+        assert not runs_dir.exists()
+        assert _read_receipt(diag, "inv-durable")["outcome"] is None
+    finally:
+        made.script.close()
+
+
+def test_receipt_is_bounded_for_a_very_long_noisy_run(tmp_path):
+    """Receipt size must not scale with the length or noisiness of the run."""
+    made = Harness(tmp_path, fast_policy(hard_max_runtime_seconds=100_000.0))
+    diag = tmp_path / "diag"
+    try:
+        made.script.ready(0, "inv-noisy")
+        for i in range(300):
+            made.script.at(
+                i * 30, "inv-noisy", "TOOL", "started", desc=f"executing tool: tool{i}"
+            )
+        # 300 events spanning 0..8970s: 301 sampling opportunities, capped at 256.
+        run = made.run("inv-noisy", exit_at=9000, diagnostics_dir=diag)
+        path = diag / "inv-noisy.json"
+        assert path.stat().st_size < RECEIPT_SIZE_CEILING_BYTES
+
+        receipt = _read_receipt(diag, "inv-noisy")
+        assert receipt["counters"]["total_progress_events"] == 300
+        assert receipt["workspace"]["samples"] == wd.MAX_SAMPLE_SERIES
+        assert len(receipt["recent_activity"]) == wd.RECENT_ACTIVITY_LEN
+        assert len(receipt["tool_names"]) == wd.MAX_TOOL_NAME_DISTINCT
+        assert receipt["tool_names_truncated"] is True
+        assert run.outcome is None
+    finally:
+        made.script.close()
+
+
+def test_pruning_keeps_the_newest_receipts_per_project(tmp_path):
+    """Bounded disk: one project keeps at most its newest receipts."""
+    diag = tmp_path / "diag"
+    for i in range(wd.MAX_RECEIPTS_PER_PROJECT + 5):
+        name = wd._write_receipt(diag, f"inv-{i:03d}", {"schema": wd.FORENSICS_SCHEMA})
+        os.utime(diag / name, ns=(1_000_000_000 + i * 1_000_000_000,) * 2)
+
+    kept = sorted(p.name for p in diag.glob("*.json"))
+    assert len(kept) == wd.MAX_RECEIPTS_PER_PROJECT
+    # The five oldest were pruned; the newest survived.
+    assert "inv-024.json" in kept
+    assert "inv-000.json" not in kept
+    # No temp files left behind by the atomic write.
+    assert list(diag.glob("*.tmp")) == []
+
+
+def test_receipt_write_failure_leaves_the_run_untouched(harness, tmp_path):
+    """A forensic write that fails must not change outcome or returncode."""
+    def _boom(*_a, **_k):
+        raise OSError("disk full")
+
+    harness.script.ready(0, "inv-A")
+    for t in range(30, 300, 30):
+        harness.script.at(t, "inv-A", "TOOL", "started", desc="executing tool: write_file")
+        harness.script.at(t, "inv-A", "TOOL", "completed", desc="tool completed: write_file (0.3s)")
+
+    run = harness.run(
+        "inv-A", exit_at=320, diagnostics_dir=tmp_path / "diag", write_receipt=_boom
+    )
+
+    assert run.outcome is None
+    assert run.returncode == 0
+    assert run.diagnostics["forensics_receipt"] is None
+    assert list((tmp_path / "diag").glob("*.json")) == []
+
+
+def test_receipt_leaks_no_prompt_absolute_path_or_url(harness, tmp_path):
+    """The receipt is an operator artifact, so it is held to the strictest bar.
+
+    Two structural guarantees are asserted here. First, nothing outside a
+    progress description is ever recorded: the prompt travels in the child's
+    argv and appears in its output, and neither reaches the receipt. Second, a
+    description IS attacker-influenced text, so a URL or an absolute path in
+    one is redacted rather than stored.
+    """
+    prompt = "You are FRONTEND, the website designer and builder for R1"
+    harness.script.ready(0, "inv-A")
+    for t in (10, 20, 30):
+        harness.script.at(
+            t, "inv-A", "TOOL", "started", desc=f"executing tool: write_file via https://x.test/a"
+        )
+    harness.script.at(
+        40, "inv-A", "TOOL", "completed", desc=f"tool completed: write_file ({tmp_path})"
+    )
+
+    diag = tmp_path / "diag"
+    run = harness.run(
+        "inv-A", exit_at=50, diagnostics_dir=diag, workspace=tmp_path,
+        stdout=prompt,
+    )
+    assert run.outcome is None
+
+    text = (diag / "inv-A.json").read_text("utf-8")
+    assert prompt not in text
+    assert str(tmp_path) not in text
+    assert "https://" not in text
+    assert "x.test" not in text
+    # The one place a path may appear is workspace-relative, and only that.
+    for entry in json.loads(text)["workspace"]["mutated_paths"]:
+        assert not entry.startswith("/") and ":" not in entry
+
+
+def test_receipt_reports_the_policy_actually_in_force(harness, tmp_path):
+    """A receipt read without the config in hand must still be interpretable."""
+    harness.script.ready(0, "inv-A")
+    harness.script.at(10, "inv-A", "MODEL", "started", desc="starting API call #1")
+
+    run = harness.run(
+        "inv-A",
+        exit_at=20,
+        diagnostics_dir=tmp_path / "diag",
+        workspace=tmp_path,
+        artifacts_probe=lambda: False,
+    )
+    policy = run.diagnostics["forensics"]["policy"]
+
+    assert policy["idle"] == harness.policy.idle_timeout_seconds
+    assert policy["hard"] == harness.policy.hard_max_runtime_seconds
+    assert policy["max_single_operation"] == harness.policy.max_single_operation_seconds
+    assert run.diagnostics["forensics"]["channel_confirmed"] is True
+    assert run.diagnostics["forensics"]["invocation_id"] == "inv-A"
+
+
+def test_degraded_mode_receipt_records_an_unconfirmed_channel(harness, tmp_path):
+    """Degraded mode must be readable too, not only the fully supervised path."""
+    for t in range(30, 800, 30):
+        harness.script.at(t, "inv-A", "TOOL", "started", desc="executing tool: write_file")
+
+    run = harness.run(
+        "inv-A", exit_at=None, diagnostics_dir=tmp_path / "diag", workspace=tmp_path
+    )
+
+    receipt = _read_receipt(tmp_path / "diag", "inv-A")
+    assert run.outcome == wd.OUTCOME_LEGACY_TIMEOUT
+    assert receipt["outcome"] == wd.OUTCOME_LEGACY_TIMEOUT
+    assert receipt["channel_confirmed"] is False
+
+
+def test_no_diagnostics_dir_writes_nothing_but_still_reports_in_memory(harness):
+    """The file is opt-in; the in-memory block is not."""
+    harness.script.ready(0, "inv-A")
+    harness.script.at(5, "inv-A", "MODEL", "started", desc="starting API call #1")
+
+    run = harness.run("inv-A", exit_at=10)
+
+    assert run.diagnostics["forensics_receipt"] is None
+    assert run.diagnostics["progress_event_count"] == 1
+    assert run.diagnostics["forensics"]["counters"]["model_started"] == 1
+    assert list(harness.tmp_path.glob("**/*.json")) == []
 
 
 # ---------------------------------------------------------------------------
