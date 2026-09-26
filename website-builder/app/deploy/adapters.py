@@ -1441,6 +1441,107 @@ class VercelAdapter:
             except Exception:
                 return _fail('PROMOTE_RECONCILIATION_REQUIRED')
 
+    # ------------------------------------------------------------------
+    # PHASE R1-A — canonical public production URL
+    # ------------------------------------------------------------------
+    #
+    # A Vercel deployment's own ``url`` is DEPLOYMENT-SPECIFIC
+    # (``<project>-<hash>-<team>.vercel.app``). It identifies one immutable
+    # build, is useful for reconciliation/rollback/diagnostics, and may sit
+    # behind Deployment Protection -- so it is never the user-facing public
+    # production URL. The PUBLIC URL is the project's own default domain,
+    # ``<project-name>.vercel.app``, which follows the project, not the build.
+    #
+    # These are two distinct concepts and are never derived from each other:
+    # the canonical URL is NEVER produced by stripping suffixes off a
+    # deployment hostname.
+    #
+    # A Vercel project name is a single lower-case DNS label, no longer than
+    # 100 characters.
+    _VERCEL_PROJECT_NAME_RE = re.compile(r'[a-z0-9][a-z0-9-]{0,99}')
+
+    def canonical_production_url(self, app_id, project, *, expected_name=None):
+        """Resolve the project's canonical PUBLIC production URL.
+
+        Resolution order:
+
+          1. Prove ownership with the same marker check as every other
+             call (``_project_valid``); a name alone never proves anything.
+          2. Read the project's own domain list and use the default domain
+             the provider positively PROVES: a record whose ``name`` is
+             exactly ``<project-name>.vercel.app`` with ``verified is True``.
+          3. Otherwise fall back to the deterministic
+             ``https://<name>.vercel.app/`` form. This is legitimate only
+             because ``name`` has already been verified against the OWNED
+             project above (it is the same value ``lookup_project`` was
+             called with, and ``_project_valid`` re-asserted it) -- the
+             fallback formats a name we own, it never invents a host from a
+             response.
+
+        A domain read that is unavailable, ambiguous, or simply does not
+        prove the default domain is NOT a failure: the project name is
+        already proven, so the canonical host is known. Only a project with
+        no usable name at all fails closed (``CANONICAL_URL_UNRESOLVED``).
+
+        A verified CUSTOM domain is deliberately NOT preferred here. It is
+        recorded and smoke-verified by the custom-domain flow, but the
+        canonical production URL is always the project's own default
+        domain, so publication never becomes coupled to that flow or to its
+        deployment-protection bypass scoping.
+
+        Read-only. Never mints, mutates, or trusts a deployment hostname.
+        """
+        try:
+            if not self._project_valid(project, app_id, expected_name=expected_name):
+                return _fail('PROJECT_IDENTITY_MISMATCH')
+            name = expected_name or self.project_name_for(app_id)
+            if (not isinstance(name, str)
+                    or not self._VERCEL_PROJECT_NAME_RE.fullmatch(name)):
+                # No provable project name -> no provable canonical host.
+                # Never fall back to a deployment hostname here.
+                return _fail('CANONICAL_URL_UNRESOLVED')
+            proven = self._default_domain_verified(name, project)
+            if proven:
+                return OperationResult.ok({
+                    'canonical_production_url': f'https://{name}.vercel.app/',
+                    'canonical_source': 'VERCEL_PROJECT_DOMAIN',
+                    'project_name': name,
+                })
+            return OperationResult.ok({
+                'canonical_production_url': f'https://{name}.vercel.app/',
+                'canonical_source': 'VERIFIED_PROJECT_NAME',
+                'project_name': name,
+            })
+        except Exception:
+            return _fail('CANONICAL_URL_UNRESOLVED')
+
+    def _default_domain_verified(self, name, project):
+        """True only when the provider PROVES the project's own default
+        domain is attached and verified.
+
+        Any doubt -- unreadable response, non-list payload, absent record, a
+        record that is not the default domain, or a non-boolean ``verified``
+        -- is False, which routes the caller to the deterministic fallback.
+        Never raises and never partially trusts a malformed body.
+        """
+        try:
+            status, body = self._call(
+                'GET', '/v9/projects/' + quote(name, safe='') + '/domains')
+        except Exception:
+            return False
+        if status != 200 or not isinstance(body, dict):
+            return False
+        domains = body.get('domains')
+        if not isinstance(domains, list):
+            return False
+        for entry in domains:
+            if not isinstance(entry, dict):
+                return False
+            if entry.get('name') != name + '.vercel.app':
+                continue
+            return entry.get('verified') is True
+        return False
+
     def _valid_hostname_for_api(self, hostname):
         return valid_custom_hostname(hostname)
 
@@ -1767,9 +1868,11 @@ class VercelAdapter:
         URL or a bare deployment_id).
 
         Outcomes (``OperationResult``):
-          * ``ok`` with ``{'status': 'PROMOTED', 'deployment_id': ...}`` --
-            current production IS the expected deployment, with every trusted
-            identity field matching exactly.
+          * ``ok`` with ``{'status': 'PROMOTED', 'deployment_id': ...,
+            'deployment_url': ...}`` -- current production IS the expected
+            deployment, with every trusted identity field matching exactly.
+            ``deployment_url`` is the deployment-SPECIFIC host (internal
+            identity/diagnostics only, never the public LIVE URL).
           * ``ok`` with ``{'status': 'NOT_PROMOTED', 'deployment_id': ...}`` --
             provider truth CONCLUSIVELY shows the expected deployment was not
             promoted. This requires positive evidence: the provider's own
@@ -1804,8 +1907,19 @@ class VercelAdapter:
             if current_prod_id == deployment_id:
                 if body.get('readyState') != 'READY':
                     return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+                # The deployment's own deployment-SPECIFIC URL, read from the
+                # authoritative deployment body. Callers keep it for internal
+                # deployment identity, reconciliation, rollback and
+                # diagnostics; it is never the user-facing public URL (see
+                # ``canonical_production_url``). Validated exactly like every
+                # other adapter URL: a deployment we cannot prove a safe
+                # origin for yields an unreadable truth, not a guess.
+                url = 'https://' + (body.get('url') or '')
+                if not _safe_origin(url):
+                    return _fail('PROMOTE_RECONCILIATION_REQUIRED')
                 return OperationResult.ok({'status': 'PROMOTED',
-                                           'deployment_id': deployment_id})
+                                           'deployment_id': deployment_id,
+                                           'deployment_url': url})
             if (self._classify_alias_job(job, deployment_id)
                     == self._PROMOTION_JOB_FAILED):
                 # The provider itself reports this promotion as terminally

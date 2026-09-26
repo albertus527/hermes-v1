@@ -387,6 +387,15 @@ class _BootstrapVercel:
     def lookup_project(self, app_id, *, expected_name=None):
         return self._inner.lookup_project(app_id, expected_name=expected_name)
 
+    def canonical_production_url(self, app_id, project, *, expected_name=None):
+        """The project's own public default domain, never the deployment host."""
+        name = expected_name or self._project.get('name') or 'pokeplay'
+        return OperationResult.ok({
+            'canonical_production_url': f'https://{name}.vercel.app/',
+            'canonical_source': 'VERCEL_PROJECT_DOMAIN',
+            'project_name': name,
+        })
+
     def find_production_deployment(self, app_id, project, *, expected_name=None):
         return OperationResult.ok({
             'deployment_id': BOOTSTRAP_ID, 'operation_id': None,
@@ -446,7 +455,7 @@ def test_first_publish_over_a_proven_bootstrap_succeeds(tmp_path):
     assert result.success, result.error
     state = store.load('proj')
     assert state.lifecycle == ProjectLifecycle.LIVE.value
-    assert state.production_url == 'https://prod.vercel.app'
+    assert state.production_url == 'https://pokeplay.vercel.app/'
     assert state.revisions.live_revision == 1
     # Exactly one promote, of the APPROVED deployment.
     assert vercel.promote_calls == ['dpl_1']

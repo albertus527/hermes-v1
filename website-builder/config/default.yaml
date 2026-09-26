@@ -37,6 +37,28 @@ website_builder:
   intake:
     debounce_seconds: 2.0
 
+  # LIVE source publication (R1).
+  #
+  # After a publish is successfully promoted, production smoke-verified and
+  # marked LIVE, the EXACT tested snapshot commit of that revision is pushed
+  # to a friendly per-project branch in this repository. The branch is the
+  # project's human-readable publication history: one commit per LIVE
+  # revision, each holding the tested snapshot's exact tree, advanced by a
+  # normal fast-forward push and never force-moved.
+  #
+  # R1 writes only. Nothing is ever read back from this repository, no source
+  # is hydrated from it, and revision behavior does not depend on it.
+  #
+  # deploy_key_path points at the VPS deploy key for this repository. The key
+  # itself is never read, copied, or logged by the application: it is handed
+  # to git as GIT_SSH_COMMAND and used for that one push. Leave it null to
+  # disable publication (nothing is attempted and nothing is reported as
+  # unsynced).
+  github:
+    enabled: true
+    repo: 'git@github.com:albertus527/website.git'
+    deploy_key_path: null
+
   # Build
   build:
     timeout_seconds: 300

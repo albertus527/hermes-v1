@@ -110,7 +110,9 @@ class TestFullLocalStory:
         # Each of the two previews ran a preview smoke; promotion ran one
         # production smoke. Total 3.
         assert len(h.smoke.calls) == 3
-        assert h.smoke.calls[-1] == "https://prod.vercel.app"
+        # The production smoke ran against the CANONICAL public url, not the
+        # promoted deployment's own host.
+        assert h.smoke.calls[-1] == "https://kitsunereading.vercel.app/"
 
         # Final consistency.
         entry = h.registry_entry(pid)
@@ -120,7 +122,7 @@ class TestFullLocalStory:
         r = state.revisions
         assert (r.source_revision == r.qa_revision == r.preview_revision
                 == r.approved_revision == r.live_revision == 2)
-        assert state.production_url == "https://prod.vercel.app"
+        assert state.production_url == "https://kitsunereading.vercel.app/"
         # No duplicate project create / deployment / Telegram preview.
         assert h.vercel.post_calls == 1
         assert h.vercel.deploy_calls == 2  # one per preview-bearing revision

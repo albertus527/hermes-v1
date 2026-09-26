@@ -31,6 +31,27 @@ production alias. This module owns:
     Phase 7/8/9/10 via the same ``ProjectRunner`` project slot,
   * Telegram notification of the LIVE promotion via the Phase 9 adapter.
 
+Two URL concepts are kept strictly apart and are never derived from one
+another:
+
+  ``deployment_url``
+      The promoted deployment's own, DEPLOYMENT-SPECIFIC Vercel hostname
+      (``<project>-<hash>-<team>.vercel.app``). Internal identity only:
+      reconciliation, rollback, and diagnostics. It may sit behind
+      Deployment Protection and must never be presented to a user.
+
+  ``canonical_production_url``
+      The project's own public default domain, resolved from authoritative
+      Vercel project/domain state AFTER the production binding is confirmed.
+      This is what gets smoke-checked, persisted as ``production_url``, and
+      sent to the user.
+
+After the site is LIVE and smoke-verified, the exact tested snapshot commit
+of the approved revision is published to a friendly per-project branch in
+the operator-configured source repository. That publication is strictly
+after LIVE: a failure to publish never rolls production back and never
+un-promotes a working site.
+
 No network call happens here without every prerequisite adapter being
 constructed and passed in explicitly by the caller, matching the Phase 9
 ``PreviewOrchestrator`` convention.
@@ -188,6 +209,25 @@ class PromoteDeps:
     # smoke (same access contract as preview smoke). None disables bypass
     # (legacy behavior: production smoke runs without a bypass header).
     bypass_for: Any = None
+    # R1-B: the application-owned output Git repository holding the exact
+    # tested snapshot commits, used to publish the LIVE source to the friendly
+    # branch. None disables publication entirely (legacy behavior: no GitHub
+    # side effect of any kind after LIVE).
+    output_repo: Any = None
+    # R1-B: the explicit, operator-configured source repository remote
+    # (SSH form, e.g. git@github.com:owner/repo.git). Never read from
+    # generated project files; the adapter revalidates the exact form.
+    source_repo_url: Optional[str] = None
+    # R1-B: optional callable(project_id, state, expected_name) -> Optional[str]
+    # returning the friendly branch name for this project. The caller passes
+    # the already-verified canonical Vercel project name (the bound slug), so
+    # the branch and the canonical public host can never drift. None disables
+    # publication.
+    source_branch_for: Any = None
+    # R1-B: optional path to the GitHub deploy key used for the push. It is
+    # passed to git as GIT_SSH_COMMAND and is never persisted, logged, or
+    # placed in a URL.
+    source_ssh_key: Any = None
 
 
 class PromotionOrchestrator:
@@ -419,10 +459,17 @@ class PromotionOrchestrator:
                 and last_live.get("deployment_id") == deployment_id
                 and last_live.get("source_revision") == source_revision
             ):
+                # Current live result, not a new promotion. ``production_url``
+                # is the canonical public URL persisted at LIVE; the
+                # deployment-specific hostname is returned alongside it, but
+                # it is internal identity only and is never what a user is
+                # shown.
                 return OperationResult.ok({
                     "production_url": state.production_url,
+                    "deployment_url": last_live.get("deployment_url"),
                     "deployment_id": deployment_id,
                     "operation_id": operation_id,
+                    "already_live": True,
                 })
             return OperationResult.fail(
                 "PROMOTION_NOT_ALLOWED_IN_LIFECYCLE",
@@ -582,8 +629,9 @@ class PromotionOrchestrator:
         #     normally. Anything ambiguous stops here, fail closed, with the
         #     intent intact and no promote sent.
         resume_identity = None
+        resume_deployment_url = None
         if is_same_operation:
-            decision, adopted = self._adopt_external_promotion(
+            decision, adopted, adopted_url = self._adopt_external_promotion(
                 project_id, app_id, vercel_project, intended_identity, expected_name,
                 recovery=recovery,
             )
@@ -593,6 +641,7 @@ class PromotionOrchestrator:
                 )
             if decision == "adopted":
                 resume_identity = adopted
+                resume_deployment_url = adopted_url
             else:
                 reconcile = self.deps.vercel.reconcile_production_deployment(
                     app_id, vercel_project, intended_identity, expected_name=expected_name,
@@ -600,6 +649,7 @@ class PromotionOrchestrator:
                 status = (reconcile.data or {}).get("status") if reconcile.success else None
                 if status == "PROMOTED":
                     resume_identity = intended_identity
+                    resume_deployment_url = (reconcile.data or {}).get("deployment_url")
                 elif status == "NOT_PROMOTED":
                     # Conclusively not promoted: fall through to the normal
                     # promote below (safe -- the provider itself reports this
@@ -617,18 +667,20 @@ class PromotionOrchestrator:
                     )
 
         if resume_identity is not None:
+            resume_deployment_url = self._deployment_url_or_fallback(
+                resume_deployment_url, resume_identity)
             logger.info(
                 "Promotion confirmed deployment=%s (reconciled)",
                 resume_identity["deployment_id"],
             )
             self._update_intent(
                 project_id, operation_id, stage="promoted",
-                production_url=self._production_url_for(resume_identity),
+                deployment_url=resume_deployment_url,
             )
             return self._post_promote(
                 project_id, workspace, app_id, vercel_project,
                 previous_identity,
-                production_url=self._production_url_for(resume_identity),
+                deployment_url=resume_deployment_url,
                 intended_identity=resume_identity,
                 expected_name=expected_name, reconciled=True,
                 approval=approval, source_revision=source_revision,
@@ -665,13 +717,14 @@ class PromotionOrchestrator:
             if status == "PROMOTED":
                 # Confirmed promoted -> continue the normal post-promote flow
                 # (production smoke, then LIVE persistence).
-                production_url = self._production_url_for(intended_identity)
+                deployment_url = self._deployment_url_or_fallback(
+                    (reconcile.data or {}).get("deployment_url"), intended_identity)
                 logger.info("Promotion confirmed deployment=%s (reconciled)", deployment_id)
                 self._update_intent(project_id, intended_identity["operation_id"],
-                                    stage="promoted", production_url=production_url)
+                                    stage="promoted", deployment_url=deployment_url)
                 return self._post_promote(
                     project_id, workspace, app_id, vercel_project,
-                    previous_identity, production_url=production_url,
+                    previous_identity, deployment_url=deployment_url,
                     intended_identity=intended_identity,
                     expected_name=expected_name, reconciled=True,
                     approval=approval, source_revision=source_revision,
@@ -709,16 +762,16 @@ class PromotionOrchestrator:
             deployment_id=promote_result.data.get("promoted_deployment_id")
             or intended_identity["deployment_id"],
         )
-        production_url = promote_result.data["production_url"]
+        deployment_url = promote_result.data.get("production_url")
         logger.info("Promotion confirmed deployment=%s", promoted_identity["deployment_id"])
         self._update_intent(
             project_id, intended_identity["operation_id"], stage="promoted",
-            production_url=production_url,
+            deployment_url=deployment_url,
             promoted_deployment_id=promoted_identity["deployment_id"],
         )
         return self._post_promote(
             project_id, workspace, app_id, vercel_project, previous_identity,
-            production_url=production_url, intended_identity=promoted_identity,
+            deployment_url=deployment_url, intended_identity=promoted_identity,
             expected_name=expected_name, reconciled=False,
             approval=approval, source_revision=source_revision,
         )
@@ -735,11 +788,12 @@ class PromotionOrchestrator:
         CREATION and therefore mints a NEW deployment id that the approved
         deployment id alone cannot recognize.
 
-        Returns ``(decision, identity)`` where decision is one of:
+        Returns ``(decision, identity, deployment_url)`` where decision is one of:
 
           ``"adopted"``  -- provider truth proves the approved artifact is
-              live; ``identity`` is the promoted deployment's identity and the
-              caller continues to production smoke and LIVE persistence.
+              live; ``identity`` is the promoted deployment's identity,
+              ``deployment_url`` its deployment-specific host, and the caller
+              continues to production smoke and LIVE persistence.
           ``"unproven"`` -- production moved, but nothing ties it to the
               approved artifact (for example a deployment created without our
               identity and for which the provider kept no lineage record).
@@ -761,7 +815,7 @@ class PromotionOrchestrator:
             data = external.data or {}
             adopted = data.get("deployment_id")
             if not isinstance(adopted, str) or not adopted:
-                return "pending", None
+                return "pending", None, None
             identity = dict(intended_identity, deployment_id=adopted)
             logger.info(
                 "Promotion adopted deployment=%s proof=%s project=%s",
@@ -770,16 +824,16 @@ class PromotionOrchestrator:
             self._update_intent(
                 project_id, intended_identity["operation_id"], stage="promoted",
                 promoted_deployment_id=adopted,
-                production_url=self._production_url_for(identity),
+                deployment_url=data.get("production_url"),
             )
-            return "adopted", identity
+            return "adopted", identity, data.get("production_url")
         if status == "PROMOTED_UNPROVEN":
             if not recovery:
                 # Not a recovery: production simply is not (yet) the approved
                 # deployment. That is the normal pre-promote state, so fall
                 # through to the ordinary reconcile instead of failing an
                 # ordinary publish.
-                return "pending", None
+                return "pending", None, None
             logger.warning(
                 "Promotion identity unproven project=%s binding=%s",
                 project_id, (external.data or {}).get("deployment_id"),
@@ -787,8 +841,8 @@ class PromotionOrchestrator:
             self._fail(
                 project_id, "PROMOTE_FAILED", "PROMOTION_IDENTITY_UNPROVEN",
             )
-            return "unproven", None
-        return "pending", None
+            return "unproven", None, None
+        return "pending", None, None
 
     def resume_publish(self, project_id: str, workspace: Path,
                        principal_id: Optional[str] = None,
@@ -864,12 +918,16 @@ class PromotionOrchestrator:
 
     def _post_promote(
         self, project_id, workspace, app_id, vercel_project, previous_identity,
-        production_url, intended_identity, expected_name, reconciled,
+        deployment_url, intended_identity, expected_name, reconciled,
         approval, source_revision,
     ) -> OperationResult:
-        """Normal post-promote flow after a CONFIRMED promote (direct or
-        reconciled): production smoke, then PUBLISHING -> LIVE, then the
-        best-effort Telegram notification.
+        """Post-promote flow after a CONFIRMED promote (direct or reconciled).
+
+        Order is load-bearing and is the R1 contract:
+
+            resolve canonical public URL -> smoke THAT url -> LIVE (persist
+            canonical + deployment URLs) -> publish the exact tested source
+            to the friendly branch -> send the canonical LIVE URL.
 
         On smoke failure the alias is rolled back to the persisted previous
         production and the EXACT observed rollback outcome is persisted.
@@ -878,18 +936,47 @@ class PromotionOrchestrator:
         operation_id = intended_identity["operation_id"]
         artifact_sha256 = intended_identity["artifact_sha256"]
 
-        # ---- Mandatory production smoke check before ever marking LIVE.
+        # ---- 1. Resolve the CANONICAL public production URL, now that the
+        # production binding is confirmed. This is the URL the user will see
+        # and the URL that must be proven reachable, so it is resolved BEFORE
+        # the smoke check rather than after it.
+        canonical = self._resolve_canonical(app_id, vercel_project, expected_name)
+        if canonical is None:
+            # Fail closed, and do it through the ordinary promotion-phase
+            # failure record: that keeps the durable ``promotion_intent``
+            # (including its previous-production identity) intact, which is
+            # exactly what makes this SAME operation resumable. Deliberately
+            # NOT a rollback: the remote promotion is confirmed good and the
+            # site may well be serving; only our own URL resolution failed.
+            # Rolling back a working site over a local formatting problem
+            # would be a worse outcome than the problem.
+            self._fail(
+                project_id, "CANONICAL_PRODUCTION_URL_UNRESOLVED",
+                "CANONICAL_PRODUCTION_URL_UNRESOLVED",
+            )
+            return OperationResult.fail(
+                "CANONICAL_PRODUCTION_URL_UNRESOLVED",
+                error_code="CANONICAL_PRODUCTION_URL_UNRESOLVED",
+            )
+        logger.info(
+            "Canonical production URL resolved project=%s source=%s",
+            project_id, canonical.get("canonical_source"),
+        )
+
+        # ---- 2. Mandatory production smoke check, against the CANONICAL
+        # url. The deployment-specific hostname may sit behind Deployment
+        # Protection and is never a meaningful health check of what users
+        # actually load.
         smoke_dir = (self.smoke_dir_root or workspace) / "qa" / "production_smoke"
         smoke_result = self._run_production_smoke(
-            production_url, smoke_dir,
+            canonical["canonical_production_url"], smoke_dir,
             (vercel_project or {}).get("id"),
         )
         self._update_intent(project_id, operation_id, stage="smoked",
                             smoke=smoke_result.data)
         if not smoke_result.success:
             logger.warning(
-                "Production smoke FAILED project=%s rollback=%s",
-                project_id, (smoke_result.data or {}).get("url") and "see-state",
+                "Production smoke FAILED project=%s", project_id,
             )
             rollback_status = self._rollback_and_fail(
                 project_id, app_id, vercel_project, previous_identity,
@@ -907,7 +994,7 @@ class PromotionOrchestrator:
         # "smoke passed" line for an operator to act on.
         logger.info("Production smoke passed project=%s", project_id)
 
-        # ---- Only now transition PUBLISHING -> LIVE.
+        # ---- 3. Only now transition PUBLISHING -> LIVE.
         with self.store.acquire_writer(project_id) as locked:
             if (
                 locked.deployment.get("approval") != approval
@@ -916,16 +1003,28 @@ class PromotionOrchestrator:
                 return OperationResult.fail("STALE_APPROVAL", error_code="STALE_APPROVAL")
             self.store.transition_lifecycle_locked(locked, ProjectLifecycle.LIVE)
             locked.revisions.live_revision = source_revision
-            locked.production_url = production_url
+            # The USER-FACING production URL is the canonical public one. The
+            # deployment-specific hostname is persisted next to it for
+            # reconciliation, rollback and diagnostics, and is never sent.
+            locked.production_url = canonical["canonical_production_url"]
             # A recovery resume arrives with the failure record of the attempt
             # that failed. LIVE is the outcome, so that record is now stale and
             # must not be left behind for an operator to misread.
             locked.failure = None
-            locked.deployment["promotion_intent"]["stage"] = "live"
+            intent = locked.deployment["promotion_intent"]
+            intent["stage"] = "live"
+            # Both URLs are recorded, each under its own name. The intent is
+            # an internal record, so keeping the two keys distinct is what
+            # stops a future reader from mistaking one for the other.
+            intent["canonical_production_url"] = canonical["canonical_production_url"]
+            intent["deployment_url"] = deployment_url
             locked.deployment["last_live_deployment"] = {
                 "operation_id": operation_id,
                 "deployment_id": deployment_id,
-                "production_url": production_url,
+                # Canonical public URL: the one reported to the user.
+                "production_url": canonical["canonical_production_url"],
+                # Deployment-specific Vercel hostname: internal identity only.
+                "deployment_url": deployment_url,
                 "source_revision": source_revision,
                 "source_sha256": approval["source_sha256"],
                 "artifact_sha256": artifact_sha256,
@@ -934,22 +1033,242 @@ class PromotionOrchestrator:
             self.store.save(locked)
             state = locked
 
-        # ---- Telegram notification of LIVE promotion (best-effort in the
+        # ---- 4. Publish the EXACT tested source of this LIVE revision to the
+        # friendly branch. Strictly after LIVE, and strictly non-destructive:
+        # a publication failure leaves the site live and records that a source
+        # sync is still required.
+        sync_status = self._publish_live_source(
+            project_id, state, expected_name, source_revision, approval,
+        )
+
+        # ---- 5. Telegram notification of LIVE promotion (best-effort in the
         # sense that a failed notification does not un-promote; the site
         # is already live and smoke-verified at this point).
-        logger.info("Project LIVE production_url=%s", production_url)
+        logger.info("Project LIVE production_url=%s", canonical["canonical_production_url"])
         chat_id = self.deps.chat_id_for(project_id, state)
         if chat_id:
             self.deps.telegram.send_text(
-                chat_id, f"🚀 Live: {production_url}"
+                chat_id, f"🚀 Live: {canonical['canonical_production_url']}"
             )
 
         return OperationResult.ok({
-            "production_url": production_url,
+            "production_url": canonical["canonical_production_url"],
+            "deployment_url": deployment_url,
             "deployment_id": deployment_id,
             "operation_id": operation_id,
             "reconciled": reconciled,
+            "source_sync": sync_status,
         })
+
+    # ------------------------------------------------------------------
+    # Canonical public production URL
+    # ------------------------------------------------------------------
+
+    def _resolve_canonical(self, app_id, vercel_project, expected_name):
+        """The canonical public production URL, or None when unresolvable.
+
+        Delegates to the adapter, which proves project ownership and then
+        reads authoritative project/domain state, falling back to the
+        deterministic ``https://<verified name>.vercel.app/`` form. A
+        collaborator that predates the helper (or raises) is treated as
+        unresolvable rather than silently degrading to a deployment hostname:
+        there is no honest URL to return in that case.
+        """
+        helper = getattr(self.deps.vercel, "canonical_production_url", None)
+        if not callable(helper):
+            return None
+        try:
+            result = helper(app_id, vercel_project, expected_name=expected_name)
+        except Exception:
+            return None
+        if not getattr(result, "success", False):
+            return None
+        data = result.data or {}
+        url = data.get("canonical_production_url")
+        if (not isinstance(url, str) or not url.startswith("https://")
+                or "vercel.app" not in url or url.rstrip("/") == "https://vercel.app"):
+            return None
+        return data
+
+    @staticmethod
+    def _deployment_url_or_fallback(observed, identity):
+        """The deployment-specific URL for internal records.
+
+        Prefers the real host the adapter read from the provider. Falls back
+        to the deployment-id-derived form ONLY for diagnostics, and that value
+        is never smoke-tested, never persisted as ``production_url``, and
+        never sent to a user.
+        """
+        if isinstance(observed, str) and observed.startswith("https://"):
+            return observed
+        return PromotionOrchestrator._production_url_for(identity)
+
+    # ------------------------------------------------------------------
+    # LIVE source publication (friendly branch)
+    # ------------------------------------------------------------------
+
+    def _publish_live_source(self, project_id, state, expected_name,
+                             source_revision, approval):
+        """Publish the exact tested snapshot commit of this LIVE revision.
+
+        Returns one of ``"SYNCED"``, ``"SOURCE_SYNC_REQUIRED"`` or ``None``
+        (not attempted: publication is not configured for this installation).
+
+        Never rolls production back, never re-smokes, never un-transitions
+        LIVE. A failure is recorded in ``state.repository`` so an operator can
+        see that the published branch is behind the live site.
+        """
+        repo = self.deps.output_repo
+        url = self.deps.source_repo_url
+        if repo is None or not url:
+            return None
+        branch = None
+        if self.deps.source_branch_for is not None:
+            try:
+                branch = self.deps.source_branch_for(project_id, state, expected_name)
+            except Exception:
+                branch = None
+        if not branch:
+            logger.warning(
+                "LIVE source publication skipped project=%s: no resolvable branch",
+                project_id,
+            )
+            return None
+        ssh_key = self.deps.source_ssh_key
+        if not ssh_key:
+            # Not configured, not attempted, not a failure: an operator who
+            # has not installed a deploy key yet must not see every publish
+            # reported as an unsynced source.
+            logger.warning(
+                "LIVE source publication skipped project=%s branch=%s: "
+                "no GitHub deploy key configured",
+                project_id, branch,
+            )
+            return None
+
+        # The commit that must be published: the exact TestedSnapshot commit
+        # the approved revision produced. Never re-derived from the mutable
+        # workspace, never recomputed.
+        try:
+            git_identity = self._tested_commit_for(
+                state, approval.get("operation_id"), approval=approval)
+        except ValueError as exc:
+            logger.error(
+                "LIVE source publication FAILED project=%s branch=%s (no trusted "
+                "tested commit: %s)", project_id, branch, exc,
+            )
+            self._record_source_sync_required(project_id, branch, "NO_TRUSTED_TESTED_COMMIT")
+            return "SOURCE_SYNC_REQUIRED"
+        previous = (state.repository or {}).get("publication_commit")
+        try:
+            published = repo.publish_project_branch(
+                git_identity["commit"], branch, url,
+                source_revision=source_revision,
+                source_sha256=approval.get("source_sha256"),
+                artifact_sha256=approval.get("artifact_sha256"),
+                previous_publication_commit=previous,
+                ssh_key=ssh_key,
+            )
+        except Exception as exc:
+            # Only the exception TYPE is logged/persisted: a git failure's
+            # message can embed the remote and local filesystem paths.
+            logger.error(
+                "LIVE source publication FAILED project=%s branch=%s (type=%s)",
+                project_id, branch, type(exc).__name__,
+            )
+            self._record_source_sync_required(
+                project_id, branch, "GITHUB_PUBLICATION_FAILED",
+                tested_commit=git_identity["commit"])
+            return "SOURCE_SYNC_REQUIRED"
+
+        self._record_source_sync(
+            project_id, branch,
+            tested_commit=git_identity["commit"],
+            publication_commit=published["publication_commit"],
+            source_revision=source_revision,
+        )
+        logger.info(
+            "LIVE source published project=%s branch=%s tested=%s publication=%s",
+            project_id, branch, git_identity["commit"],
+            published["publication_commit"],
+        )
+        return "SYNCED"
+
+    @staticmethod
+    def _tested_commit_for(state, operation_id, approval=None):
+        """The exact TestedSnapshot commit bound to this approved preview.
+
+        Read from the preview operation intent and cross-checked against the
+        approval's own source/artifact hashes. Any disagreement means the
+        commit we would push is not provably the approved artifact, so it is
+        refused rather than pushed on trust.
+        """
+        intent = (state.deployment or {}).get("preview_intent") or {}
+        git_identity = intent.get("git") or {}
+        commit = git_identity.get("commit")
+        if intent.get("operation_id") != operation_id or not commit:
+            raise ValueError("preview intent does not belong to this operation")
+        if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+            raise ValueError("tested commit is not a commit id")
+        if approval is not None:
+            if git_identity.get("source_sha256") != approval.get("source_sha256"):
+                raise ValueError("tested commit source hash does not match approval")
+            if git_identity.get("artifact_sha256") != approval.get("artifact_sha256"):
+                raise ValueError("tested commit artifact hash does not match approval")
+        return git_identity
+
+    def _record_source_sync(self, project_id, branch, *, tested_commit,
+                            publication_commit, source_revision):
+        with self.store.acquire_writer(project_id) as state:
+            state.repository = {
+                "provider": "github",
+                "repo": self._source_repo_name(),
+                "branch": branch,
+                "tested_commit": tested_commit,
+                "publication_commit": publication_commit,
+                "source_revision": source_revision,
+                "sync_status": "SYNCED",
+                "synced_at": time.time(),
+            }
+            self.store.save(state)
+
+    def _source_repo_name(self):
+        """``owner/name`` for the configured remote, or None.
+
+        Derived from the operator-configured remote so the persisted record
+        names the repository without carrying a scheme, a host, or a key path.
+        """
+        url = self.deps.source_repo_url
+        if not isinstance(url, str):
+            return None
+        match = re.fullmatch(r"git@github\.com:([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)\.git", url)
+        return f"{match.group(1)}/{match.group(2)}" if match else None
+
+    def _record_source_sync_required(self, project_id, branch, error_code,
+                                     tested_commit=None):
+        """Record that the published branch is behind the live site.
+
+        ``tested_commit`` is the revision's source that SHOULD be in the
+        branch, which is what an operator needs to reconcile. No
+        ``publication_commit`` is written, because none was confirmed to
+        exist on the remote, and the previous one is deliberately PRESERVED:
+        it is the parent authority for the next publication and names the
+        last revision that genuinely reached the remote.
+        """
+        with self.store.acquire_writer(project_id) as state:
+            record = dict(state.repository or {})
+            record.update({
+                "provider": "github",
+                "repo": self._source_repo_name() or record.get("repo"),
+                "branch": branch,
+                "sync_status": "SOURCE_SYNC_REQUIRED",
+                "last_error_code": error_code,
+                "recorded_at": time.time(),
+            })
+            if tested_commit:
+                record["tested_commit"] = tested_commit
+            state.repository = record
+            self.store.save(state)
 
     # ------------------------------------------------------------------
     # Internals

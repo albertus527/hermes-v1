@@ -81,6 +81,7 @@ class FakeHermes:
         # Counters.
         self.fast_calls: List[str] = []
         self.frontend_calls = 0
+        self.frontend_operation_ids: List[object] = []
 
     # -- scripting helpers -------------------------------------------------
     def set_router_decision(
@@ -142,8 +143,12 @@ class FakeHermes:
             "readiness": "NEEDS_CLARIFICATION",
         }
 
-    def frontend_build(self, project_id, brief, workspace, design_dna_instructions=None):
+    def frontend_build(self, project_id, brief, workspace,
+                       design_dna_instructions=None, build_operation_id=None):
+        # build_operation_id is the caller's operation identity, recorded by the
+        # orchestrator for diagnostics; this boundary only needs to accept it.
         self.frontend_calls += 1
+        self.frontend_operation_ids.append(build_operation_id)
         if self.frontend_results:
             result = self.frontend_results.pop(0)
         elif self.frontend_result is not None:
@@ -419,6 +424,16 @@ class FakeVercel:
                                      expected_name=None):
         self.reconcile_external_calls.append(dict(intended_identity))
         return OperationResult.ok({"status": "PROMOTED_UNPROVEN", "deployment_id": None})
+
+    def canonical_production_url(self, app_id, project, *, expected_name=None):
+        """The project's own public default domain (never the deployment host)."""
+        self.project = getattr(self, "project", None) or {}
+        name = expected_name or self.project.get("name") or "site"
+        return OperationResult.ok({
+            "canonical_production_url": "https://{}.vercel.app/".format(name),
+            "canonical_source": "VERCEL_PROJECT_DOMAIN",
+            "project_name": name,
+        })
 
 
 class FakeTelegramOut:

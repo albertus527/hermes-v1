@@ -262,7 +262,10 @@ def test_unauthorized_promote_leaves_state_byte_identical_via_dispatch(tmp_path)
     deps = PromoteDeps(vercel=Vercel(), telegram=None, smoke=None, chat_id_for=lambda *a: None)
     promote = PromotionOrchestrator(runner, store, deps)
     intake = IntakeProcessor(store, hermes_adapter=None)
-    dispatcher = TelegramDispatcher(store, intake, promote=promote)
+    # Approving now publishes, so the dispatcher needs a workspace to promote
+    # into; the refusal under test is the role check, not the wiring.
+    dispatcher = TelegramDispatcher(store, intake, promote=promote,
+                                    workspace_for=lambda pid: tmp_path / "ws" / pid)
 
     with store.acquire_writer("proj") as state:
         state.roles["owner"] = "telegram:999"

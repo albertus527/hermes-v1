@@ -99,7 +99,7 @@ def test_happy_publish_logs_every_meaningful_boundary(tmp_path):
     assert "Promotion intent persisted project=proj operation=op-1" in text
     assert "Promotion confirmed deployment=dpl_1" in text
     assert "Production smoke passed project=proj" in text
-    assert "Project LIVE production_url=https://prod.vercel.app" in text
+    assert "Project LIVE production_url=https://wb.vercel.app/" in text
     # Every line is INFO: this is signal, not noise.
     assert all(r.levelno == logging.INFO for r in handler.records)
     # Concise: one record per boundary, no per-poll spam.
@@ -186,10 +186,12 @@ def test_logs_never_carry_secrets_or_user_payload(tmp_path):
     text = handler.text()
     assert SECRET not in text
     assert "Authorization" not in text and "Bearer" not in text
-    # The protected PREVIEW url is never logged (production url is fine -- it is
-    # the site the user asked to publish).
+    # The protected PREVIEW url is never logged, and neither is the promoted
+    # deployment's own host: the canonical production url (the site the user
+    # asked to publish) is what appears.
     assert shown['preview_url'] not in text
-    assert "https://prod.vercel.app" in text
+    assert "https://prod.vercel.app" not in text
+    assert "https://wb.vercel.app/" in text
 
 
 def test_failed_publish_still_reaches_the_operator(tmp_path):

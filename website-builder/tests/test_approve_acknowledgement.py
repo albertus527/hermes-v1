@@ -5,15 +5,20 @@ succeeded (approved_revision advanced, every identity field matched) and
 ``_handle_approve`` only surfaced errors, so a successful approve produced no
 user-visible outcome at all and read as "still thinking".
 
-The acknowledgement must be:
+R1 changed WHAT an approval means: approving the exact shown preview now also
+publishes it, so the acknowledgement is a PROGRESS message
+("Preview approved. Publishing...") and the publish outcome follows it
+(``🚀 Live: <canonical url>``) or, on failure, the truthful failure copy.
 
-  * sent on success, naming the next step ("publish"), and publishing
-    nothing itself,
-  * at-most-once per approved identity -- a replayed Telegram update AND a
+The acknowledgement must:
+
+  * be sent on success, naming what happens next, and asserting nothing
+    about the outcome,
+  * be at-most-once per approved identity -- a replayed Telegram update AND a
     brand-new update that re-approves the SAME preview both stay silent,
-  * still allowed for a genuinely NEW approved identity (a newly shown
+  * still be allowed for a genuinely NEW approved identity (a newly shown
     preview), because that is a different thing the user did,
-  * never sent on a failed approve, which keeps its existing error reply,
+  * never be sent on a failed approve, which keeps its existing error reply,
   * fail-closed on an ambiguous send: the durable outcome stays PENDING so a
     possibly-delivered acknowledgement is never repeated.
 
@@ -135,7 +140,7 @@ def _preview_ready_project(store, source_revision=1):
 
 
 # ---------------------------------------------------------------------------
-# The happy path: one acknowledgement, no publish
+# The happy path: one acknowledgement, then the publish outcome
 # ---------------------------------------------------------------------------
 
 def test_successful_approve_acknowledges_exactly_once(tmp_path):
@@ -146,17 +151,19 @@ def test_successful_approve_acknowledges_exactly_once(tmp_path):
 
     acks = _ack_texts(out)
     assert len(acks) == 1, "a successful approval must be acknowledged once"
-    assert "publish" in acks[0]
-    assert acks[0].startswith("✅")
+    assert acks[0] == "✅ Preview approved. Publishing..."
     # Bound to the exact shown preview identity...
     state = store.load(PROJECT_ID)
     assert state.revisions.approved_revision == 1
     assert state.deployment["approval"]["operation_id"] == "op-1"
-    assert state.lifecycle == "PREVIEW_READY"
-    # ...and approve must NOT publish.
-    assert not state.production_url
-    assert state.revisions.live_revision == 0
-    assert state.deployment.get("promotion_intent") is None
+    # ...and the approval publishes that exact preview: no second confirmation
+    # step exists.
+    assert state.lifecycle == "LIVE"
+    assert state.revisions.live_revision == 1
+    assert state.production_url == "https://wb.vercel.app/"
+    # The user is told the canonical public URL, never the deployment host.
+    assert [text for _c, text in out.sent if "Live" in text] == [
+        "🚀 Live: https://wb.vercel.app/"]
     ack = state.deployment["approval_ack"]
     assert ack["outcome"] == "SENT"
     assert ack["message_id"] == 4242
@@ -177,7 +184,8 @@ def test_replayed_update_sends_no_second_acknowledgement(tmp_path):
     # The same Telegram update, replayed.
     loop._process_update(_payload(302, "approve"))
     assert len(_ack_texts(out)) == 1
-
+    # ...and nothing was promoted twice.
+    assert store.load(PROJECT_ID).revisions.live_revision == 1
 
 def test_a_distinct_update_re_approving_the_same_identity_is_silent(tmp_path):
     """The user repeating "approve" is a duplicate approval, not a new one."""
@@ -186,17 +194,25 @@ def test_a_distinct_update_re_approving_the_same_identity_is_silent(tmp_path):
 
     loop._process_update(_payload(303, "approve"))
     assert len(_ack_texts(out)) == 1
+    live_url = store.load(PROJECT_ID).production_url
 
     # A genuinely different update id, same approved identity.
     loop._process_update(_payload(304, "oke approve"))
     assert len(_ack_texts(out)) == 1
     assert store.load(PROJECT_ID).deployment["approval"]["operation_id"] == "op-1"
+    # A duplicate approval never promotes a second time; the project is still
+    # the one live deployment it already was.
+    assert store.load(PROJECT_ID).revisions.live_revision == 1
+    assert store.load(PROJECT_ID).production_url == live_url
+    assert [text for _c, text in out.sent if "Live" in text] == [
+        f"🚀 Live: {live_url}"]
 
 
 def test_a_new_shown_preview_gets_its_own_acknowledgement(tmp_path):
     """A different approved identity is a different action, and is allowed."""
     loop, store, out, promote, _vercel, _hermes = _make(tmp_path)
     _preview_ready_project(store)
+
     loop._process_update(_payload(305, "approve"))
     assert len(_ack_texts(out)) == 1
 
@@ -244,9 +260,18 @@ def test_proved_rejection_re_arms_the_acknowledgement(tmp_path):
 
     loop._process_update(_payload(309, "approve"))
 
-    # One attempt, proved undelivered, so the acknowledgement is re-armed.
-    assert len(out.sent) == 1
+    # One acknowledgement attempt, proved undelivered, so the acknowledgement
+    # is re-armed. The LIVE message is a separate, later send.
+    assert len(_ack_texts(out)) == 1
+    assert len(out.sent) == 2
     assert store.load(PROJECT_ID).deployment["approval_ack"]["outcome"] == "NOT_SENT"
+
+    # Approving publishes, so the project is LIVE now. Put it back on a
+    # preview the user can re-approve, which is the state this test is about:
+    # whether a proved-undelivered acknowledgement may be driven again.
+    with store.acquire_writer(PROJECT_ID) as state:
+        state.lifecycle = "PREVIEW_READY"
+        store.save(state)
 
     out.reject_text = False
     loop._process_update(_payload(310, "approve"))
@@ -301,17 +326,26 @@ def test_publish_dispatch_does_not_emit_an_approve_acknowledgement(tmp_path):
     # The live notification is a different message.
     assert any("Live" in text or "live" in text for _chat, text in out.sent)
     assert state.lifecycle == "LIVE"
-    assert state.production_url == "https://prod.vercel.app"
+    assert state.production_url == "https://wb.vercel.app/"
 
 
-def test_ack_never_contains_the_preview_url(tmp_path):
-    """The protected preview URL stays internal in every message we send."""
+def test_no_message_contains_the_protected_preview_url(tmp_path):
+    """The protected preview URL and the promoted deployment's own host stay
+    internal in every message we send; the only host a user sees is the
+    canonical public one."""
     loop, store, out, promote, _vercel, _hermes = _make(tmp_path)
     _preview_ready_project(store)
 
     loop._process_update(_payload(314, "approve"))
 
+    state = store.load(PROJECT_ID)
+    shown = state.deployment["latest_shown_preview"]
     for _chat, text in out.sent:
-        assert "vercel.app" not in text
+        assert shown["preview_url"] not in text
         assert "dpl_1" not in text
         assert "op-1" not in text
+    # The acknowledgement itself carries no URL at all; the LIVE message
+    # carries exactly the canonical public domain.
+    assert "vercel.app" not in _ack_texts(out)[0]
+    assert [text for _c, text in out.sent if "vercel.app" in text] == [
+        "🚀 Live: https://wb.vercel.app/"]

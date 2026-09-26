@@ -182,8 +182,24 @@ class FakeVercel:
         self.expected_names.append(expected_name)
         return OperationResult.ok({
             'deployment_id': deployment_id,
+            # Deployment-SPECIFIC host: internal identity only, never the URL
+            # the user is shown.
             'production_url': 'https://prod.vercel.app',
             'state': 'READY',
+        })
+
+    def canonical_production_url(self, app_id, project, *, expected_name=None):
+        """The project's own public default domain.
+
+        Mirrors the real adapter: the name is the verified project name, and
+        the host is that name's default domain -- never the deployment host.
+        """
+        self.expected_names.append(expected_name)
+        name = expected_name or self._project['name']
+        return OperationResult.ok({
+            'canonical_production_url': f'https://{name}.vercel.app/',
+            'canonical_source': 'VERCEL_PROJECT_DOMAIN',
+            'project_name': name,
         })
 
 
@@ -304,8 +320,13 @@ def test_fresh_approval_promotes_successfully(tmp_path):
     state = store.load('proj')
     assert state.lifecycle == ProjectLifecycle.LIVE.value
     assert state.revisions.live_revision == 1
-    assert state.production_url == 'https://prod.vercel.app'
+    # The user-facing production URL is the project's canonical public domain,
+    # never the promoted deployment's own host.
+    assert state.production_url == 'https://wb.vercel.app/'
+    assert state.deployment['last_live_deployment']['production_url'] == 'https://wb.vercel.app/'
+    assert state.deployment['last_live_deployment']['deployment_url'] == 'https://prod.vercel.app'
     assert deps.telegram.sent
+    assert deps.telegram.sent[-1] == ('123', '🚀 Live: https://wb.vercel.app/')
 
 
 def test_stale_approval_blocked_when_newer_preview_produced(tmp_path):

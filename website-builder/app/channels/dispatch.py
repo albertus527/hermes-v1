@@ -95,7 +95,8 @@ class TelegramDispatcher:
 
     def dispatch(self, payload, project_id, action, *, authenticated=None, seq=None,
                  reference_token=None, data=None, role=None, url=None, brief=None,
-                 index=None, hostname=None, ownership_claim=False, claim_suffix=None):
+                 index=None, hostname=None, ownership_claim=False, claim_suffix=None,
+                 on_approved=None):
         try:
             if isinstance(authenticated, AuthenticatedTelegramContext):
                 normalizer = TelegramNormalizer
@@ -133,7 +134,8 @@ class TelegramDispatcher:
             if collaborators.get(action) is None:
                 return OperationResult.fail("UNSUPPORTED_ACTION", error_code="UNSUPPORTED_ACTION")
             domain_action = action in {"domain_connect", "domain_prepare", "domain_verify"}
-            if (domain_action or action in {"directions_propose", "publish", "reconcile_preview"}) and self.workspace_for is None:
+            if (domain_action or action in {"directions_propose", "publish", "approve",
+                                            "reconcile_preview"}) and self.workspace_for is None:
                 return OperationResult.fail("UNSUPPORTED_ACTION", error_code="UNSUPPORTED_ACTION")
             key = hashlib.sha256(json.dumps(
                 [principal, authenticated.conversation_id, message.event_id],
@@ -456,7 +458,36 @@ class TelegramDispatcher:
                                 project_id, seq, message.text, principal_id=principal,
                             )
                 elif action == "approve":
-                    result = self.promote.approve(project_id, principal_id=principal)
+                    # Approval IS publication. An approval intent for the
+                    # exact preview the user was just shown means "approve
+                    # this and put it live": there is no second confirmation
+                    # step and no second dispatch claim.
+                    #
+                    # ``approve()`` still owns every identity check
+                    # (operation_id, deployment_id, source_sha256,
+                    # artifact_sha256, source_revision, preview_revision), so
+                    # the exact approved preview is the exact thing promoted.
+                    # ``promote()`` re-verifies that same identity and fails
+                    # closed on a stale approval, then reuses the existing
+                    # idempotent no-op path when this exact preview is already
+                    # LIVE.
+                    approval = self.promote.approve(project_id, principal_id=principal)
+                    if approval.success and on_approved is not None:
+                        # Progress acknowledgement only. A failure here is
+                        # logged and swallowed: a notification must never
+                        # decide whether a confirmed approval gets published.
+                        try:
+                            on_approved()
+                        except Exception:
+                            logger.exception(
+                                "Approval acknowledgement hook raised for project %s; "
+                                "continuing to publish",
+                                project_id,
+                            )
+                    if not approval.success:
+                        result = approval
+                    else:
+                        result = self.promote.promote(project_id, self.workspace_for(project_id), principal_id=principal)
                 elif action == "publish":
                     approval = self.promote.approve(project_id, principal_id=principal)
                     if not approval.success:

@@ -125,6 +125,12 @@ class RuntimeConfig:
     vercel_ownership_namespace: str
     web3forms_access_key: Optional[str] = field(default=None, repr=False)
     smoke_browser_factory: Optional[Any] = field(default=None, repr=False)
+    # R1-B: LIVE source publication. ``github_source_repo`` is a non-secret
+    # remote (SSH form) and ``github_ssh_key`` is a path to the deploy key --
+    # neither is a credential value, so both live in config.yaml rather than
+    # .env. The key's contents are never read by this application.
+    github_source_repo: Optional[str] = None
+    github_ssh_key: Optional[Path] = None
 
     def __post_init__(self):
         # Expand ~ in paths
@@ -132,6 +138,8 @@ class RuntimeConfig:
         object.__setattr__(self, "workspace_root", Path(self.workspace_root).expanduser())
         object.__setattr__(self, "state_root", Path(self.state_root).expanduser())
         object.__setattr__(self, "output_repo_path", Path(self.output_repo_path).expanduser())
+        if self.github_ssh_key is not None:
+            object.__setattr__(self, "github_ssh_key", Path(self.github_ssh_key).expanduser())
 
 
 def _required_env(name: str) -> str:
@@ -194,6 +202,24 @@ def load_runtime_config(config_path: Optional[Path] = None) -> RuntimeConfig:
         "VERCEL_OWNERSHIP_NAMESPACE", ""
     ).strip() or f"wb-{vercel_team_id}"
 
+    # LIVE source publication (R1). Both values are non-secret (a remote and a
+    # key PATH), so config.yaml is the home for them; the env overrides exist
+    # only for per-deployment convenience.
+    github_cfg = wb.get("github") or {}
+    if github_cfg.get("enabled") is False:
+        github_source_repo = None
+    else:
+        github_source_repo = (
+            os.environ.get("WEBSITE_BUILDER_GITHUB_REPO", "").strip()
+            or github_cfg.get("repo")
+            or None
+        )
+    github_ssh_key = (
+        os.environ.get("WEBSITE_BUILDER_GITHUB_SSH_KEY", "").strip()
+        or github_cfg.get("deploy_key_path")
+        or None
+    )
+
     # Smoke browser factory — optional; if absent, preview/promotion smoke
     # tests will fail closed at runtime (which is the correct behavior).
     smoke_browser_factory = _load_smoke_browser_factory()
@@ -209,6 +235,8 @@ def load_runtime_config(config_path: Optional[Path] = None) -> RuntimeConfig:
         vercel_ownership_namespace=vercel_ownership_namespace,
         web3forms_access_key=web3forms_access_key,
         smoke_browser_factory=smoke_browser_factory,
+        github_source_repo=github_source_repo,
+        github_ssh_key=github_ssh_key,
     )
 
 
@@ -791,6 +819,17 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
         web3forms_access_key=config.web3forms_access_key,
     )
 
+    # LIVE source publication (R1). The friendly branch name is the project's
+    # already-bound canonical Vercel name -- the same value the promote path
+    # verified against the OWNED Vercel project -- so the branch and the
+    # canonical public host are derived from one identity and can never drift.
+    # A project still on the legacy opaque hash-derived name keeps that name
+    # as its branch, which stays consistent with its canonical host.
+    def _publication_branch_for(pid, state, expected_name):
+        if not expected_name:
+            return None
+        return _bound_slug_for(pid, state) or expected_name
+
     # Promotion orchestrator deps
     promote_deps = PromoteDeps(
         vercel=vercel,
@@ -799,6 +838,10 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
         chat_id_for=chat_id_for,
         slug_for=_bound_slug_for,
         bypass_for=lambda vercel_project_id: bypass_store.resolve(vercel_project_id),
+        output_repo=output_repo,
+        source_repo_url=config.github_source_repo,
+        source_branch_for=_publication_branch_for,
+        source_ssh_key=config.github_ssh_key,
     )
     promote = PromotionOrchestrator(runner, store, promote_deps)
 
@@ -1055,6 +1098,11 @@ ERROR_MESSAGES: Dict[str, str] = {
     "INVALID_PRODUCTION_URL": (
         "Publish belum bisa diselesaikan karena alamat production-nya tidak valid. "
         "Preview kamu tetap aman dan belum berubah."
+    ),
+    "CANONICAL_PRODUCTION_URL_UNRESOLVED": (
+        "Publish-nya sudah dikirim ke Vercel, tapi alamat publik production-nya "
+        "belum bisa aku pastikan, jadi aku tidak mau menyatakan berhasil. "
+        "Preview kamu tetap aman dan belum berubah — sudah dicatat untuk diperiksa."
     ),
     "ROLLBACK_FAILED": (
         "Ada kendala saat publish, dan efforts untuk mengembalikan website "
@@ -2101,17 +2149,30 @@ User message:
         authenticated: AuthenticatedTelegramContext,
         state,
     ) -> None:
-        """Handle APPROVE intent — user accepts the current preview.
+        """Handle APPROVE intent — approve the exact shown preview AND publish it.
 
-        This binds the approval to the exact shown preview identity and
-        acknowledges it. It does NOT publish — publication is a separate step
-        the user has to ask for.
+        There is no second "publish" confirmation step. ``approve()`` binds the
+        approval to the exact shown preview identity; ``promote()`` then
+        promotes that exact approved deployment, smoke-checks the canonical
+        public URL, transitions LIVE, publishes the tested source to the
+        friendly branch, and sends the canonical LIVE URL. Every existing
+        identity check (operation_id, deployment_id, source_sha256,
+        artifact_sha256, source_revision, preview_revision) and the
+        fail-closed stale-preview protection are unchanged: a stale approval
+        still never promotes.
+
+        A replayed Telegram update is already CLAIMED in durable state, so the
+        dispatcher short-circuits it before the action body runs -- no second
+        acknowledgement, no second promotion.
         """
         result = self.dispatcher.dispatch(
             update,
             project_id,
             "approve",
             authenticated=authenticated,
+            on_approved=lambda: self._send_approval_ack_once(
+                project_id, state.conversation_id if state else None,
+            ),
         )
 
         if not result.success:
@@ -2123,20 +2184,15 @@ User message:
             self._send_error_reply(
                 state.conversation_id if state else None, result.error_code
             )
-            return
-
-        # A replayed event (same Telegram update_id) is already CLAIMED in
-        # durable state, so the dispatcher short-circuits it. Never acknowledge
-        # it a second time.
-        if (result.data or {}).get("duplicate"):
-            return
-
-        self._send_approval_ack_once(
-            project_id, state.conversation_id if state else None,
-        )
 
     def _send_approval_ack_once(self, project_id: str, conversation_id) -> None:
         """Acknowledge a successful approval exactly once per approved identity.
+
+        This is a PROGRESS acknowledgement only: approval now immediately
+        enters the existing publish flow, so the copy says "Publishing..." and
+        never asks the user for a second "publish" confirmation. The final
+        outcome is whatever the promotion actually did -- ``🚀 Live: <url>``
+        on success, or the truthful publish-failure copy.
 
         Approval is otherwise SILENT: the binding succeeded and the user got
         nothing back, which reads as "the bot is still thinking" (the p9
@@ -2179,8 +2235,7 @@ User message:
 
         try:
             send_result = self.telegram_out.send_text(
-                chat_id,
-                '✅ Preview approved.\nKalau sudah siap ditayangkan, bilang "publish".',
+                chat_id, "✅ Preview approved. Publishing..."
             )
         except Exception:
             # Ambiguous: leave PENDING. Never resend a possibly-delivered ack.
@@ -2225,12 +2280,17 @@ User message:
         authenticated: AuthenticatedTelegramContext,
         state,
     ) -> None:
-        """Handle PUBLISH intent — user explicitly intends to go-live.
+        """Handle PUBLISH intent — the user explicitly intends to go-live.
 
         The dispatcher's "publish" action is the single application-owned
         go-live operation: it approves the current exact shown preview and,
         if approval succeeds, promotes that exact approved preview. One
         Telegram event = one dispatch claim, so replay is idempotent.
+
+        Kept for backward compatibility only. Approval already publishes, so
+        this is now a second door onto the same operation rather than a
+        distinct step; when the exact approved preview is already LIVE it
+        returns the current canonical LIVE result and promotes nothing.
         """
         conversation_id = state.conversation_id if state else None
 

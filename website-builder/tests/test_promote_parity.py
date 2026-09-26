@@ -431,6 +431,15 @@ class P9Vercel:
     def lookup_project(self, app_id, *, expected_name=None):
         return OperationResult.ok({'project': self._project, 'app_id': app_id})
 
+    def canonical_production_url(self, app_id, project, *, expected_name=None):
+        """The project's own public default domain, never the deployment host."""
+        name = expected_name or self._project['name']
+        return OperationResult.ok({
+            'canonical_production_url': 'https://{}.vercel.app/'.format(name),
+            'canonical_source': 'VERCEL_PROJECT_DOMAIN',
+            'project_name': name,
+        })
+
     def find_production_deployment(self, app_id, project, *, expected_name=None):
         return OperationResult.ok({
             'deployment_id': 'dpl_bootstrap_p9',
@@ -550,12 +559,15 @@ def _orchestrator(tmp_path, vercel, smoke=None, project_id=P9):
     return orch, store
 
 
-@pytest.mark.parametrize('remote,expected_live,expected_url', [
+P9_CANONICAL_URL = 'https://pokeplay.vercel.app/'
+
+
+@pytest.mark.parametrize('remote,expected_live,deployment_url', [
     ('promoted_by_id', True, 'https://' + P9_DEPLOYMENT_ID + '.vercel.app'),
     ('promoted_by_lineage', True, 'https://dpl_cli_created_p9.vercel.app'),
 ])
 def test_p9_recovers_to_live_with_zero_promote_posts(tmp_path, remote,
-                                                     expected_live, expected_url):
+                                                     expected_live, deployment_url):
     """local FAILED + durable intent + remote already promoted -> reconcile,
     production smoke, persist LIVE, with zero promote POSTs."""
     vercel = P9Vercel(remote)
@@ -572,14 +584,23 @@ def test_p9_recovers_to_live_with_zero_promote_posts(tmp_path, remote,
     state = store.load(P9)
     assert state.lifecycle == (ProjectLifecycle.LIVE.value if expected_live
                                else state.lifecycle)
-    assert state.production_url == expected_url
+    # The user-facing URL is the project's canonical public domain; the
+    # deployment-specific host is kept only as internal identity.
+    assert state.production_url == P9_CANONICAL_URL
+    assert state.deployment['last_live_deployment']['production_url'] == \
+        P9_CANONICAL_URL
+    assert state.deployment['last_live_deployment']['deployment_url'] == \
+        deployment_url
     assert state.failure is None
     assert state.deployment['promotion_intent']['stage'] == 'live'
+    assert state.deployment['promotion_intent']['canonical_production_url'] == \
+        P9_CANONICAL_URL
     assert state.deployment['last_live_deployment']['operation_id'] == P9_OPERATION_ID
-    assert orch.deps.smoke.calls == [expected_url]
+    # The smoke checked the canonical url, not the deployment host.
+    assert orch.deps.smoke.calls == [P9_CANONICAL_URL]
     # A successful recovery may not touch the running loop's Telegram surface
     # for anything but the LIVE notification.
-    assert len(orch.deps.telegram.sent) == 1
+    assert orch.deps.telegram.sent == [('chat-1', f'🚀 Live: {P9_CANONICAL_URL}')]
 
 
 def test_p9_recovery_refuses_wrong_remote_deployment(tmp_path):
