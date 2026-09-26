@@ -32,6 +32,7 @@ from app.runtime import (
     RuntimeComposition,
     TelegramProviderError,
     TelegramReceiveLoop,
+    _run_reconcile_publish,
     compose,
     load_runtime_config,
     main,
@@ -1184,6 +1185,63 @@ class TestPreflightChecks:
             assert exit_code == 0
             mock_node.assert_called_once()
             mock_smoke.assert_called_once()
+
+
+class TestReconcilePublishEntrypoint:
+    """``python -m app --reconcile-publish <project_id> --as <principal>`` is the
+    only way to drive a same-operation publish recovery, so it is pinned here
+    rather than left as unexercised wiring."""
+
+    @staticmethod
+    def _composition(owner_id='owner-1', result=None, state='__default__'):
+        composition = MagicMock()
+        composition.promote.resume_publish.return_value = (
+            result if result is not None else OperationResult.ok(
+                {'production_url': 'https://dpl_x.vercel.app'})
+        )
+        composition.store.load.return_value = (
+            MagicMock(owner_id=owner_id) if state == '__default__' else state)
+        composition.runner.create_workspace.return_value = '/tmp/ws'
+        return composition
+
+    def test_missing_arguments_are_usage_errors(self):
+        assert _run_reconcile_publish(self._composition(), ['--reconcile-publish']) == 2
+        assert _run_reconcile_publish(
+            self._composition(), ['--reconcile-publish', 'tg-6329821361-p9']) == 2
+        assert _run_reconcile_publish(
+            self._composition(), ['--reconcile-publish', 'tg-6329821361-p9', '--as']) == 2
+
+    def test_unknown_project_fails_closed(self):
+        assert _run_reconcile_publish(
+            self._composition(state=None),
+            ['--reconcile-publish', 'tg-6329821361-p9', '--as', 'owner-1'],
+        ) == 1
+
+    def test_principal_must_own_the_project(self):
+        """Recovery may never self-authorize: the stated principal must match
+        the recorded owner."""
+        composition = self._composition(owner_id='owner-1')
+        assert _run_reconcile_publish(
+            composition, ['--reconcile-publish', 'tg-6329821361-p9', '--as', 'stranger'],
+        ) == 1
+        composition.promote.resume_publish.assert_not_called()
+
+    def test_successful_recovery_reports_live(self):
+        composition = self._composition()
+        assert _run_reconcile_publish(
+            composition, ['--reconcile-publish', 'tg-6329821361-p9', '--as', 'owner-1'],
+        ) == 0
+        composition.promote.resume_publish.assert_called_once_with(
+            'tg-6329821361-p9', '/tmp/ws', principal_id='owner-1',
+        )
+
+    def test_failed_recovery_reports_the_error_code(self):
+        composition = self._composition(result=OperationResult.fail(
+            'PROMOTE_FAILED', error_code='PROMOTION_IDENTITY_UNPROVEN'))
+        assert _run_reconcile_publish(
+            composition, ['--reconcile-publish', 'tg-6329821361-p9', '--as', 'owner-1'],
+        ) == 1
+
 
 
 # ---------------------------------------------------------------------------

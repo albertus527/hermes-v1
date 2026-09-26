@@ -309,9 +309,12 @@ def test_bootstrap_must_be_the_actual_production_binding(tmp_path):
     assert result.error_code == "INCOMPLETE_LOOKUP"
 
 
-def test_a_readable_bootstrap_proof_with_no_production_binding_fails_closed(
+def test_no_production_binding_reports_no_production_never_a_bootstrap(
         tmp_path):
-    """No production target at all cannot be "this deployment is production"."""
+    """No production binding means the project has NO production deployment --
+    the honest answer, and never "this deployment is production". The caller
+    classifies that as unknown and fails closed on it, which is the real
+    invariant."""
     adapter = _adapter(tmp_path)
     adapter._call = _fake_provider(deployment_meta=_bootstrap_meta(),
                                    production_binding=None)
@@ -319,8 +322,11 @@ def test_a_readable_bootstrap_proof_with_no_production_binding_fails_closed(
     result = adapter.find_production_deployment(APP_ID, _project(None),
                                                 expected_name="pokeplay")
 
-    assert not result.success
-    assert result.error_code == "INCOMPLETE_LOOKUP"
+    assert result.success
+    assert result.data == {"deployment_id": None}
+    assert "bootstrap_proof" not in result.data
+    # Classified as "no production at all" -- never as a rollback target.
+    assert _classify_previous_production(result)[0] == "NO_PRODUCTION"
 
 
 def test_authoritative_reread_mismatch_fails_closed(tmp_path):
@@ -341,22 +347,26 @@ def test_authoritative_reread_mismatch_fails_closed(tmp_path):
 
 
 def test_real_production_with_complete_metadata_needs_no_reread(tmp_path):
-    """The common case is untouched: a complete content identity from the list
-    is used as-is, with no extra provider call."""
+    """The common case is untouched: a complete content identity from the
+    authoritative per-deployment read is used as-is, with no second read."""
     adapter = _adapter(tmp_path)
     calls = []
     real = dict(_bootstrap_meta(), wbOperation="op-7", wbRevision="3",
                 wbArtifact="b" * 64)
-    adapter._call = _fake_provider(list_meta=real, calls=calls,
-                                   deployment_id="dpl_live")
+    adapter._call = _fake_provider(deployment_meta=real, calls=calls,
+                                   deployment_id="dpl_live",
+                                   production_binding="dpl_live")
 
     result = adapter.find_production_deployment(APP_ID, _project("dpl_live"),
                                                 expected_name="pokeplay")
 
     assert result.success
     assert _classify_previous_production(result)[0] == PREVIOUS_PRODUCTION_REAL
-    assert not any('/v13/deployments/' in p for p in calls)
-    assert not any(p.startswith('/v9/projects/') for p in calls)
+    # The production binding is resolved from the project, and the deployment
+    # read happens exactly once.
+    assert sum(1 for p in calls if p.startswith('/v9/projects/')) == 1
+    assert sum(1 for p in calls if '/v13/deployments/' in p) == 1
+    assert not any(p.startswith('/v6/deployments') for p in calls)
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +399,11 @@ class _BootstrapVercel:
                                         expected_name=None):
         return self._inner.reconcile_production_deployment(
             app_id, project, expected_identity, expected_name=expected_name)
+
+    def reconcile_external_promotion(self, app_id, project, intended_identity, *,
+                                     expected_name=None):
+        return self._inner.reconcile_external_promotion(
+            app_id, project, intended_identity, expected_name=expected_name)
 
     @property
     def production_now(self):

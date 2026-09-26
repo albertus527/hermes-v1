@@ -75,6 +75,14 @@ class FakeVercel:
         # -> reconciliation cannot decide.
         self.production_now = 'NOT_SET'
         self.reconcile_calls = []
+        # External adoption reads: records every same-operation recovery read so
+        # a test can assert a recovery reconciled BEFORE promoting anything.
+        self.reconcile_external_calls = []
+        # Remote truth for reconcile_external_promotion, mirroring the real
+        # adapter. 'FOLLOW_PRODUCTION' (default) reports the same truth the
+        # ordinary reconcile would; tests override it to model a promote CHILD
+        # or an unattributable production binding.
+        self.external_now = 'FOLLOW_PRODUCTION'
 
     def lookup_project(self, app_id, *, expected_name=None):
         self.expected_names.append(expected_name)
@@ -119,6 +127,54 @@ class FakeVercel:
                                        'deployment_id': expected_identity['deployment_id']})
         return OperationResult.ok({'status': 'NOT_PROMOTED',
                                    'deployment_id': now.get('deployment_id')})
+
+    def reconcile_external_promotion(self, app_id, project, intended_identity, *,
+                                     expected_name=None):
+        """Default fake: report the SAME provider truth as
+        ``reconcile_production_deployment``, because for a deployment id that
+        is still ours the two reads agree by definition.
+
+        ``external_now`` overrides it:
+          * 'FOLLOW_PRODUCTION' (default) -> mirror ``production_now``
+          * 'UNPROVEN'  -> production moved, nothing ties it to us
+          * 'AMBIGUOUS' -> truth unreadable -> reconciliation cannot decide
+          * dict        -> a promote CHILD of our deployment is production
+        """
+        self.reconcile_external_calls.append(dict(intended_identity))
+        self.expected_names.append(expected_name)
+        now = getattr(self, 'external_now', 'FOLLOW_PRODUCTION')
+        if now == 'UNPROVEN':
+            return OperationResult.ok({'status': 'PROMOTED_UNPROVEN',
+                                       'deployment_id': 'dpl_someone_elses'})
+        if now == 'AMBIGUOUS':
+            return OperationResult.fail('PROMOTE_RECONCILIATION_REQUIRED',
+                                        error_code='PROMOTE_RECONCILIATION_REQUIRED')
+        if now != 'FOLLOW_PRODUCTION':
+            return OperationResult.ok({
+                'status': 'PROMOTED',
+                'deployment_id': now.get('deployment_id'),
+                'proof': 'PROVIDER_LINEAGE',
+                'production_url': 'https://prod.vercel.app',
+            })
+        # Mirror production_now: this is the truth the provider would report for
+        # either read, so an ordinary resume keeps its previous semantics.
+        production = getattr(self, 'production_now', 'NOT_SET')
+        if production == 'AMBIGUOUS':
+            return OperationResult.fail('PROMOTE_RECONCILIATION_REQUIRED',
+                                        error_code='PROMOTE_RECONCILIATION_REQUIRED')
+        if (isinstance(production, dict)
+                and all(production.get(k) == intended_identity.get(k)
+                        for k in ('deployment_id', 'operation_id',
+                                  'source_revision', 'artifact_sha256'))):
+            return OperationResult.ok({
+                'status': 'PROMOTED', 'deployment_id': production['deployment_id'],
+                'proof': 'DIRECT_IDENTITY', 'production_url': 'https://prod.vercel.app',
+            })
+        binding = (production.get('deployment_id')
+                   if isinstance(production, dict)
+                   else (self.previous_identity or {}).get('deployment_id'))
+        return OperationResult.ok({'status': 'PROMOTED_UNPROVEN',
+                                   'deployment_id': binding})
 
     def promote_deployment(self, app_id, project, deployment_id, operation_id,
                            source_revision, artifact_sha256, *, expected_name=None):

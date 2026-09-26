@@ -220,8 +220,11 @@ def test_reconcile_production_confirms_promoted_deployment():
     assert result.success and result.data['status'] == 'PROMOTED'
     assert all(c[0] == 'GET' for c in t.calls)
 
-def test_reconcile_production_reports_not_promoted():
-    """Current production is a DIFFERENT deployment -> NOT_PROMOTED."""
+def test_reconcile_production_stale_binding_is_ambiguous_not_not_promoted():
+    """Current production is a DIFFERENT deployment with no job record. That is
+    NOT a confirmed negative: Vercel keeps the remote promotion running after a
+    client stops waiting, so a stale binding can only be reported as ambiguous
+    and must stay resumable."""
     a, t = adapter()
     d = deployment(a)
     p = project(a)
@@ -230,15 +233,55 @@ def test_reconcile_production_reports_not_promoted():
         (200, {**p, 'targets': {'production': {'id': 'dpl_other'}}}),
     ]
     result = a.reconcile_production_deployment('app', p, _reconcile_identity())
-    assert result.success and result.data['status'] == 'NOT_PROMOTED'
+    assert not result.success
+    assert result.error_code == 'PROMOTE_RECONCILIATION_REQUIRED'
 
-def test_reconcile_production_no_binding_is_not_promoted():
+
+def test_reconcile_production_no_binding_is_ambiguous_not_not_promoted():
+    """No production binding at all is likewise not proof the promote did not
+    land -- a queued/queued-then-aliased promotion is exactly this shape."""
     a, t = adapter()
     d = deployment(a)
     p = project(a)
     t.responses = [(200, d), (200, {**p, 'targets': {}})]
     result = a.reconcile_production_deployment('app', p, _reconcile_identity())
+    assert not result.success
+    assert result.error_code == 'PROMOTE_RECONCILIATION_REQUIRED'
+
+
+def test_reconcile_production_terminal_job_failure_is_not_promoted():
+    """NOT_PROMOTED requires POSITIVE evidence: the provider's own alias job
+    reports this promotion as terminally failed."""
+    a, t = adapter()
+    d = deployment(a)
+    p = project(a)
+    t.responses = [
+        (200, d),
+        (200, {**p, 'targets': {'production': {'id': 'dpl_other'}},
+               'lastAliasRequest': {'jobStatus': 'failed',
+                                    'toDeploymentId': _reconcile_identity()['deployment_id'],
+                                    'requestedAt': 1000, 'type': 'promote'}}),
+    ]
+    result = a.reconcile_production_deployment('app', p, _reconcile_identity())
     assert result.success and result.data['status'] == 'NOT_PROMOTED'
+
+
+def test_reconcile_production_in_flight_job_stays_ambiguous():
+    """An in-flight job for OUR deployment is the pure async case: keep waiting,
+    never conclude."""
+    a, t = adapter()
+    d = deployment(a)
+    p = project(a)
+    t.responses = [
+        (200, d),
+        (200, {**p, 'targets': {'production': {'id': 'dpl_other'}},
+               'lastAliasRequest': {'jobStatus': 'in-progress',
+                                    'toDeploymentId': _reconcile_identity()['deployment_id'],
+                                    'requestedAt': 1000, 'type': 'promote'}}),
+    ]
+    result = a.reconcile_production_deployment('app', p, _reconcile_identity())
+    assert not result.success
+    assert result.error_code == 'PROMOTE_RECONCILIATION_REQUIRED'
 
 @pytest.mark.parametrize('mutate', [
     lambda d: d.__setitem__('id', 'dpl_9'),

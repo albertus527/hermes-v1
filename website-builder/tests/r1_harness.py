@@ -221,6 +221,9 @@ class FakeVercel:
         self.created_projects: List[str] = []
         self.deployed_operations: List[str] = []
         self.promoted_deployments: List[str] = []
+        # Records every same-operation recovery adoption read, so a test can
+        # assert a recovery reconciled before it considered any promote.
+        self.reconcile_external_calls: List[Dict[str, Any]] = []
         # Bound friendly project name (slug) once created.
         self.project_name = None
         self.last_deployment: Dict[str, Any] = {}
@@ -411,6 +414,11 @@ class FakeVercel:
     def reconcile_production_deployment(self, app_id, project, expected_identity, *,
                                         expected_name=None):
         return OperationResult.ok({"status": "NOT_PROMOTED", "deployment_id": None})
+
+    def reconcile_external_promotion(self, app_id, project, intended_identity, *,
+                                     expected_name=None):
+        self.reconcile_external_calls.append(dict(intended_identity))
+        return OperationResult.ok({"status": "PROMOTED_UNPROVEN", "deployment_id": None})
 
 
 class FakeTelegramOut:

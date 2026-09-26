@@ -929,20 +929,376 @@ class VercelAdapter:
             return _fail('INCOMPLETE_LOOKUP')
 
 
-    def promote_deployment(self, app_id, project, deployment_id, operation_id,
-                           source_revision, artifact_sha256, *, expected_name=None):
-        """Promote an EXISTING deployment (already built/deployed as preview)
-        to the project's production alias. No rebuild, no new files.
+    # ------------------------------------------------------------------
+    # PHASE R — Vercel promotion contract (CLI parity)
+    # ------------------------------------------------------------------
+    #
+    # Promotion on Vercel is ASYNCHRONOUS, and its proof of success is never a
+    # field on the promoted deployment:
+    #
+    #   * ``POST /v10/projects/{id}/promote/{deploymentId}`` is an ALIAS REMAP
+    #     ("does NOT rebuild the deployment"). Its only success statuses are
+    #     201 and 202 -- 202 means the request was QUEUED, not applied. This
+    #     is the mechanism the Vercel CLI uses only for deployments that were
+    #     already built for production.
+    #   * For a PREVIEW-target deployment the CLI promotes by CREATION:
+    #     ``POST /v13/deployments`` with the source ``deploymentId`` and
+    #     ``target: 'production'``. The API documents this as producing "a new
+    #     ID, URL, and build" -- the alias-remap path is not served for
+    #     previews, which is exactly the shape Website Builder deploys.
+    #   * Either way the authoritative production binding is the project's own
+    #     ``targets.production`` binding, and the job's progress lives on
+    #     ``project.lastAliasRequest`` (``jobStatus`` in pending /
+    #     in-progress / succeeded / failed / skipped).
+    #   * A promotion timeout does NOT cancel the remote promotion; it only
+    #     stops waiting for it. "Still not promoted when we stopped looking" is
+    #     therefore AMBIGUOUS, never a confirmed negative.
+    #
+    # ``deployment.target`` is deliberately NOT part of any success condition:
+    # the CLI never checks it, and an alias remap binds ``targets.production``
+    # without rewriting the promoted deployment's own target.
 
-        Verifies project/meta identity on the deployment both before the
-        promote call and after, via GET — never trusts the promote response
-        body alone. Caller supplies the exact operation identity that was
-        bound to the original preview deploy_static_files call.
+    # 201 = applied, 202 = queued. 200/204 are tolerated for robustness but are
+    # not documented for this endpoint; 202 is the one that was previously
+    # misread as a hard failure.
+    _PROMOTE_ALIAS_REMAP_ACCEPTED = frozenset({200, 201, 202, 204})
+    _PROMOTE_CREATE_ACCEPTED = frozenset({200, 201})
+    # A deterministic, terminal provider-side refusal of the promote request
+    # itself: the provider received it and rejected it on its merits, so the
+    # deployment provably did not become production.
+    _PROMOTE_REJECTED_STATUSES = frozenset({400, 401, 403, 410, 422})
+
+    # Real wall-clock budget for the read-only confirmation loop, with a
+    # ~2s poll step. The deadline is wall-clock, not a poll count, so a slow
+    # provider shortens the number of polls instead of extending the wait.
+    _PROMOTION_CONFIRM_TIMEOUT = 60.0
+    _PROMOTION_CONFIRM_INTERVAL = 2.0
+
+    _PROMOTION_JOB_IN_FLIGHT = 'in_flight'
+    _PROMOTION_JOB_SUCCEEDED = 'succeeded'
+    _PROMOTION_JOB_FAILED = 'failed'
+    _PROMOTION_JOB_ABSENT = 'absent'
+    _PROMOTION_JOB_UNKNOWN = 'unknown'
+
+    @staticmethod
+    def _complete_identity(identity):
+        """True when ``identity`` is the COMPLETE, re-promotable trusted tuple
+        (deployment_id + operation_id + source_revision + artifact_sha256).
+
+        A partial identity can never prove anything, so it must fail closed
+        rather than be completed by inference.
+        """
+        if not isinstance(identity, dict):
+            return False
+        deployment_id = identity.get('deployment_id')
+        operation_id = identity.get('operation_id')
+        source_revision = identity.get('source_revision')
+        artifact_sha256 = identity.get('artifact_sha256')
+        return bool(
+            deployment_id
+            and re.fullmatch(r'[A-Za-z0-9_-]{1,128}', deployment_id)
+            and isinstance(operation_id, str) and operation_id
+            and type(source_revision) is int and source_revision >= 1
+            and isinstance(artifact_sha256, str)
+            and re.fullmatch('[a-f0-9]{64}', artifact_sha256)
+        )
+
+    def _identity_meta(self, app_id, identity):
+        """The ``wb*`` metadata block for a complete identity, or raise
+        ValueError when the identity is not trustworthy enough to assert.
+        """
+        if not self._complete_identity(identity):
+            raise ValueError('Invalid operation identity')
+        return self._meta(app_id, identity['operation_id'],
+                          identity['source_revision'],
+                          identity['artifact_sha256'])
+
+    def _promotion_state(self, project):
+        """One read-only project fetch carrying BOTH authoritative promotion
+        facts: the current production alias binding, and the provider's own
+        record of the last alias/promote job.
+
+        Returns ``(binding_id, job, project_body)`` where ``job`` is the
+        already-validated ``lastAliasRequest`` dict or ``None``. Any
+        malformed/ambiguous shape raises -- callers must fail closed, never
+        infer "not live" from an unreadable response.
+        """
+        status, fresh = self._call('GET', '/v9/projects/' + project['name'])
+        if status != 200 or not isinstance(fresh, dict) or fresh.get('id') != project['id']:
+            raise ValueError('PROMOTION_STATE_LOOKUP_FAILED')
+        if fresh.get('rollingRelease'):
+            # A rolling release changes what "promoted" means (the CLI requests
+            # a release rather than remapping aliases). We never enable one, so
+            # a truthy value is an unmodelled provider state and must never be
+            # read as a completed alias remap.
+            raise ValueError('ROLLING_RELEASE_UNSUPPORTED')
+        binding_id = None
+        targets = fresh.get('targets')
+        if targets is not None:
+            if not isinstance(targets, dict):
+                raise ValueError('PROMOTION_STATE_LOOKUP_FAILED')
+            prod = targets.get('production')
+            if prod is not None:
+                if not isinstance(prod, dict) or not prod.get('id'):
+                    raise ValueError('PROMOTION_STATE_LOOKUP_FAILED')
+                binding_id = prod['id']
+        job = fresh.get('lastAliasRequest')
+        if job is not None and not isinstance(job, dict):
+            raise ValueError('PROMOTION_STATE_LOOKUP_FAILED')
+        return binding_id, job, fresh
+
+    def _classify_alias_job(self, job, expected_to_id):
+        """Classify the provider's own promote/alias job record, mirroring the
+        Vercel CLI's ``promote status`` algorithm.
+
+        ``pending``/``in-progress`` mean the remap is still running;
+        ``succeeded`` means it completed; ``failed`` is terminal; anything
+        missing, unrecognised, or recorded against a DIFFERENT deployment is
+        "no usable signal" -- which is ambiguous, never a negative answer.
+
+        A terminal ``failed`` is only attributed to our promotion when its
+        ``toDeploymentId`` is the deployment we actually asked to promote.
+        """
+        if not isinstance(job, dict) or not job:
+            return self._PROMOTION_JOB_ABSENT
+        status = job.get('jobStatus')
+        to_id = job.get('toDeploymentId')
+        requested_at = job.get('requestedAt')
+        if (not isinstance(status, str) or not status
+                or not isinstance(to_id, str) or not to_id
+                or type(requested_at) is not int or requested_at <= 0):
+            return self._PROMOTION_JOB_UNKNOWN
+        if status in ('pending', 'in-progress'):
+            return self._PROMOTION_JOB_IN_FLIGHT
+        if status == 'succeeded':
+            return self._PROMOTION_JOB_SUCCEEDED
+        if status == 'failed':
+            return (self._PROMOTION_JOB_FAILED if to_id == expected_to_id
+                    else self._PROMOTION_JOB_UNKNOWN)
+        return self._PROMOTION_JOB_UNKNOWN
+
+    def _validated_deployment(self, identifier, project, meta):
+        """GET one deployment and revalidate the COMPLETE trusted identity
+        (id, project, team, ``wb*`` meta). Returns the body, or ``None`` on any
+        doubt so callers keep failing closed.
+        """
+        status, body = self._call('GET', '/v13/deployments/' + quote(identifier, safe=''))
+        if status != 200 or not isinstance(body, dict) or body.get('id') != identifier:
+            return None
+        team = body.get('teamId') or (body.get('team') or {}).get('id')
+        project_id_field = body.get('projectId') or (body.get('project') or {}).get('id')
+        if project_id_field != project['id'] or team != self.team_id:
+            return None
+        if any((body.get('meta') or {}).get(k) != v for k, v in meta.items()):
+            return None
+        return body
+
+    def confirm_production_promotion(self, app_id, project, expected_identity, *,
+                                     expected_name=None, sleep_fn=time.sleep,
+                                     now=time.time, timeout=None, interval=None):
+        """Bounded READ-ONLY confirmation that ``expected_identity`` is this
+        project's live production deployment.
+
+        The loop is deadline-driven, not poll-count-driven: the budget is a
+        real wall-clock deadline with a ~2s step, so a slow provider shrinks
+        the number of polls instead of extending the wait. ``sleep_fn``/``now``
+        are injected so tests never spend real time.
+
+        Outcomes (``OperationResult``):
+          * ``ok`` ``{'status': 'PROMOTED', 'deployment_id', 'production_url'}``
+            -- the project's production binding IS the expected deployment,
+            its complete stored identity matches, and it is READY.
+          * ``fail('PROMOTE_NOT_APPLIED')`` -- the provider conclusively reports
+            THIS promotion job as terminally failed. It is a failure, not a
+            success carrying a status, so a caller can never read the
+            ``production_url`` of a deployment that is not live.
+          * ``fail('PROMOTE_RECONCILIATION_REQUIRED')`` -- the budget expired
+            with no conclusive signal, or truth could not be read.
+
+        A merely stale binding is never a final answer: the remote promotion
+        keeps running after we stop watching, so a timeout is a non-terminal,
+        reconcilable state -- not ``NOT_PROMOTED``.
+        """
+        try:
+            if not self._project_valid(project, app_id, expected_name=expected_name):
+                return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+            if not self._complete_identity(expected_identity):
+                return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+            try:
+                meta = self._identity_meta(app_id, expected_identity)
+            except ValueError:
+                return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+            deployment_id = expected_identity['deployment_id']
+            budget = self._PROMOTION_CONFIRM_TIMEOUT if timeout is None else timeout
+            step = self._PROMOTION_CONFIRM_INTERVAL if interval is None else interval
+            deadline = now() + budget
+            while True:
+                try:
+                    binding_id, job, _ = self._promotion_state(project)
+                except Exception:
+                    return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+                if binding_id == deployment_id:
+                    body = self._validated_deployment(deployment_id, project, meta)
+                    if body is not None and body.get('readyState') == 'READY':
+                        url = 'https://' + (body.get('url') or '')
+                        if not _safe_origin(url):
+                            return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+                        return OperationResult.ok({
+                            'status': 'PROMOTED',
+                            'deployment_id': deployment_id,
+                            'production_url': url,
+                            'job': self._classify_alias_job(job, deployment_id),
+                            'deployment': body,
+                        })
+                    # Bound to us but not yet provably serving: keep waiting
+                    # inside the same budget rather than guessing.
+                elif (self._classify_alias_job(job, deployment_id)
+                      == self._PROMOTION_JOB_FAILED):
+                    # The provider itself reports this promotion as terminally
+                    # failed, so the approved artifact provably never took
+                    # over. Terminal, and reported as a failure so no caller
+                    # can read a production URL for a deployment that is not
+                    # live.
+                    return _fail('PROMOTE_NOT_APPLIED')
+                if now() >= deadline:
+                    return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+                try:
+                    sleep_fn(step)
+                except Exception:
+                    return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+        except Exception:
+            return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+
+    def reconcile_external_promotion(self, app_id, project, intended_identity, *,
+                                     expected_name=None):
+        """Read-only adoption check for a promotion that was applied OUTSIDE
+        this process (for example an operator promoting by hand with the
+        Vercel CLI, which mints a NEW deployment id and therefore cannot be
+        recognized by deployment id alone).
+
+        Two, and only two, proofs are accepted:
+
+          * DIRECT -- the project's production binding IS the intended
+            deployment id, and that deployment still carries the exact trusted
+            operation identity.
+          * LINEAGE -- the binding is a different deployment, but Vercel's own
+            ``lastAliasRequest`` records ``type == 'promote'`` with
+            ``fromDeploymentId == <intended id>`` and
+            ``toDeploymentId == <binding id>`` and ``jobStatus ==
+            'succeeded'``, and that deployment is READY with its alias
+            assigned. The provider itself attests this production deployment is
+            the promotion of our exact deployment -- provider truth, not a
+            guess.
+
+        Outcomes (``OperationResult``):
+          * ``ok`` ``{'status': 'PROMOTED', 'deployment_id', 'production_url',
+            'proof': 'DIRECT_IDENTITY' | 'PROVIDER_LINEAGE'}``
+          * ``ok`` ``{'status': 'PROMOTED_UNPROVEN', 'deployment_id': ...}``
+            -- a production deployment exists (or none does) but neither proof
+            holds. Notably this is what a deployment created by a tool that did
+            not carry our identity, and for which the provider kept no lineage
+            record, looks like. The caller must fail closed: there is no
+            trusted evidence tying it to the approved artifact.
+          * ``fail('PROMOTE_RECONCILIATION_REQUIRED')`` -- truth unreadable.
+
+        Never mutates anything, and never treats "no production deployment" as
+        proof of anything.
+        """
+        try:
+            if not self._project_valid(project, app_id, expected_name=expected_name):
+                return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+            if not self._complete_identity(intended_identity):
+                return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+            try:
+                meta = self._identity_meta(app_id, intended_identity)
+            except ValueError:
+                return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+            intended_id = intended_identity['deployment_id']
+            try:
+                binding_id, job, _ = self._promotion_state(project)
+            except Exception:
+                return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+            if not binding_id:
+                return OperationResult.ok({'status': 'PROMOTED_UNPROVEN',
+                                           'deployment_id': None})
+            direct = binding_id == intended_id
+            lineage = bool(
+                not direct
+                and isinstance(job, dict)
+                and job.get('jobStatus') == 'succeeded'
+                and job.get('type') == 'promote'
+                and job.get('fromDeploymentId') == intended_id
+                and job.get('toDeploymentId') == binding_id
+            )
+            if not direct and not lineage:
+                return OperationResult.ok({'status': 'PROMOTED_UNPROVEN',
+                                           'deployment_id': binding_id})
+            status, body = self._call(
+                'GET', '/v13/deployments/' + quote(binding_id, safe=''))
+            if status != 200 or not isinstance(body, dict) or body.get('id') != binding_id:
+                return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+            team = body.get('teamId') or (body.get('team') or {}).get('id')
+            project_id_field = body.get('projectId') or (body.get('project') or {}).get('id')
+            if (project_id_field != project['id'] or team != self.team_id
+                    or body.get('readyState') != 'READY' or not body.get('aliasAssigned')):
+                return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+            if direct and any((body.get('meta') or {}).get(k) != v
+                              for k, v in meta.items()):
+                # Bound to us by id, but the stored identity is not the
+                # approved one: something else occupies that deployment id.
+                return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+            url = 'https://' + (body.get('url') or '')
+            if not _safe_origin(url):
+                return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+            return OperationResult.ok({
+                'status': 'PROMOTED',
+                'deployment_id': binding_id,
+                'promoted_deployment_id': binding_id,
+                'proof': 'DIRECT_IDENTITY' if direct else 'PROVIDER_LINEAGE',
+                'production_url': url,
+                'deployment': body,
+            })
+        except Exception:
+            return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+
+    def promote_deployment(self, app_id, project, deployment_id, operation_id,
+                           source_revision, artifact_sha256, *, expected_name=None,
+                           sleep_fn=time.sleep, now=time.time):
+        """Promote an EXISTING deployment to the project's production alias,
+        matching the Vercel CLI's own mechanism selection.
+
+        The CLI routes on the deployment's own ``target``:
+
+          * ``target == 'production'`` -- already built for production, so the
+            alias is remapped with ``POST /v10/projects/{id}/promote/{dpl}``.
+            201 means applied, 202 means QUEUED; both are followed by the
+            bounded read-only confirmation.
+          * anything else (Website Builder's preview deployments) -- the
+            alias-remap path is not served for previews, so the deployment is
+            promoted by CREATION via ``POST /v13/deployments`` with the source
+            ``deploymentId`` and ``target: 'production'``. Vercel documents
+            this as producing "a new ID, URL, and build", so the new id becomes
+            the production identity and is confirmed through the same loop.
+
+        No rebuild of our own and no new files: the created deployment inherits
+        the exact approved artifact from the deployment validated immediately
+        before, and the ``wb*`` identity stamped on it is what makes it
+        independently verifiable and re-promotable as a rollback target.
+
+        The full identity tuple is validated on the deployment BEFORE the
+        promote, and production truth is proven afterwards from the project's
+        own binding -- the promote response body is never trusted as proof.
         """
         try:
             if not self._project_valid(project, app_id, expected_name=expected_name):
                 return _fail('PROJECT_IDENTITY_MISMATCH')
-            meta = self._meta(app_id, operation_id, source_revision, artifact_sha256)
+            identity = {
+                'deployment_id': deployment_id,
+                'operation_id': operation_id,
+                'source_revision': source_revision,
+                'artifact_sha256': artifact_sha256,
+            }
+            meta = self._identity_meta(app_id, identity)
             if not deployment_id or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', deployment_id):
                 return _fail('INVALID_DEPLOYMENT_ID')
             # Confirm the deployment we are about to promote is the exact one
@@ -951,29 +1307,139 @@ class VercelAdapter:
             if (status != 200 or body.get('id') != deployment_id
                     or any((body.get('meta') or {}).get(k) != v for k, v in meta.items())):
                 return _fail('DEPLOYMENT_IDENTITY_MISMATCH')
-            status, _ = self._call(
-                'POST', '/v10/projects/' + project['id'] + '/promote/' + quote(deployment_id, safe=''),
-                {},
-            )
-            if status not in (200, 201, 204):
-                return _fail('PROMOTE_RECONCILIATION_REQUIRED')
-            # Re-GET after promote; never trust the promote response body for
-            # production identity/target.
-            status, body = self._call('GET', '/v13/deployments/' + quote(deployment_id, safe=''))
-            team = body.get('teamId') or (body.get('team') or {}).get('id')
-            project_id_field = body.get('projectId') or (body.get('project') or {}).get('id')
-            if (status != 200 or body.get('id') != deployment_id or project_id_field != project['id']
-                    or team != self.team_id or body.get('target') != 'production'
-                    or any((body.get('meta') or {}).get(k) != v for k, v in meta.items())):
-                return _fail('PROMOTE_VERIFICATION_FAILED')
-            url = 'https://' + body.get('url', '')
-            if not _safe_origin(url):
-                return _fail('INVALID_PRODUCTION_URL')
-            return OperationResult.ok({'deployment_id': body['id'], 'production_url': url,
-                                       'state': body.get('readyState') or body.get('status'),
-                                       'deployment': body})
+            if body.get('target') == 'production':
+                return self._promote_by_alias_remap(
+                    app_id, project, identity, expected_name=expected_name,
+                    sleep_fn=sleep_fn, now=now)
+            return self._promote_by_creation(
+                app_id, project, identity, expected_name=expected_name,
+                sleep_fn=sleep_fn, now=now)
         except Exception:
             return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+
+    def _promote_by_alias_remap(self, app_id, project, identity, *, expected_name,
+                                sleep_fn, now):
+        """Alias remap, for a deployment already built for production.
+
+        A 202 means the request was QUEUED, not applied -- which is why the
+        request is never treated as the outcome. Success is decided only by the
+        bounded confirmation loop against the project's production binding.
+        """
+        status, _ = self._call(
+            'POST', '/v10/projects/' + project['id'] + '/promote/'
+            + quote(identity['deployment_id'], safe=''),
+            {},
+        )
+        if status in self._PROMOTE_REJECTED_STATUSES:
+            return _fail('PROMOTE_REJECTED')
+        if status not in self._PROMOTE_ALIAS_REMAP_ACCEPTED:
+            return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+        return self.confirm_production_promotion(
+            app_id, project, identity, expected_name=expected_name,
+            sleep_fn=sleep_fn, now=now)
+
+    def _promote_by_creation(self, app_id, project, identity, *, expected_name,
+                             sleep_fn, now):
+        """Promote-by-creation, for a preview-target deployment (CLI parity).
+
+        The request deliberately carries NO ``files``/``builds``: those are
+        inherited from the source deployment, and re-sending them would risk
+        publishing bytes that were never the approved artifact. The ``wb*``
+        identity IS sent, so the resulting production deployment is
+        independently verifiable and re-promotable as a rollback target.
+
+        A 409 is a proven collision, not a licence for a second create: the
+        bounded confirmation still decides the outcome from provider truth.
+        """
+        try:
+            meta = self._identity_meta(app_id, identity)
+        except ValueError:
+            return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+        status, body = self._call('POST', '/v13/deployments', {
+            'name': project['name'], 'project': project['id'],
+            'deploymentId': identity['deployment_id'], 'target': 'production',
+            'meta': {'action': 'promote', **meta},
+        })
+        if status in self._PROMOTE_REJECTED_STATUSES:
+            return _fail('PROMOTE_REJECTED')
+        promoted_id = body.get('id') if isinstance(body, dict) else None
+        if status not in self._PROMOTE_CREATE_ACCEPTED or not isinstance(promoted_id, str) \
+                or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', promoted_id):
+            return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+        promoted_identity = dict(identity, deployment_id=promoted_id)
+        # The created deployment must be READY before its alias is meaningful,
+        # AND it must carry the identity we stamped on it -- that is what makes
+        # the new production deployment independently verifiable and
+        # re-promotable as a rollback target. A terminal build state is a
+        # CONCLUSIVE failure (the provider will never alias it); still building
+        # at the deadline is ambiguous.
+        ready = self._await_promoted_ready(
+            app_id, project, promoted_id, identity, expected_name=expected_name,
+            sleep_fn=sleep_fn, now=now)
+        if not ready.success:
+            return ready
+        confirmed = self.confirm_production_promotion(
+            app_id, project, promoted_identity, expected_name=expected_name,
+            sleep_fn=sleep_fn, now=now)
+        if not confirmed.success or confirmed.data.get('status') != 'PROMOTED':
+            return confirmed
+        return OperationResult.ok({
+            'deployment_id': promoted_id,
+            'promoted_deployment_id': promoted_id,
+            'source_deployment_id': identity['deployment_id'],
+            'production_url': confirmed.data['production_url'],
+            'mechanism': 'promote_by_creation',
+            'state': ready.data.get('readyState'),
+            'deployment': confirmed.data.get('deployment'),
+        })
+
+    def _await_promoted_ready(self, app_id, project, promoted_id, identity, *,
+                              expected_name, sleep_fn, now, timeout=None, interval=None):
+        """Bounded wait for a promote-by-creation deployment to become READY
+        and to prove it is OURS.
+
+        Runs under the same wall-clock discipline as the confirmation loop. A
+        terminal build state (ERROR/CANCELED) is conclusive -- Vercel will
+        never alias it -- and is reported as a confirmed ``PROMOTE_FAILED``.
+        Still building when the budget expires is ambiguous, because the alias
+        may be assigned afterwards. A deployment that becomes READY without
+        carrying the identity we sent is NOT our deployment, and fails closed
+        rather than waiting for an alias that must not be trusted.
+        """
+        try:
+            meta = self._identity_meta(app_id, identity)
+        except ValueError:
+            return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+        budget = self._PROMOTION_CONFIRM_TIMEOUT if timeout is None else timeout
+        step = self._PROMOTION_CONFIRM_INTERVAL if interval is None else interval
+        deadline = now() + budget
+        while True:
+            try:
+                status, body = self._call(
+                    'GET', '/v13/deployments/' + quote(promoted_id, safe=''))
+            except Exception:
+                return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+            if status == 200 and isinstance(body, dict) and body.get('id') == promoted_id:
+                team = body.get('teamId') or (body.get('team') or {}).get('id')
+                project_id_field = body.get('projectId') or (body.get('project') or {}).get('id')
+                if project_id_field != project['id'] or team != self.team_id:
+                    return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+                state = body.get('readyState')
+                if state == 'READY':
+                    if any((body.get('meta') or {}).get(k) != v
+                           for k, v in meta.items()):
+                        return _fail('DEPLOYMENT_IDENTITY_MISMATCH')
+                    return OperationResult.ok(body)
+                if state in _BOOTSTRAP_TERMINAL_STATES:
+                    # Definitively failed/canceled -- never promote again to
+                    # "fix" it; a fresh operation must build a new deployment.
+                    return _fail('PROMOTE_FAILED')
+            if now() >= deadline:
+                return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+            try:
+                sleep_fn(step)
+            except Exception:
+                return _fail('PROMOTE_RECONCILIATION_REQUIRED')
 
     def _valid_hostname_for_api(self, hostname):
         return valid_custom_hostname(hostname)
@@ -1107,9 +1573,15 @@ class VercelAdapter:
             meta = self._meta(app_id, identity['operation_id'], identity['source_revision'],
                               identity['artifact_sha256'])
             status, body = self._call('GET', '/v13/deployments/' + quote(identifier, safe=''))
+            # ``target`` is deliberately absent from the proof: an alias remap
+            # binds targets.production without rewriting the promoted
+            # deployment's own target, so requiring ``target == 'production'``
+            # would reject a genuinely live production deployment. The
+            # project's own binding, the deployment id, team, project, ready
+            # state and stored identity are the real evidence.
             if (status != 200 or body.get('id') != identifier
                     or body.get('projectId') != fresh['id'] or body.get('teamId') != self.team_id
-                    or body.get('name') != fresh['name'] or body.get('target') != 'production'
+                    or body.get('name') != fresh['name']
                     or body.get('readyState') != 'READY'
                     or any((body.get('meta') or {}).get(k) != v for k, v in meta.items())):
                 return _fail('PRODUCTION_IDENTITY_MISMATCH')
@@ -1188,6 +1660,13 @@ class VercelAdapter:
         Used to capture last-known-good identity before promoting a new
         deployment, so a failed post-promotion smoke check can roll back.
 
+        The CURRENT production deployment is resolved from the project's own
+        ``targets.production`` binding, not from a ``?target=production``
+        list query. That distinction is load-bearing: Vercel does not rewrite a
+        promoted deployment's own ``target`` field, so a deployment promoted
+        while still marked preview is INVISIBLE to the filtered list query but
+        is exactly the deployment a rollback needs to re-promote.
+
         Returns one of three shapes, all proven exclusively from provider
         state:
 
@@ -1214,25 +1693,18 @@ class VercelAdapter:
         try:
             if not self._project_valid(project, app_id, expected_name=expected_name):
                 return _fail('PROJECT_IDENTITY_MISMATCH')
-            status, body = self._call('GET', '/v6/deployments',
-                                      projectId=project['id'], target='production', limit=1)
-            if status != 200 or not isinstance(body.get('deployments'), list):
+            try:
+                identifier = self._current_production_id(project)
+            except Exception:
                 return _fail('INCOMPLETE_LOOKUP')
-            deployments = body['deployments']
-            if not deployments:
-                return OperationResult.ok({'deployment_id': None})
-            item = deployments[0]
-            identifier = item.get('uid') or item.get('id')
             if not identifier:
-                return _fail('INCOMPLETE_LOOKUP')
+                return OperationResult.ok({'deployment_id': None})
             # The deployment metadata carries the exact repository identity
             # the deployment was created with. Absent/incomplete metadata
             # means we cannot safely re-promote this deployment as a
             # rollback target -- so re-read it authoritatively before
             # concluding anything, then fail closed if it is still absent.
-            meta = item.get('meta')
-            if not self._content_identity_complete(meta):
-                meta = self._authoritative_deployment_meta(identifier, project)
+            meta = self._authoritative_deployment_meta(identifier, project)
             bootstrap_proof = self._is_proven_bootstrap(meta, app_id, identifier, project)
             if not bootstrap_proof and not self._content_identity_complete(meta):
                 return _fail('INCOMPLETE_LOOKUP')
@@ -1299,8 +1771,12 @@ class VercelAdapter:
             current production IS the expected deployment, with every trusted
             identity field matching exactly.
           * ``ok`` with ``{'status': 'NOT_PROMOTED', 'deployment_id': ...}`` --
-            provider truth conclusively shows a DIFFERENT (or no) production
-            deployment; the expected deployment was not promoted.
+            provider truth CONCLUSIVELY shows the expected deployment was not
+            promoted. This requires positive evidence: the provider's own
+            ``lastAliasRequest`` reports this promotion job as terminally
+            ``failed``. A binding that merely still points somewhere else is
+            NOT conclusive -- Vercel keeps the remote promotion running after
+            a client stops watching, so a stale binding is ambiguous.
           * ``fail('PROMOTE_RECONCILIATION_REQUIRED')`` -- production truth is
             still ambiguous, could not be read, or the expected deployment's
             stored identity is incomplete. Callers MUST fail closed here and
@@ -1309,38 +1785,20 @@ class VercelAdapter:
         try:
             if not self._project_valid(project, app_id, expected_name=expected_name):
                 return _fail('PROMOTE_RECONCILIATION_REQUIRED')
-            if not isinstance(expected_identity, dict):
-                return _fail('PROMOTE_RECONCILIATION_REQUIRED')
-            deployment_id = expected_identity.get('deployment_id')
-            operation_id = expected_identity.get('operation_id')
-            source_revision = expected_identity.get('source_revision')
-            artifact_sha256 = expected_identity.get('artifact_sha256')
-            if (not deployment_id
-                    or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', deployment_id)
-                    or not isinstance(operation_id, str) or not operation_id
-                    or type(source_revision) is not int or source_revision < 1
-                    or not isinstance(artifact_sha256, str)
-                    or not re.fullmatch('[a-f0-9]{64}', artifact_sha256)):
+            if not self._complete_identity(expected_identity):
                 # Incomplete trusted identity -> cannot prove anything.
                 return _fail('PROMOTE_RECONCILIATION_REQUIRED')
+            deployment_id = expected_identity['deployment_id']
+            meta = self._identity_meta(app_id, expected_identity)
             # The expected deployment must exist, belong to this project, and
             # carry EXACTLY the expected operation identity. Anything else is
             # ambiguous -- never guess.
-            status, body = self._call('GET', '/v13/deployments/' + quote(deployment_id, safe=''))
-            if status != 200 or body.get('id') != deployment_id:
-                return _fail('PROMOTE_RECONCILIATION_REQUIRED')
-            team = body.get('teamId') or (body.get('team') or {}).get('id')
-            project_id_field = body.get('projectId') or (body.get('project') or {}).get('id')
-            meta = body.get('meta')
-            if (project_id_field != project['id'] or team != self.team_id
-                    or not isinstance(meta, dict)
-                    or meta.get('wbOperation') != operation_id
-                    or meta.get('wbRevision') != str(source_revision)
-                    or meta.get('wbArtifact') != artifact_sha256):
+            body = self._validated_deployment(deployment_id, project, meta)
+            if body is None:
                 return _fail('PROMOTE_RECONCILIATION_REQUIRED')
             # Authoritative production binding, straight from the project.
             try:
-                current_prod_id = self._current_production_id(project)
+                current_prod_id, job, _ = self._promotion_state(project)
             except Exception:
                 return _fail('PROMOTE_RECONCILIATION_REQUIRED')
             if current_prod_id == deployment_id:
@@ -1348,11 +1806,16 @@ class VercelAdapter:
                     return _fail('PROMOTE_RECONCILIATION_REQUIRED')
                 return OperationResult.ok({'status': 'PROMOTED',
                                            'deployment_id': deployment_id})
-            # A conclusive, well-formed production binding to someone else
-            # (or no production at all) proves the expected deployment is not
-            # the live target.
-            return OperationResult.ok({'status': 'NOT_PROMOTED',
-                                       'deployment_id': current_prod_id})
+            if (self._classify_alias_job(job, deployment_id)
+                    == self._PROMOTION_JOB_FAILED):
+                # The provider itself reports this promotion as terminally
+                # failed, so the expected deployment provably never took over.
+                return OperationResult.ok({'status': 'NOT_PROMOTED',
+                                           'deployment_id': current_prod_id})
+            # The binding points elsewhere but the provider has not reported
+            # this promotion as failed: the request may still be in flight.
+            # Ambiguous is the only honest answer, and it is resumable.
+            return _fail('PROMOTE_RECONCILIATION_REQUIRED')
         except Exception:
             return _fail('PROMOTE_RECONCILIATION_REQUIRED')
 

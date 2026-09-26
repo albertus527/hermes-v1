@@ -210,12 +210,28 @@ def test_domain_readback_failclosed(tmp_path, override):
 
 
 @pytest.mark.parametrize('field,value', [('teamId', 'foreign'), ('projectId', 'foreign'),
-    ('id', 'other'), ('readyState', 'BUILDING'), ('meta', {}), ('target', 'preview')])
+    ('id', 'other'), ('readyState', 'BUILDING'), ('meta', {})])
 def test_exact_production_identity_before_writes(tmp_path, field, value):
     _, p, _, connect, _ = setup(tmp_path)
     p.deployment[field] = value
     assert not connect().success
     assert all(c[0] == 'GET' for c in p.calls)
+
+
+def test_preview_labelled_but_genuinely_bound_deployment_is_production(tmp_path):
+    """``deployment.target`` is NOT part of the production proof.
+
+    Vercel does not rewrite a promoted deployment's own target, so a
+    deployment that IS the project's production binding can still be labelled
+    preview. Requiring ``target == 'production'`` would refuse to attach a
+    domain to a genuinely live production deployment, while adding no real
+    safety: the binding plus the exact identity is the proof.
+    """
+    store, p, _, connect, _ = setup(tmp_path)
+    p.misconfigured = False
+    p.deployment['target'] = 'preview'
+    assert connect().success
+    assert store.load('app').domain.connection_stage == 'ATTACHED'
 
 
 def test_historical_production_not_current(tmp_path):

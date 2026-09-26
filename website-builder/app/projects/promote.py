@@ -10,8 +10,19 @@ production alias. This module owns:
     the project's CURRENT latest shown preview -- if a newer preview was
     produced after approval (revision, revise, or a fresh preview run),
     the approval is stale and promotion is fail-closed / blocked,
-  * reusing the Phase 9 owned-Vercel-project adapters to alias/promote the
-    EXACT existing preview deployment -- never rebuilding or redeploying,
+  * reusing the Phase 9 owned-Vercel-project adapters to promote the EXACT
+    approved artifact -- no rebuild of our own, no new files. Following the
+    Vercel CLI, a preview-target deployment is promoted by CREATION (the
+    created deployment inherits the approved deployment's exact files) and a
+    production-target deployment by alias remap,
+  * a BOUNDED READ-ONLY confirmation of production truth afterwards. Vercel
+    promotion is asynchronous, so "still the old binding when we stopped
+    looking" is ambiguous -- never a confirmed failure. Only a provider-side
+    terminal rejection or job failure is terminal; a timeout leaves the
+    durable intent intact and the operation reconcilable,
+  * same-operation recovery for a project that already failed mid-promotion,
+    which reconciles remote truth and adopts it when -- and only when -- the
+    exact trusted identity is proven, with no second promote request,
   * a mandatory production smoke check before ever marking the lifecycle
     LIVE; on smoke failure the lifecycle fails closed to FAILED and the
     production alias is rolled back to the prior last-known-good
@@ -314,15 +325,18 @@ class PromotionOrchestrator:
             self.runner.release_project(project_id)
 
     def _promote(self, project_id: str, workspace: Path,
-                 principal_id=None, reference_token=None) -> OperationResult:
+                 principal_id=None, reference_token=None,
+                 recovery: bool = False) -> OperationResult:
         with self.store.acquire_writer(project_id) as state:
             try:
                 require_owner_role(state, principal_id, reference_token)
             except AuthzError as exc:
                 return OperationResult.fail(exc.error_code, error_code=exc.error_code)
-        return self._promote_authorized(project_id, workspace, principal_id, reference_token)
+        return self._promote_authorized(project_id, workspace, principal_id,
+                                        reference_token, recovery=recovery)
 
-    def _promote_authorized(self, project_id, workspace, principal_id=None, reference_token=None):
+    def _promote_authorized(self, project_id, workspace, principal_id=None,
+                            reference_token=None, recovery: bool = False):
         state = self.store.load(project_id)
         if state is None:
             return OperationResult.fail("NO_PROJECT_STATE", error_code="NO_PROJECT_STATE")
@@ -335,15 +349,33 @@ class PromotionOrchestrator:
         if not approval or not approval.get("operation_id"):
             return OperationResult.fail("NOT_APPROVED", error_code="NOT_APPROVED")
 
-        # A crash mid-promotion leaves the project in PUBLISHING. Re-entering
-        # the SAME operation (approval's operation_id matches the persisted
-        # promotion_intent's) is the intended crash-recovery resume, NOT a new
-        # operation -- it reuses the durable previous-production identity so
-        # the rollback target is never recomputed against a drifted state.
+        # A crash mid-promotion leaves the project in PUBLISHING, and a
+        # promotion that concluded as a failure leaves it in FAILED with the
+        # durable intent intact. Re-entering the SAME operation (the approval's
+        # operation_id matches the persisted promotion_intent's) is the intended
+        # resume in both cases, NOT a new operation -- it reuses the durable
+        # previous-production identity so the rollback target is never
+        # recomputed against a drifted state.
+        #
+        # The FAILED arm is deliberately narrower: a FAILED project is only
+        # resumable when the intent belongs to THIS approval, comes from a
+        # promotion-phase failure, and carries the persisted previous-production
+        # record a recovery needs. The PUBLISHING arm keeps its original,
+        # looser gate so a pre-hardening intent with no ``previous_production``
+        # key still reaches the lookup that fails it closed, instead of being
+        # turned away at the door.
         _intent = state.deployment.get("promotion_intent") or {}
+        _failure = state.failure or {}
         is_resume = (
-            state.lifecycle == ProjectLifecycle.PUBLISHING.value
-            and _intent.get("operation_id") == approval.get("operation_id")
+            _intent.get("operation_id") == approval.get("operation_id")
+            and (
+                state.lifecycle == ProjectLifecycle.PUBLISHING.value
+                or (
+                    state.lifecycle == ProjectLifecycle.FAILED.value
+                    and _failure.get("phase") == "promotion"
+                    and "previous_production" in _intent
+                )
+            )
         )
         if state.lifecycle not in (
             ProjectLifecycle.PREVIEW_READY.value,
@@ -533,72 +565,99 @@ class PromotionOrchestrator:
             project_id, operation_id, intent_class,
         )
 
-        # ---- Same-operation resume after an AMBIGUOUS remote promote:
-        # reconcile remote truth BEFORE re-issuing any promote request.
-        # If Vercel already promoted this exact deployment, adopt that
-        # truth (never a second promote POST). If remote truth says it was
-        # NOT promoted, the normal promote below is safe (it will fail
-        # closed on any residual ambiguity without duplicating a
-        # side effect). If truth is still ambiguous, stop here -- fail
-        # closed, keep PUBLISHING, and do not send a second promote.
-        resume_reconciled_url = None
-        resume_fail_closed = False
+        # ---- Same-operation resume: reconcile remote truth BEFORE issuing
+        # any promote request, and never issue a second one for an operation
+        # whose promotion may already have been applied.
+        #
+        # Two read-only passes, in order:
+        #
+        #  1. ADOPTION -- did this exact approved artifact already become
+        #     production, whoever applied it (a crash after the remote call, or
+        #     an operator promoting by hand with the Vercel CLI, which mints a
+        #     new deployment id)? This is the only path that can reach LIVE
+        #     with zero promote POSTs.
+        #  2. ORDINARY RECONCILE -- is the intended deployment itself the
+        #     production binding? If yes, adopt. If the provider CONCLUSIVELY
+        #     reports this promotion as failed, fall through and promote
+        #     normally. Anything ambiguous stops here, fail closed, with the
+        #     intent intact and no promote sent.
+        resume_identity = None
         if is_same_operation:
-            reconcile = self.deps.vercel.reconcile_production_deployment(
-                app_id, vercel_project, intended_identity, expected_name=expected_name,
+            decision, adopted = self._adopt_external_promotion(
+                project_id, app_id, vercel_project, intended_identity, expected_name,
+                recovery=recovery,
             )
-            status = (reconcile.data or {}).get("status") if reconcile.success else None
-            if status == "PROMOTED":
-                resume_reconciled_url = self._production_url_for(intended_identity)
-                logger.info("Promotion confirmed deployment=%s (reconciled)", deployment_id)
-                self._update_intent(project_id, operation_id,
-                                    stage="promoted",
-                                    production_url=resume_reconciled_url)
-            elif status == "NOT_PROMOTED":
-                # Conclusively not promoted: fall through to the normal
-                # promote below (safe -- the intended deployment is not
-                # the live target).
-                pass
-            else:
-                # Ambiguous resume: do NOT blindly re-promote.
-                self._fail_reconciliation_required(
-                    project_id, "PROMOTION_RECONCILIATION_REQUIRED",
-                    intended_identity, "promote",
+            if decision == "unproven":
+                return OperationResult.fail(
+                    "PROMOTE_FAILED", error_code="PROMOTION_IDENTITY_UNPROVEN",
                 )
-                resume_fail_closed = True
+            if decision == "adopted":
+                resume_identity = adopted
+            else:
+                reconcile = self.deps.vercel.reconcile_production_deployment(
+                    app_id, vercel_project, intended_identity, expected_name=expected_name,
+                )
+                status = (reconcile.data or {}).get("status") if reconcile.success else None
+                if status == "PROMOTED":
+                    resume_identity = intended_identity
+                elif status == "NOT_PROMOTED":
+                    # Conclusively not promoted: fall through to the normal
+                    # promote below (safe -- the provider itself reports this
+                    # promotion job as terminally failed).
+                    pass
+                else:
+                    # Ambiguous resume: do NOT blindly re-promote.
+                    self._fail_reconciliation_required(
+                        project_id, "PROMOTION_RECONCILIATION_REQUIRED",
+                        intended_identity, "promote",
+                    )
+                    return OperationResult.fail(
+                        "PROMOTION_RECONCILIATION_REQUIRED",
+                        error_code="PROMOTION_RECONCILIATION_REQUIRED",
+                    )
 
-        if resume_reconciled_url is not None or resume_fail_closed:
-            promote_result = None
-        else:
-            promote_result = self.deps.vercel.promote_deployment(
-                app_id, vercel_project, deployment_id, operation_id,
-                source_revision, artifact_sha256, expected_name=expected_name,
+        if resume_identity is not None:
+            logger.info(
+                "Promotion confirmed deployment=%s (reconciled)",
+                resume_identity["deployment_id"],
             )
-
-        if resume_fail_closed:
-            return OperationResult.fail(
-                "PROMOTION_RECONCILIATION_REQUIRED",
-                error_code="PROMOTION_RECONCILIATION_REQUIRED",
+            self._update_intent(
+                project_id, operation_id, stage="promoted",
+                production_url=self._production_url_for(resume_identity),
             )
-        if resume_reconciled_url is not None:
             return self._post_promote(
                 project_id, workspace, app_id, vercel_project,
-                previous_identity, production_url=resume_reconciled_url,
-                intended_identity=intended_identity,
+                previous_identity,
+                production_url=self._production_url_for(resume_identity),
+                intended_identity=resume_identity,
                 expected_name=expected_name, reconciled=True,
                 approval=approval, source_revision=source_revision,
             )
 
+        promote_result = self.deps.vercel.promote_deployment(
+            app_id, vercel_project, deployment_id, operation_id,
+            source_revision, artifact_sha256, expected_name=expected_name,
+        )
+
         if not promote_result.success:
             error_code = promote_result.error_code or "PROMOTE_FAILED"
+            # ``PROMOTE_RECONCILIATION_REQUIRED`` is the adapter's single
+            # "ambiguous, do not re-promote" signal. Everything else is
+            # TERMINAL and conclusive: ``PROMOTE_REJECTED`` (the provider
+            # refused the request on its merits), ``PROMOTE_NOT_APPLIED`` (the
+            # provider reports this promotion job as terminally failed) and
+            # ``PROMOTE_FAILED`` (a created deployment reached a terminal build
+            # state). Only the ambiguous class may be re-decided below.
             if error_code != "PROMOTE_RECONCILIATION_REQUIRED":
                 self._fail(project_id, "PROMOTE_FAILED", error_code)
                 return promote_result
-            # ---- AMBIGUOUS remote promote: the request may have reached
-            # Vercel but the outcome is unknown. NEVER treat this as a
-            # confirmed failure (Vercel may already be serving the new
-            # deployment) and NEVER blindly re-send the promote. Re-read
-            # production truth and decide from the COMPLETE identity tuple.
+            # ---- AMBIGUOUS or terminally-failed remote promote. The request
+            # may have reached Vercel, or a promotion job may still be in
+            # flight. NEVER treat ambiguity as a confirmed failure (Vercel may
+            # already be serving the approved artifact, and a timed-out wait
+            # does not stop the remote promotion) and NEVER blindly re-send the
+            # promote. Re-read production truth and decide from the COMPLETE
+            # identity tuple.
             reconcile = self.deps.vercel.reconcile_production_deployment(
                 app_id, vercel_project, intended_identity, expected_name=expected_name,
             )
@@ -617,38 +676,191 @@ class PromotionOrchestrator:
                     expected_name=expected_name, reconciled=True,
                     approval=approval, source_revision=source_revision,
                 )
-            elif status == "NOT_PROMOTED":
-                # Remote truth conclusively shows the intended deployment was
-                # NOT promoted -> a real, confirmed failure.
+            if status == "NOT_PROMOTED":
+                # The provider CONCLUSIVELY reports this promotion as failed,
+                # so the approved artifact provably never took over. A stale
+                # binding on its own never reaches this branch: an ambiguous
+                # promote resolves to PROMOTION_RECONCILIATION_REQUIRED below,
+                # which keeps the intent intact and stays resumable.
                 self._fail(project_id, "PROMOTE_FAILED", "PROMOTE_NOT_APPLIED")
                 return OperationResult.fail(
                     "PROMOTE_FAILED", error_code="PROMOTE_NOT_APPLIED",
                 )
-            else:
-                # Still ambiguous / lookup failed / identity incomplete:
-                # preserve PUBLISHING + the intact promotion_intent and fail
-                # closed as reconciliation-required. A later same-operation
-                # resume reconciles again and reuses the SAME intent (no
-                # second promote POST).
-                self._fail_reconciliation_required(
-                    project_id, "PROMOTION_RECONCILIATION_REQUIRED",
-                    intended_identity, "promote",
-                )
-                return OperationResult.fail(
-                    "PROMOTION_RECONCILIATION_REQUIRED",
-                    error_code="PROMOTION_RECONCILIATION_REQUIRED",
-                )
+            # Still ambiguous / lookup failed / identity incomplete:
+            # preserve PUBLISHING + the intact promotion_intent and fail
+            # closed as reconciliation-required. A later same-operation
+            # resume reconciles again and reuses the SAME intent (no
+            # second promote POST).
+            self._fail_reconciliation_required(
+                project_id, "PROMOTION_RECONCILIATION_REQUIRED",
+                intended_identity, "promote",
+            )
+            return OperationResult.fail(
+                "PROMOTION_RECONCILIATION_REQUIRED",
+                error_code="PROMOTION_RECONCILIATION_REQUIRED",
+            )
 
+        # Promote-by-creation mints a NEW deployment id that becomes the
+        # production identity; the approved preview id stays in the intent for
+        # provenance and rollback. An alias remap returns no new id, so this
+        # falls back to the approved deployment itself.
+        promoted_identity = dict(
+            intended_identity,
+            deployment_id=promote_result.data.get("promoted_deployment_id")
+            or intended_identity["deployment_id"],
+        )
         production_url = promote_result.data["production_url"]
-        logger.info("Promotion confirmed deployment=%s", deployment_id)
-        self._update_intent(project_id, intended_identity["operation_id"],
-                            stage="promoted", production_url=production_url)
+        logger.info("Promotion confirmed deployment=%s", promoted_identity["deployment_id"])
+        self._update_intent(
+            project_id, intended_identity["operation_id"], stage="promoted",
+            production_url=production_url,
+            promoted_deployment_id=promoted_identity["deployment_id"],
+        )
         return self._post_promote(
             project_id, workspace, app_id, vercel_project, previous_identity,
-            production_url=production_url, intended_identity=intended_identity,
+            production_url=production_url, intended_identity=promoted_identity,
             expected_name=expected_name, reconciled=False,
             approval=approval, source_revision=source_revision,
         )
+
+    def _adopt_external_promotion(self, project_id, app_id, vercel_project,
+                                  intended_identity, expected_name, *,
+                                  recovery: bool = False):
+        """Reconcile remote truth for a SAME-OPERATION resume and adopt a
+        promotion that has ALREADY been applied, with zero promote POSTs.
+
+        Read-only. This covers both a crash after the remote call and a
+        promotion an operator applied out of band -- notably the Vercel CLI's
+        ``vercel promote``, which for a preview-target deployment promotes by
+        CREATION and therefore mints a NEW deployment id that the approved
+        deployment id alone cannot recognize.
+
+        Returns ``(decision, identity)`` where decision is one of:
+
+          ``"adopted"``  -- provider truth proves the approved artifact is
+              live; ``identity`` is the promoted deployment's identity and the
+              caller continues to production smoke and LIVE persistence.
+          ``"unproven"`` -- production moved, but nothing ties it to the
+              approved artifact (for example a deployment created without our
+              identity and for which the provider kept no lineage record).
+              Terminal for this attempt and deliberately non-destructive: the
+              durable intent is left intact and nothing remote is touched. This
+              is a RECOVERY-only verdict (``recovery=True``): during an ordinary
+              publish or a first-attempt resume, "production is bound to
+              something that is not (yet) our deployment" is the normal
+              pre-promote state and simply falls through to the ordinary
+              reconcile below, so it is never fatal there.
+          ``"pending"``  -- not promoted, or truth unreadable. The caller falls
+              through to the ordinary same-operation reconcile.
+        """
+        external = self.deps.vercel.reconcile_external_promotion(
+            app_id, vercel_project, intended_identity, expected_name=expected_name,
+        )
+        status = (external.data or {}).get("status") if external.success else None
+        if status == "PROMOTED":
+            data = external.data or {}
+            adopted = data.get("deployment_id")
+            if not isinstance(adopted, str) or not adopted:
+                return "pending", None
+            identity = dict(intended_identity, deployment_id=adopted)
+            logger.info(
+                "Promotion adopted deployment=%s proof=%s project=%s",
+                adopted, data.get("proof"), project_id,
+            )
+            self._update_intent(
+                project_id, intended_identity["operation_id"], stage="promoted",
+                promoted_deployment_id=adopted,
+                production_url=self._production_url_for(identity),
+            )
+            return "adopted", identity
+        if status == "PROMOTED_UNPROVEN":
+            if not recovery:
+                # Not a recovery: production simply is not (yet) the approved
+                # deployment. That is the normal pre-promote state, so fall
+                # through to the ordinary reconcile instead of failing an
+                # ordinary publish.
+                return "pending", None
+            logger.warning(
+                "Promotion identity unproven project=%s binding=%s",
+                project_id, (external.data or {}).get("deployment_id"),
+            )
+            self._fail(
+                project_id, "PROMOTE_FAILED", "PROMOTION_IDENTITY_UNPROVEN",
+            )
+            return "unproven", None
+        return "pending", None
+
+    def resume_publish(self, project_id: str, workspace: Path,
+                       principal_id: Optional[str] = None,
+                       reference_token: Optional[str] = None) -> OperationResult:
+        """Operator-facing SAME-OPERATION recovery for a project whose publish
+        already failed mid-promotion.
+
+        This is the only way to reach the resume branch, and it refuses unless
+        the durable ``promotion_intent`` belongs to the current approval,
+        carries the persisted previous-production record, and the lifecycle is
+        PUBLISHING or a promotion-phase FAILED. A first publish can therefore
+        never be confused with a recovery, and a recovery can never invent a
+        new operation.
+
+        Recovery is READ-ONLY against the provider until it is proven that the
+        promotion has NOT been applied: remote truth is reconciled first, and
+        an already-applied promotion is adopted (production smoke, then LIVE)
+        with zero promote requests. Only a conclusive "not promoted" verdict
+        lets the normal promote run.
+
+        Owner-only, exactly like ``promote``: a reviewer may approve a preview
+        but must not be able to publish or recover one.
+        """
+        state = self.store.load(project_id)
+        if state is None:
+            return OperationResult.fail("NO_PROJECT_STATE", error_code="NO_PROJECT_STATE")
+        intent = state.deployment.get("promotion_intent") or {}
+        approval = state.deployment.get("approval") or {}
+        failure = state.failure or {}
+        last_live = state.deployment.get("last_live_deployment") or {}
+        resumable = (
+            bool(approval.get("operation_id"))
+            and intent.get("operation_id") == approval.get("operation_id")
+            and "previous_production" in intent
+            and (
+                state.lifecycle == ProjectLifecycle.PUBLISHING.value
+                or (
+                    state.lifecycle == ProjectLifecycle.FAILED.value
+                    and failure.get("phase") == "promotion"
+                )
+                # An operator re-invoking a recovery that already reached LIVE
+                # is a duplicate, not a new recovery. The exact-identity match
+                # routes it into the existing idempotent no-op; a LIVE project
+                # with any other identity is refused below.
+                or (
+                    state.lifecycle == ProjectLifecycle.LIVE.value
+                    and last_live.get("operation_id") == approval.get("operation_id")
+                )
+            )
+        )
+        if not resumable:
+            # Refuse BEFORE any remote call and before acquiring the worker
+            # slot: a normal publish, or a failure from another phase, is not
+            # a recovery and must keep its own error surface.
+            return OperationResult.fail(
+                "RESUME_NOT_APPLICABLE", error_code="RESUME_NOT_APPLICABLE",
+            )
+        # ``recovery=True`` so that production bound to a deployment this
+        # operation cannot prove is fatal HERE, where the whole point is to
+        # decide whether the remote state may be adopted, rather than being
+        # folded into the ordinary pre-promote "not live yet" state.
+        if not self.runner.acquire_project(project_id):
+            return OperationResult.fail(
+                "WORKER_BUSY", error_code="WORKER_BUSY", retryable=True,
+            )
+        try:
+            return self._promote(
+                project_id, workspace, principal_id, reference_token,
+                recovery=True,
+            )
+        finally:
+            self.runner.release_project(project_id)
 
     def _post_promote(
         self, project_id, workspace, app_id, vercel_project, previous_identity,
@@ -705,6 +917,10 @@ class PromotionOrchestrator:
             self.store.transition_lifecycle_locked(locked, ProjectLifecycle.LIVE)
             locked.revisions.live_revision = source_revision
             locked.production_url = production_url
+            # A recovery resume arrives with the failure record of the attempt
+            # that failed. LIVE is the outcome, so that record is now stale and
+            # must not be left behind for an operator to misread.
+            locked.failure = None
             locked.deployment["promotion_intent"]["stage"] = "live"
             locked.deployment["last_live_deployment"] = {
                 "operation_id": operation_id,

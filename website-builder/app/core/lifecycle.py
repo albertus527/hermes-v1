@@ -85,6 +85,16 @@ _TRANSITIONS: Dict[ProjectLifecycle, Set[ProjectLifecycle]] = {
     ProjectLifecycle.FAILED: {
         ProjectLifecycle.DISCOVERING,
         ProjectLifecycle.READY,
+        # Same-operation publish recovery ONLY. A project that failed during
+        # promotion keeps its durable promotion_intent; re-entering the SAME
+        # operation (approval.operation_id == promotion_intent.operation_id)
+        # resumes that intent so remote truth is reconciled before anything is
+        # promoted again. It is NOT a generic FAILED -> anything door: the
+        # promotion orchestrator refuses the edge unless the intent is intact
+        # and the approval identity still matches, and it reuses the persisted
+        # previous_production verbatim instead of recomputing a rollback
+        # target against drifted remote state.
+        ProjectLifecycle.PUBLISHING,
         ProjectLifecycle.CANCELED,
     },
     ProjectLifecycle.PAUSED: {

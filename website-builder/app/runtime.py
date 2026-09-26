@@ -1005,6 +1005,20 @@ ERROR_MESSAGES: Dict[str, str] = {
         "Preview kamu tetap aman dan belum berubah. "
         "Coba kirim \"publish\" lagi nanti ya."
     ),
+    "PROMOTE_REJECTED": (
+        "Vercel menolak permintaan publish-nya, jadi publish belum aktif. "
+        "Preview kamu tetap aman dan belum berubah. "
+        "Coba kirim \"publish\" lagi nanti ya."
+    ),
+    "PROMOTION_IDENTITY_UNPROVEN": (
+        "Situs production sudah berganti, tapi aku tidak bisa membuktikan bahwa "
+        "isinya persis preview yang kamu setujui, jadi aku tidak mau menyatakan "
+        "berhasil. Preview kamu tetap aman dan belum berubah."
+    ),
+    "RESUME_NOT_APPLICABLE": (
+        "Publish ini tidak bisa dilanjutkan dari status sekarang, jadi tidak "
+        "ada yang aku ubah. Preview kamu tetap aman dan belum berubah."
+    ),
     "PROMOTE_FAILED": (
         "Publish belum berhasil. Preview kamu tetap aman dan belum berubah. "
         "Coba kirim \"publish\" lagi nanti ya."
@@ -2393,6 +2407,19 @@ def main(argv: Optional[List[str]] = None) -> int:
             ", ".join(f"{pid} (was {lc})" for pid, lc in sorted(_recovered.items())),
         )
 
+    # ---- Operator-only same-operation publish recovery:
+    #   python -m app --reconcile-publish <project_id> --as <principal_id>
+    #
+    # A project whose publish already failed mid-promotion keeps a durable
+    # promotion_intent, but there is deliberately NO Telegram route back into
+    # it: a user's "publish" must never be able to drive production recovery.
+    # This flag is the operator's door. It reconciles remote truth and, when
+    # the approved artifact is provably already live, adopts it (production
+    # smoke, then LIVE) with ZERO promote requests. It exits without starting
+    # the receive loop, so it can never race the running runtime.
+    if "--reconcile-publish" in argv:
+        return _run_reconcile_publish(composition, argv)
+
     loop = TelegramReceiveLoop(
         bot_token=config.telegram_bot_token,
         dispatcher=composition.dispatcher,
@@ -2416,6 +2443,61 @@ def main(argv: Optional[List[str]] = None) -> int:
     finally:
         loop.stop()
 
+    return 0
+
+
+def _flag_value(argv, flag):
+    """Value of ``--flag <value>`` in *argv*, or None when absent."""
+    try:
+        index = argv.index(flag)
+    except ValueError:
+        return None
+    if index + 1 >= len(argv):
+        return None
+    value = argv[index + 1]
+    return value if value and not value.startswith("--") else None
+
+
+def _run_reconcile_publish(composition, argv) -> int:
+    """Operator entry point for same-operation publish recovery.
+
+    Fails closed on anything it cannot prove: a missing/ambiguous project id, a
+    missing ``--as`` principal, or a project the owner check rejects. The
+    principal is stated explicitly on the command line rather than inferred, so
+    the recovery is attributable and can never self-authorize.
+    """
+    project_id = _flag_value(argv, "--reconcile-publish")
+    principal_id = _flag_value(argv, "--as")
+    if not project_id or not principal_id:
+        logger.error(
+            "Usage: python -m app --reconcile-publish <project_id> --as <principal_id>"
+        )
+        return 2
+    state = composition.store.load(project_id)
+    if state is None:
+        logger.error("No project state for project=%s", project_id)
+        return 1
+    if state.owner_id != principal_id:
+        logger.error(
+            "Principal does not own the project project=%s", project_id,
+        )
+        return 1
+    result = composition.promote.resume_publish(
+        project_id, composition.runner.create_workspace(project_id),
+        principal_id=principal_id,
+    )
+    if not result.success:
+        # The error CODE is the actionable part for an operator; the rendered
+        # user copy is deliberately not logged here.
+        logger.error(
+            "Publish recovery failed project=%s error_code=%s",
+            project_id, result.error_code,
+        )
+        return 1
+    logger.info(
+        "Publish recovery complete project=%s lifecycle=LIVE production_url=%s",
+        project_id, (result.data or {}).get("production_url"),
+    )
     return 0
 
 
