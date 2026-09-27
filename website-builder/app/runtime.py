@@ -71,7 +71,7 @@ from app.core import credentials
 from app.core.intake import IntakeProcessor
 from app.core.state import ProjectStateStore, reconcile_stranded_projects
 from app.core.registry import ConversationRegistryStore, DuplicateProjectName, slugify_display_name
-from app.core.secrets import BypassSecretStore
+from app.core.secrets import BYPASS_STORE_DIRNAME, BypassSecretStore, migrate_legacy_bypass_secrets
 from app.conversations import ConversationRoute, ConversationRouter
 from app.deploy.adapters import (
     PreviewSmokeTester,
@@ -580,11 +580,48 @@ def preflight_role_validation(config: RuntimeConfig) -> bool:
     (with a value-free, actionable message) is far better than discovering it
     at the first FRONTEND build, which is where the per-spawn guard lives.
 
+    That gate runs AFTER one repair step: an R1 install that provisioned
+    Vercel bypass secrets under the profile is moved onto the same start by
+    :func:`~app.core.secrets.migrate_legacy_bypass_secrets` (a fail-closed
+    move, never a delete). Without it, refusing the profile would leave an
+    R1 install unbootable and the operator's only recourse would be deleting
+    provisioned secrets. This is the migration's only call site — a profile
+    that is already clean is untouched.
+
     Returns True only when every required role resolves (and VISION passes
     the image-input capability gate) and the profile is clean.
     """
     from app.core import credentials
     from app.hermes.adapter import HermesAdapter
+
+    # FIRST, repair the one known legacy shape this profile can be in: an R1
+    # install provisioned Vercel bypass secrets under the profile home, which
+    # the guard below correctly refuses. The migration has to run before the
+    # guard, or an R1 install cannot start at all and the operator's only
+    # recourse is deleting provisioned secrets. It only acts when that exact
+    # directory exists, so a clean install stays side-effect free here.
+    try:
+        migration = migrate_legacy_bypass_secrets(config.hermes_home, config.state_root)
+    except ValueError as exc:
+        logger.error(
+            "Website Builder cannot start: the pre-R2 Vercel bypass secret "
+            "store under the Hermes profile could not be migrated safely."
+        )
+        logger.error("  %s", exc)
+        logger.error("Profile path: %s", config.hermes_home)
+        return False
+    if migration:
+        logger.info(
+            "Migrated the legacy Vercel bypass secret store out of the "
+            "generation profile: %d project(s) migrated, %d already current, "
+            "%d temp leftover(s) retained in quarantine. Legacy path: %s. "
+            "Quarantine: %s. The quarantined copy can be deleted once the "
+            "migration is confirmed.",
+            len(migration["migrated"]), len(migration["already_current"]),
+            migration["temp_leftovers"],
+            config.hermes_home / BYPASS_STORE_DIRNAME,
+            migration["quarantined_to"],
+        )
 
     try:
         credentials.assert_profile_dotenv_clean(config.hermes_home)
@@ -794,9 +831,15 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
     # credential stored there is readable by a generation role regardless of
     # process-environment isolation. The pre-migration location is retained as
     # a read-only legacy root so an existing provisioned secret is not lost.
+    #
+    # By the time compose() runs, startup preflight has already MIGRATED that
+    # directory out of the profile (see migrate_legacy_bypass_secrets and
+    # preflight_role_validation), so `legacy_roots` is a belt-and-braces read
+    # path for a store that reappears — an operator-restored profile backup,
+    # a fresh state root — not the migration mechanism.
     bypass_store = BypassSecretStore(
-        config.state_root / "vercel-bypass",
-        legacy_roots=[config.hermes_home / "vercel-bypass"],
+        config.state_root / BYPASS_STORE_DIRNAME,
+        legacy_roots=[config.hermes_home / BYPASS_STORE_DIRNAME],
     )
     bypass_provisioner = BypassProvisioner(vercel, bypass_store)
 

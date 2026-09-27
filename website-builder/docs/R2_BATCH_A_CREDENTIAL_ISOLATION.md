@@ -55,9 +55,12 @@ canary that only inspects a child environment.
   (R2-B2: provider narrowing, profile guards, residual warning)
 - `website-builder/app/sandbox/runner.py` — delegate to policy; scope both env builders
 - `website-builder/app/core/secrets.py` — `BypassSecretStore` gains `legacy_roots`
-  so the store can be relocated without losing a provisioned secret (R2-B2)
+  so the store can be relocated without losing a provisioned secret (R2-B2), plus
+  `migrate_legacy_bypass_secrets()` — the R1 → R2 startup migration that moves a
+  pre-R2 store out of the profile home (R2-B3)
 - `website-builder/app/runtime.py` — bypass store root moved to `state_root`;
-  `preflight_role_validation` also gates the profile (R2-B2)
+  `preflight_role_validation` also gates the profile (R2-B2) and runs the legacy
+  bypass migration before that gate (R2-B3)
 - `website-builder/docs/R2_BATCH_A_CREDENTIAL_ISOLATION.md` — this document
 - `website-builder/app/deploy/git_output.py` — Git adapter-scoped env
 - `website-builder/app/qa/screenshot.py` — strict shell env for `agent-browser`
@@ -68,6 +71,63 @@ canary that only inspects a child environment.
 
 No `os.environ.copy()` remains in any live path (verified by grep; remaining
 matches are comments describing the fix).
+
+### 2a. R2-B3 — the R1 → R2 upgrade path
+
+R2-B2 left an un-migrated R1 install **unable to start**: it had provisioned
+secrets under the profile home, and `assert_profile_home_clean` (run at startup
+preflight, before `compose()`) refuses a profile that still holds that
+directory. The `legacy_roots` read path Batch A added could therefore never be
+exercised, and the operator's only apparent recourse was deleting provisioned
+secrets.
+
+`migrate_legacy_bypass_secrets(hermes_home, state_root)` — in
+`app/core/secrets.py`, the store's own module, so path/permission/validation
+logic cannot drift from the store contract — runs as the **first** step of
+`preflight_role_validation` and is the *only* call site. It has one deliberate,
+verified on-disk side effect: it creates `<state_root>/vercel-bypass`, and only
+when the known legacy directory exists.
+
+* **The destination is proven to be outside the profile home first**, before a
+  single byte is written or renamed: if the resolved `state_root` is the
+  resolved `HERMES_HOME`, or anywhere underneath it, the migration fails closed
+  and touches nothing. This is checked by the migration rather than by
+  `assert_profile_home_clean`, which is deliberately **not** extended into a
+  recursive walk — it has to stay O(entries) over a profile that holds sessions
+  and caches. A direct-children guard cannot see
+  `HERMES_HOME/state/vercel-bypass`, and a state root equal to the profile would
+  rename the store aside under a name the guard does not recognise while the
+  secret stayed behind, satisfying the guard instead of the boundary.
+* **Moved, never deleted.** The legacy directory is retired with one atomic
+  `os.replace` to `<state_root>/vercel-bypass-migrated-<UTC timestamp>[-N]`.
+  Nothing is lost; the operator can delete that directory once satisfied.
+* **Cross-device retirement is refused, not emulated.** `os.replace` cannot
+  span filesystems, so `EXDEV` fails closed with the legacy directory untouched
+  and the primary entries already written left valid. There is deliberately no
+  copy+delete fallback: it would trade a recoverable refusal for a window in
+  which the only copy of a secret is in neither place. The operator points
+  `WEBSITE_BUILDER_STATE_ROOT` (or `state_root` in `config.yaml`) at a directory
+  on the same filesystem as the profile home for this one-time migration.
+* **Fail closed on anything unverifiable** — a subdirectory, a symlink, a
+  non-`.json` name, a `.json` whose stem is not a valid project id, unparsable
+  JSON, a pathologically nested document (the JSON decoder's `RecursionError`),
+  a missing/blank secret, or a read-back mismatch aborts with the legacy
+  directory **untouched** and the startup refused. A `*.tmp` leftover (the
+  store's own `mkstemp` crash artifact) is the single tolerated case: it is
+  carried into quarantine and reported by count.
+* **Primary wins.** Where the state root already holds a project, the entry is
+  only verified readable — never rewritten, never merged. An unreadable primary
+  next to a valid legacy copy fails closed naming both paths.
+* **Idempotent / crash-safe.** Writes are atomic and re-read before the
+  retirement, so an interrupted run is simply re-run by the next start.
+* **`legacy_roots` is now belt-and-braces** — a read path for a store that
+  reappears (an operator-restored profile backup, a fresh state root), not the
+  migration mechanism.
+* **No secret, ever, in a log or error** — ids, counts and paths only.
+
+No operator CLI, no `--dry-run` (D4): the migration happens on a real start.
+`tests/r1_harness.py` still builds a store at the pre-migration path — that is a
+fixture simulating the R1 layout, not production wiring, and is out of scope.
 
 ---
 
@@ -195,6 +255,65 @@ matter how the environment was scoped:
 It now asserts the R2 contract, plus a new test that the model credential
 survives and one that the parent is not mutated.
 
+### R2-B3 additions (the R1 → R2 upgrade path)
+
+`tests/test_bypass_legacy_migration.py` (28 tests) — real `BypassSecretStore`
+writes and real files, mocks only for injected faults:
+
+- a clean install is a genuine no-op: nothing is created anywhere, and
+  `assert_profile_home_clean` still passes
+- **the state root is validated before anything moves:** a root that equals
+  `HERMES_HOME`, sits one level under it, or is deeply nested under it fails
+  closed with a byte-identical profile and nothing created; a sibling whose
+  name merely shares a string prefix with the profile is accepted, so the check
+  is containment and not a string comparison
+- a valid legacy secret lands in the state root with the store's 0600/0700
+  modes and the exact payload shape; the profile no longer holds the directory
+  and the guard is **satisfied, not weakened** — it is proven to still refuse
+  the very same directory name, and `BYPASS_STORE_DIRNAME` is asserted to be
+  the one `PRIVILEGED_SECRET_SUBPATHS` refuses
+- primary wins: a pre-existing valid primary entry is left byte-identical and
+  reported as `already_current`
+- repeated startup is a no-op with exactly one quarantine directory; new writes
+  land only in the state root
+- fail-closed, with the legacy directory and every file byte-identical and
+  nothing retired: malformed JSON, non-object JSON, blank secret, a file
+  declaring another project id, a subdirectory, a symlinked entry, a symlinked
+  store directory, `..%2fescape.json`, `bad name.json`, `.json`, `notes.txt`
+- a corrupt/unreadable primary beside a valid legacy copy fails closed naming
+  the project id and **both** paths, touching neither
+- interruption: a write that fails mid-copy, a write that does not read back
+  identically, and a refused retirement all leave the legacy directory in place
+  and the already-migrated entries valid; a clean re-run completes the move
+- a cross-device (`EXDEV`) retirement is refused with its own actionable
+  message — distinct from a name collision, not retried, legacy intact, primary
+  preserved, and fixed by correcting the path layout
+- a pathologically nested legacy document fails closed through the sanitized
+  `LegacyBypassMigrationError` instead of escaping as a `RecursionError`
+  traceback out of startup
+- a concurrent start that already retired the directory is a success no-op
+- a taken quarantine name rolls to the next suffix rather than overwriting an
+  earlier migration
+- a `*.tmp` leftover is retained, unread, in quarantine and reported by count
+- **no canary value reaches any log record or exception message on any branch**,
+  successful or failing — every branch is driven in one test so a leak only has
+  to happen once, including the primary-wins/`already_current` branch with two
+  *different* live secret values (the legacy canary and `PRIMARY_SECRET`)
+
+`tests/test_role_preflight.py` — the real upgrade-shape regression, through the
+real `preflight_role_validation` with the state root **outside** the profile
+(§2a):
+
+- `test_r1_upgrade_shape_migrates_then_role_preflight_succeeds` — a profile
+  provisioned through a real `BypassSecretStore` at the pre-migration path: the
+  guard refuses it before the upgrade, preflight then returns `True`, the
+  legacy directory is gone, the secret resolves from the primary with 0600, one
+  quarantine directory holds the retired copy, and a second start changes
+  nothing
+- `test_r1_upgrade_shape_with_a_malformed_legacy_secret_refuses_startup` —
+  negative control: preflight returns `False`, the legacy file is byte-identical,
+  no secret was written, and the log names the file without its contents
+
 ---
 
 ## 5. Focused test results
@@ -224,6 +343,26 @@ test_frontend_watchdog.py + test_r2_credential_isolation  127 passed  (ordering 
 tests (full suite)                                1770 passed, 16 skipped
 ```
 
+### R2-B3 results (the R1 → R2 upgrade path)
+
+```
+tests/test_bypass_legacy_migration.py                     35 passed
+tests/test_bypass_legacy_migration.py + test_role_preflight  67 passed
+test_r2_credential_isolation, test_bypass_provisioning,
+test_bypass_contract, test_bypass_leakage, test_runtime   219 passed
+tests (full suite)                                1808 passed, 16 skipped
+```
+
+Same invocation as R2-B2 (`py -3 -m pytest tests -q -p no:randomly` from
+`website-builder/`; `scripts/run_tests.sh` needs a venv this machine does not
+have — see §6). Zero failures; 30 new tests in the R2-B3 batch plus 8 in the
+hardening follow-up, and no existing test changed except `runtime_config()` in
+`test_role_preflight.py`, which gained an optional `state_root` parameter. Its
+**default is now a sibling of the profile** (`<tmp>/.website-builder/state`),
+because the previous default (`<profile>/state`) was the very shape the
+hardening refuses — the fixture now models the valid production contract instead
+of the vulnerable one.
+
 ### 6c. Guard verification — mutation-checked
 
 A guard that cannot fail is not a guard, so each new guard was disabled in turn
@@ -234,8 +373,14 @@ and the suite re-run. Every one goes red:
 | `assert_profile_dotenv_clean` | **14 failed** — all 11 `.env` parametrised cases, the value-free-diagnostic case, the end-to-end spawn-seam case, and the parent-not-mutated case |
 | `assert_profile_home_clean` | **3 failed** — the unit case, the spawn-seam case, the parent case |
 | `provider=` narrowing at the adapter | **1 failed** — `test_spawn_seam_uses_the_role_provider_for_narrowing`, and the residual `WARNING` visibly fired with `NOUS_API_KEY, WEB3FORMS_ACCESS_KEY`, proving the reporting path is live |
+| `migrate_legacy_bypass_secrets()` call in `preflight_role_validation` (R2-B3) | **2 failed** — both `test_r1_upgrade_shape_*` cases; the second one's log showed the R2-B2 guard refusing the un-migrated profile, which is the exact regression |
+| the retirement `os.replace` inside the migration (R2-B3) | **18 failed** — every test that pins the legacy directory as gone, plus both upgrade-shape cases |
+| the state-root containment guard, `_assert_state_root_outside_profile` (hardening) | **5 failed** — the equal / one-level-nested / deeply-nested cases (`DID NOT RAISE`), the actionable-message case, and the preflight-level case. With the guard gone, the nested shape migrates a secret into `HERMES_HOME/state/vercel-bypass` and the profile guard still passes |
+| the `EXDEV` branch in the retirement handler (hardening) | **1 failed** — the cross-device case, which then only got the generic "could not be moved aside … (OSError). fix the filesystem" message and no longer proved a single non-retried attempt |
+| `except RecursionError` in `_strict_read` (hardening) | **2 failed** — the nested-document regression and the leakage matrix, both with `RecursionError: maximum recursion depth exceeded while decoding a JSON array` escaping as a traceback, exactly the startup behaviour being removed |
 
-All three mutations were reverted; the suite is green again.
+All mutations were reverted (`secrets.py` verified byte-identical to its
+pre-mutation hash) and the suite is green again.
 
 ### 6d. One ordering defect the canaries caught
 
@@ -445,6 +590,24 @@ passing.
    read-only legacy root so no provisioned secret is silently lost, and adds
    `assert_profile_home_clean` so a second secret store under a profile home
    cannot be added without tripping a fail-closed guard.
+   *R2-B3:* those two changes together made an un-migrated R1 install unbootable
+   — the guard runs before anything could move the file — so startup now runs
+   `migrate_legacy_bypass_secrets` first (§2a). It MOVES the store, never
+   deletes it: the retired directory is renamed to
+   `<state_root>/vercel-bypass-migrated-<UTC timestamp>` and **can be deleted by
+   the operator** once the migration is confirmed. Anything it cannot verify
+   fails closed with the legacy directory untouched and the start refused, so
+   re-running is always the recovery and no repair command is needed. The
+   quarantine keeps a second copy of bypass material under the state root; it is
+   outside `HERMES_HOME`, and the same-user readability limitation is risk 10
+   below. **Operator cleanup:** delete
+   `~/.website-builder/state/vercel-bypass-migrated-*` once
+   `~/.hermes-website/vercel-bypass` is gone and preflight reports the
+   migration. **Operator prerequisite:** `WEBSITE_BUILDER_STATE_ROOT` (or
+   `state_root` in `config.yaml`) must point outside the profile home and, for
+   the one-time retirement rename, on the same filesystem as it — the migration
+   now refuses both shapes by name instead of moving a secret somewhere the
+   guard cannot see.
    *Residual:* relocating a file reduces its reachability; it does not create an
    OS boundary. A determined agent that guesses an absolute path can still read
    any file the operator's account can read — see risk 10.

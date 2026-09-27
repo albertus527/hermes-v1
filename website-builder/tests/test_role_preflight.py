@@ -14,6 +14,8 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from app.core import credentials
+from app.core.secrets import BypassSecretStore, file_mode
 from app.hermes.adapter import HermesAdapter
 from app.runtime import RuntimeConfig, main, preflight_role_validation
 from hermes_constants import (
@@ -22,6 +24,7 @@ from hermes_constants import (
 from hermes_cli.runtime_provider import resolve_runtime_provider
 
 ROLES = ("FAST", "FRONTEND", "VISION")
+BYPASS_SECRET = "CANARY_MIGRATION_BYPASS_SECRET"
 
 
 def write_profile(home, *, endpoint="website", disabled=(), vision=True):
@@ -76,10 +79,16 @@ def profile(tmp_path):
     return home, cfg, HermesAdapter(store=None, hermes_home=home, repo_root=tmp_path)
 
 
-def runtime_config(home):
+def runtime_config(home, state_root=None):
+    # The state root is a SIBLING of the profile, exactly as production places
+    # it (~/.website-builder/state vs ~/.hermes-website). A state root under the
+    # profile is not a valid shape: the migration refuses it, because
+    # assert_profile_home_clean only inspects the profile's direct children and
+    # could not see a store written to HERMES_HOME/state/vercel-bypass.
     return RuntimeConfig(
         telegram_bot_token="test-only", hermes_home=home,
-        workspace_root=home / "ws", state_root=home / "state",
+        workspace_root=home / "ws",
+        state_root=state_root or home.parent / ".website-builder" / "state",
         output_repo_path=home / "output", vercel_token="test-only",
         vercel_team_id="test-team", vercel_ownership_namespace="test",
     )
@@ -207,6 +216,103 @@ def test_main_refuses_unresolvable_role_before_composition(profile, monkeypatch,
     loop.assert_not_called()
     assert not (home / "state").exists()
     assert not (home / "ws").exists()
+
+
+def test_r1_upgrade_shape_migrates_then_role_preflight_succeeds(profile, tmp_path):
+    """The real R1 -> R2 upgrade, through the real startup preflight.
+
+    R1 provisioned each project's Vercel automation-bypass secret under the
+    generation profile home. R2 relocated that store into the application's
+    state root and made the profile guard refuse to start against a profile
+    that still holds one. Without a migration at startup the two changes leave
+    an R1 install unable to boot at all, and the operator's only way out is
+    deleting provisioned secrets. The state root sits OUTSIDE the profile here
+    exactly as production places it (~/.website-builder/state vs
+    ~/.hermes-website).
+    """
+    home, cfg, adapter = profile
+    state_root = tmp_path / ".website-builder" / "state"
+    BypassSecretStore(home / "vercel-bypass").set("prj_canary", BYPASS_SECRET)
+
+    # The state the upgrade actually finds, and the guard correctly refusing it.
+    with pytest.raises(ValueError, match="privileged secret store"):
+        credentials.assert_profile_home_clean(home)
+
+    assert preflight_role_validation(runtime_config(home, state_root)) is True
+
+    assert not (home / "vercel-bypass").exists()
+    credentials.assert_profile_home_clean(home)
+    migrated = BypassSecretStore(state_root / "vercel-bypass")
+    assert migrated.get("prj_canary") == BYPASS_SECRET
+    if os.name == "posix":
+        assert file_mode(migrated.path_for("prj_canary")) == 0o600
+    quarantine = list(state_root.glob("vercel-bypass-migrated-*"))
+    assert len(quarantine) == 1
+    assert (quarantine[0] / "prj_canary.json").is_file()
+    # Every later start is a no-op, and never retires a second copy.
+    assert preflight_role_validation(runtime_config(home, state_root)) is True
+    assert len(list(state_root.glob("vercel-bypass-migrated-*"))) == 1
+
+
+def test_r1_upgrade_shape_with_a_malformed_legacy_secret_refuses_startup(
+    profile, tmp_path, caplog,
+):
+    """Negative control: an unverifiable legacy file blocks the start, quietly.
+
+    The operator gets the file to look at and nothing else — the startup must
+    not delete the file, and must not echo its contents into the log.
+    """
+    home, cfg, adapter = profile
+    state_root = tmp_path / ".website-builder" / "state"
+    legacy = home / "vercel-bypass" / "prj_canary.json"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text(
+        '{"project_id": "prj_canary", "secret": "%s' % BYPASS_SECRET, encoding="utf-8",
+    )
+    before = legacy.read_bytes()
+
+    with caplog.at_level(logging.DEBUG):
+        assert preflight_role_validation(runtime_config(home, state_root)) is False
+
+    assert legacy.read_bytes() == before
+    # The primary directory is created while resolving the entry, but no
+    # secret is written: the unverifiable file is the operator's to fix.
+    assert not (state_root / "vercel-bypass" / "prj_canary.json").exists()
+    assert not list(state_root.glob("vercel-bypass-migrated-*"))
+    assert "could not be migrated safely" in caplog.text
+    assert "prj_canary.json" in caplog.text
+    assert BYPASS_SECRET not in caplog.text
+
+
+def test_r1_upgrade_refuses_startup_when_the_state_root_is_inside_the_profile(
+    profile, tmp_path, caplog,
+):
+    """The destination is validated at the seam that actually starts the app.
+
+    A state root under the profile would relocate the bypass secret into a
+    directory a generation agent can read, and the profile guard would not
+    notice (it inspects direct children only). The migration refuses instead,
+    leaving the operator's file exactly where it is.
+    """
+    home, cfg, adapter = profile
+    BypassSecretStore(home / "vercel-bypass").set("prj_canary", BYPASS_SECRET)
+    legacy = home / "vercel-bypass" / "prj_canary.json"
+    before = legacy.read_bytes()
+
+    with caplog.at_level(logging.DEBUG):
+        assert preflight_role_validation(
+            runtime_config(home, home / "state")
+        ) is False
+
+    assert legacy.read_bytes() == before
+    # Nothing was created under the refused destination, not even the primary.
+    state = home / "state"
+    assert not state.exists() or not list(state.iterdir())
+    assert "outside the profile home" in caplog.text
+    assert BYPASS_SECRET not in caplog.text
+    # The guard is unchanged and still refuses the untouched profile.
+    with pytest.raises(ValueError, match="privileged secret store"):
+        credentials.assert_profile_home_clean(home)
 
 
 @pytest.mark.parametrize("disabled", [False, True])
