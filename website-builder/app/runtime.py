@@ -81,6 +81,7 @@ from app.deploy.adapters import (
 )
 from app.deploy.bypass import BypassProvisioner
 from app.deploy.git_output import OutputGitRepository
+from app.deploy.hydrate import WorkspaceHydrator
 from app.deploy.preview import PreviewDeps, PreviewOrchestrator
 from app.hermes.adapter import HermesAdapter
 from app.projects.build import FrontendBuilder
@@ -891,13 +892,28 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
         web3forms_access_key=config.web3forms_access_key,
     )
 
-    # Revision orchestrator
+    # Revision orchestrator.
+    #
+    # The hydrator is the exact-source authority: it materializes a disposable
+    # revision workspace from the base frozen at reservation time and promotes
+    # it through the pointer. It needs the output repository and the
+    # operator-configured source remote, which is why it is wired HERE rather
+    # than constructed inside the orchestrator.
+    hydrator = WorkspaceHydrator(
+        runner,
+        store,
+        output_repo=output_repo,
+        source_repo_url=config.github_source_repo,
+        source_ssh_key=config.github_ssh_key,
+    )
     revise = RevisionOrchestrator(
         runner=runner,
         store=store,
         hermes_adapter=hermes,
         preview_orchestrator=preview,
         web3forms_access_key=config.web3forms_access_key,
+        hydrator=hydrator,
+        source_repo_url=config.github_source_repo,
     )
 
     # LIVE source publication (R1). The friendly branch name is the project's
@@ -1204,6 +1220,129 @@ ERROR_MESSAGES: Dict[str, str] = {
         "Ada kendala saat publish, dan website sebelumnya belum bisa diidentifikasi "
         "dengan aman untuk dikembalikan. "
         "Preview kamu tetap aman dan belum berubah — sudah dicatat untuk diperiksa."
+    ),
+    # ---- exact-source admission and revision hydration (R2-C) -------------
+    # Every one of these refuses to START a revision. None of them touched the
+    # site, the preview, or production, and none of them is fixed by asking
+    # again: they are properties of durable state, not of a transient moment.
+    # So the copy says what is true -- nothing changed, a new verified
+    # publication is what is needed -- and never says "try again".
+    "CANONICAL_SOURCE_NO_LIVE_RELEASE": (
+        "Perubahan belum bisa dimulai karena belum ada catatan publikasi yang "
+        "terverifikasi untuk website ini. Aku tidak mau menebak sumbernya, jadi "
+        "tidak ada yang aku ubah. Website production kamu tetap aman dan belum "
+        "berubah."
+    ),
+    "CANONICAL_SOURCE_SYNC_REQUIRED": (
+        "Perubahan belum bisa dimulai karena publikasi sebelumnya tercatat belum "
+        "tersinkron. Aku tidak mau menebak sumbernya, jadi tidak ada yang aku "
+        "ubah. Website production kamu tetap aman dan belum berubah."
+    ),
+    "CANONICAL_SOURCE_LEGACY_IDENTITY": (
+        "Perubahan belum bisa dimulai karena catatan publikasi website ini belum "
+        "lengkap, jadi aku tidak bisa memastikan sumber yang benar. Tidak ada "
+        "yang aku ubah. Website production kamu tetap aman dan belum berubah."
+    ),
+    "CANONICAL_SOURCE_NOT_PUBLISHED": (
+        "Perubahan belum bisa dimulai karena website ini belum pernah dipublikasikan, "
+        "jadi belum ada sumber yang bisa diverifikasi. Tidak ada yang aku ubah. "
+        "Website production kamu tetap aman dan belum berubah."
+    ),
+    "CANONICAL_SOURCE_COMMIT_MISSING": (
+        "Perubahan belum bisa dimulai karena catatan publikasi website ini tidak "
+        "menyebut commit yang bisa diverifikasi, jadi tidak ada yang aku ubah. "
+        "Website production kamu tetap aman dan belum berubah."
+    ),
+    "CANONICAL_SOURCE_PARENT_UNRESOLVED": (
+        "Perubahan belum bisa dimulai karena riwayat publikasi website ini tidak "
+        "terbaca, jadi tidak ada yang aku ubah. "
+        "Website production kamu tetap aman dan belum berubah."
+    ),
+    "CANONICAL_SOURCE_REPO_UNRESOLVED": (
+        "Perubahan belum bisa dimulai karena tujuan publikasi website ini tidak "
+        "tercatat dengan benar, jadi tidak ada yang aku ubah. "
+        "Website production kamu tetap aman dan belum berubah."
+    ),
+    "CANONICAL_SOURCE_REPO_MISMATCH": (
+        "Perubahan belum bisa dimulai karena tujuan publikasi yang tercatat "
+        "berbeda dari repository yang dikonfigurasi, jadi tidak ada yang aku ubah. "
+        "Website production kamu tetap aman dan belum berubah."
+    ),
+    "DRAFT_SNAPSHOT_UNAVAILABLE": (
+        "Perubahan belum bisa dimulai karena versi terakhir yang sudah diuji "
+        "belum tersimpan utuh, jadi aku tidak mau melanjutkan dari sumber yang "
+        "mungkin salah. Tidak ada yang aku ubah."
+    ),
+    # A hydrated project's pointer is unusable. That is an operator-repair
+    # condition, not something the user can retry past, so the copy says so.
+    "WORKSPACE_POINTER_INVALID": (
+        "Perubahan belum bisa dimulai karena penanda workspace website ini "
+        "tidak terbaca, jadi aku berhenti di sini dan tidak memakai workspace "
+        "lama. Website production kamu tetap aman dan belum berubah."
+    ),
+    "WORKSPACE_POINTER_MISSING_AFTER_HYDRATION": (
+        "Perubahan belum bisa dimulai karena penanda workspace website ini "
+        "hilang, jadi aku berhenti di sini dan tidak memakai workspace lama. "
+        "Website production kamu tetap aman dan belum berubah."
+    ),
+    "HYDRATION_BASE_DRIFT": (
+        "Perubahan belum bisa dimulai karena sumber yang sudah dicadangkan "
+        "berbeda dengan yang tercatat, jadi tidak ada yang aku ubah."
+    ),
+    "HYDRATION_COMMIT_UNAVAILABLE": (
+        "Perubahan belum bisa dimulai karena versi yang dipublikasikan tidak "
+        "lagi bisa diambil, jadi tidak ada yang aku ubah. "
+        "Website production kamu tetap aman dan belum berubah."
+    ),
+    "HYDRATION_TREE_MISMATCH": (
+        "Perubahan belum bisa dimulai karena isi yang tercatat tidak cocok "
+        "dengan versi yang dipublikasikan, jadi tidak ada yang aku ubah."
+    ),
+    "HYDRATION_REPO_MISMATCH": (
+        "Perubahan belum bisa dimulai karena repository yang dikonfigurasi "
+        "berbeda dari yang tercatat, jadi tidak ada yang aku ubah."
+    ),
+    "HYDRATION_SOURCE_MISMATCH": (
+        "Perubahan belum bisa dimulai karena isi website setelah diambil tidak "
+        "cocok dengan yang sudah diuji, jadi tidak ada yang aku ubah. "
+        "Website production kamu tetap aman dan belum berubah."
+    ),
+    "HYDRATION_ARTIFACT_MISMATCH": (
+        "Perubahan belum bisa dimulai karena hasil build yang tercatat tidak "
+        "cocok dengan yang sudah diuji, jadi tidak ada yang aku ubah. "
+        "Website production kamu tetap aman dan belum berubah."
+    ),
+    "HYDRATION_UNSAFE_ENTRY": (
+        "Perubahan belum bisa dimulai karena ada file di versi yang dipublikasikan "
+        "yang tidak bisa dipakai dengan aman, jadi tidak ada yang aku ubah."
+    ),
+    "HYDRATION_UNSUPPORTED_LFS": (
+        "Perubahan belum bisa dimulai karena website ini memakai Git LFS, yang "
+        "belum didukung, jadi tidak ada yang aku ubah. "
+        "Website production kamu tetap aman dan belum berubah."
+    ),
+    "HYDRATION_STAGING_UNAVAILABLE": (
+        "Perubahan belum bisa dimulai karena folder kerja untuk revisi ini tidak "
+        "bisa disiapkan dengan aman, jadi tidak ada yang aku ubah."
+    ),
+    "HYDRATION_RECORD_INVALID": (
+        "Perubahan belum bisa dimulai karena catatan proses revisinya tidak "
+        "konsisten, jadi tidak ada yang aku ubah. "
+        "Website production kamu tetap aman dan belum berubah."
+    ),
+    # The only two hydration codes where resuming is meaningful, and only for
+    # the operation that already owns this revision. A NEW request will not
+    # clear either of them, so the copy must not read as "send it again".
+    "HYDRATION_RECOVERY_REQUIRED": (
+        "Ada perubahan sebelumnya yang belum selesai dan masih memegang website "
+        "ini, jadi revisi baru belum bisa dimulai. Aku tidak mau menimpa yang "
+        "sedang berjalan. Kirim ulang perintah yang sama persis setelah yang "
+        "sebelumnya selesai — perintah yang berbeda tidak akan menyelesaikan ini."
+    ),
+    "HYDRATION_STATE_UNPERSISTED": (
+        "Workspace website sudah siap dan tidak ada yang berubah, tapi catatan "
+        "penyimpanannya belum tertulis. Revisi yang sama persis akan dilanjutkan "
+        "otomatis — kirim ulang perintah yang sama, bukan perintah baru."
     ),
 }
 

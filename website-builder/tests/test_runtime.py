@@ -1717,7 +1717,20 @@ def _h7_revision_ready_store(tmp_path, project_id, lifecycle="REVISION_REQUESTED
                              queued_seq=1, pending_applied=False,
                              pending_principal="telegram:1"):
     """Build a REAL store with the crash-after-reserve durable state."""
+    from app.deploy.hydrate import build_draft_base
+    from app.deploy.snapshot import TestedSnapshot
+
     store = ProjectStateStore(tmp_path / "state")
+    # A revision continues from the last tested snapshot, so the seeded
+    # reservation must carry a frozen base exactly as ``reserve()`` writes it --
+    # otherwise the re-drive has nothing to hydrate from and fails closed
+    # before the redrive path is ever reached.
+    ws = tmp_path / "workspaces" / project_id
+    (ws / "src").mkdir(parents=True, exist_ok=True)
+    (ws / "src" / "App.tsx").write_text("// content", encoding="utf-8")
+    (ws / "dist").mkdir(exist_ok=True)
+    (ws / "dist" / "index.html").write_text("<html>rev</html>", encoding="utf-8")
+    snapshot = TestedSnapshot.capture(ws)
     with store.acquire_writer(project_id) as state:
         state.lifecycle = "PREVIEW_READY"
         state.roles = {"owner": "telegram:1", "reviewers": [], "viewers": []}
@@ -1727,6 +1740,12 @@ def _h7_revision_ready_store(tmp_path, project_id, lifecycle="REVISION_REQUESTED
         state.revisions.source_revision = 1
         state.revisions.qa_revision = 1
         state.revisions.preview_revision = 1
+        state.deployment["checked"] = {
+            "source_revision": 1,
+            "source_sha256": snapshot.source_sha256,
+            "artifact_sha256": snapshot.artifact_sha256,
+        }
+        state.deployment["tested_snapshot"] = snapshot.to_dict()
         if lifecycle == "REVISION_REQUESTED":
             state.lifecycle = "REVISION_REQUESTED"
             state.revisions.queued_revision_seq = queued_seq
@@ -1735,6 +1754,12 @@ def _h7_revision_ready_store(tmp_path, project_id, lifecycle="REVISION_REQUESTED
                 "principal_id": pending_principal,
                 "reserved_at": 1.0,
                 "applied": pending_applied,
+                "base": build_draft_base(
+                    snapshot, seq=queued_seq, reserved_at=1.0,
+                    requirements_version=state.revisions.requirements_version,
+                    design_dna_version=state.revisions.design_dna_version,
+                    source_revision=state.revisions.source_revision,
+                ).to_dict(),
             })
         store.save(state)
     return store
@@ -1804,13 +1829,18 @@ class TestRevisionRedriveReachability:
         runner = ProjectRunner(ws_root, store)
         ws = ws_root / "tg-555"
         (ws / "src").mkdir(parents=True, exist_ok=True)
+        (ws / "src" / "App.tsx").write_text("// content", encoding="utf-8")
+        (ws / "dist").mkdir(exist_ok=True)
+        (ws / "dist" / "index.html").write_text("<html>rev</html>", encoding="utf-8")
         adapter = MagicMock()
         if frontend_result is not None:
             adapter.frontend_build.return_value = frontend_result
         preview = MagicMock()
         preview.run_owned.return_value = OperationResult.ok({"preview_url": "https://x.vercel.app"})
+        from app.deploy.hydrate import WorkspaceHydrator
         revise = RevisionOrchestrator(
-            runner, store, hermes_adapter=adapter, preview_orchestrator=preview
+            runner, store, hermes_adapter=adapter, preview_orchestrator=preview,
+            hydrator=WorkspaceHydrator(runner, store),
         )
         return revise, adapter, preview
 
@@ -2000,8 +2030,10 @@ class TestRevisionRedriveRoutedPath:
         }
         preview = MagicMock()
         preview.run_owned.return_value = OperationResult.ok({"preview_url": "https://x.vercel.app"})
+        from app.deploy.hydrate import WorkspaceHydrator
         revise = RevisionOrchestrator(
-            runner, store, hermes_adapter=adapter, preview_orchestrator=preview
+            runner, store, hermes_adapter=adapter, preview_orchestrator=preview,
+            hydrator=WorkspaceHydrator(runner, store),
         )
 
         telegram_out = MagicMock()

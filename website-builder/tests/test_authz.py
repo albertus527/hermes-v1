@@ -31,6 +31,29 @@ def _owned(store, project_id, owner="owner-1", reviewers=None, viewers=None):
         store.save(state)
 
 
+def _seed_draft_base(store, project_id, workspace):
+    """Record the last tested snapshot exactly as a real QA pass leaves it.
+
+    A revision continues from the last tested snapshot, so a DRAFT revision is
+    only admissible when ``tested_snapshot`` and the ``checked`` binding that
+    QA wrote both exist and agree. Seeding them here keeps these authorization
+    tests about authorization: without a base, ``reserve()`` refuses before any
+    authorization question is ever reached.
+    """
+    from app.deploy.snapshot import TestedSnapshot
+
+    snapshot = TestedSnapshot.capture(workspace)
+    with store.acquire_writer(project_id) as state:
+        state.deployment["checked"] = {
+            "source_revision": state.revisions.source_revision,
+            "source_sha256": snapshot.source_sha256,
+            "artifact_sha256": snapshot.artifact_sha256,
+        }
+        state.deployment["tested_snapshot"] = snapshot.to_dict()
+        store.save(state)
+    return snapshot
+
+
 def test_legacy_unowned_state_has_no_owner_and_denies_mutation(tmp_path):
     store = _store(tmp_path)
     with store.acquire_writer("legacy") as state:
@@ -199,6 +222,7 @@ def test_dispatch_intake_rejected_for_stranger_after_create(tmp_path):
 def test_dispatch_revise_reserve_apply_authorized(tmp_path):
     from unittest.mock import MagicMock, patch
     from app.core.contracts import OperationResult
+    from app.deploy.hydrate import WorkspaceHydrator
     from app.projects.revise import RevisionOrchestrator
     from app.sandbox.runner import ProjectRunner
 
@@ -211,7 +235,8 @@ def test_dispatch_revise_reserve_apply_authorized(tmp_path):
     }
     mock_preview = MagicMock()
     mock_preview.run_owned.return_value = OperationResult.ok({})
-    revise = RevisionOrchestrator(runner, store, hermes_adapter=mock_adapter, preview_orchestrator=mock_preview)
+    revise = RevisionOrchestrator(runner, store, hermes_adapter=mock_adapter, preview_orchestrator=mock_preview,
+                                  hydrator=WorkspaceHydrator(runner, store))
 
     intake = IntakeProcessor(store, hermes_adapter=None)
     dispatcher = TelegramDispatcher(store, intake, revise=revise)
@@ -222,6 +247,7 @@ def test_dispatch_revise_reserve_apply_authorized(tmp_path):
     (ws / "design-dna.json").write_text('{"version": 1}', encoding="utf-8")
     (ws / "dist").mkdir(exist_ok=True)
     (ws / "dist" / "index.html").write_text("<html>x</html>", encoding="utf-8")
+    _seed_draft_base(store, "proj", ws)
 
     with store.acquire_writer("proj") as state:
         state.roles["owner"] = "telegram:999"
@@ -363,41 +389,100 @@ def test_revocation_wins_writer_before_effects(tmp_path, operation):
     from concurrent.futures import ThreadPoolExecutor
     from threading import Event
     from unittest.mock import MagicMock
+    from app.deploy.hydrate import WorkspaceHydrator
     from app.projects.revise import RevisionOrchestrator
     from app.projects.promote import PromotionOrchestrator, PromoteDeps
     from app.sandbox.runner import ProjectRunner
     store = _store(tmp_path)
     _owned(store, "proj")
+    ws = tmp_path / "workspaces" / "proj"
+    (ws / "src").mkdir(parents=True)
+    (ws / "src" / "App.tsx").write_text("x", encoding="utf-8")
+    (ws / "design-dna.json").write_text('{"version": 1}', encoding="utf-8")
+    (ws / "dist").mkdir(exist_ok=True)
+    (ws / "dist" / "index.html").write_text("<html>x</html>", encoding="utf-8")
+    _seed_draft_base(store, "proj", ws)
     with store.acquire_writer("proj") as state:
         state.lifecycle = ProjectLifecycle.PREVIEW_READY.value
         store.save(state)
     runner = ProjectRunner(tmp_path / "workspaces", store)
     adapter = MagicMock()
-    revise = RevisionOrchestrator(runner, store, hermes_adapter=adapter)
+    hydrator = WorkspaceHydrator(runner, store)
+    revise = RevisionOrchestrator(runner, store, hermes_adapter=adapter,
+                                  hydrator=hydrator)
     promote = PromotionOrchestrator(runner, store, PromoteDeps(adapter, adapter, adapter, adapter))
     if operation == "revise":
         assert revise.reserve("proj", 1, principal_id="owner-1").success
     reached = Event()
+    proceed = Event()
     original = runner.acquire_project
-    def acquire(pid):
-        acquired = original(pid)
-        reached.set()
-        return acquired
+    if operation == "revise":
+        # A revision hydrates BEFORE it takes the writer block, and hydration
+        # needs the project writer to persist its own stage transitions. The
+        # worker therefore cannot be left waiting on a lock this thread holds,
+        # and the revocation is instead delivered at the exact window under
+        # test: after the workspace was hydrated, before the writer block
+        # re-reads authorization. Pausing there is safe precisely because the
+        # worker holds no lock at that moment.
+        real_hydrate = hydrator.hydrate
+
+        def acquire(pid):
+            return original(pid)
+
+        def paused_hydrate(project_id, seq, base):
+            outcome = real_hydrate(project_id, seq, base)
+            reached.set()
+            assert proceed.wait(20), "the revocation was never delivered"
+            return outcome
+
+        hydrator.hydrate = paused_hydrate
+    else:
+        # Promotion has no pre-writer work, so it is paused as soon as it owns
+        # the single worker slot and before it reaches its authorization check.
+        def acquire(pid):
+            acquired = original(pid)
+            reached.set()
+            assert proceed.wait(20), "the revocation was never delivered"
+            return acquired
     runner.acquire_project = acquire
+
+    if operation == "revise":
+        call = lambda: revise.apply("proj", 1, "change", principal_id="owner-1")
+    else:
+        call = lambda: promote.promote("proj", tmp_path / "workspace",
+                                       principal_id="owner-1")
     with ThreadPoolExecutor() as pool:
+        future = pool.submit(call)
+        assert reached.wait(20)
         with store.acquire_writer("proj") as state:
-            call = (lambda: revise.apply("proj", 1, "change", principal_id="owner-1")) if operation == "revise" else (
-                lambda: promote.promote("proj", tmp_path / "workspace", principal_id="owner-1"))
-            future = pool.submit(call)
-            assert reached.wait(5)
             state.roles["owner"] = "replacement"
             store.save(state)
             before = store._project_path("proj").read_bytes()
-        result = future.result(timeout=5)
+        proceed.set()
+        result = future.result(timeout=20)
     assert result.error_code == "UNAUTHORIZED_ROLE"
-    assert store._project_path("proj").read_bytes() == before
     assert not adapter.mock_calls
-    assert not (tmp_path / "workspaces" / "proj").exists()
+    if operation == "revise":
+        # A revocation that lands after the workspace was hydrated but before
+        # the writer block must still abort the revision before anything
+        # observable. Hydration legitimately runs before the writer block, so
+        # the state file is no longer byte-identical: it now carries the
+        # operation's own hydration record. What must hold is that no revision
+        # work happened at all.
+        after = store.load("proj")
+        assert after.revisions.source_revision == 0, "no source was advanced"
+        assert after.lifecycle == ProjectLifecycle.REVISION_REQUESTED.value
+        assert not after.failure, "a refusal is not a project failure"
+        for key in ("qa", "approval", "latest_shown_preview", "preview_intent"):
+            assert key not in (after.deployment or {}), key
+    else:
+        assert store._project_path("proj").read_bytes() == before
+        # The seeded workspace is the source a promotion would have used, so
+        # "it must not exist" is no longer the assertion. What must hold is
+        # that promotion never turned it into a runtime workspace: those are
+        # exactly the directories ``create_workspace`` creates.
+        for name in (".hermes", ".browser", ".runtime", ".ops", "current"):
+            assert not (tmp_path / "workspaces" / "proj" / name).exists(), name
 
 
 @pytest.mark.parametrize("principal", [None, "viewer", "stranger"])

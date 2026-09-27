@@ -1,4 +1,4 @@
-"""Phase 10 revision orchestrator for Website Builder R1.
+"""Phase 10 revision orchestrator for Website Builder R1/R2.
 
 Applies strictly-ordered natural-language revision requests against a
 project's persisted Design DNA. FRONTEND performs the actual compatible
@@ -13,6 +13,9 @@ Ordering model (two-phase, fail-closed):
      Design DNA, or lifecycle mutation happens. Reservation is what moves
      the project into REVISION_REQUESTED, which blocks a second concurrent
      reservation until this one is applied (or explicitly abandoned).
+     Reservation also FREEZES the revision base -- the exact source identity
+     this revision will hydrate from -- after admission is proven and before
+     the first mutation, so a refusal leaves durable state untouched.
   2. ``apply(project_id, seq, request_text)`` -- performs the actual
      revision under the single MAX_WORKERS=1 worker slot shared with
      Phase 7/8/9. Requires an exact, still-current reservation for the
@@ -37,15 +40,32 @@ from app.core.design_dna import typography_violation_message, validate_typograph
 from app.core.composition import compose_project_instructions, validate_composed_dna
 from app.core.lifecycle import LifecycleError, ProjectLifecycle
 from app.core.state import ProjectStateStore
-from app.deploy.snapshot import record_checks, source_fingerprint
+from app.deploy.hydrate import (
+    BASE_KIND_DRAFT,
+    BASE_KIND_LIVE,
+    DRAFT_SNAPSHOT_UNAVAILABLE,
+    HYDRATION_STAGING_UNAVAILABLE,
+    HYDRATION_STATE_UNPERSISTED,
+    HydrationError,
+    RevisionBase,
+    build_draft_base,
+    build_live_base,
+)
+from app.deploy.git_output import repository_name_for_url
+from app.deploy.snapshot import TestedSnapshot, record_checks, source_fingerprint
 from app.core.selfcontained import EXTERNAL_RUNTIME_DEPENDENCY
 from app.projects.build import (
     _CHEAP_CHECK_SEQUENCE,
     normalize_and_check_self_contained,
     run_fixed_checks,
 )
+from app.projects.release import (
+    CanonicalSourceRefusal,
+    canonical_source_repo_verdict,
+    canonical_source_verdict,
+)
 from app.qa.orchestrator import QAOrchestrator
-from app.sandbox.runner import ProjectRunner
+from app.sandbox.runner import PointerResolutionError, ProjectRunner
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +84,10 @@ class RevisionResult:
     reconciled: bool = False
     diagnostics: Optional[Dict[str, Any]] = None
     data: Optional[Dict[str, Any]] = None
+    # Which frozen base this revision hydrated from, and the identity it was
+    # acquired under. Both are None when the ``workspace`` seam was used.
+    base_kind: Optional[str] = None
+    hydrated_from: Optional[Dict[str, Any]] = None
 
 
 class RevisionOrchestrator:
@@ -81,12 +105,109 @@ class RevisionOrchestrator:
         hermes_adapter=None,
         preview_orchestrator=None,
         web3forms_access_key: Optional[str] = None,
+        hydrator=None,
+        source_repo_url: Optional[str] = None,
     ):
         self.runner = runner
         self.store = store
         self.hermes_adapter = hermes_adapter
         self.preview_orchestrator = preview_orchestrator
         self.web3forms_access_key = web3forms_access_key
+        # The exact-source authority. Injected by ``compose()`` because a LIVE
+        # revision additionally needs the output repository and the
+        # operator-configured remote, which only the composition root holds.
+        self.hydrator = hydrator
+        # Operator-configured source remote (SSH form). Used only to prove the
+        # recorded repository identity still names the configured one, offline.
+        self.source_repo_url = source_repo_url
+
+    # ------------------------------------------------------------------
+    # Revision base (frozen at reservation time)
+    # ------------------------------------------------------------------
+
+    def _configured_repo_name(self) -> Optional[str]:
+        return repository_name_for_url(self.source_repo_url)
+
+    def _freeze_base(self, state, seq: int) -> RevisionBase:
+        """Compute the revision base, or refuse before any mutation.
+
+        LIVE takes its identity ONLY from ``last_live_release`` and DRAFT only
+        from ``tested_snapshot``. There is deliberately no third source and no
+        "best effort" combination of the two: a base assembled from whatever
+        happens to be on disk is exactly the mutable-workspace reconstruction
+        this design removes.
+        """
+        if state.lifecycle == ProjectLifecycle.LIVE.value:
+            try:
+                verdict = canonical_source_verdict(state)
+                if not verdict.ready:
+                    raise CanonicalSourceRefusal(
+                        verdict.error_code or "CANONICAL_SOURCE_COMMIT_MISSING")
+                repo_verdict = canonical_source_repo_verdict(
+                    state, self._configured_repo_name())
+                if not repo_verdict.ready:
+                    raise CanonicalSourceRefusal(repo_verdict.error_code)
+            except CanonicalSourceRefusal as exc:
+                # Re-raised as a hydration refusal so every admission code
+                # travels the same classified path; nothing has been mutated.
+                raise HydrationError(exc.error_code, str(exc)) from None
+            return build_live_base(
+                state.deployment["last_live_release"],
+                seq=seq,
+                reserved_at=time.time(),
+                requirements_version=state.revisions.requirements_version,
+                design_dna_version=state.revisions.design_dna_version,
+            )
+
+        # DRAFT: the last tested snapshot IS the source. It must exist, parse,
+        # and agree with the ``checked`` binding -- otherwise the bytes a
+        # revision would continue from are unknown, and "unknown" is not a
+        # starting point.
+        snapshot_payload = (state.deployment or {}).get("tested_snapshot")
+        if not isinstance(snapshot_payload, dict):
+            raise HydrationError(
+                DRAFT_SNAPSHOT_UNAVAILABLE, "no tested snapshot is recorded")
+        try:
+            snapshot = TestedSnapshot.from_dict(snapshot_payload)
+        except Exception as exc:
+            raise HydrationError(
+                DRAFT_SNAPSHOT_UNAVAILABLE, type(exc).__name__) from None
+        checked = (state.deployment or {}).get("checked") or {}
+        if (checked.get("source_sha256") != snapshot.source_sha256
+                or checked.get("artifact_sha256") != snapshot.artifact_sha256):
+            raise HydrationError(
+                DRAFT_SNAPSHOT_UNAVAILABLE,
+                "the tested snapshot does not match the checked binding")
+        return build_draft_base(
+            snapshot,
+            seq=seq,
+            reserved_at=time.time(),
+            requirements_version=state.revisions.requirements_version,
+            design_dna_version=state.revisions.design_dna_version,
+            source_revision=state.revisions.source_revision,
+        )
+
+    def reserved_base(self, project_id: str, seq: int) -> Optional[RevisionBase]:
+        """The frozen base of the still-unapplied reservation for *seq*.
+
+        Read from DURABLE state, never recomputed: a revision hydrates from
+        what it was admitted against, not from what the project looks like now.
+        """
+        state = self.store.load(project_id)
+        if state is None:
+            return None
+        entry = next(
+            (e for e in (state.pending_revisions or [])
+             if isinstance(e, dict) and e.get("seq") == seq
+             and e.get("applied") is False and isinstance(e.get("base"), dict)),
+            None,
+        )
+        if entry is None:
+            return None
+        try:
+            return RevisionBase.from_dict(entry["base"])
+        except HydrationError:
+            return None
 
     # ------------------------------------------------------------------
     # Ordering reservation
@@ -155,6 +276,14 @@ class RevisionOrchestrator:
                     "REVISION_NOT_ALLOWED_IN_LIFECYCLE",
                     error_code="REVISION_NOT_ALLOWED_IN_LIFECYCLE",
                 )
+            # Admission, then freeze -- both strictly BEFORE the first
+            # mutation below. A refusal returns here with no sequence bump, no
+            # lifecycle change, no reservation append and no cache write, so
+            # durable state is byte-equivalent either way.
+            try:
+                base = self._freeze_base(state, seq)
+            except HydrationError as exc:
+                return OperationResult.fail(exc.error_code, error_code=exc.error_code)
             state.revisions.queued_revision_seq = seq
             self.store.transition_lifecycle_locked(state, ProjectLifecycle.REVISION_REQUESTED)
             state.pending_revisions.append({
@@ -162,6 +291,7 @@ class RevisionOrchestrator:
                 "principal_id": principal_id,
                 "reserved_at": time.time(),
                 "applied": False,
+                "base": base.to_dict(),
             })
             # Bound the ledger atomically with this append. Pruning always keeps
             # unapplied reservations, so the one just added (and any other
@@ -236,6 +366,21 @@ class RevisionOrchestrator:
         Requires an owner or authorized reviewer principal/reference token.
         Unauthorized attempts are rejected before any workspace, Design DNA,
         or lifecycle mutation.
+
+        ``workspace`` is a COMPATIBILITY / TEST SEAM and nothing else. It is
+        never supplied by production: the sole production caller is the
+        Telegram dispatcher, which passes only ``project_id``, ``seq``,
+        ``request_text`` and ``principal_id``. When it is ``None`` -- which is
+        every production call -- hydration from the reservation's frozen base
+        is MANDATORY and there is no fallback.
+
+        There is deliberately no ``workspace or create_workspace(...)``
+        fallback any more. That expression *was* "silently continue from
+        whatever mutable workspace happened to be left on disk", which is the
+        single behaviour this exact-source design exists to remove. There is
+        also no public flag that would let a runtime caller choose an arbitrary
+        directory: the only way to inject a workspace is this parameter, and
+        only tests use it.
         """
         state = self.store.load(project_id)
         if state is None:
@@ -296,6 +441,56 @@ class RevisionOrchestrator:
             )
 
         try:
+            # ---- exact-source hydration -------------------------------
+            # Runs BEFORE the writer block on purpose. Everything that makes a
+            # revision observable -- ``source_revision``, the QA/preview/
+            # approval invalidation, FRONTEND, the build, QA, the preview and
+            # any provider call -- happens strictly after this, so a refusal
+            # here leaves the project exactly as it was.
+            base_kind = None
+            hydrated_from = None
+            if workspace is None:
+                frozen = self.reserved_base(project_id, seq)
+                if frozen is None:
+                    return RevisionResult(
+                        False, project_id, seq,
+                        error="REVISION_NOT_RESERVED",
+                        error_code="REVISION_NOT_RESERVED")
+                if self.hydrator is None:
+                    # No exact-source authority is wired into this runtime, so
+                    # no revision can be proven to start from the right bytes.
+                    # Fail closed: there is deliberately no fallback to a
+                    # leftover workspace.
+                    return self._fail(project_id, seq,
+                                      "no hydrator is configured",
+                                      HYDRATION_STAGING_UNAVAILABLE,
+                                      base_kind=frozen.base_kind)
+                try:
+                    outcome = self.hydrator.hydrate(project_id, seq, frozen)
+                except PointerResolutionError as exc:
+                    return self._fail(project_id, seq, exc.error_code, exc.error_code,
+                                      base_kind=frozen.base_kind)
+                except HydrationError as exc:
+                    if exc.error_code == HYDRATION_STATE_UNPERSISTED:
+                        # NOT a hydration failure. The pointer swap committed
+                        # and the promoted workspace is intact; only the durable
+                        # READY / pointer_mode write was lost. The lifecycle
+                        # deliberately stays at REVISION_REQUESTED so the same
+                        # reservation can be re-driven, which resumes into the
+                        # already-swapped case: persist the write, clean up, and
+                        # continue. Failing the revision here would strand a
+                        # workspace the project is already using.
+                        return RevisionResult(
+                            False, project_id, seq,
+                            error=exc.error_code, error_code=exc.error_code,
+                            base_kind=frozen.base_kind,
+                        )
+                    return self._fail(project_id, seq, exc.error_code,
+                                      exc.error_code, base_kind=frozen.base_kind)
+                workspace = outcome.workspace
+                base_kind = outcome.base_kind
+                hydrated_from = outcome.hydrated_from
+
             # QUEUED -> RUNNING, mirroring Phase 7. Invalidate QA/preview/
             # approval BEFORE invoking FRONTEND -- even a failed or partial
             # mutation may have changed source on disk.
@@ -324,7 +519,6 @@ class RevisionOrchestrator:
                     return RevisionResult(False, project_id, seq, error=str(exc),
                                           error_code="INVALID_PERSISTED_REFERENCES")
                 brief = dict(state.brief)
-                workspace = workspace or self.runner.create_workspace(project_id)
                 self.store.transition_lifecycle_locked(locked, ProjectLifecycle.QUEUED)
                 self.store.transition_lifecycle_locked(locked, ProjectLifecycle.RUNNING)
                 locked.revisions.source_revision += 1
@@ -552,7 +746,8 @@ class RevisionOrchestrator:
                         entry["applied_at"] = time.time()
                 self.store.save(locked)
 
-            return RevisionResult(True, project_id, seq)
+            return RevisionResult(True, project_id, seq, base_kind=base_kind,
+                                  hydrated_from=hydrated_from)
         finally:
             self.runner.release_project(project_id)
 
@@ -560,7 +755,18 @@ class RevisionOrchestrator:
     # Internals
     # ------------------------------------------------------------------
 
-    def _fail(self, project_id: str, seq: int, error: str, error_code: str) -> RevisionResult:
+    def _fail(self, project_id: str, seq: int, error: str, error_code: str,
+              *, base_kind: Optional[str] = None,
+              hydrated_from: Optional[Dict[str, Any]] = None) -> RevisionResult:
+        """Record one terminal revision failure and return it.
+
+        The persisted ``error_code`` and the returned ``error_code`` are the
+        same value. A caller that only inspects the return value and an
+        operator reading the durable record must never be able to disagree
+        about why a revision failed; before this, the durable record carried
+        only free text, so a classification that existed in memory was gone by
+        the time anyone looked at the project.
+        """
         with self.store.acquire_writer(project_id) as state:
             if state.lifecycle != ProjectLifecycle.FAILED.value:
                 try:
@@ -571,10 +777,13 @@ class RevisionOrchestrator:
                 "phase": "revision",
                 "seq": seq,
                 "error": error,
+                "error_code": error_code,
                 "failed_at": time.time(),
             }
             self.store.save(state)
-        return RevisionResult(False, project_id, seq, error=error, error_code=error_code)
+        return RevisionResult(False, project_id, seq, error=error,
+                              error_code=error_code, base_kind=base_kind,
+                              hydrated_from=hydrated_from)
 
     def _build_revision_instructions(
         self, design_dna: Optional[Dict[str, Any]], request_text: str

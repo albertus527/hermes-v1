@@ -17,6 +17,181 @@ from app.deploy.snapshot import TestedSnapshot
 # names (which are what the branch is derived from) are the same shape.
 _FRIENDLY_BRANCH_RE = re.compile(r'[a-z0-9][a-z0-9._-]{0,99}')
 
+# The ONE accepted form of the operator-configured source remote. Publication
+# and hydration both derive the repository NAME from it, so a release recorded
+# against a different remote is a mismatch rather than a second code path.
+_GITHUB_SSH_RE = re.compile(r'git@github\.com:([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)\.git')
+
+_SHA1_RE = re.compile(r'[0-9a-f]{40}')
+_MODE_RE = re.compile(rb'[0-7]{6}')
+_BLOB_SHA_RE = re.compile(rb'[0-9a-f]{40}')
+
+#: Blob modes hydration will write. Everything else is refused, each with its
+#: own reason: 120000 is a symlink, 160000 is a gitlink (submodule), and any
+#: other mode is unsupported. There is no "skip it and carry on".
+_ACCEPTED_BLOB_MODES = ('100644', '100755')
+
+#: Git-LFS pointer recognition is a bounded, EXPLICIT grammar check (D29) and
+#: nothing more. A canonical pointer is exactly three LF-terminated ASCII
+#: lines: the spec header, the ``oid``, the ``size``. Bytes that do not match
+#: that structure are ordinary committed bytes -- this is NOT a general LFS
+#: detector and never claims to be one. Digest verification at VERIFIED is a
+#: CONTENT-INTEGRITY check, not a fallback LFS safety net: if non-canonical
+#: LFS-like bytes were themselves what was tested and published, the recorded
+#: digest matches them and hydration legitimately succeeds.
+_LFS_VERSION_LINE = b'version https://git-lfs.github.com/spec/v1'
+_LFS_POINTER_MAX_BYTES = 1024
+_LFS_OID_RE = re.compile(rb'oid sha256:[0-9a-f]{64}\Z')
+_LFS_SIZE_RE = re.compile(rb'size [0-9]+\Z')
+
+
+class MaterializationRefusal(RuntimeError):
+    """One refused tree entry (or refused commit), with its own reason.
+
+    ``reason`` is a stable slug the hydrator maps to a user-facing code. The
+    offending ``path`` is the safe repository path, never a host path.
+    """
+
+    def __init__(self, reason: str, path=None):
+        self.reason = reason
+        self.path = path
+        super().__init__(reason if path is None else f'{reason}: {path}')
+
+
+def repository_name_for_url(url):
+    """``owner/name`` derived from the configured SSH remote, else ``None``."""
+    if not isinstance(url, str):
+        return None
+    match = _GITHUB_SSH_RE.fullmatch(url)
+    return f'{match.group(1)}/{match.group(2)}' if match else None
+
+
+def verify_repository_identity(url, expected_repo):
+    """Offline: the configured remote must name the recorded repository.
+
+    Deliberately hoisted ahead of any fetch so a mismatch is refused without
+    touching the network, and never repaired by fetching from the wrong place.
+    """
+    name = repository_name_for_url(url)
+    if name is None:
+        raise MaterializationRefusal('repo_identity')
+    if isinstance(expected_repo, str) and expected_repo and name != expected_repo:
+        raise MaterializationRefusal('repo_mismatch', expected_repo)
+    return name
+
+
+def looks_like_canonical_lfs_pointer(data: bytes) -> bool:
+    """True only for the canonical Git-LFS pointer grammar implemented here."""
+    if not isinstance(data, (bytes, bytearray)):
+        return False
+    if len(data) > _LFS_POINTER_MAX_BYTES:
+        return False
+    if not data.startswith(_LFS_VERSION_LINE + b'\n'):
+        return False
+    body = bytes(data)[len(_LFS_VERSION_LINE) + 1:]
+    lines = body.split(b'\n')
+    if lines and lines[-1] == b'':
+        lines.pop()
+    if len(lines) != 2:
+        return False
+    return bool(_LFS_OID_RE.match(lines[0]) and _LFS_SIZE_RE.match(lines[1]))
+
+
+def unsafe_repository_path(name) -> bool:
+    """The same predicate ``commit()`` applies to a snapshot path.
+
+    Traversal, absolute paths, empty/``.``/``..``/``.git`` components,
+    backslashes, colons and NULs are all refused. A path is never sanitized --
+    it is accepted or it is refused.
+    """
+    if not isinstance(name, str) or not name:
+        return True
+    if name.startswith('/'):
+        return True
+    if any(c in name for c in ('\\', ':', '\0')):
+        return True
+    return any(p in ('', '.', '..', '.git') for p in name.split('/'))
+
+
+def _parse_ls_tree(raw: bytes):
+    """Strictly parse ``ls-tree -r -z`` output.
+
+    The record shape is ``<mode> SP <type> SP <sha> TAB <path> NUL``. Anything
+    that does not parse exactly is refused rather than skipped, because a
+    parser that skips what it cannot read is a parser that silently
+    materializes less than the commit contains.
+    """
+    records = raw.split(b'\0')
+    if records and records[-1] == b'':
+        records.pop()
+    entries = []
+    for record in records:
+        if not record:
+            raise MaterializationRefusal('unparseable')
+        head, separator, path = record.partition(b'\t')
+        if not separator or not path:
+            raise MaterializationRefusal('unparseable')
+        try:
+            path_text = path.decode('utf-8')
+        except UnicodeDecodeError:
+            raise MaterializationRefusal('unparseable') from None
+        fields = head.split(b' ')
+        if len(fields) != 3:
+            raise MaterializationRefusal('unparseable', path_text)
+        mode, kind, blob = fields
+        if not _MODE_RE.fullmatch(mode) or not _BLOB_SHA_RE.fullmatch(blob):
+            raise MaterializationRefusal('unparseable', path_text)
+        try:
+            kind_text = kind.decode('ascii')
+        except UnicodeDecodeError:
+            raise MaterializationRefusal('unparseable', path_text)
+        entries.append((mode.decode('ascii'), kind_text, blob.decode('ascii'),
+                        path_text))
+    return entries
+
+
+def refuse_tree_entry(mode: str, kind: str, path: str) -> None:
+    """The blob-type / mode gate. Each refusal names its own reason."""
+    if mode == '120000':
+        raise MaterializationRefusal('symlink', path)
+    if mode == '160000':
+        raise MaterializationRefusal('submodule', path)
+    if mode not in _ACCEPTED_BLOB_MODES:
+        raise MaterializationRefusal('mode', path)
+    if kind != 'blob':
+        raise MaterializationRefusal('non_blob', path)
+    if unsafe_repository_path(path):
+        raise MaterializationRefusal('unsafe_path', path)
+
+
+def assert_write_target(staging: Path, destination: Path) -> None:
+    """Re-checked before EVERY write, not once per run.
+
+    The staging directory itself must not be a symlink, no component between
+    the staging root and the destination may be an existing symlink, and the
+    fully resolved destination must still be inside the resolved staging root.
+    A single up-front check would be satisfied by a tree that changed shape
+    while it was being written.
+    """
+    if staging.is_symlink():
+        raise MaterializationRefusal('containment')
+    try:
+        relative = destination.relative_to(staging)
+    except ValueError:
+        raise MaterializationRefusal('containment') from None
+    current = staging
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise MaterializationRefusal('containment')
+    try:
+        resolved = destination.resolve(strict=False)
+        root = staging.resolve(strict=False)
+    except OSError:
+        raise MaterializationRefusal('containment') from None
+    if resolved != root and root not in resolved.parents:
+        raise MaterializationRefusal('containment')
+
 # A publication commit is a deterministic, human-readable record of one LIVE
 # publication. It carries no secret and no unbounded content, and it is built
 # from fixed values only, so the same (tree, parent, inputs) always yields the
@@ -264,6 +439,93 @@ class OutputGitRepository:
         result = self._run(['cat-file', '-e', str(revision) + '^{commit}'], check=False)
         return result.returncode == 0
 
+    # -- hydration reads (R2-C) --------------------------------------------
+
+    def has_commit(self, commit):
+        """Whether the object is present locally. Never touches the network."""
+        if not _SHA1_RE.fullmatch(str(commit or '')):
+            return False
+        return self._has_commit(commit)
+
+    def has_tested_snapshot_commit(self, commit):
+        """Whether ``commit`` is the head of an immutable preview ref."""
+        if not _SHA1_RE.fullmatch(str(commit or '')):
+            return False
+        return self._is_tested_snapshot_commit(commit)
+
+    def commit_tree(self, commit):
+        """The exact tree id of ``commit``. Raises if the object is unknown."""
+        return self._run(['rev-parse', str(commit) + '^{tree}']).strip().decode()
+
+    def fetch_pinned_commit(self, commit, url, *, ssh_key=None, extra_env=None):
+        """Fetch EXACTLY ``commit`` into a private namespaced hydration ref.
+
+        The refspec is the literal 40-hex object id, so what lands is the
+        recorded publication commit and nothing else. There is deliberately no
+        branch, no tag, no wildcard and no ``FETCH_HEAD`` fallback: a branch
+        tip that has moved since the release is not the release, and resolving
+        it "close enough" is exactly the source-of-truth drift this fetch
+        exists to prevent.
+
+        Returns the namespaced ref name. A failure raises; the caller decides
+        what an absent object means.
+        """
+        if not _SHA1_RE.fullmatch(str(commit or '')):
+            raise MaterializationRefusal('commit')
+        extra = self._ssh_env(ssh_key)
+        if extra_env:
+            extra = dict(extra or {}, **extra_env)
+        ref = 'refs/hydrate/' + commit
+        self._run(['-c', 'credential.helper=', 'fetch', '--no-tags',
+                   '--no-write-fetch-head', '--', url, commit + ':' + ref],
+                  extra=extra)
+        return ref
+
+    def materialize_commit(self, commit, expected_tree, staging, *, extra_env=None):
+        """Write ``commit``'s exact blobs into ``staging``. No worktree at all.
+
+        Never ``checkout``, ``checkout-index``, ``read-tree`` as a worktree
+        materializer, ``archive``, ``tar``, a filter, clean/smudge or a hook.
+        Every file is fetched as a raw blob object and written by Python, so
+        the bytes on disk are the bytes in the commit and nothing else can
+        influence them.
+
+        Returns ``{'source': [...], 'dist': [...]}`` -- the repository-relative
+        names written under each kind, which the caller re-walks from the real
+        filesystem before the workspace is allowed to become current.
+        """
+        if not _SHA1_RE.fullmatch(str(commit or '')):
+            raise MaterializationRefusal('commit')
+        if not _SHA1_RE.fullmatch(str(expected_tree or '')):
+            raise MaterializationRefusal('tree')
+        if self.commit_tree(commit) != expected_tree:
+            raise MaterializationRefusal('tree_mismatch')
+        entries = _parse_ls_tree(
+            self._run(['ls-tree', '-r', '-z', str(commit)], extra=extra_env))
+        staging = Path(staging)
+        staging.mkdir(parents=True, exist_ok=True)
+        source, dist = [], []
+        for mode, kind, blob, path in entries:
+            refuse_tree_entry(mode, kind, path)
+            destination = staging / path
+            assert_write_target(staging, destination)
+            data = self._run(['cat-file', 'blob', blob], extra=extra_env)
+            # LFS is unsupported: recognised before the write, so the bytes
+            # never reach disk. No Git LFS process, no filter, no clean/smudge
+            # and no LFS object fetch is ever attempted.
+            if looks_like_canonical_lfs_pointer(data):
+                raise MaterializationRefusal('lfs', path)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(data)
+            # The executable bit comes from the mode and only from 100755;
+            # every other accepted mode is written plain.
+            os.chmod(destination, 0o755 if mode == '100755' else 0o644)
+            if path.startswith('dist/'):
+                dist.append(path[len('dist/'):])
+            else:
+                source.append(path)
+        return {'source': sorted(source), 'dist': sorted(dist)}
+
     def _is_tested_snapshot_commit(self, commit):
         """True only when ``commit`` is the head of an internal
         ``preview/<project-sha>/<snapshot-sha>`` ref.
@@ -391,11 +653,9 @@ class OutputGitRepository:
         publication, factored out so ``prepare_publication`` is the only entry
         point that decides whether an intended publication is well-formed.
         """
-        if not isinstance(url, str) or not re.fullmatch(
-                r'git@github\.com:([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)\.git', url):
+        if not isinstance(url, str) or not _GITHUB_SSH_RE.fullmatch(url):
             raise ValueError('Explicit GitHub SSH remote required')
-        repo = re.fullmatch(
-            r'git@github\.com:([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)\.git', url)
+        repo = _GITHUB_SSH_RE.fullmatch(url)
         repo_name = repo.group(1) + '/' + repo.group(2)
         if (not isinstance(branch, str)
                 or not _FRIENDLY_BRANCH_RE.fullmatch(branch)

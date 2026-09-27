@@ -33,6 +33,56 @@ class WorkspaceError(ValueError):
     """Raised when workspace validation fails."""
 
 
+# ---------------------------------------------------------------------------
+# Pointer workspaces (R2-C)
+# ---------------------------------------------------------------------------
+# A revision workspace is DISPOSABLE. It is materialized from a proven exact
+# source into ``<project>/.ops/rev-<seq>/`` and only becomes the project's
+# workspace when the ``current`` pointer is atomically swapped to name it.
+#
+# ``current`` holds ONE line: the validated operation token ``rev-<digits>``.
+# It never holds a commit, a branch or a path -- so no commit or branch
+# identity can ever be inferred from it, and a pointer that somehow holds one
+# is a refusal rather than a guess.
+#
+# The historical witness that a project has crossed the pointer boundary is
+# ``deployment["pointer_mode"]``, a monotonic boolean. It is consulted because
+# ``deployment["hydration"]`` is a SINGLE record that a later operation may
+# supersede: a project whose record was replaced by a new operation's RESERVED
+# while its ``current`` file was lost must NOT silently fall back to the legacy
+# mutable workspace. That fallback is precisely the source-of-truth behaviour
+# this layout exists to remove.
+
+WORKSPACE_POINTER_INVALID = "WORKSPACE_POINTER_INVALID"
+WORKSPACE_POINTER_MISSING_AFTER_HYDRATION = "WORKSPACE_POINTER_MISSING_AFTER_HYDRATION"
+
+POINTER_FILENAME = "current"
+OPS_DIRNAME = ".ops"
+#: Runtime directories that live INSIDE the resolved workspace, wherever that
+#: workspace is. In pointer mode they move with the revision.
+RUNTIME_DIRNAMES = (".hermes", ".browser", ".runtime")
+
+_OP_TOKEN_RE = re.compile(r"rev-[0-9]+")
+_SHA1_RE = re.compile(r"[0-9a-f]{40}")
+
+
+class PointerResolutionError(WorkspaceError):
+    """The ``current`` pointer could not be resolved. Carries its error code."""
+
+    def __init__(self, error_code: str, message: str = ""):
+        self.error_code = error_code
+        super().__init__(message or error_code)
+
+
+def validate_operation_token(token) -> str:
+    """Only a bare ``rev-<digits>`` operation token is ever accepted."""
+    if not isinstance(token, str) or not _OP_TOKEN_RE.fullmatch(token):
+        raise PointerResolutionError(
+            WORKSPACE_POINTER_INVALID,
+            f"Invalid workspace operation token: {token!r}")
+    return token
+
+
 def validate_project_id(project_id: str) -> str:
     """Validate a project ID to prevent path traversal.
 
@@ -199,16 +249,213 @@ class ProjectRunner:
         self._active_lock = __import__("threading").Lock()
 
     def create_workspace(self, project_id: str) -> Path:
-        """Create an isolated workspace for a project."""
-        path = project_workspace_path(self.workspace_root, project_id)
+        """Create an isolated workspace for a project.
+
+        Resolve FIRST, then create. Creating the legacy root and discovering
+        the operation directory afterwards would leave a second, plausible
+        looking workspace behind that every other runtime helper would keep
+        using -- which is the exact split-brain this resolver exists to
+        prevent. The three runtime directories are created inside whatever
+        directory was resolved, so a pointer-mode project binds
+        ``WORKSPACE_ROOT``/``HERMES_HOME`` to its current operation workspace.
+        """
+        path = self.resolve_workspace(project_id)
         path.mkdir(parents=True, exist_ok=True)
 
         # Create subdirectories
-        (path / ".hermes").mkdir(exist_ok=True)
-        (path / ".browser").mkdir(exist_ok=True)
-        (path / ".runtime").mkdir(exist_ok=True)
+        for name in RUNTIME_DIRNAMES:
+            (path / name).mkdir(exist_ok=True)
 
         return path
+
+    # ------------------------------------------------------------------
+    # Pointer-aware workspace resolution (the single authority)
+    # ------------------------------------------------------------------
+
+    def project_root(self, project_id: str) -> Path:
+        """The project's own directory -- the legacy mutable workspace."""
+        return project_workspace_path(self.workspace_root, project_id)
+
+    def ops_dir(self, project_id: str) -> Path:
+        """The operations directory. Never created, never followed blindly."""
+        return self.project_root(project_id) / OPS_DIRNAME
+
+    def pointer_mode(self, project_id: str) -> bool:
+        """Whether this project has ever committed a pointer swap.
+
+        A plain state read, deliberately NOT the writer lock. ``build.py``
+        calls ``create_workspace`` from inside a writer block, so a resolver
+        that reached for the lock would invert lock order and deadlock. The
+        read is a bare file read plus the in-memory migration, which is safe to
+        nest. A project with no state file has no ``pointer_mode`` and has
+        therefore never crossed the boundary.
+        """
+        state = self.state_store.load(project_id)
+        if state is None:
+            return False
+        return (state.deployment or {}).get("pointer_mode") is True
+
+    def pointer_token(self, project_id: str) -> Optional[str]:
+        """The validated operation token named by ``current``, or ``None``.
+
+        ``None`` means the file is genuinely absent. Anything present but
+        unusable -- empty, multi-line, multi-token, a bare commit id, a
+        symlink, or a name that is not ``rev-<digits>`` -- is a refusal. There
+        is no "best effort" reading of a pointer, because a misread pointer
+        would send every runtime helper into a different workspace than the
+        one the durable state describes.
+        """
+        pointer = self.project_root(project_id) / POINTER_FILENAME
+        if pointer.is_symlink():
+            raise PointerResolutionError(
+                WORKSPACE_POINTER_INVALID, "Workspace pointer is a symlink")
+        if not pointer.exists():
+            return None
+        try:
+            raw = pointer.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            raise PointerResolutionError(
+                WORKSPACE_POINTER_INVALID, "Workspace pointer is unreadable") from None
+        lines = raw.split("\n")
+        if raw.endswith("\n"):
+            lines.pop()
+        if len(lines) != 1:
+            raise PointerResolutionError(
+                WORKSPACE_POINTER_INVALID,
+                "Workspace pointer must name exactly one operation")
+        token = lines[0]
+        if not token:
+            raise PointerResolutionError(
+                WORKSPACE_POINTER_INVALID, "Workspace pointer is empty")
+        if _SHA1_RE.fullmatch(token):
+            raise PointerResolutionError(
+                WORKSPACE_POINTER_INVALID,
+                "Workspace pointer must not hold a commit id")
+        return validate_operation_token(token)
+
+    def resolve_workspace(self, project_id: str) -> Path:
+        """The ONE directory this project's runtime may use. Never guesses.
+
+        The four rules, in order:
+
+        1. ``current`` absent AND ``pointer_mode`` is not ``True`` -> the
+           legacy project directory (the R1 / never-hydrated case).
+        2. ``current`` absent AND ``pointer_mode`` is ``True`` -> fail closed.
+           A swap has committed at least once, so the legacy mutable workspace
+           must never be resurrected, whatever ``hydration`` currently says.
+        3. ``current`` names a valid token -> that operation directory, with
+           containment and symlink escape checked.
+        4. ``current`` exists but is unusable -> fail closed, never legacy.
+        """
+        root = self.project_root(project_id)
+        token = self.pointer_token(project_id)
+        if token is None:
+            if self.pointer_mode(project_id):
+                raise PointerResolutionError(
+                    WORKSPACE_POINTER_MISSING_AFTER_HYDRATION,
+                    "Workspace pointer is missing after hydration")
+            return root
+        ops = root / OPS_DIRNAME
+        if ops.is_symlink():
+            raise PointerResolutionError(
+                WORKSPACE_POINTER_INVALID, "Operations directory is a symlink")
+        operation = ops / token
+        if operation.is_symlink():
+            raise PointerResolutionError(
+                WORKSPACE_POINTER_INVALID, "Operation directory is a symlink")
+        if not operation.is_dir():
+            raise PointerResolutionError(
+                WORKSPACE_POINTER_INVALID, "Operation directory does not exist")
+        try:
+            resolved = operation.resolve()
+            base = root.resolve()
+        except OSError:
+            raise PointerResolutionError(
+                WORKSPACE_POINTER_INVALID,
+                "Operation directory could not be resolved") from None
+        if resolved != base and base not in resolved.parents:
+            raise PointerResolutionError(
+                WORKSPACE_POINTER_INVALID,
+                "Operation directory escapes the project workspace")
+        return operation
+
+    def op_dir_for(self, project_id: str, seq: int) -> Path:
+        """Where one revision's staging workspace is materialized.
+
+        The name is derived from the reserved ``seq``, so two operations can
+        never share a directory: a leftover directory under this name belongs
+        to this exact reservation and is disposable.
+        """
+        token = validate_operation_token(f"rev-{seq}")
+        ops = self.ops_dir(project_id)
+        if ops.is_symlink():
+            raise PointerResolutionError(
+                WORKSPACE_POINTER_INVALID, "Operations directory is a symlink")
+        ops.mkdir(parents=True, exist_ok=True)
+        return ops / token
+
+    def write_pointer(self, project_id: str, token: str) -> None:
+        """Atomically make ``token`` the project's current workspace.
+
+        Refuses a symlinked ``current`` and a symlinked ``.ops``: writing
+        through either would let an attacker redirect the project's entire
+        workspace, and a pointer that cannot be written safely is a refusal
+        rather than a best-effort update.
+        """
+        token = validate_operation_token(token)
+        root = self.project_root(project_id)
+        ops = root / OPS_DIRNAME
+        if ops.is_symlink():
+            raise PointerResolutionError(
+                WORKSPACE_POINTER_INVALID, "Operations directory is a symlink")
+        pointer = root / POINTER_FILENAME
+        if pointer.is_symlink():
+            raise PointerResolutionError(
+                WORKSPACE_POINTER_INVALID, "Workspace pointer is a symlink")
+        ops.mkdir(parents=True, exist_ok=True)
+        staging = root / f".{POINTER_FILENAME}.{token}.tmp"
+        try:
+            staging.write_text(token + "\n", encoding="ascii")
+            os.replace(staging, pointer)
+        finally:
+            if staging.exists():
+                staging.unlink()
+
+    def sweep_ops(self, project_id: str, *, keep: tuple = ()) -> list:
+        """Delete operation directories that no longer serve the project.
+
+        The pointer target is preserved UNCONDITIONALLY -- independently of
+        the hydration record, of which operation is in flight, and of what any
+        caller passes in ``keep``. That is what lets a new operation run its
+        whole RESERVED/FETCHED/VERIFIED sequence while the previous current
+        workspace stays alive and usable, and it stays usable right up to the
+        instant the new swap commits.
+        """
+        preserved = {str(name) for name in keep if isinstance(name, str)}
+        try:
+            token = self.pointer_token(project_id)
+        except PointerResolutionError:
+            # An unusable pointer is not a reason to delete directories: the
+            # one it was pointing at may well be the only copy of the
+            # workspace. Sweeping nothing is the fail-closed direction.
+            return []
+        if token:
+            preserved.add(token)
+        ops = self.ops_dir(project_id)
+        if ops.is_symlink() or not ops.is_dir():
+            return []
+        removed = []
+        for child in sorted(ops.iterdir()):
+            if child.name in preserved:
+                continue
+            if child.is_symlink():
+                # Unlink the link itself; never follow it out of .ops.
+                child.unlink()
+                removed.append(child.name)
+            elif child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+                removed.append(child.name)
+        return removed
 
     def acquire_project(self, project_id: str) -> bool:
         """Acquire the single active project slot. MAX_WORKERS=1."""
@@ -234,10 +481,13 @@ class ProjectRunner:
     ) -> subprocess.CompletedProcess:
         """Run a command inside the project's isolated workspace.
 
-        The command runs with the project workspace as cwd and with
-        project-local environment isolation.
+        The command runs with the project's RESOLVED workspace as cwd -- which
+        in pointer mode is the current operation directory, not the project
+        root -- and with project-local environment isolation. Both the cwd
+        containment check and ``WORKSPACE_ROOT``/``HERMES_HOME`` therefore bind
+        to the same directory every other helper uses.
         """
-        workspace = project_workspace_path(self.workspace_root, project_id)
+        workspace = self.resolve_workspace(project_id)
         if cwd is None:
             cwd = workspace
 
@@ -351,7 +601,7 @@ class ProjectRunner:
         ``cleanup``/``cleanup_all``. Does NOT block waiting for the process
         to exit — callers own readiness polling.
         """
-        workspace = project_workspace_path(self.workspace_root, project_id)
+        workspace = self.resolve_workspace(project_id)
         if cwd is None:
             cwd = workspace
         cwd = Path(cwd).resolve()

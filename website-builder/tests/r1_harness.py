@@ -657,6 +657,17 @@ class LocalR1Scenario:
         self.smoke = FakeSmoke()
         self.output_repo = FakeOutputRepo()
         self.runner = RecordingRunner(self.workspace_root)
+        # R2-C: revisions hydrate from an exact source instead of continuing
+        # from whatever is on disk, so the harness wires the REAL
+        # WorkspaceHydrator. It needs the real pointer layout, which the real
+        # ProjectRunner owns -- ``RecordingRunner`` deliberately has no opinion
+        # about where a workspace lives, because it never creates one on
+        # demand. DRAFT hydration needs no output repository: it reads the
+        # durable tested_snapshot, so no Git and no network are involved.
+        from app.deploy.hydrate import WorkspaceHydrator
+        from app.sandbox.runner import ProjectRunner
+        self.pointer_runner = ProjectRunner(self.workspace_root, self.store)
+        self.hydrator = WorkspaceHydrator(self.pointer_runner, self.store)
 
         # Real domain logic.
         self.intake = IntakeProcessor(self.store, hermes_adapter=self.hermes)
@@ -708,7 +719,7 @@ class LocalR1Scenario:
         )
         self.revise = RevisionOrchestrator(
             runner=self.runner, store=self.store, hermes_adapter=self.hermes,
-            preview_orchestrator=self.preview,
+            preview_orchestrator=self.preview, hydrator=self.hydrator,
         )
         self.promote = PromotionOrchestrator(
             self.runner, self.store,
@@ -830,7 +841,7 @@ class LocalR1Scenario:
         )
         self.revise = RevisionOrchestrator(
             runner=self.runner, store=self.store, hermes_adapter=self.hermes,
-            preview_orchestrator=self.preview,
+            preview_orchestrator=self.preview, hydrator=self.hydrator,
         )
         self.promote = PromotionOrchestrator(
             self.runner, self.store,

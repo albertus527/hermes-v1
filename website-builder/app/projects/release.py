@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import re
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, Optional
 from urllib.parse import urlsplit
 
@@ -651,6 +652,194 @@ def legacy_live_release(last_live_deployment: Dict[str, Any],
     return record
 
 
+# ---------------------------------------------------------------------------
+# Canonical source (R2-C)
+# ---------------------------------------------------------------------------
+#
+# A revision may only start from a source whose identity is PROVEN. These
+# verdicts are the admission gate: they say whether
+# ``deployment.last_live_release`` names an exact, well-formed publication
+# that can be hydrated byte-for-byte, and they never touch the filesystem.
+#
+# ``canonical_source_verdict`` is a PURE READ. It computes no cache, writes
+# nothing, and takes no lock; ``reserve()`` is its only caller. The reason is
+# not tidiness: a read path that wrote would make an admission check into a
+# mutation, and a refusal must leave durable state byte-equivalent.
+#
+# Retrying never helps any of these. They are properties of durable state, not
+# transient conditions, so the user-facing copy must never say "try again".
+
+CANONICAL_SOURCE_NO_LIVE_RELEASE = "CANONICAL_SOURCE_NO_LIVE_RELEASE"
+CANONICAL_SOURCE_SYNC_REQUIRED = "CANONICAL_SOURCE_SYNC_REQUIRED"
+CANONICAL_SOURCE_LEGACY_IDENTITY = "CANONICAL_SOURCE_LEGACY_IDENTITY"
+CANONICAL_SOURCE_NOT_PUBLISHED = "CANONICAL_SOURCE_NOT_PUBLISHED"
+CANONICAL_SOURCE_COMMIT_MISSING = "CANONICAL_SOURCE_COMMIT_MISSING"
+CANONICAL_SOURCE_PARENT_UNRESOLVED = "CANONICAL_SOURCE_PARENT_UNRESOLVED"
+CANONICAL_SOURCE_REPO_UNRESOLVED = "CANONICAL_SOURCE_REPO_UNRESOLVED"
+CANONICAL_SOURCE_REPO_MISMATCH = "CANONICAL_SOURCE_REPO_MISMATCH"
+
+#: Verdict names. ``READY`` is the only one that admits a LIVE revision.
+VERDICT_NO_LIVE_RELEASE = "NO_LIVE_RELEASE"
+VERDICT_SOURCE_SYNC_REQUIRED = "SOURCE_SYNC_REQUIRED"
+VERDICT_LEGACY_RELEASE_IDENTITY = "LEGACY_RELEASE_IDENTITY"
+VERDICT_PUBLICATION_NOT_CONFIGURED = "PUBLICATION_NOT_CONFIGURED"
+VERDICT_NO_PUBLICATION_COMMIT = "NO_PUBLICATION_COMMIT"
+VERDICT_PUBLICATION_PARENT_UNRESOLVED = "PUBLICATION_PARENT_UNRESOLVED"
+VERDICT_REMOTE_IDENTITY_UNRESOLVED = "REMOTE_IDENTITY_UNRESOLVED"
+VERDICT_REPO_MISMATCH = "REPO_MISMATCH"
+VERDICT_READY = "READY"
+
+#: R1's exact "publication was attempted and never synced" evidence. The
+#: comparison is an exact string on purpose: any other value (``SYNCED``, an
+#: unrecognised status) is not this evidence and falls through to the general
+#: legacy verdict rather than being read as a claim.
+LEGACY_SYNC_REQUIRED = "SOURCE_SYNC_REQUIRED"
+
+
+class CanonicalSourceRefusal(ValueError):
+    """A LIVE revision's canonical source is not admissible.
+
+    Carries the stable error code so ``reserve()`` and the user-facing copy
+    both read the same classification instead of re-deriving it.
+    """
+
+    def __init__(self, error_code: str, message: str = ""):
+        self.error_code = error_code
+        super().__init__(message or error_code)
+
+
+@dataclass(frozen=True)
+class CanonicalSourceVerdict:
+    """One admission verdict. Pure data, no side effects."""
+
+    verdict: str
+    error_code: Optional[str] = None
+
+    @property
+    def ready(self) -> bool:
+        return self.verdict == VERDICT_READY
+
+
+READY = CanonicalSourceVerdict(VERDICT_READY)
+
+
+def _verdict(verdict: str, error_code: str) -> CanonicalSourceVerdict:
+    return CanonicalSourceVerdict(verdict, error_code)
+
+
+def _complete_release_admission(record: Dict[str, Any]) -> CanonicalSourceVerdict:
+    """Every way a COMPLETE R2 release can still be unusable as a source.
+
+    Nothing here is loosened relative to ``validate_last_live_release``; this
+    only re-reads the same fields to name WHICH identity is missing, so the
+    refusal is specific instead of a generic "not ready".
+
+    ``publication_parent is None`` is VALID and is not refused: that is a root
+    publication, which is the normal shape of a project's first LIVE release.
+    Only a non-null parent that is not a commit id is unresolved.
+    """
+    if not _is_sha1(record.get("publication_commit")):
+        return _verdict(VERDICT_NO_PUBLICATION_COMMIT,
+                        CANONICAL_SOURCE_COMMIT_MISSING)
+    parent = record.get("publication_parent")
+    if parent is not None and not _is_sha1(parent):
+        return _verdict(VERDICT_PUBLICATION_PARENT_UNRESOLVED,
+                        CANONICAL_SOURCE_PARENT_UNRESOLVED)
+    repo = record.get("publication_repo")
+    if not isinstance(repo, str) or not _REPO_RE.fullmatch(repo):
+        return _verdict(VERDICT_REMOTE_IDENTITY_UNRESOLVED,
+                        CANONICAL_SOURCE_REPO_UNRESOLVED)
+    branch = record.get("publication_branch")
+    if (not isinstance(branch, str) or not _BRANCH_RE.fullmatch(branch)
+            or branch.startswith("preview/")):
+        return _verdict(VERDICT_REMOTE_IDENTITY_UNRESOLVED,
+                        CANONICAL_SOURCE_REPO_UNRESOLVED)
+    if not _is_sha1(record.get("publication_tree")):
+        return _verdict(VERDICT_NO_PUBLICATION_COMMIT,
+                        CANONICAL_SOURCE_COMMIT_MISSING)
+    if not _is_sha1(record.get("tested_commit")) or not _is_sha1(record.get("tested_tree")):
+        return _verdict(VERDICT_NO_PUBLICATION_COMMIT,
+                        CANONICAL_SOURCE_COMMIT_MISSING)
+    if not _is_sha256(record.get("source_sha256")) or not _is_sha256(
+            record.get("artifact_sha256")):
+        return _verdict(VERDICT_NO_PUBLICATION_COMMIT,
+                        CANONICAL_SOURCE_COMMIT_MISSING)
+    return READY
+
+
+def canonical_source_verdict(state: Any) -> CanonicalSourceVerdict:
+    """Whether a LIVE revision has an admissible exact source. Pure read.
+
+    Locked precedence:
+
+    1. ``NO_LIVE_RELEASE`` -- no release record at all.
+    2. ``SOURCE_SYNC_REQUIRED`` -- R1 proved a publication was attempted and
+       never synced. The R1 evidence is read from
+       ``deployment.legacy_source_sync`` (projected by the lazy migration) and
+       applies ONLY inside the ``LEGACY_PARTIAL`` branch.
+    3. ``LEGACY_RELEASE_IDENTITY`` -- an R1 record with no more specific
+       evidence.
+    4. ``PUBLICATION_NOT_CONFIGURED`` -- a COMPLETE R2 release whose
+       publication was never configured, so it has no Git identity to hydrate.
+    5. A COMPLETE release whose identity is missing or malformed.
+    6. ``READY``.
+
+    The ``LEGACY_PARTIAL`` gate on 2 and 3 is load-bearing, and is defended
+    twice over. A project that was R1 and later earned a genuine R2 COMPLETE
+    release still carries whatever ``legacy_source_sync`` its R1 state left
+    behind, so reading that evidence without the branch gate would refuse a
+    perfectly good R2 release. The second defense is ``commit_release``, which
+    removes the R1 evidence on the single successful COMPLETE COMMITTED save.
+    """
+    record = (getattr(state, "deployment", None) or {}).get("last_live_release")
+    if not isinstance(record, dict):
+        return _verdict(VERDICT_NO_LIVE_RELEASE, CANONICAL_SOURCE_NO_LIVE_RELEASE)
+    completeness = record.get("completeness")
+
+    if completeness == COMPLETENESS_LEGACY_PARTIAL:
+        legacy_sync = (getattr(state, "deployment", None) or {}).get(
+            "legacy_source_sync")
+        if isinstance(legacy_sync, dict) and legacy_sync.get("sync_status") == LEGACY_SYNC_REQUIRED:
+            return _verdict(VERDICT_SOURCE_SYNC_REQUIRED,
+                            CANONICAL_SOURCE_SYNC_REQUIRED)
+        return _verdict(VERDICT_LEGACY_RELEASE_IDENTITY,
+                        CANONICAL_SOURCE_LEGACY_IDENTITY)
+
+    if completeness != COMPLETENESS_COMPLETE:
+        # Neither COMPLETE nor LEGACY_PARTIAL: the record states no usable
+        # completeness, and an unrecognised one is never read as the strictest.
+        return _verdict(VERDICT_NO_PUBLICATION_COMMIT,
+                        CANONICAL_SOURCE_COMMIT_MISSING)
+
+    if record.get(PUBLICATION_CONFIGURED_FIELD) is False:
+        return _verdict(VERDICT_PUBLICATION_NOT_CONFIGURED,
+                        CANONICAL_SOURCE_NOT_PUBLISHED)
+    return _complete_release_admission(record)
+
+
+def canonical_source_repo_verdict(state: Any,
+                                  configured_repo: Optional[str]) -> CanonicalSourceVerdict:
+    """Whether the recorded repo names the operator-configured remote.
+
+    Pure and offline. Separate from ``canonical_source_verdict`` because
+    comparing against configuration is not a read of durable project state.
+
+    A project with a COMPLETE configured release but no configured remote
+    cannot be compared here, and is not refused for it: the hydrate-time
+    repository-identity check (``HYDRATION_REPO_MISMATCH``) is the authority
+    there, and inventing a refusal here would duplicate it in a place that
+    cannot see the configuration.
+    """
+    if not isinstance(configured_repo, str) or not configured_repo:
+        return READY
+    record = (getattr(state, "deployment", None) or {}).get("last_live_release")
+    if not isinstance(record, dict):
+        return READY
+    if record.get("publication_repo") != configured_repo:
+        return _verdict(VERDICT_REPO_MISMATCH, CANONICAL_SOURCE_REPO_MISMATCH)
+    return READY
+
+
 def _legacy_publication_configured(repository: Dict[str, Any]) -> Optional[bool]:
     """``True`` if R1 proves publication was configured, else ``None``.
 
@@ -935,6 +1124,15 @@ class ReleaseCoordinator:
             }
             state.deployment["last_live_release"] = dict(record)
             state.deployment.pop("pending_publication", None)
+            # D8': the R1 "publication was attempted and never synced" evidence
+            # is now STALE by construction. This save commits a genuine R2
+            # COMPLETE release, so the record that follows can no longer be
+            # refused for R1 evidence about a different generation of the
+            # project. It is removed HERE, after every validation above
+            # succeeded and in the same atomic write as the release itself --
+            # a refused or failed commit raises before reaching this line, so
+            # the evidence survives exactly as long as the refusal it explains.
+            state.deployment.pop("legacy_source_sync", None)
             self.store.save(state)
         return dict(record)
     # -- internals -----------------------------------------------------

@@ -94,6 +94,25 @@ def _migrate_release_identity(data: Dict[str, Any]) -> Dict[str, Any]:
                 "confirmed_at": repository.get("synced_at"),
             }
 
+    # R1 recorded WHY a publication did not land in exactly one field:
+    # ``state.repository["sync_status"]``. ``SOURCE_SYNC_REQUIRED`` is the only
+    # value that carries a fact ("a publication was attempted and never
+    # synced"); it is projected into the freeform ``deployment`` bag BEFORE the
+    # repository bag is emptied, because after this point nothing could read it.
+    #
+    # Three rules keep the projection honest:
+    #   * never OVERWRITE an existing value -- a later record is the newer fact;
+    #   * ABSENT stays unknown -- an empty/absent ``sync_status`` writes
+    #     nothing, and ``False`` is never a projection of "no sync status"
+    #     because R1 never had a way to record that;
+    #   * never touch ``pointer_mode`` (R2-C), which lives in the same bag and
+    #     is a monotonic marker that must survive this read untouched.
+    sync_status = repository.get("sync_status")
+    if isinstance(sync_status, str) and sync_status:
+        existing = deployment.get("legacy_source_sync")
+        if not isinstance(existing, dict) or not existing.get("sync_status"):
+            deployment["legacy_source_sync"] = {"sync_status": sync_status}
+
     # ``state.repository`` is retired. The dataclass field stays (so
     # ``from_dict(**data)`` never breaks on an old file) but its contents are
     # dropped for EVERY record, migrated or not: nothing reads it, and a stale

@@ -13,6 +13,9 @@ from unittest.mock import MagicMock, patch
 from app.core.contracts import OperationResult
 from app.core.lifecycle import ProjectLifecycle
 from app.core.state import ProjectStateStore
+# Aliased: pytest tries to collect a class whose name starts with "Test", and
+# ``TestedSnapshot`` is a dataclass, not a test case.
+from app.deploy.snapshot import TestedSnapshot as Snapshot
 from app.projects.revise import RevisionOrchestrator
 from app.sandbox.runner import ProjectRunner
 
@@ -69,12 +72,24 @@ class RevisionOrchestratorTestBase(unittest.TestCase):
 
     def _preview_ready(self, project_id: str) -> Path:
         ws = _make_workspace(self.tmpdir, project_id)
+        snapshot = Snapshot.capture(ws)
         with self.store.acquire_writer(project_id) as state:
             state.brief = {"name": "Northcut", "what": "barbershop", "why": "booking WA"}
             state.design_dna = {"version": 1, "typography": {"heading_font": "Inter", "body_font": "Inter"}}
             state.lifecycle = ProjectLifecycle.RUNNING.value
             state.lifecycle = ProjectLifecycle.PREVIEW_READY.value
             state.roles["owner"] = OWNER
+            # A DRAFT revision continues from the last tested snapshot, so
+            # PREVIEW_READY means "a tested snapshot and its ``checked``
+            # binding exist" -- exactly the shape real QA leaves behind.
+            # Without them ``reserve()`` has no admissible base and correctly
+            # refuses, which would make every ordering test below vacuous.
+            state.deployment["checked"] = {
+                "source_revision": state.revisions.source_revision,
+                "source_sha256": snapshot.source_sha256,
+                "artifact_sha256": snapshot.artifact_sha256,
+            }
+            state.deployment["tested_snapshot"] = snapshot.to_dict()
             self.store.save(state)
         return ws
 
