@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 
 from app.core import credentials
+from app.core.contracts import OperationResult
 from app.deploy.snapshot import TestedSnapshot
 
 # A friendly publication branch is a single lower-case Git ref path component,
@@ -32,6 +33,73 @@ def _publication_message(project_branch, source_revision, tested_commit,
         f'Source sha256: {source_sha256}\n'
         f'Artifact sha256: {artifact_sha256}\n'
     ).encode('utf-8')
+
+
+#: A LOCAL publication-input failure: the intended commit or parent this
+#: operation persisted is not a commit id.
+#:
+#: This is deliberately NOT ``PUBLICATION_HEAD_CONFLICT``. C and D classify
+#: what the REMOTE holds -- C is "we read it and it is not ours", D is "we could
+#: not read it". A malformed local identity means nothing was read at all, and
+#: labelling it C sends an operator to inspect GitHub instead of the state
+#: record that is actually corrupt.
+PUBLICATION_INPUT_INVALID = 'PUBLICATION_INPUT_INVALID'
+
+#: The remote accepted the push, but the LOCAL mirror ref could not be written.
+#: The branch is durable history and is never rolled back for this: the record
+#: stays at PREPARED, and the retry re-pushes, is rejected as a non-fast-forward
+#: (the remote already holds the intended commit), and adopts as case A.
+PUBLICATION_LOCAL_REF_UPDATE_FAILED = 'PUBLICATION_LOCAL_REF_UPDATE_FAILED'
+
+
+def _verdict(verdict: str, error_code: str, **data) -> OperationResult:
+    """One classified reconciliation failure carrying its verdict.
+
+    C and D stay distinct all the way out: ``C_CONFLICT`` means the remote was
+    read and holds an unexpected state, ``D_UNAVAILABLE`` means it could not be
+    read. ``OperationResult.fail`` has no ``data`` parameter, so the result is
+    constructed directly rather than losing the verdict on the way.
+    """
+    return OperationResult(
+        success=False, error=error_code, error_code=error_code,
+        data={'verdict': verdict, **data},
+    )
+
+
+def _local_input_invalid(reason: str) -> OperationResult:
+    """A refusal to reconcile because the LOCAL identity is unusable.
+
+    Carries no verdict: nothing was read, so there is nothing to classify
+    against the A/B/C/D matrix. Constructed directly for the same reason
+    ``_verdict`` is -- ``OperationResult.fail`` takes no ``data``.
+    """
+    return OperationResult(
+        success=False, error=reason, error_code=PUBLICATION_INPUT_INVALID,
+        data={'verdict': None, 'local_reason': reason},
+    )
+
+
+def _push_rejected(rejected_as: str) -> OperationResult:
+    """One classified push failure. Only the rejection KIND is ever exposed."""
+    return OperationResult(
+        success=False, error='PUBLICATION_PUSH_REJECTED',
+        error_code='PUBLICATION_PUSH_FAILED', data={'rejected_as': rejected_as},
+    )
+
+
+def _local_ref_update_failed() -> OperationResult:
+    """A local mirror-ref write that failed after an ACCEPTED remote push.
+
+    Reported as a push failure so ``GIT_CONFIRMED`` is not persisted, which is
+    honest: the durable record of the confirmation is exactly what was lost. It
+    stays recoverable because the retry reaches case A, and the remote branch is
+    never rolled back to make the local state look tidy.
+    """
+    return OperationResult(
+        success=False, error=PUBLICATION_LOCAL_REF_UPDATE_FAILED,
+        error_code=PUBLICATION_LOCAL_REF_UPDATE_FAILED,
+        data={'rejected_as': 'OTHER'},
+    )
 
 
 class OutputGitRepository:
@@ -150,10 +218,26 @@ class OutputGitRepository:
     # checkout is used, the remote is never read from generated project
     # files, and the Hermes repository is never touched.
     #
-    # The parent comes from the caller (the last SYNCED publication recorded
-    # in project state), NOT from the local ref and NOT from a remote read.
-    # That is what keeps the branch honest: a revision whose push failed
-    # never enters the friendly branch's ancestry.
+    # The parent comes from the caller (``deployment.publication_head`` in
+    # project state, the last publication commit CONFIRMED on the remote
+    # branch), NOT from the local ref and NOT from a remote read. That is what
+    # keeps the branch honest: a revision whose push failed never enters the
+    # friendly branch's ancestry.
+    #
+    # Publication is three explicit steps, and only the middle one touches the
+    # remote on the happy path:
+    #
+    #   1. ``prepare_publication``  -- local only; builds the one intended
+    #      commit and proves its tree equals the tested tree.
+    #   2. ``push_prepared_publication`` -- one plain non-force push. An
+    #      ACCEPTED push is the proof: it can only have succeeded as a
+    #      fast-forward from the parent we built against.
+    #   3. ``reconcile_publication_head`` -- the ONLY remote read, used on
+    #      resume/recovery and on a rejected push to classify A/B/C/D and fail
+    #      closed on anything that is not provably ours.
+    #
+    # There is deliberately no re-parent path. A conflicting remote head is a
+    # conflict to report, not a commit to build on top of.
 
     _PUSH_REJECTION_MARKERS = ('(non-fast-forward)', '(fetch first)')
 
@@ -247,8 +331,30 @@ class OutputGitRepository:
         return False
 
     def _remote_head(self, url, branch, extra):
-        """The remote branch head SHA, or None when the branch is absent or
-        unreadable.
+        """Classify the remote branch head. Never returns a bare ``None``.
+
+        Returns one of:
+
+            ``("HEAD", sha)``       -- the branch exists; ``sha`` is its head.
+            ``("ABSENT", None)``    -- the remote answered, and the answer was
+                                       trustworthy, and the branch is not there.
+            ``("UNREADABLE", None)``-- the remote could not be read at all
+                                       (transport/auth failure) OR it answered
+                                       with output we cannot parse as ref data.
+
+        Collapsing the last two into a single ``None`` is the R1 defect this
+        split fixes: "the branch is gone" and "we could not ask" license
+        completely different actions (a root push vs. fail closed).
+
+        The parse is strict, and the strictness is load-bearing. ``ls-remote``
+        with a ref pattern prints nothing at all when the pattern matches
+        nothing, so *empty* output is a genuine, trustworthy ABSENT. Output that
+        is present but not shaped like ``<40-hex><TAB-or-space><ref>`` is
+        something else entirely -- a proxy, a wrapper, a corrupted transport --
+        and it is UNREADABLE, because a reader that cannot understand the reply
+        has learned nothing about the branch. Treating it as ABSENT would let an
+        unreadable remote authorise either a conflict verdict (we read it, it is
+        wrong) or, with no parent yet, a root push at a branch of unknown state.
 
         This is a REF-HEAD reconcile only: it returns a 40-character SHA and
         no file content. It is never a fetch, clone, pull, archive or any
@@ -259,38 +365,31 @@ class OutputGitRepository:
             check=False, extra=extra,
         )
         if result.returncode != 0:
-            return None
+            return ('UNREADABLE', None)
+        malformed = False
         for line in result.stdout.decode('utf-8', 'replace').splitlines():
-            fields = line.split()
-            if len(fields) != 2 or fields[1] != 'refs/heads/' + branch:
+            if not line.strip():
                 continue
-            sha = fields[0]
-            if re.fullmatch(r'[0-9a-f]{40}', sha):
-                return sha
-        return None
+            fields = line.split()
+            if len(fields) != 2 or not re.fullmatch(r'[0-9a-f]{40}', fields[0]):
+                # Present, but not ref data. Nothing about the branch can be
+                # concluded from it, so nothing is concluded.
+                malformed = True
+                continue
+            if fields[1] == 'refs/heads/' + branch:
+                return ('HEAD', fields[0])
+        if malformed:
+            return ('UNREADABLE', None)
+        # The remote answered with ref data (or with nothing at all) and named
+        # no such branch: that is a trustworthy ABSENT.
+        return ('ABSENT', None)
 
-    def publish_project_branch(self, tested_commit, branch, url, *, source_revision=None,
-                               source_sha256=None, artifact_sha256=None,
-                               previous_publication_commit=None, ssh_key=None,
-                               extra_env=None):
-        """Publish one LIVE revision to the friendly ``<project-slug>`` branch.
+    def _publication_inputs(self, tested_commit, branch, url, previous_publication_commit):
+        """Validate every publication input and return the shared identity.
 
-        Publishes the EXACT tested snapshot commit that was approved and
-        promoted -- never mutable workspace contents, never an untested
-        build. Returns the two identities plus the shared tree:
-
-            {'branch', 'repo', 'tested_commit', 'publication_commit', 'tree',
-             'parent', 'reparented'}
-
-        ``previous_publication_commit`` is the parent for the new publication
-        commit, or None for the first publication (a root commit). It must be
-        a commit this repository already holds: a parent we do not have is a
-        hard error, never a reason to fetch.
-
-        ``extra_env`` is additional git configuration for the push subprocess
-        (applied after the ``GIT_*`` environment strip), e.g. an
-        ``insteadOf`` mirror of the configured remote. It is never populated
-        from generated project files and never carries a credential.
+        No network, no push, no ref update: this is the validation half of
+        publication, factored out so ``prepare_publication`` is the only entry
+        point that decides whether an intended publication is well-formed.
         """
         if not isinstance(url, str) or not re.fullmatch(
                 r'git@github\.com:([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)\.git', url):
@@ -322,59 +421,182 @@ class OutputGitRepository:
                 # No fetch, ever: an unavailable parent is an operator
                 # decision, not something to paper over.
                 raise ValueError('Unknown previous publication commit')
+        return repo_name, parent
 
+    def prepare_publication(self, tested_commit, branch, url, *, source_revision=None,
+                            source_sha256=None, artifact_sha256=None,
+                            previous_publication_commit=None, ssh_key=None,
+                            extra_env=None):
+        """Build and return the ONE intended publication commit, with no side
+        effects beyond writing that commit object into the local repository.
+
+        The commit is deterministic (pinned identity/dates in ``_run``, fixed
+        message in ``_publication_message``), so preparing the same inputs
+        twice always yields the same SHA. That is what makes case A below
+        possible: after a crash that lost the ``GIT_CONFIRMED`` write, the
+        retried operation rebuilds the *identical* commit and the remote is
+        found to already hold it, rather than forking a competing publication.
+
+        Returns:
+
+            {'branch', 'repo', 'tested_commit', 'tested_tree', 'tree',
+             'parent', 'publication_commit'}
+
+        No network access happens here: no push, no ``ls-remote``, no fetch.
+        """
+        repo_name, parent = self._publication_inputs(
+            tested_commit, branch, url, previous_publication_commit)
         # The exact tree of the approved tested commit, reused verbatim.
         tree = self._run(['rev-parse', str(tested_commit) + '^{tree}']).strip().decode()
-        extra = self._ssh_env(ssh_key)
-        if extra_env:
-            extra = dict(extra or {}, **extra_env)
         publication = self._build_publication_commit(
             tree, branch, parent, source_revision=source_revision,
             tested_commit=tested_commit, source_sha256=source_sha256,
             artifact_sha256=artifact_sha256)
-        # Cheap, and the whole point of the contract: the published commit's
+        # Cheap, and the whole point of the contract: the publication commit's
         # tree is the tested commit's tree.
         if self._run(['rev-parse', publication + '^{tree}']).strip().decode() != tree:
             raise ValueError('Publication commit tree does not match tested tree')
-
-        reparented = False
-        try:
-            self._push_publication(url, publication, branch, extra)
-        except subprocess.CalledProcessError as exc:
-            if not self._rejected_as_non_fast_forward(exc):
-                raise
-            # Bounded reconcile for the one case a fast-forward push cannot
-            # self-heal: the remote accepted an earlier publication and the
-            # local record of it was lost (a crash between the push and the
-            # caller's state write). Re-parent onto the remote head and push
-            # once more. The remote is never rewritten, only extended, and
-            # only with a commit that holds the same tested tree.
-            remote_head = self._remote_head(url, branch, extra)
-            if remote_head is None or remote_head == parent:
-                raise
-            if not self._has_commit(remote_head):
-                # An unknown remote head cannot be extended from here, and
-                # fetching is R2 behavior. Fail closed.
-                raise ValueError('Remote publication head is not available locally')
-            publication = self._build_publication_commit(
-                tree, branch, remote_head, source_revision=source_revision,
-                tested_commit=tested_commit, source_sha256=source_sha256,
-                artifact_sha256=artifact_sha256)
-            if self._run(['rev-parse', publication + '^{tree}']).strip().decode() != tree:
-                raise ValueError('Publication commit tree does not match tested tree')
-            self._push_publication(url, publication, branch, extra)
-            parent, reparented = remote_head, True
-
-        # Object retention and a local human-visible mirror of the branch.
-        # This ref is NOT the parent authority: the caller persists the
-        # publication commit and passes it back as the parent next time.
-        self._run(['update-ref', 'refs/heads/' + branch, publication])
         return {
             'branch': branch,
             'repo': repo_name,
             'tested_commit': tested_commit,
+            'tested_tree': tree,
             'publication_commit': publication,
             'tree': tree,
             'parent': parent,
-            'reparented': reparented,
         }
+
+    def push_prepared_publication(self, url, commit, branch, *, ssh_key=None,
+                                  extra_env=None):
+        """Push one already-prepared publication commit. Returns an
+        ``OperationResult`` whose ``data["rejected_as"]`` is ``None`` on
+        success, ``"NON_FAST_FORWARD"`` when the branch moved, or
+        ``"OTHER"`` for every other refusal.
+
+        On success this performs NO remote read. A plain fast-forward push
+        already proves the remote's previous head was exactly the parent we
+        built against, so a verification round-trip would be a redundant
+        network call and a second source of truth for a settled fact.
+        """
+        extra = self._ssh_env(ssh_key)
+        if extra_env:
+            extra = dict(extra or {}, **extra_env)
+        try:
+            self._push_publication(url, commit, branch, extra)
+        except subprocess.CalledProcessError as exc:
+            rejected_as = (
+                'NON_FAST_FORWARD' if self._rejected_as_non_fast_forward(exc) else 'OTHER'
+            )
+            return _push_rejected(rejected_as)
+        except Exception:
+            # A transport failure that is not a clean non-zero exit (an ssh
+            # connection error, a missing key, a timeout). Classified, not
+            # propagated: the caller decides terminal-vs-reconcile from the
+            # classification, and only the rejection KIND is ever surfaced --
+            # a git failure's message can embed the remote and local paths.
+            return _push_rejected('OTHER')
+        # Object retention and a local human-visible mirror of the branch.
+        # This ref is NOT the parent authority: the caller persists the
+        # publication commit in ``publication_head`` and passes it back as the
+        # parent next time.
+        #
+        # A failure here is classified, never propagated. The push has already
+        # been accepted, so the only thing lost is a local convenience ref and
+        # the caller's ability to persist GIT_CONFIRMED on this attempt; the
+        # remote branch is durable history and is NEVER rolled back to make the
+        # local state look consistent. The retry re-pushes, is refused as a
+        # non-fast-forward, and adopts the existing commit as case A.
+        try:
+            self._run(['update-ref', 'refs/heads/' + branch, commit])
+        except Exception:
+            return _local_ref_update_failed()
+        return OperationResult.ok({'rejected_as': None, 'publication_commit': commit})
+
+    def reconcile_publication_head(self, url, branch, intended_commit, intended_parent,
+                                   *, ssh_key=None, extra_env=None,
+                                   already_confirmed=False):
+        """Classify the remote branch head against one intended publication.
+
+        Read-only, and the ONLY entry point that reads the remote. Runs on
+        resume/recovery and on a rejected push -- never on the ordinary
+        successful path.
+
+        Returns an ``OperationResult`` with ``data['verdict']``:
+
+            ``A_ADOPT``       the remote already holds ``intended_commit``;
+                              the publication is confirmed, no push is needed.
+            ``B_RETRY``       the remote still holds ``intended_parent`` (or
+                              the branch is absent and there is no parent), so
+                              the exact intended commit is a clean fast-forward.
+            ``C_CONFLICT``    the remote holds something else entirely.
+            ``D_UNAVAILABLE`` the remote could not be read or trusted.
+
+        C and D are deliberately distinct: C means we READ the remote and it
+        holds an unexpected state, D means we could not read it and therefore
+        assert nothing. They map to distinct error codes
+        (``PUBLICATION_HEAD_CONFLICT`` / ``PUBLICATION_HEAD_UNREADABLE``) and
+        must never be merged.
+
+        ``already_confirmed`` narrows the matrix to the RESUME semantics, and
+        the narrowing is a safety property, not a convenience. It says the
+        persisted stage already asserts the push landed, so anything other than
+        ``intended_commit`` means the remote changed AFTER confirmation -- which
+        is a conflict to report, never a commit to re-establish. B_RETRY is
+        therefore never returned in that mode: re-pushing a branch a previous
+        process already published is exactly the second publication the stage
+        machine exists to prevent. B_RETRY remains for reconciliation while
+        still at PREPARED, after a rejected initial push, where the remote
+        genuinely has not seen the commit yet.
+        """
+        if not re.fullmatch(r'[0-9a-f]{40}', str(intended_commit or '')):
+            # LOCAL, not remote: nothing is read, and nothing is asserted about
+            # the branch. Raising here is what used to happen, and it escaped
+            # the whole stage machine as a TypeError.
+            return _local_input_invalid('Invalid intended publication commit')
+        if intended_parent is not None and not re.fullmatch(
+                r'[0-9a-f]{40}', str(intended_parent)):
+            return _local_input_invalid('Invalid intended publication parent')
+        extra = self._ssh_env(ssh_key)
+        if extra_env:
+            extra = dict(extra or {}, **extra_env)
+        state, head = self._remote_head(url, branch, extra)
+        if state == 'UNREADABLE':
+            return _verdict(
+                'D_UNAVAILABLE', 'PUBLICATION_HEAD_UNREADABLE',
+                remote_state=state,
+            )
+        if state == 'HEAD':
+            if head == intended_commit:
+                return OperationResult.ok(
+                    {'verdict': 'A_ADOPT', 'remote_head': head, 'remote_state': state})
+            if already_confirmed:
+                # The remote moved after this operation was told the commit was
+                # there. Reported, never re-published.
+                return _verdict(
+                    'C_CONFLICT', 'PUBLICATION_HEAD_CONFLICT',
+                    remote_head=head, remote_state=state,
+                )
+            if intended_parent is not None and head == intended_parent:
+                return OperationResult.ok(
+                    {'verdict': 'B_RETRY', 'remote_head': head, 'remote_state': state})
+            # A valid head we did not intend. Not adoptable, not retryable,
+            # and never a reason to re-parent onto it.
+            return _verdict(
+                'C_CONFLICT', 'PUBLICATION_HEAD_CONFLICT',
+                remote_head=head, remote_state=state,
+            )
+        # ABSENT. A first-ever publication (no parent) is a clean root push;
+        # an absent branch that was supposed to exist means the remote lost
+        # confirmed history, which we never silently re-create.
+        if already_confirmed:
+            return _verdict(
+                'C_CONFLICT', 'PUBLICATION_HEAD_CONFLICT',
+                remote_head=None, remote_state='ABSENT',
+            )
+        if intended_parent is None:
+            return OperationResult.ok(
+                {'verdict': 'B_RETRY', 'remote_head': None, 'remote_state': 'ABSENT'})
+        return _verdict(
+            'C_CONFLICT', 'PUBLICATION_HEAD_CONFLICT',
+            remote_head=None, remote_state='ABSENT',
+        )

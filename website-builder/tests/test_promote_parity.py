@@ -23,6 +23,9 @@ from app.deploy.adapters import HttpResponse, VercelAdapter
 from app.projects.promote import (
     PREVIOUS_PRODUCTION_BOOTSTRAP, PromoteDeps, PromotionOrchestrator,
 )
+from app.projects.release import (
+    STAGE_PRODUCTION_CONFIRMED, build_pending_publication,
+)
 from app.sandbox.runner import ProjectRunner
 
 # --- the exact p9 identity under test -------------------------------------
@@ -510,7 +513,15 @@ class FakeSmoke:
 def _seed_p9_state(store, project_id=P9):
     """p9 exactly as it is on disk: FAILED, PROMOTE_NOT_APPLIED, an intact
     promotion_intent still at stage ``publishing``, KNOWN_BOOTSTRAP previous
-    production and no production_url."""
+    production and no production_url.
+
+    R2: a resumable operation must also carry an INTACT pending publication,
+    otherwise there is no record of which commit was intended for the branch or
+    how far the Git stage got. This install publishes no source (no remote, no
+    deploy key), so the publication is NOT_CONFIGURED. p9's promote was issued
+    and terminally failed, so the Git stage it passed is complete and the stage
+    it reached is PRODUCTION_CONFIRMED.
+    """
     shown = {
         'operation_id': P9_OPERATION_ID,
         'source_revision': P9_SOURCE_REVISION,
@@ -539,6 +550,15 @@ def _seed_p9_state(store, project_id=P9):
             'stage': 'publishing',
             'created_at': 3.0,
         }
+        pending = build_pending_publication(
+            operation_id=P9_OPERATION_ID,
+            source_revision=P9_SOURCE_REVISION,
+            source_sha256=P9_SOURCE,
+            artifact_sha256=P9_ARTIFACT,
+            now=3.0,
+        )
+        pending['stage'] = STAGE_PRODUCTION_CONFIRMED
+        state.deployment['pending_publication'] = pending
         state.failure = {
             'phase': 'promotion', 'error': 'PROMOTE_FAILED',
             'error_code': 'PROMOTE_NOT_APPLIED', 'failed_at': 4.0,

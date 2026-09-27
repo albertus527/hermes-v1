@@ -40,7 +40,10 @@ from app.core.contracts import OperationResult  # noqa: E402
 from app.core.intake import IntakeProcessor  # noqa: E402
 from app.core.lifecycle import ProjectLifecycle  # noqa: E402
 from app.core.state import ProjectStateStore  # noqa: E402
-from app.deploy.git_output import OutputGitRepository  # noqa: E402
+from app.deploy.git_output import (  # noqa: E402
+    OutputGitRepository,
+    _push_rejected,
+)
 from app.deploy.snapshot import TestedSnapshot  # noqa: E402
 from app.projects.promote import PromoteDeps, PromotionOrchestrator  # noqa: E402
 from app.runtime import TelegramReceiveLoop  # noqa: E402
@@ -50,6 +53,7 @@ from test_promote import (  # noqa: E402
     FakeSmoke,
     FakeTelegram,
     FakeVercel,
+    FlakyPromoteVercel,
     _make_workspace,
 )
 
@@ -103,31 +107,67 @@ class _PublishingRepo(OutputGitRepository):
     """Real OutputGitRepository that records every git invocation.
 
     The recording is what lets the tests assert what the publication path does
-    NOT do (no fetch, no clone, no force) instead of merely what it does.
+    NOT do (no fetch, no clone, no force, no remote read on the happy path)
+    instead of merely what it does.
+
+    Every entry point is routed through the ``insteadOf`` mirror so the code
+    under test still validates and pushes the exact operator-configured
+    GitHub SSH remote; only the transport target differs.
     """
 
     def __init__(self, path, hermes_root, remote):
         self.git_calls: list[list[str]] = []
-        self.publish_calls: list[dict] = []
+        self.prepare_calls: list[dict] = []
+        self.push_calls: list[dict] = []
+        self.reconcile_calls: list[dict] = []
         self.raise_on_publish = None
+        self._reject_next_push = False
         super().__init__(path, hermes_root=hermes_root)
         self.remote = remote
 
+    def reject_next_publication_push(self):
+        """Model a push the server refused AFTER updating the branch.
+
+        The client is told the push failed while the remote in fact holds the
+        intended commit. That is the only way the A_ADOPT arm of the rejected-
+        push path is reachable -- a plain re-push of a commit the remote
+        already holds is accepted as a no-op -- and it is exactly the ambiguity
+        the durable record exists for: the side effect happened and the client
+        cannot prove it.
+        """
+        self._reject_next_push = True
+
     def _run(self, args, data=None, extra=None, init=False, check=True):
         self.git_calls.append(list(args))
-        # Every push is aimed at the real remote through the mirror, and no
-        # publication path may use a force flag or a ``+`` refspec.
-        if "push" in args:
-            if self.raise_on_publish is not None:
-                raise self.raise_on_publish
+        # A transport failure is raised from the subprocess seam, exactly where
+        # ssh would fail, so the code under test's own classification decides
+        # what it means rather than the harness deciding for it.
+        if "push" in args and self.raise_on_publish is not None:
+            raise self.raise_on_publish
         return super()._run(args, data=data, extra=extra, init=init, check=check)
 
-    def publish_project_branch(self, tested_commit, branch, url, **kwargs):
-        self.publish_calls.append(
-            {"tested_commit": tested_commit, "branch": branch, "url": url, **kwargs}
+    def prepare_publication(self, *args, **kwargs):
+        self.prepare_calls.append(dict(kwargs, tested_commit=args[0],
+                                       branch=args[1], url=args[2]))
+        return super().prepare_publication(*args, **kwargs)
+
+    def push_prepared_publication(self, url, commit, branch, **kwargs):
+        self.push_calls.append({"commit": commit, "branch": branch, "url": url})
+        if self._reject_next_push:
+            self._reject_next_push = False
+            return _push_rejected("NON_FAST_FORWARD")
+        return super().push_prepared_publication(
+            url, commit, branch,
+            **{**kwargs, "extra_env": _mirror_env(self.remote)},
         )
-        return super().publish_project_branch(
-            tested_commit, branch, url,
+
+    def reconcile_publication_head(self, url, branch, intended_commit,
+                                   intended_parent, **kwargs):
+        self.reconcile_calls.append(
+            {"branch": branch, "intended_commit": intended_commit,
+             "intended_parent": intended_parent})
+        return super().reconcile_publication_head(
+            url, branch, intended_commit, intended_parent,
             **{**kwargs, "extra_env": _mirror_env(self.remote)},
         )
 
@@ -136,11 +176,25 @@ class _PublishingRepo(OutputGitRepository):
     def push_argvs(self) -> list[list[str]]:
         return [args for args in self.git_calls if "push" in args]
 
+    def remote_reads(self) -> list[list[str]]:
+        """Every invocation that reads the remote, for the zero-read assertion."""
+        return [args for args in self.git_calls
+                if args and args[0] in ("ls-remote", "fetch", "clone", "pull", "archive")]
+
     def ref_heads(self, ref: str) -> str:
         return self._run(["rev-parse", ref]).strip().decode()
 
     def tree_of(self, commit: str) -> str:
         return self._run(["rev-parse", f"{commit}^{{tree}}"]).strip().decode()
+
+
+class _SimulatedCrash(RuntimeError):
+    """A process that died mid-write.
+
+    Raised from the storage seam, not from the code under test, so the recovery
+    path runs exactly as it would after a real crash: the durable record is
+    whatever was last successfully written, and nothing in memory survives.
+    """
 
 
 class _FailingGitRepo(_PublishingRepo):
@@ -150,6 +204,37 @@ class _FailingGitRepo(_PublishingRepo):
         super().__init__(path, hermes_root, remote)
         self.raise_on_publish = RuntimeError("ssh: connect to host github.com:22")
 
+
+class _DropStageStore(ProjectStateStore):
+    """A real state store that can lose ONE stage write.
+
+    Models the failure the durable publication intent exists for: the remote
+    side effect happened, and the record of it was lost. The write is dropped
+    at the storage seam rather than by patching the code under test, so the
+    recovery path runs for real and decides for itself.
+
+    With ``crash`` set to an exception CLASS, the process is taken down at the
+    same seam instead, which is what a real crash looks like: the durable record
+    is whatever was last written successfully, and nothing in memory survives to
+    be mistaken for progress. The class is injected rather than imported so a
+    caller in another test module can catch it with its own identity.
+    """
+
+    def __init__(self, root):
+        super().__init__(root)
+        self.drop_stage = None
+        self.crash = None
+        self.dropped = []
+
+    def save(self, state):
+        stage = ((state.deployment or {}).get("pending_publication") or {}).get("stage")
+        if self.drop_stage is not None and stage == self.drop_stage:
+            self.dropped.append(stage)
+            self.drop_stage = None
+            if self.crash is not None:
+                raise self.crash(f"process died before the {stage} write")
+            return
+        super().save(state)
 
 # ---------------------------------------------------------------------------
 # Fakes
@@ -212,9 +297,13 @@ class Live:
     """One project's store, workspace, real output repo and orchestrators."""
 
     def __init__(self, tmp_path, repo_factory=_PublishingRepo, vercel=None,
-                 smoke=None, github=True):
+                 smoke=None, github=True, store_factory=None, crash=None):
         self.tmp_path = tmp_path
-        self.store = ProjectStateStore(tmp_path / "state")
+        self.store = (store_factory or ProjectStateStore)(tmp_path / "state")
+        if crash is not None:
+            # ``store_factory`` may be a plain ProjectStateStore; a crash is
+            # only meaningful for the stage-dropping one.
+            self.store.crash = crash
         self.ws = _make_workspace(tmp_path)
         self.runner = ProjectRunner(tmp_path / "workspaces", self.store)
         self.remote = _bare_remote(tmp_path / "remote.git")
@@ -237,6 +326,11 @@ class Live:
             source_ssh_key=tmp_path / DEPLOY_KEY if github else None,
         )
         self.orch = PromotionOrchestrator(self.runner, self.store, self.deps)
+
+    def fresh_orchestrator(self):
+        """A new orchestrator over the SAME state root, as a restarted process
+        would build. Nothing in-memory carries over."""
+        return PromotionOrchestrator(self.runner, self.store, self.deps)
 
     # -- state construction --------------------------------------------------
 
@@ -379,38 +473,43 @@ def test_first_live_publication_creates_the_friendly_branch(live):
 
     assert live.approve_and_publish().success
 
-    record = live.state().repository
-    assert record["provider"] == "github"
-    assert record["repo"] == "albertus527/website"
-    assert record["branch"] == SLUG
-    assert record["tested_commit"] == git["commit"]
-    assert record["sync_status"] == "SYNCED"
-    assert record["source_revision"] == 1
-    assert record["publication_commit"]
-
+    release = live.state().deployment["last_live_release"]
+    assert release["publication_repo"] == "albertus527/website"
+    assert release["publication_branch"] == SLUG
+    assert release["tested_commit"] == git["commit"]
+    assert release["source_revision"] == 1
+    assert release["completeness"] == "COMPLETE"
+    assert release["publication_commit"]
     # The branch really exists on the remote, at a ROOT publication commit.
     head = _remote_git(live.remote, "rev-parse", f"refs/heads/{SLUG}")
-    assert head == record["publication_commit"]
+    assert head == release["publication_commit"]
     assert _remote_git(live.remote, "rev-list", "--count", f"refs/heads/{SLUG}") == "1"
-    assert not live.repo.publish_calls[0]["previous_publication_commit"]
+    # The branch-parent authority is the same commit, and the first
+    # publication has no parent.
+    assert live.state().deployment["publication_head"]["commit"] == \
+        release["publication_commit"]
+    assert release["publication_parent"] is None
+    assert not live.repo.prepare_calls[0]["previous_publication_commit"]
     # A publication commit is a different object from the tested commit...
-    assert record["publication_commit"] != git["commit"]
+    assert release["publication_commit"] != git["commit"]
     # ...that holds exactly the tested snapshot's tree.
-    assert live.repo.tree_of(record["publication_commit"]) == live.repo.tree_of(
+    assert live.repo.tree_of(release["publication_commit"]) == live.repo.tree_of(
         git["commit"])
+    assert release["publication_tree"] == live.repo.tree_of(git["commit"])
 
 
 def test_second_live_revision_advances_the_branch_and_keeps_history(live):
     git1 = live.show_preview(1, b"v=1", b"<html>1</html>")
     assert live.approve_and_publish().success
-    pub1 = live.state().repository["publication_commit"]
+    pub1 = live.state().deployment["last_live_release"]["publication_commit"]
 
     git2 = live.show_preview(2, b"v=2", b"<html>2</html>")
     assert live.approve_and_publish().success
-    pub2 = live.state().repository["publication_commit"]
+    release = live.state().deployment["last_live_release"]
+    pub2 = release["publication_commit"]
 
     assert pub2 != pub1
-    assert live.state().repository["tested_commit"] == git2["commit"]
+    assert release["tested_commit"] == git2["commit"]
     # Revision 1 stays in revision 2's ancestry.
     _remote_git(live.remote, "merge-base", "--is-ancestor", pub1, pub2)
     assert _remote_git(live.remote, "rev-list", "--count",
@@ -418,7 +517,8 @@ def test_second_live_revision_advances_the_branch_and_keeps_history(live):
     assert _remote_git(live.remote, "rev-parse", f"refs/heads/{SLUG}") == pub2
     # The new publication is chained to the previous one, not to the tested
     # snapshot commit.
-    assert live.repo.publish_calls[1]["previous_publication_commit"] == pub1
+    assert live.repo.prepare_calls[1]["previous_publication_commit"] == pub1
+    assert release["publication_parent"] == pub1
     assert _remote_git(live.remote, "rev-parse", f"{pub2}^") == pub1
 
 
@@ -430,9 +530,11 @@ def test_every_publication_commit_holds_its_tested_tree(live):
     ):
         git = live.show_preview(revision, source, artifact)
         assert live.approve_and_publish().success
-        record = live.state().repository
-        pairs.append((record["tested_commit"], record["publication_commit"], git))
-        assert record["publication_commit"] != record["tested_commit"]
+        release = live.state().deployment["last_live_release"]
+        pairs.append((release["tested_commit"], release["publication_commit"], git))
+        assert release["publication_commit"] != release["tested_commit"]
+        # The recorded tree IS the tested tree, by identity not by re-read.
+        assert release["publication_tree"] == release["tested_tree"]
 
     for tested, publication, git in pairs:
         assert live.repo.tree_of(publication) == live.repo.tree_of(tested)
@@ -459,17 +561,17 @@ def test_publication_is_never_force_moved(live):
 def test_persisted_publication_commit_is_the_next_parent(live):
     live.show_preview(1, b"v=1", b"<html>1</html>")
     assert live.approve_and_publish().success
-    first = live.state().repository["publication_commit"]
+    first = live.state().deployment["publication_head"]["commit"]
 
     live.show_preview(2, b"v=2", b"<html>2</html>")
     assert live.approve_and_publish().success
 
     # The parent the orchestrator passed came from persisted state, and the
     # commit it created is that state's successor.
-    assert live.repo.publish_calls[1]["previous_publication_commit"] == first
-    assert live.state().repository["publication_commit"] != first
-    assert _remote_git(live.remote, "rev-parse",
-                       f"{live.state().repository['publication_commit']}^") == first
+    assert live.repo.prepare_calls[1]["previous_publication_commit"] == first
+    second = live.state().deployment["publication_head"]["commit"]
+    assert second != first
+    assert _remote_git(live.remote, "rev-parse", f"{second}^") == first
 
 
 def test_published_source_is_the_tested_commit_of_the_approved_operation(live):
@@ -477,35 +579,44 @@ def test_published_source_is_the_tested_commit_of_the_approved_operation(live):
 
     assert live.approve_and_publish().success
 
-    assert live.repo.publish_calls[0]["tested_commit"] == git["commit"]
-    assert live.repo.publish_calls[0]["source_sha256"] == git["source_sha256"]
-    assert live.repo.publish_calls[0]["artifact_sha256"] == git["artifact_sha256"]
+    assert live.repo.prepare_calls[0]["tested_commit"] == git["commit"]
+    assert live.repo.prepare_calls[0]["source_sha256"] == git["source_sha256"]
+    assert live.repo.prepare_calls[0]["artifact_sha256"] == git["artifact_sha256"]
 
 
 def test_preview_intent_of_another_operation_is_never_published(tmp_path):
     """A preview intent that does not belong to the approved operation is not
-    publishable at all: the adapter is never reached."""
+    publishable at all: the publish fails closed and production is never
+    touched."""
     live = Live(tmp_path)
     live.show_preview(1, b"v=1", b"<html>1</html>")
     with live.store.acquire_writer(PROJECT) as state:
         state.deployment["preview_intent"]["operation_id"] = "op-someone-else"
         live.store.save(state)
 
-    assert live.approve_and_publish().success
+    result = live.approve_and_publish()
 
-    assert live.repo.publish_calls == []
-    record = live.state().repository
-    assert record["sync_status"] == "SOURCE_SYNC_REQUIRED"
-    assert record["last_error_code"] == "NO_TRUSTED_TESTED_COMMIT"
-    # The site is still LIVE and still reported with its canonical URL.
-    assert live.state().lifecycle == ProjectLifecycle.LIVE.value
-    assert live.live_messages() == [f"🚀 Live: {CANONICAL}"]
+    assert not result.success
+    assert result.error_code == "NO_TRUSTED_TESTED_COMMIT"
+    # Nothing was pushed, and no Vercel call was ever made.
+    assert live.repo.push_calls == []
+    assert live.vercel.promote_calls == []
+    assert live.smoke.urls == []
+    state = live.state()
+    assert state.lifecycle == ProjectLifecycle.FAILED.value
+    # There was never a pending publication: nothing was ever intended.
+    assert "pending_publication" not in state.deployment
+    assert not live.live_messages()
+    # The branch on the remote was never created.
+    with pytest.raises(subprocess.CalledProcessError):
+        _remote_git(live.remote, "rev-parse", f"refs/heads/{SLUG}")
 
 
 def test_a_commit_outside_the_tested_snapshot_refs_is_never_pushed(tmp_path):
     """The commit published must be the head of an immutable
     ``preview/<hash>/<hash>`` ref. A commit we happen to hold that is not one
-    is refused by the repository boundary, so nothing is pushed."""
+    is refused by the repository boundary, so nothing is pushed and production
+    is never touched."""
     live = Live(tmp_path)
     git = live.show_preview(1, b"v=1", b"<html>1</html>")
     # A real commit object in the same repository, on no preview ref at all.
@@ -519,12 +630,16 @@ def test_a_commit_outside_the_tested_snapshot_refs_is_never_pushed(tmp_path):
         intent["git"] = dict(intent["git"], commit=stranger)
         live.store.save(state)
 
-    assert live.approve_and_publish().success
+    result = live.approve_and_publish()
 
-    # The site is live; only the source sync failed.
-    assert live.state().lifecycle == ProjectLifecycle.LIVE.value
-    assert live.state().repository["sync_status"] == "SOURCE_SYNC_REQUIRED"
-    assert live.state().repository["last_error_code"] == "GITHUB_PUBLICATION_FAILED"
+    assert not result.success
+    assert result.error_code == "NO_TRUSTED_TESTED_COMMIT"
+    # The site is NOT live: the publication could not be proven, so production
+    # was never touched.
+    assert live.state().lifecycle == ProjectLifecycle.FAILED.value
+    assert live.vercel.promote_calls == []
+    assert live.smoke.urls == []
+    assert not live.live_messages()
     # And the branch on the remote was never created.
     with pytest.raises(subprocess.CalledProcessError):
         _remote_git(live.remote, "rev-parse", f"refs/heads/{SLUG}")
@@ -534,8 +649,8 @@ def test_preview_only_revision_never_moves_the_branch(live):
     live.show_preview(1, b"v=1", b"<html>1</html>")
     live.show_preview(2, b"v=2", b"<html>2</html>")
 
-    assert live.repo.publish_calls == []
-    assert not live.state().repository
+    assert live.repo.push_calls == []
+    assert "publication_head" not in live.state().deployment
     with pytest.raises(subprocess.CalledProcessError):
         _remote_git(live.remote, "rev-parse", f"refs/heads/{SLUG}")
 
@@ -550,10 +665,13 @@ def test_stale_approval_never_moves_the_branch(live):
 
     assert not result.success
     assert result.error_code == "STALE_APPROVAL"
-    assert live.repo.publish_calls == []
+    assert live.repo.push_calls == []
 
 
 def test_failed_publish_never_moves_the_branch(tmp_path):
+    """A smoke failure happens AFTER the Git stage, so the branch DOES move --
+    and that is correct: the branch is durable publication history, and the
+    LIVE release record still describes the previous release."""
     live = Live(tmp_path, smoke=_RecordingSmoke(success=False))
     live.show_preview(1, b"v=1", b"<html>1</html>")
 
@@ -561,86 +679,91 @@ def test_failed_publish_never_moves_the_branch(tmp_path):
 
     assert not result.success
     assert result.error_code == "SMOKE_FAILED"
-    assert live.repo.publish_calls == []
+    assert len(live.repo.push_calls) == 1
     assert live.state().lifecycle == ProjectLifecycle.FAILED.value
+    # The branch is ahead of production, and the state says so explicitly.
+    head = live.state().deployment["publication_head"]["commit"]
+    assert _remote_git(live.remote, "rev-parse", f"refs/heads/{SLUG}") == head
+    assert "last_live_release" not in live.state().deployment
 
 
-def test_publication_failure_keeps_the_site_live(tmp_path):
+def test_publication_failure_never_touches_production(tmp_path):
+    """R2 inversion of the old "git failure still goes live" contract: a
+    publication that cannot be proven means production is never reached at
+    all."""
     live = Live(tmp_path, repo_factory=_FailingGitRepo)
-    git = live.show_preview(1, b"v=1", b"<html>1</html>")
+    live.show_preview(1, b"v=1", b"<html>1</html>")
 
     result = live.approve_and_publish()
 
-    # The publish itself SUCCEEDS: the site is live and the user is told so.
-    assert result.success, result.error
-    assert result.data["source_sync"] == "SOURCE_SYNC_REQUIRED"
+    assert not result.success
+    assert result.error_code == "PUBLICATION_PUSH_FAILED"
     state = live.state()
-    assert state.lifecycle == ProjectLifecycle.LIVE.value
-    assert state.production_url == CANONICAL
-    # No rollback and no re-smoke were attempted.
-    assert live.vercel.promote_calls == ["dpl_1"]
-    assert live.smoke.urls == [CANONICAL]
-    # The user still gets the truthful canonical LIVE URL.
-    assert live.live_messages() == [f"🚀 Live: {CANONICAL}"]
-    # The source is recorded as needing a sync, naming the revision that
-    # should be in the branch. No publication commit is claimed, because none
-    # was confirmed to exist on the remote.
-    assert state.repository["sync_status"] == "SOURCE_SYNC_REQUIRED"
-    assert state.repository["last_error_code"] == "GITHUB_PUBLICATION_FAILED"
-    assert state.repository["branch"] == SLUG
-    assert state.repository["tested_commit"] == git["commit"]
-    assert "publication_commit" not in state.repository
+    assert state.lifecycle == ProjectLifecycle.FAILED.value
+    assert state.production_url is None
+    # No promotion, no smoke, no LIVE message: production was never touched.
+    assert live.vercel.promote_calls == []
+    assert live.smoke.urls == []
+    assert live.live_messages() == []
+    # The record says exactly how far the operation got, and does not invent
+    # a branch head that was never confirmed.
+    pending = state.deployment["pending_publication"]
+    assert pending["stage"] == "PREPARED"
+    assert pending["outcome"] == "TERMINAL_FAILED"
+    assert pending["publication"]["status"] == "FAILED"
+    assert pending["last_error_code"] == "PUBLICATION_PUSH_FAILED"
+    assert "publication_head" not in state.deployment
+    # And the user is told the truth.
+    assert state.deployment["approval"]["operation_id"] == "op-1"
 
 
 def test_publication_failure_preserves_the_last_published_commit(tmp_path):
     live = Live(tmp_path)
     live.show_preview(1, b"v=1", b"<html>1</html>")
     assert live.approve_and_publish().success
-    first = live.state().repository["publication_commit"]
+    first = live.state().deployment["publication_head"]["commit"]
 
     live.repo.raise_on_publish = RuntimeError("ssh: network unreachable")
     live.show_preview(2, b"v=2", b"<html>2</html>")
     result = live.approve_and_publish()
 
-    assert result.success
-    record = live.state().repository
-    assert record["sync_status"] == "SOURCE_SYNC_REQUIRED"
+    assert not result.success
     # The last revision that genuinely reached the remote is still the parent
     # authority, so a failed revision never enters the published history.
-    assert record["publication_commit"] == first
+    assert live.state().deployment["publication_head"]["commit"] == first
     assert _remote_git(live.remote, "rev-parse", f"refs/heads/{SLUG}") == first
     assert _remote_git(live.remote, "rev-list", "--count",
                        f"refs/heads/{SLUG}") == "1"
+    # The first release is still the LIVE release.
+    assert live.state().deployment["last_live_release"]["publication_commit"] == first
 
 
 def test_retry_after_a_publication_failure_replays_the_same_commit(tmp_path):
     live = Live(tmp_path)
     live.show_preview(1, b"v=1", b"<html>1</html>")
     live.repo.raise_on_publish = RuntimeError("ssh: network unreachable")
-    assert live.approve_and_publish().success
-    assert live.state().repository["sync_status"] == "SOURCE_SYNC_REQUIRED"
+    assert not live.approve_and_publish().success
 
     live.repo.raise_on_publish = None
-    # Same exact tested commit, retried: the deterministic publication commit
-    # is recreated, so nothing forks.
-    assert live.orch.approve(PROJECT, principal_id=OWNER).success
-    live.show_preview(1, b"v=1", b"<html>1</html>")
-    result = live.orch.promote(PROJECT, live.ws, principal_id=OWNER)
+    # Same-operation recovery, same exact tested commit: the deterministic
+    # publication commit is recreated, so nothing forks.
+    result = live.orch.resume_publish(PROJECT, live.ws, principal_id=OWNER)
 
     assert result.success, result.error
-    record = live.state().repository
-    assert record["sync_status"] == "SYNCED"
+    release = live.state().deployment["last_live_release"]
+    assert release["completeness"] == "COMPLETE"
     assert _remote_git(live.remote, "rev-list", "--count",
                        f"refs/heads/{SLUG}") == "1"
 
 
 def test_no_github_read_back_in_r1(live):
-    """R1 writes to the source repository and never reads source back from it.
+    """R2 writes to the source repository and never reads source back from it.
 
     Asserted on the recorded git invocations across a full publish plus a
     second revision: there is no fetch, clone, pull, archive, or any other
-    content read. The only read the publication path may ever perform is the
-    ref-head reconcile below, and it only happens on a rejected push.
+    content read -- and, since an accepted fast-forward push is itself the
+    proof, not even a ref-head read. ``ls-remote`` is permitted only on a
+    rejected push or a resume, and is covered by the reconciliation tests.
     """
     live.show_preview(1, b"v=1", b"<html>1</html>")
     assert live.approve_and_publish().success
@@ -651,66 +774,113 @@ def test_no_github_read_back_in_r1(live):
     for argv in live.repo.git_calls:
         assert not (forbidden & set(argv)), argv
     # Nothing was read back from the remote on the normal path.
-    assert not [argv for argv in live.repo.git_calls if "ls-remote" in argv]
+    assert live.repo.remote_reads() == []
 
 
-def test_rejected_push_reconciles_the_remote_head_once(tmp_path):
-    """A push refused as non-fast-forward (an earlier publication reached the
-    remote but its local record was lost) is reconciled from the remote ref
-    head, re-parented and pushed -- once, and without any content read."""
-    live = Live(tmp_path)
-    git1 = live.show_preview(1, b"v=1", b"<html>1</html>")
-    assert live.approve_and_publish().success
-    pub1 = live.state().repository["publication_commit"]
+def test_resume_at_git_confirmed_adopts_without_a_second_push(tmp_path):
+    """The case-A recovery the durable publication record exists for.
 
-    # A publication commit that reached the remote but was never recorded
-    # locally: build it, push it, and pretend state never learned about it.
-    orphan_tree = live.repo.tree_of(git1["commit"])
-    orphan = live.repo._build_publication_commit(
-        orphan_tree, SLUG, pub1, source_revision=1, tested_commit=git1["commit"],
-        source_sha256="a" * 64, artifact_sha256="b" * 64,
-    )
-    live.repo._push_publication(GITHUB_SSH_URL, orphan, SLUG,
-                                _mirror_env(live.remote))
+    The Git stage completed and was persisted, then the production stage failed
+    terminally. The operator recovery re-derives the Git fact from the remote --
+    the head is exactly the intended commit -- adopts it, and pushes nothing.
+    One ref-head read, for one ref, and one push for the whole publication.
+
+    (R1 re-parented onto whatever the remote held. R2 does not: a remote head
+    we did not publish is case C, covered by
+    ``test_conflicting_remote_head_fails_closed_without_forcing``.)
+    """
+    live = Live(tmp_path, vercel=FlakyPromoteVercel(fail_on={"dpl_1"}))
+    live.show_preview(1, b"v=1", b"<html>1</html>")
+
+    first = live.approve_and_publish()
+
+    assert not first.success
+    assert first.error_code == "PROMOTE_FAILED"
+    pending = live.state().deployment["pending_publication"]
+    assert pending["stage"] == "GIT_CONFIRMED"
+    assert pending["outcome"] == "TERMINAL_FAILED"
+    # The push already landed and nothing was read to find that out.
+    assert len(live.repo.push_argvs()) == 1
+    assert live.repo.remote_reads() == []
+    head = _remote_git(live.remote, "rev-parse", f"refs/heads/{SLUG}")
     live.repo.git_calls.clear()
 
-    git2 = live.show_preview(2, b"v=2", b"<html>2</html>")
-    result = live.approve_and_publish()
+    live.vercel.fail_on = set()
+    result = live.orch.resume_publish(PROJECT, live.ws, principal_id=OWNER)
 
     assert result.success, result.error
-    record = live.state().repository
-    assert record["sync_status"] == "SYNCED"
-    # Exactly one ref-head reconcile, and exactly two pushes for this
-    # publication: the refused one and the re-parented one.
-    ls_remotes = [argv for argv in live.repo.git_calls if "ls-remote" in argv]
-    assert len(ls_remotes) == 1
-    assert ls_remotes[0][-1] == f"refs/heads/{SLUG}"
-    assert len(live.repo.push_argvs()) == 2
-    # The orphan is now an ancestor: history was extended, not rewritten.
-    _remote_git(live.remote, "merge-base", "--is-ancestor", orphan,
-                record["publication_commit"])
-    _remote_git(live.remote, "merge-base", "--is-ancestor", pub1,
-                record["publication_commit"])
-    assert live.repo.tree_of(record["publication_commit"]) == live.repo.tree_of(
-        git2["commit"])
+    release = live.state().deployment["last_live_release"]
+    assert release["publication_commit"] == head
+    # Exactly one ref-head read, for exactly one ref, and no second push.
+    reads = live.repo.remote_reads()
+    assert len(reads) == 1
+    assert reads[0][-1] == f"refs/heads/{SLUG}"
+    assert live.repo.push_argvs() == []
+    # A single logical publication: the branch still holds one commit.
+    assert _remote_git(live.remote, "rev-list", "--count",
+                       f"refs/heads/{SLUG}") == "1"
 
 
-def test_unavailable_remote_head_fails_closed_without_forcing(tmp_path):
-    """A remote head this repository does not hold is not fetched and not
-    clobbered: the publication fails closed and the source is flagged."""
+def test_resume_at_git_confirmed_with_a_moved_head_is_case_c(tmp_path):
+    """A resume whose branch head has moved off the intended commit is case C:
+    reported, never built on, never clobbered."""
+    live = Live(tmp_path, vercel=FlakyPromoteVercel(fail_on={"dpl_1"}))
+    live.show_preview(1, b"v=1", b"<html>1</html>")
+    assert not live.approve_and_publish().success
+    head = live.state().deployment["publication_head"]["commit"]
+
+    # Somebody else advanced the branch after our confirmed commit.
+    other = OutputGitRepository(tmp_path / "other-out",
+                               hermes_root=tmp_path / "other-hermes")
+    foreign = other.commit(
+        PROJECT, TestedSnapshot({"src/App.tsx": b"elsewhere"},
+                                {"index.html": b"<html>elsewhere</html>"}))
+    fetched = subprocess.run(
+        ["git", "--git-dir", str(live.remote), "fetch",
+         "file:///" + other.path.as_posix(), foreign["commit"]],
+        capture_output=True,
+    )
+    assert fetched.returncode == 0, fetched.stderr
+    moved = subprocess.run(
+        ["git", "--git-dir", str(live.remote), "update-ref",
+         f"refs/heads/{SLUG}", foreign["commit"]],
+        capture_output=True,
+    )
+    assert moved.returncode == 0, moved.stderr
+    live.vercel.fail_on = set()
+    live.repo.git_calls.clear()
+
+    result = live.orch.resume_publish(PROJECT, live.ws, principal_id=OWNER)
+
+    assert not result.success
+    assert result.error_code == "PUBLICATION_HEAD_CONFLICT"
+    # No push at all, and the remote is untouched.
+    assert live.repo.push_argvs() == []
+    assert _remote_git(live.remote, "rev-parse",
+                       f"refs/heads/{SLUG}") == foreign["commit"]
+    # The branch authority still names what we genuinely confirmed.
+    assert live.state().deployment["publication_head"]["commit"] == head
+    assert live.vercel.promote_calls == ["dpl_1"]
+
+
+def test_conflicting_remote_head_fails_closed_without_forcing(tmp_path):
+    """A remote branch holding a valid commit we did not publish is case C.
+
+    It is reported, never built on top of and never clobbered, and production
+    is never touched.
+    """
     live = Live(tmp_path)
     live.show_preview(1, b"v=1", b"<html>1</html>")
     assert live.approve_and_publish().success
+    first = live.state().deployment["publication_head"]["commit"]
 
-    # Publish a commit from a SEPARATE repository, so the remote branch head
-    # is a commit this repository does not hold and will not fetch. The bytes
-    # differ, so the commit really is a different object.
+    # A commit from a SEPARATE repository: the remote branch head is a valid
+    # 40-hex that this repository did not publish and will not fetch.
     other = OutputGitRepository(tmp_path / "other-out",
                                hermes_root=tmp_path / "other-hermes")
     foreign_git = other.commit(
         PROJECT, TestedSnapshot({"src/App.tsx": b"elsewhere"},
                                 {"index.html": b"<html>elsewhere</html>"}))
-    assert foreign_git["commit"] not in live.repo.git_calls
     fetched = subprocess.run(
         ["git", "--git-dir", str(live.remote), "fetch",
          "file:///" + other.path.as_posix(), foreign_git["commit"]],
@@ -728,10 +898,8 @@ def test_unavailable_remote_head_fails_closed_without_forcing(tmp_path):
     live.show_preview(2, b"v=2", b"<html>2</html>")
     result = live.approve_and_publish()
 
-    # The site is still live; only the source sync failed.
-    assert result.success
-    assert result.data["source_sync"] == "SOURCE_SYNC_REQUIRED"
-    assert live.state().repository["last_error_code"] == "GITHUB_PUBLICATION_FAILED"
+    assert not result.success
+    assert result.error_code == "PUBLICATION_HEAD_CONFLICT"
     # Nothing was force-pushed over the remote head, and nothing was fetched.
     for argv in live.repo.push_argvs():
         assert "--force" not in argv
@@ -740,6 +908,16 @@ def test_unavailable_remote_head_fails_closed_without_forcing(tmp_path):
     # The remote head is still the foreign commit: untouched.
     assert _remote_git(live.remote, "rev-parse",
                        f"refs/heads/{SLUG}") == foreign_git["commit"]
+    # Production was reached exactly once: by revision 1, never by the
+    # conflicted revision 2.
+    assert live.vercel.promote_calls == ["dpl_1"]
+    assert live.smoke.urls == [CANONICAL]
+    assert live.state().deployment["publication_head"]["commit"] == first
+    assert live.state().lifecycle == ProjectLifecycle.PUBLISHING.value
+    # Held open for reconciliation, so no new operation may supersede it.
+    pending = live.state().deployment["pending_publication"]
+    assert pending["reconciliation_required"] is True
+    assert pending["outcome"] == "RECONCILIATION_REQUIRED"
 
 
 # ---------------------------------------------------------------------------
@@ -834,7 +1012,8 @@ def test_duplicate_approval_of_the_same_preview_is_idempotent(live):
     assert live.approve_and_publish().success
     before = live.state()
     before_live = before.deployment["last_live_deployment"]
-    before_repository = dict(before.repository)
+    before_release = dict(before.deployment["last_live_release"])
+    before_head = dict(before.deployment["publication_head"])
 
     assert live.orch.approve(PROJECT, principal_id=OWNER).success
     again = live.orch.promote(PROJECT, live.ws, principal_id=OWNER)
@@ -843,16 +1022,19 @@ def test_duplicate_approval_of_the_same_preview_is_idempotent(live):
     assert again.data["already_live"] is True
     assert again.data["production_url"] == CANONICAL
     assert again.data["deployment_url"] == DEPLOYMENT_URL
+    # The reported release is the committed one, not the derived projection.
+    assert again.data["release"] == before_release
     # No second promotion, no re-smoke, no second publication.
     assert live.vercel.promote_calls == ["dpl_1"]
     assert live.smoke.urls == [CANONICAL]
-    assert len(live.repo.publish_calls) == 1
+    assert len(live.repo.push_calls) == 1
     after = live.state()
     assert after.lifecycle == before.lifecycle
     assert after.production_url == before.production_url
     assert after.revisions.live_revision == before.revisions.live_revision
     assert after.deployment["last_live_deployment"] == before_live
-    assert after.repository == before_repository
+    assert after.deployment["last_live_release"] == before_release
+    assert after.deployment["publication_head"] == before_head
     # The orchestrator reported the current live result to its caller.
     assert again.data["operation_id"] == "op-1"
 
@@ -879,7 +1061,7 @@ def test_duplicate_approve_of_a_live_project_never_promotes_again(tmp_path, live
 
     assert live.vercel.promote_calls == ["dpl_1"]
     assert live.smoke.urls == [CANONICAL]
-    assert len(live.repo.publish_calls) == 1
+    assert len(live.repo.push_calls) == 1
     assert live.live_messages() == [f"🚀 Live: {CANONICAL}"]
 
 
@@ -901,14 +1083,14 @@ def test_explicit_publish_after_live_approval_is_a_no_op(tmp_path, live):
     after = live.state()
     assert after.lifecycle == before.lifecycle
     assert after.production_url == before.production_url
-    assert after.repository == before.repository
-    assert live.repo.publish_calls[0]["previous_publication_commit"] is None
+    assert after.deployment["last_live_release"] == before.deployment["last_live_release"]
+    assert live.repo.prepare_calls[0]["previous_publication_commit"] is None
 
 
 def test_a_revision_landing_mid_flight_fails_closed(tmp_path):
     """A newer revision landing between the approval and the promotion's own
-    re-check makes the approval stale: nothing is promoted, nothing is
-    published, and the user is not told the site is live."""
+    re-check makes the approval stale: nothing is published, nothing is
+    promoted, and the user is not told the site is live."""
     def land_revision():
         with live.store.acquire_writer(PROJECT) as state:
             state.revisions.source_revision = 2
@@ -932,7 +1114,7 @@ def test_a_revision_landing_mid_flight_fails_closed(tmp_path):
     assert not result.success
     assert result.error_code == "STALE_APPROVAL"
     assert live.vercel.promote_calls == []
-    assert live.repo.publish_calls == []
+    assert live.repo.push_calls == []
     assert live.state().lifecycle == ProjectLifecycle.PREVIEW_READY.value
     assert not live.live_messages()
 
@@ -948,7 +1130,8 @@ def test_failed_publish_after_approval_sends_truthful_copy(tmp_path):
     # Never claims the site is live.
     assert not live.live_messages()
     assert any("Preview" in text for _c, text in out.sent)
-    assert live.repo.publish_calls == []
+    # The Git stage completed BEFORE production, so the branch did move.
+    assert len(live.repo.push_calls) == 1
 
 
 def test_reviewer_approval_still_binds_but_cannot_publish(tmp_path, live):
@@ -982,7 +1165,7 @@ def test_approve_without_a_shown_preview_never_publishes(tmp_path, live):
     loop._process_update(_payload(411, "approve"))
 
     assert live.vercel.promote_calls == []
-    assert live.repo.publish_calls == []
+    assert live.repo.push_calls == []
     assert not live.live_messages()
     assert out.sent
 
@@ -993,6 +1176,9 @@ def test_approve_without_a_shown_preview_never_publishes(tmp_path, live):
 
 
 def test_github_publication_is_disabled_when_not_configured(tmp_path):
+    """Publication-not-configured is a STATUS, not a shortcut: the machine
+    still advances through GIT_CONFIRMED as a local no-op with zero Git
+    subprocesses, then proceeds to production normally."""
     live = Live(tmp_path, github=False)
     live.show_preview(1, b"v=1", b"<html>1</html>")
 
@@ -1000,22 +1186,35 @@ def test_github_publication_is_disabled_when_not_configured(tmp_path):
 
     assert result.success, result.error
     # Not attempted, so nothing is reported as an unsynced source.
-    assert result.data["source_sync"] is None
-    assert live.repo.publish_calls == []
-    assert live.state().repository == {}
+    assert live.repo.prepare_calls == []
+    assert live.repo.push_calls == []
+    assert live.repo.push_argvs() == []
+    assert live.repo.remote_reads() == []
+    state = live.state()
+    release = state.deployment["last_live_release"]
+    assert release["completeness"] == "COMPLETE"
+    assert release["publication_commit"] is None
+    assert release["tested_commit"] is None
+    # No branch authority is claimed when nothing was published.
+    assert "publication_head" not in state.deployment
+    assert state.production_url == CANONICAL
     assert live.live_messages() == [f"🚀 Live: {CANONICAL}"]
 
 
-def test_persisted_repository_record_carries_no_credentials(tmp_path):
+def test_persisted_release_record_carries_no_credentials(tmp_path):
     live = Live(tmp_path)
     live.show_preview(1, b"v=1", b"<html>1</html>")
 
     assert live.approve_and_publish().success
 
-    record = live.state().repository
-    assert set(record) >= {"provider", "repo", "branch", "tested_commit",
-                           "publication_commit", "source_revision",
-                           "sync_status"}
+    record = live.state().deployment["last_live_release"]
+    assert set(record) >= {"release_id", "operation_id", "source_revision",
+                           "tested_commit", "tested_tree", "publication_commit",
+                           "publication_tree", "publication_parent",
+                           "publication_branch", "publication_repo",
+                           "source_sha256", "artifact_sha256", "deployment_id",
+                           "production_url", "deployment_url", "smoke",
+                           "committed_at", "completeness"}
     serialized = json.dumps(record)
     # No remote URL, no key path, no ssh command, nothing secret.
     assert "git@github.com" not in serialized

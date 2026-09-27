@@ -88,6 +88,7 @@ from app.projects.directions import DirectionsOrchestrator
 from app.projects.domain import CustomDomainOrchestrator, DomainDeps
 from app.projects.promote import PromoteDeps, PromotionOrchestrator
 from app.projects.references import ReferenceIntake
+from app.projects.release import ReleaseCoordinator
 from app.projects.revise import RevisionOrchestrator
 from app.sandbox.runner import ProjectRunner
 
@@ -910,7 +911,11 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
             return None
         return _bound_slug_for(pid, state) or expected_name
 
-    # Promotion orchestrator deps
+    # Promotion orchestrator deps. The R2 release coordinator is wired
+    # explicitly rather than left to the orchestrator's own default: it is a
+    # boundary object like every other one here, and a caller that swaps the
+    # store must not silently end up with a coordinator bound to a different
+    # one.
     promote_deps = PromoteDeps(
         vercel=vercel,
         telegram=telegram_out,
@@ -922,6 +927,7 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
         source_repo_url=config.github_source_repo,
         source_branch_for=_publication_branch_for,
         source_ssh_key=config.github_ssh_key,
+        releases=ReleaseCoordinator(store),
     )
     promote = PromotionOrchestrator(runner, store, promote_deps)
 

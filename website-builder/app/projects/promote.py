@@ -27,6 +27,14 @@ production alias. This module owns:
     LIVE; on smoke failure the lifecycle fails closed to FAILED and the
     production alias is rolled back to the prior last-known-good
     deployment (or left untouched if there was none),
+  * R2: publishing the EXACT tested source to the friendly per-project branch
+    BEFORE any production side effect, so a release that cannot be published
+    never touches production at all. The Git branch is a publication HISTORY;
+    what is LIVE is decided by ``deployment.last_live_release`` in
+    application state and never inferred from a branch head,
+  * R2: strict A/B/C/D reconciliation of the publication head on resume and on
+    a rejected push. A conflicting remote head is reported, never re-parented
+    onto; an unreadable remote fails closed,
   * MAX_WORKERS=1 ownership for the promotion operation, shared with
     Phase 7/8/9/10 via the same ``ProjectRunner`` project slot,
   * Telegram notification of the LIVE promotion via the Phase 9 adapter.
@@ -46,11 +54,21 @@ another:
       This is what gets smoke-checked, persisted as ``production_url``, and
       sent to the user.
 
-After the site is LIVE and smoke-verified, the exact tested snapshot commit
-of the approved revision is published to a friendly per-project branch in
-the operator-configured source repository. That publication is strictly
-after LIVE: a failure to publish never rolls production back and never
-un-promotes a working site.
+The R2 publication stage order is a single linear graph, enforced in
+``app.projects.release``:
+
+    PREPARED -> GIT_CONFIRMED -> PRODUCTION_CONFIRMED -> SMOKE_PASSED -> COMMITTED
+
+Publication-not-configured is a *status*, not a shortcut past GIT_CONFIRMED:
+the machine still advances through stage 2, as a local no-op with zero Git
+subprocesses, so resume and recovery have one code path.
+
+The reorder is a deliberate inversion of R1, which published after LIVE and
+therefore kept the site live even when Git was unreachable. A Git failure now
+means production is never touched. That is the point: the branch and the live
+release can no longer disagree without the disagreement being *recorded*, and
+a revision that was confirmed on Git but never reached production is
+explicitly visible as such rather than inferred from a branch head.
 
 No network call happens here without every prerequisite adapter being
 constructed and passed in explicitly by the caller, matching the Phase 9
@@ -64,11 +82,13 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 from app.core.authz import AuthzError, require_mutating_role, require_owner_role
 from app.core.contracts import OperationResult, StaleOperationIntent
 from app.core.lifecycle import LifecycleError, ProjectLifecycle
 from app.core.state import ProjectStateStore
+from app.projects import release as release_contract
 from app.sandbox.runner import ProjectRunner
 
 logger = logging.getLogger(__name__)
@@ -107,6 +127,45 @@ PREVIOUS_PRODUCTION_NONE = "NO_PRODUCTION"
 PREVIOUS_PRODUCTION_BOOTSTRAP = "KNOWN_BOOTSTRAP"
 PREVIOUS_PRODUCTION_REAL = "REAL_PRODUCTION"
 PREVIOUS_PRODUCTION_UNKNOWN = "UNKNOWN_OR_INCOMPLETE_PRODUCTION"
+
+
+def _release_smoke_evidence(raw: dict, status: str, requested_url: str) -> Optional[dict]:
+    """The smoke evidence a release record carries, or None when it is not
+    provably about the URL we checked.
+
+    The target host and path are derived from ``requested_url`` -- the URL
+    THIS call actually passed to the smoke collaborator -- rather than trusted
+    from the collaborator's own report. A collaborator that cannot say which
+    host it exercised is not evidence, and a collaborator that reports a
+    DIFFERENT host than the one we asked about is a contract violation, so
+    both fail closed here instead of being recorded as a passed release.
+
+    Failure evidence is passed through with whatever target the collaborator
+    reported: it is diagnostics, and inventing a target for a failure would be
+    a guess about what was being tested when it failed.
+    """
+    if status != "PASSED":
+        return {
+            "status": status,
+            "at": raw.get("at"),
+            "target_host": raw.get("target_host"),
+            "target_path": raw.get("target_path"),
+            "failure_classification": raw.get("failure_classification"),
+        }
+    host = urlsplit(requested_url).hostname
+    path = urlsplit(requested_url).path or "/"
+    if not host:
+        return None
+    reported = raw.get("target_host")
+    if isinstance(reported, str) and reported and reported != host:
+        return None
+    return {
+        "status": "PASSED",
+        "at": raw.get("at"),
+        "target_host": host,
+        "target_path": path,
+        "failure_classification": None,
+    }
 
 
 def _safe_identity(identity) -> Optional[dict]:
@@ -212,7 +271,7 @@ class PromoteDeps:
     # R1-B: the application-owned output Git repository holding the exact
     # tested snapshot commits, used to publish the LIVE source to the friendly
     # branch. None disables publication entirely (legacy behavior: no GitHub
-    # side effect of any kind after LIVE).
+    # side effect of any kind).
     output_repo: Any = None
     # R1-B: the explicit, operator-configured source repository remote
     # (SSH form, e.g. git@github.com:owner/repo.git). Never read from
@@ -228,6 +287,11 @@ class PromoteDeps:
     # passed to git as GIT_SSH_COMMAND and is never persisted, logged, or
     # placed in a URL.
     source_ssh_key: Any = None
+    # R2: the durable release-contract writer (stage advances, the single
+    # COMMITTED write, failure bookkeeping). Constructed from the same store
+    # when omitted, so a caller that never heard of R2 still gets the R2
+    # contract rather than a silently weaker one.
+    releases: Any = None
 
 
 class PromotionOrchestrator:
@@ -259,6 +323,7 @@ class PromotionOrchestrator:
         self.store = store
         self.deps = deps
         self.smoke_dir_root = smoke_dir_root
+        self.releases = deps.releases or release_contract.ReleaseCoordinator(store)
 
     # ------------------------------------------------------------------
     # Step 1: approval -- binds the exact shown preview identity.
@@ -406,8 +471,9 @@ class PromotionOrchestrator:
         # turned away at the door.
         _intent = state.deployment.get("promotion_intent") or {}
         _failure = state.failure or {}
+        is_same_operation = _intent.get("operation_id") == approval.get("operation_id")
         is_resume = (
-            _intent.get("operation_id") == approval.get("operation_id")
+            is_same_operation
             and (
                 state.lifecycle == ProjectLifecycle.PUBLISHING.value
                 or (
@@ -417,6 +483,32 @@ class PromotionOrchestrator:
                 )
             )
         )
+
+        # R2 supersede guard, before any side effect: a NEW operation may not
+        # begin while an earlier operation's publication is held for
+        # reconciliation. That record describes a remote state this system
+        # could not read or could not reconcile; starting a different operation
+        # would publish against a branch head that may have moved, which is
+        # exactly the ambiguity the record exists to hold open. A terminal
+        # pending publication is supersedable and is replaced by the new
+        # PREPARED record.
+        #
+        # Deliberately AFTER the same-operation test, and not a refusal for a
+        # resume: holding the record open is what makes the same operation
+        # resumable, so blocking the resume too would strand the project with
+        # no forward path at all.
+        if not is_same_operation and self.releases.is_reconciliation_required(state):
+            pending = self.releases.pending(state) or {}
+            logger.warning(
+                "Publish refused project=%s: publication held for reconciliation "
+                "operation=%s code=%s",
+                project_id, pending.get("operation_id"), pending.get("last_error_code"),
+            )
+            return OperationResult.fail(
+                release_contract.ERROR_SUPERSEDE_FORBIDDEN,
+                error_code=release_contract.ERROR_SUPERSEDE_FORBIDDEN,
+            )
+
         if state.lifecycle not in (
             ProjectLifecycle.PREVIEW_READY.value,
             ProjectLifecycle.LIVE.value,
@@ -452,13 +544,36 @@ class PromotionOrchestrator:
         # (e.g. a duplicate/retried promote call). Nothing to do — do not
         # re-promote, re-smoke, or attempt a PUBLISHING transition (LIVE ->
         # PUBLISHING is not a valid lifecycle edge).
+        #
+        # Matched on ``last_live_release`` when one exists, because that is
+        # the authoritative LIVE release. ``last_live_deployment`` stays the
+        # fallback for a pre-upgrade project whose release record is a lazily
+        # derived LEGACY_PARTIAL one; that payload is returned labelled as
+        # partial and is never dressed up as a full release identity.
         if state.lifecycle == ProjectLifecycle.LIVE.value:
+            release = state.deployment.get("last_live_release")
+            if not isinstance(release, dict) or release.get("operation_id") != operation_id:
+                release = None
+            elif release.get("completeness") != release_contract.COMPLETENESS_COMPLETE:
+                # A lazily derived LEGACY_PARTIAL identity is a real previous
+                # release, so it is still a valid match -- but it is never
+                # dressed up as a full release identity.
+                if release.get("completeness") == \
+                        release_contract.COMPLETENESS_LEGACY_PARTIAL:
+                    release = dict(release)
+                else:
+                    release = None
             last_live = state.deployment.get("last_live_deployment") or {}
-            if (
-                last_live.get("operation_id") == operation_id
-                and last_live.get("deployment_id") == deployment_id
-                and last_live.get("source_revision") == source_revision
-            ):
+            identity_matches = (
+                release is not None
+                or (
+                    not isinstance(state.deployment.get("last_live_release"), dict)
+                    and last_live.get("operation_id") == operation_id
+                    and last_live.get("deployment_id") == deployment_id
+                    and last_live.get("source_revision") == source_revision
+                )
+            )
+            if identity_matches:
                 # Current live result, not a new promotion. ``production_url``
                 # is the canonical public URL persisted at LIVE; the
                 # deployment-specific hostname is returned alongside it, but
@@ -466,10 +581,11 @@ class PromotionOrchestrator:
                 # shown.
                 return OperationResult.ok({
                     "production_url": state.production_url,
-                    "deployment_url": last_live.get("deployment_url"),
+                    "deployment_url": (release or last_live).get("deployment_url"),
                     "deployment_id": deployment_id,
                     "operation_id": operation_id,
                     "already_live": True,
+                    "release": release,
                 })
             return OperationResult.fail(
                 "PROMOTION_NOT_ALLOWED_IN_LIFECYCLE",
@@ -576,26 +692,72 @@ class PromotionOrchestrator:
                     "stage": "publishing",
                     "created_at": time.time(),
                 }
-            self.store.save(locked)
-            # Report the classification this intent ACTUALLY carries: on a
-            # same-operation resume the persisted one is authoritative, because
-            # the fresh lookup describes post-crash remote state, not the
-            # rollback target the operation was started against.
-            intent_class = (
-                (locked.deployment.get("promotion_intent") or {}).get(
-                    "previous_production_class"
-                ) or previous_class
-            )
 
-            # The exact trusted identity of the deployment we intended to
-            # promote. Reconciliation compares the COMPLETE tuple -- never a
-            # URL or a bare deployment_id.
-            intended_identity = {
-                "deployment_id": deployment_id,
-                "operation_id": operation_id,
-                "source_revision": source_revision,
-                "artifact_sha256": artifact_sha256,
-            }
+            # R2: the pending publication is written in the SAME locked write
+            # as the promotion intent, because both describe one operation and
+            # either alone is an incomplete record. The branch is resolved
+            # HERE, at PREPARED, rather than after LIVE: the friendly branch
+            # name belongs in the durable publication intent, and a crash after
+            # the push must not lose it.
+            #
+            # A same-operation resume with an INTACT pending record keeps it
+            # exactly as it is -- its stage is how far the previous process
+            # actually got, and rebuilding it would both lose that and forge a
+            # second intended commit. A same-operation resume with NO pending
+            # record is a pre-upgrade state (R1 never wrote one); it gets a
+            # PREPARED record, and the git stage reconciles from there.
+            existing_pending = locked.deployment.get("pending_publication")
+            prepare_failed = False
+            if not (is_same_operation
+                    and isinstance(existing_pending, dict)
+                    and existing_pending.get("operation_id") == operation_id):
+                try:
+                    locked.deployment["pending_publication"] = self._prepare_publication(
+                        locked, expected_name, operation_id, source_revision, approval,
+                    )
+                except (release_contract.ReleaseRecordError, ValueError):
+                    # No trusted tested commit, or an unbuildable intended
+                    # commit: the branch is never advanced and no production
+                    # side effect has happened. There is no pending record to
+                    # leave behind -- there is nothing that was ever intended.
+                    locked.deployment.pop("pending_publication", None)
+                    prepare_failed = True
+            self.store.save(locked)
+            if prepare_failed:
+                # The lifecycle failure is written AFTER the lock is released:
+                # ``_fail`` takes the same per-project writer lock, which is a
+                # file lock and not reentrant.
+                pass
+            else:
+                # Report the classification this intent ACTUALLY carries: on a
+                # same-operation resume the persisted one is authoritative,
+                # because the fresh lookup describes post-crash remote state,
+                # not the rollback target the operation was started against.
+                intent_class = (
+                    (locked.deployment.get("promotion_intent") or {}).get(
+                        "previous_production_class"
+                    ) or previous_class
+                )
+
+                # The exact trusted identity of the deployment we intended to
+                # promote. Reconciliation compares the COMPLETE tuple -- never
+                # a URL or a bare deployment_id.
+                intended_identity = {
+                    "deployment_id": deployment_id,
+                    "operation_id": operation_id,
+                    "source_revision": source_revision,
+                    "artifact_sha256": artifact_sha256,
+                }
+
+        if prepare_failed:
+            self._fail(
+                project_id, "PUBLICATION_PREPARE_FAILED",
+                release_contract.ERROR_NO_TRUSTED_TESTED_COMMIT,
+            )
+            return OperationResult.fail(
+                release_contract.ERROR_NO_TRUSTED_TESTED_COMMIT,
+                error_code=release_contract.ERROR_NO_TRUSTED_TESTED_COMMIT,
+            )
 
         # ---- Writer lock RELEASED. Every remote call happens from here on.
         #
@@ -611,6 +773,15 @@ class PromotionOrchestrator:
             "Promotion intent persisted project=%s operation=%s class=%s",
             project_id, operation_id, intent_class,
         )
+
+        # ---- R2 GIT STAGE. The exact tested source is published to the
+        # friendly branch BEFORE any Vercel call. This is the batch's central
+        # inversion of R1: a publication that cannot be proven now means
+        # production is never touched, instead of going live with the branch
+        # silently behind.
+        git_result = self._confirm_git(project_id, operation_id)
+        if not git_result.success:
+            return git_result
 
         # ---- Same-operation resume: reconcile remote truth BEFORE issuing
         # any promote request, and never issue a second one for an operation
@@ -657,6 +828,18 @@ class PromotionOrchestrator:
                     pass
                 else:
                     # Ambiguous resume: do NOT blindly re-promote.
+                    #
+                    # The pending publication is held exactly as the parallel
+                    # ambiguous-promote path below holds it. This branch used to
+                    # record only the promotion failure, which left
+                    # ``reconciliation_required`` False and let a NEW operation
+                    # supersede a publication the state machine says is
+                    # unresolved -- the same hold, on a path that reached the
+                    # same conclusion by a different route.
+                    self._mark_publication_reconciliation_required(
+                        project_id, operation_id,
+                        "PROMOTION_RECONCILIATION_REQUIRED",
+                    )
                     self._fail_reconciliation_required(
                         project_id, "PROMOTION_RECONCILIATION_REQUIRED",
                         intended_identity, "promote",
@@ -701,6 +884,10 @@ class PromotionOrchestrator:
             # ``PROMOTE_FAILED`` (a created deployment reached a terminal build
             # state). Only the ambiguous class may be re-decided below.
             if error_code != "PROMOTE_RECONCILIATION_REQUIRED":
+                # The Git stage already completed, so the record knows how far
+                # this operation got and where it stopped.
+                self._mark_publication_terminal_failure(
+                    project_id, operation_id, error_code)
                 self._fail(project_id, "PROMOTE_FAILED", error_code)
                 return promote_result
             # ---- AMBIGUOUS or terminally-failed remote promote. The request
@@ -735,6 +922,8 @@ class PromotionOrchestrator:
                 # binding on its own never reaches this branch: an ambiguous
                 # promote resolves to PROMOTION_RECONCILIATION_REQUIRED below,
                 # which keeps the intent intact and stays resumable.
+                self._mark_publication_terminal_failure(
+                    project_id, operation_id, "PROMOTE_NOT_APPLIED")
                 self._fail(project_id, "PROMOTE_FAILED", "PROMOTE_NOT_APPLIED")
                 return OperationResult.fail(
                     "PROMOTE_FAILED", error_code="PROMOTE_NOT_APPLIED",
@@ -743,7 +932,11 @@ class PromotionOrchestrator:
             # preserve PUBLISHING + the intact promotion_intent and fail
             # closed as reconciliation-required. A later same-operation
             # resume reconciles again and reuses the SAME intent (no
-            # second promote POST).
+            # second promote POST). The pending publication is held the same
+            # way, so a NEW operation cannot supersede it either.
+            self._mark_publication_reconciliation_required(
+                project_id, operation_id, "PROMOTION_RECONCILIATION_REQUIRED",
+            )
             self._fail_reconciliation_required(
                 project_id, "PROMOTION_RECONCILIATION_REQUIRED",
                 intended_identity, "promote",
@@ -865,18 +1058,46 @@ class PromotionOrchestrator:
 
         Owner-only, exactly like ``promote``: a reviewer may approve a preview
         but must not be able to publish or recover one.
+
+        Authorization is checked BEFORE the resumability gate. Refusing an
+        unauthorized caller with "not applicable" instead of "unauthorized"
+        would both skip the gate and tell an unauthorized principal whether
+        this project is mid-publish.
         """
         state = self.store.load(project_id)
         if state is None:
             return OperationResult.fail("NO_PROJECT_STATE", error_code="NO_PROJECT_STATE")
+        try:
+            require_owner_role(state, principal_id, reference_token)
+        except AuthzError as exc:
+            return OperationResult.fail(exc.error_code, error_code=exc.error_code)
         intent = state.deployment.get("promotion_intent") or {}
         approval = state.deployment.get("approval") or {}
         failure = state.failure or {}
         last_live = state.deployment.get("last_live_deployment") or {}
+        # R2: a recovery must carry an INTACT pending publication. Without one
+        # there is no record of which commit was intended for the branch or how
+        # far the Git stage got, so there is nothing to reconcile and nothing
+        # to resume.
+        #
+        # The one exception is a project already LIVE for this operation: the
+        # COMMITTED write deliberately clears the pending record, so its
+        # absence there means "this recovery already finished", not "this
+        # recovery cannot be described". That duplicate routes into the
+        # idempotent no-op below, which is where a repeated operator recovery
+        # belongs.
+        pending = self.releases.pending(state)
+        pending_intact = bool(
+            pending and pending.get("operation_id") == approval.get("operation_id"))
+        already_live = (
+            state.lifecycle == ProjectLifecycle.LIVE.value
+            and last_live.get("operation_id") == approval.get("operation_id")
+        )
         resumable = (
             bool(approval.get("operation_id"))
             and intent.get("operation_id") == approval.get("operation_id")
             and "previous_production" in intent
+            and (pending_intact or already_live)
             and (
                 state.lifecycle == ProjectLifecycle.PUBLISHING.value
                 or (
@@ -887,10 +1108,7 @@ class PromotionOrchestrator:
                 # is a duplicate, not a new recovery. The exact-identity match
                 # routes it into the existing idempotent no-op; a LIVE project
                 # with any other identity is refused below.
-                or (
-                    state.lifecycle == ProjectLifecycle.LIVE.value
-                    and last_live.get("operation_id") == approval.get("operation_id")
-                )
+                or already_live
             )
         )
         if not resumable:
@@ -900,10 +1118,22 @@ class PromotionOrchestrator:
             return OperationResult.fail(
                 "RESUME_NOT_APPLICABLE", error_code="RESUME_NOT_APPLICABLE",
             )
-        # ``recovery=True`` so that production bound to a deployment this
-        # operation cannot prove is fatal HERE, where the whole point is to
-        # decide whether the remote state may be adopted, rather than being
-        # folded into the ordinary pre-promote "not live yet" state.
+        # ``recovery=True`` only when this operation actually reached the
+        # production stage. That flag turns "production is bound to a
+        # deployment this operation cannot attribute" from the normal
+        # pre-promote state into a fatal one, which is right when a promote
+        # request may already be in flight and wrong when the Git stage failed
+        # first: the pending record proves no provider side effect was ever
+        # possible, so there is nothing ambiguous to protect against.
+        try:
+            stage = (pending or {}).get("stage")
+            reached_production = (
+                stage is not None
+                and release_contract.at_least(
+                    stage, release_contract.STAGE_PRODUCTION_CONFIRMED)
+            )
+        except release_contract.ReleaseStageError:
+            reached_production = False
         if not self.runner.acquire_project(project_id):
             return OperationResult.fail(
                 "WORKER_BUSY", error_code="WORKER_BUSY", retryable=True,
@@ -911,7 +1141,7 @@ class PromotionOrchestrator:
         try:
             return self._promote(
                 project_id, workspace, principal_id, reference_token,
-                recovery=True,
+                recovery=reached_production,
             )
         finally:
             self.runner.release_project(project_id)
@@ -923,20 +1153,72 @@ class PromotionOrchestrator:
     ) -> OperationResult:
         """Post-promote flow after a CONFIRMED promote (direct or reconciled).
 
-        Order is load-bearing and is the R1 contract:
+        Order is load-bearing and is the R2 contract. The Git stage already
+        happened BEFORE ``promote_deployment`` was called (see
+        ``_confirm_git``); what remains is:
 
-            resolve canonical public URL -> smoke THAT url -> LIVE (persist
-            canonical + deployment URLs) -> publish the exact tested source
-            to the friendly branch -> send the canonical LIVE URL.
+            resolve canonical public URL -> smoke THAT url -> SMOKE_PASSED ->
+            one atomic COMMITTED write -> send the canonical LIVE URL.
 
         On smoke failure the alias is rolled back to the persisted previous
-        production and the EXACT observed rollback outcome is persisted.
+        production and the EXACT observed rollback outcome is persisted. The
+        Git branch is never rolled back: it is durable history, so after a
+        smoke failure the branch legitimately holds this release while
+        ``last_live_release`` still describes the previous one.
+
+        Every stage step below is CONDITIONAL on how far the record already got.
+        A crash between any two of them leaves the durable record ahead of this
+        process, and re-running a step the record has already completed is how
+        an operation used to become unrecoverable: ``ensure_stage`` correctly
+        refuses to walk a stage backwards, so an unconditional
+        ``PRODUCTION_CONFIRMED`` call turned a crash after ``SMOKE_PASSED``
+        into a permanent ``PROMOTION_STAGE_LOST``. The stage graph itself is
+        untouched; the orchestration simply resumes from where the record says
+        it is, which is what a stage is for.
         """
         deployment_id = intended_identity["deployment_id"]
         operation_id = intended_identity["operation_id"]
         artifact_sha256 = intended_identity["artifact_sha256"]
 
-        # ---- 1. Resolve the CANONICAL public production URL, now that the
+        # ---- 0. How far did an earlier process actually get? The record is
+        # the only honest answer: a remote side effect that happened without a
+        # durable record of it must be re-derived, never re-issued.
+        stage_state = self.store.load(project_id)
+        if stage_state is None:
+            return OperationResult.fail("NO_PROJECT_STATE", error_code="NO_PROJECT_STATE")
+        pending = self.releases.pending(stage_state) or {}
+        if pending.get("operation_id") != operation_id:
+            self._fail(project_id, "PROMOTE_FAILED", "PROMOTION_STAGE_LOST")
+            return OperationResult.fail("PROMOTE_FAILED", error_code="PROMOTION_STAGE_LOST")
+        try:
+            reached = release_contract.stage_index(pending.get("stage"))
+        except release_contract.ReleaseStageError:
+            reached = -1
+        production_already_confirmed = reached >= release_contract.stage_index(
+            release_contract.STAGE_PRODUCTION_CONFIRMED)
+        smoke_already_passed = reached >= release_contract.stage_index(
+            release_contract.STAGE_SMOKE_PASSED)
+
+        # ---- 1. PRODUCTION_CONFIRMED. The exact intended artifact is now
+        # bound to the production alias, so the stage advances before any
+        # local work that can fail. Skipped when the record is already at or
+        # past it -- the promote really did happen, and the evidence for it is
+        # already durable.
+        if not production_already_confirmed:
+            try:
+                self.releases.ensure_stage(
+                    project_id, operation_id, release_contract.STAGE_PRODUCTION_CONFIRMED,
+                    production={
+                        "deployment_id": deployment_id,
+                        "promoted_deployment_id": deployment_id,
+                        "confirmed_at": time.time(),
+                    },
+                )
+            except (StaleOperationIntent, release_contract.ReleaseStageError):
+                self._fail(project_id, "PROMOTE_FAILED", "PROMOTION_STAGE_LOST")
+                return OperationResult.fail("PROMOTE_FAILED", error_code="PROMOTION_STAGE_LOST")
+
+        # ---- 2. Resolve the CANONICAL public production URL, now that the
         # production binding is confirmed. This is the URL the user will see
         # and the URL that must be proven reachable, so it is resolved BEFORE
         # the smoke check rather than after it.
@@ -950,6 +1232,10 @@ class PromotionOrchestrator:
             # site may well be serving; only our own URL resolution failed.
             # Rolling back a working site over a local formatting problem
             # would be a worse outcome than the problem.
+            self._mark_publication_terminal_failure(
+                project_id, operation_id,
+                "CANONICAL_PRODUCTION_URL_UNRESOLVED",
+            )
             self._fail(
                 project_id, "CANONICAL_PRODUCTION_URL_UNRESOLVED",
                 "CANONICAL_PRODUCTION_URL_UNRESOLVED",
@@ -963,88 +1249,69 @@ class PromotionOrchestrator:
             project_id, canonical.get("canonical_source"),
         )
 
-        # ---- 2. Mandatory production smoke check, against the CANONICAL
+        # ---- 3. Mandatory production smoke check, against the CANONICAL
         # url. The deployment-specific hostname may sit behind Deployment
         # Protection and is never a meaningful health check of what users
         # actually load.
-        smoke_dir = (self.smoke_dir_root or workspace) / "qa" / "production_smoke"
-        smoke_result = self._run_production_smoke(
-            canonical["canonical_production_url"], smoke_dir,
-            (vercel_project or {}).get("id"),
-        )
-        self._update_intent(project_id, operation_id, stage="smoked",
-                            smoke=smoke_result.data)
-        if not smoke_result.success:
-            logger.warning(
-                "Production smoke FAILED project=%s", project_id,
+        #
+        # Skipped when the record is already at SMOKE_PASSED. The smoke ran,
+        # it passed, and its evidence is durable on the pending record; running
+        # it again would be a second external action for a fact already
+        # established, and this stage is a statement of fact, not an event to
+        # re-emit.
+        if smoke_already_passed:
+            passed_evidence = dict(pending.get("smoke") or {})
+            logger.info(
+                "Resuming after SMOKE_PASSED project=%s; smoke evidence reused",
+                project_id,
             )
-            rollback_status = self._rollback_and_fail(
-                project_id, app_id, vercel_project, previous_identity,
-                error_code="SMOKE_FAILED", expected_name=expected_name,
-            )
-            return OperationResult(
-                success=False, error="SMOKE_FAILED", error_code="SMOKE_FAILED",
-                data={
-                    **(smoke_result.data or {}),
-                    "rollback": rollback_status,
-                    "production_smoke_failed": True,
-                },
-            )
-        # Logged only AFTER the check: a failed smoke must never produce a
-        # "smoke passed" line for an operator to act on.
-        logger.info("Production smoke passed project=%s", project_id)
+        else:
+            passed_evidence, smoke_failure = self._smoke_production(
+                project_id, operation_id, workspace, app_id, vercel_project,
+                expected_name, canonical, previous_identity)
+            if smoke_failure is not None:
+                return smoke_failure
+            try:
+                self.releases.ensure_stage(
+                    project_id, operation_id, release_contract.STAGE_SMOKE_PASSED,
+                    smoke=passed_evidence,
+                )
+            except (StaleOperationIntent, release_contract.ReleaseStageError):
+                self._fail(project_id, "PROMOTE_FAILED", "PROMOTION_STAGE_LOST")
+                return OperationResult.fail("PROMOTE_FAILED",
+                                            error_code="PROMOTION_STAGE_LOST")
 
-        # ---- 3. Only now transition PUBLISHING -> LIVE.
-        with self.store.acquire_writer(project_id) as locked:
-            if (
-                locked.deployment.get("approval") != approval
-                or locked.lifecycle != ProjectLifecycle.PUBLISHING.value
-            ):
-                return OperationResult.fail("STALE_APPROVAL", error_code="STALE_APPROVAL")
-            self.store.transition_lifecycle_locked(locked, ProjectLifecycle.LIVE)
-            locked.revisions.live_revision = source_revision
-            # The USER-FACING production URL is the canonical public one. The
-            # deployment-specific hostname is persisted next to it for
-            # reconciliation, rollback and diagnostics, and is never sent.
-            locked.production_url = canonical["canonical_production_url"]
-            # A recovery resume arrives with the failure record of the attempt
-            # that failed. LIVE is the outcome, so that record is now stale and
-            # must not be left behind for an operator to misread.
-            locked.failure = None
-            intent = locked.deployment["promotion_intent"]
-            intent["stage"] = "live"
-            # Both URLs are recorded, each under its own name. The intent is
-            # an internal record, so keeping the two keys distinct is what
-            # stops a future reader from mistaking one for the other.
-            intent["canonical_production_url"] = canonical["canonical_production_url"]
-            intent["deployment_url"] = deployment_url
-            locked.deployment["last_live_deployment"] = {
-                "operation_id": operation_id,
-                "deployment_id": deployment_id,
-                # Canonical public URL: the one reported to the user.
-                "production_url": canonical["canonical_production_url"],
-                # Deployment-specific Vercel hostname: internal identity only.
-                "deployment_url": deployment_url,
-                "source_revision": source_revision,
-                "source_sha256": approval["source_sha256"],
-                "artifact_sha256": artifact_sha256,
-                "live_at": time.time(),
-            }
-            self.store.save(locked)
-            state = locked
-
-        # ---- 4. Publish the EXACT tested source of this LIVE revision to the
-        # friendly branch. Strictly after LIVE, and strictly non-destructive:
-        # a publication failure leaves the site live and records that a source
-        # sync is still required.
-        sync_status = self._publish_live_source(
-            project_id, state, expected_name, source_revision, approval,
-        )
+        # ---- 4. The single atomic COMMITTED write: lifecycle LIVE,
+        # live_revision, canonical production_url, the derived
+        # last_live_deployment projection, the authoritative
+        # last_live_release, and the clearing of pending_publication.
+        #
+        # Re-read rather than reuse the stage snapshot above: the smoke ran in
+        # between, and an approval replaced during it must still be caught here.
+        state = self.store.load(project_id)
+        if state is None:
+            return OperationResult.fail("NO_PROJECT_STATE", error_code="NO_PROJECT_STATE")
+        if state.deployment.get("approval") != approval:
+            return OperationResult.fail("STALE_APPROVAL", error_code="STALE_APPROVAL")
+        try:
+            release_record = self._commit_release(
+                project_id, operation_id, source_revision, deployment_id,
+                deployment_url, canonical["canonical_production_url"],
+                approval, passed_evidence,
+            )
+        except (StaleOperationIntent, release_contract.ReleaseRecordError,
+                release_contract.ReleaseStageError):
+            # The release could not be written; the project stays PUBLISHING
+            # with its intent intact, so a same-operation resume retries the
+            # commit rather than re-running the whole operation.
+            return OperationResult.fail(
+                "RELEASE_COMMIT_FAILED", error_code="RELEASE_COMMIT_FAILED",
+            )
+        logger.info("Project LIVE production_url=%s", canonical["canonical_production_url"])
 
         # ---- 5. Telegram notification of LIVE promotion (best-effort in the
         # sense that a failed notification does not un-promote; the site
         # is already live and smoke-verified at this point).
-        logger.info("Project LIVE production_url=%s", canonical["canonical_production_url"])
         chat_id = self.deps.chat_id_for(project_id, state)
         if chat_id:
             self.deps.telegram.send_text(
@@ -1057,8 +1324,107 @@ class PromotionOrchestrator:
             "deployment_id": deployment_id,
             "operation_id": operation_id,
             "reconciled": reconciled,
-            "source_sync": sync_status,
+            "release": release_record,
         })
+
+    def _smoke_production(self, project_id, operation_id, workspace, app_id,
+                          vercel_project, expected_name, canonical,
+                          previous_identity):
+        """Run the mandatory production smoke and classify the outcome.
+
+        Returns ``(passed_evidence, None)`` when the canonical production URL
+        was proven, or ``(None, failure_result)`` when it was not -- the caller
+        returns that result verbatim, so the smoke stage owns every side effect
+        it implies (the failure record, the rollback, the persisted evidence)
+        rather than reporting success and leaving them to a caller that might
+        forget.
+
+        Only the PASSED path produces release evidence. A failure records what
+        was observed and rolls production back to the persisted previous
+        identity; it never records a release, because the release has not
+        happened.
+        """
+        smoke_dir = (self.smoke_dir_root or workspace) / "qa" / "production_smoke"
+        smoke_result = self._run_production_smoke(
+            canonical["canonical_production_url"], smoke_dir,
+            (vercel_project or {}).get("id"),
+        )
+        self._update_intent(project_id, operation_id, stage="smoked",
+                            smoke=smoke_result.data)
+        smoke_evidence = {
+            "at": time.time(),
+            "target_host": (smoke_result.data or {}).get("target_host"),
+            "target_path": (smoke_result.data or {}).get("target_path"),
+            "failure_classification": (smoke_result.data or {}).get(
+                "failure_classification"),
+        }
+        if not smoke_result.success:
+            logger.warning(
+                "Production smoke FAILED project=%s", project_id,
+            )
+            # The failure evidence is persisted BEFORE the rollback, so a crash
+            # inside the rollback cannot lose the reason this release stopped.
+            self._mark_publication_terminal_failure(
+                project_id, operation_id, "SMOKE_FAILED",
+                smoke=_release_smoke_evidence(
+                    smoke_evidence, "FAILED",
+                    canonical["canonical_production_url"]),
+            )
+            rollback_status = self._rollback_and_fail(
+                project_id, app_id, vercel_project, previous_identity,
+                error_code="SMOKE_FAILED", expected_name=expected_name,
+            )
+            return None, OperationResult(
+                success=False, error="SMOKE_FAILED", error_code="SMOKE_FAILED",
+                data={
+                    **(smoke_result.data or {}),
+                    "rollback": rollback_status,
+                    "production_smoke_failed": True,
+                },
+            )
+        # Logged only AFTER the check: a failed smoke must never produce a
+        # "smoke passed" line for an operator to act on.
+        logger.info("Production smoke passed project=%s", project_id)
+        passed_evidence = _release_smoke_evidence(
+            smoke_evidence, "PASSED", canonical["canonical_production_url"])
+        if passed_evidence is None:
+            # The smoke reported success but did not describe WHAT it checked.
+            # A release identity that cannot say which host was proven is not
+            # a release identity; fail closed rather than record a guess.
+            self._mark_publication_terminal_failure(
+                project_id, operation_id, "SMOKE_EVIDENCE_INCOMPLETE",
+            )
+            self._fail(
+                project_id, "SMOKE_EVIDENCE_INCOMPLETE",
+                "SMOKE_EVIDENCE_INCOMPLETE",
+            )
+            return None, OperationResult.fail(
+                "SMOKE_EVIDENCE_INCOMPLETE",
+                error_code="SMOKE_EVIDENCE_INCOMPLETE",
+            )
+        return passed_evidence, None
+
+    def _commit_release(self, project_id, operation_id, source_revision,
+                       deployment_id, deployment_url, production_url,
+                       approval, smoke_evidence):
+        """Build and commit the authoritative LIVE release record."""
+        state = self.store.load(project_id)
+        if state is None:
+            raise StaleOperationIntent("project state disappeared before commit")
+        pending = self.releases.pending(state) or {}
+        record = release_contract.build_last_live_release(
+            operation_id=operation_id,
+            source_revision=source_revision,
+            source_sha256=approval["source_sha256"],
+            artifact_sha256=approval["artifact_sha256"],
+            deployment_id=deployment_id,
+            production_url=production_url,
+            deployment_url=deployment_url,
+            smoke=smoke_evidence,
+            publication=pending.get("publication") or {},
+        )
+        return self.releases.commit_release(
+            project_id, operation_id=operation_id, release=record)
 
     # ------------------------------------------------------------------
     # Canonical public production URL
@@ -1104,95 +1470,383 @@ class PromotionOrchestrator:
         return PromotionOrchestrator._production_url_for(identity)
 
     # ------------------------------------------------------------------
-    # LIVE source publication (friendly branch)
+    # R2 Git stage: PREPARED -> GIT_CONFIRMED
     # ------------------------------------------------------------------
+    #
+    # Publication happens BEFORE production. Three properties this section
+    # exists to guarantee:
+    #
+    #   * A successful exact fast-forward push is sufficient proof. The
+    #     accepted push already established that the remote's previous head
+    #     was exactly the parent we built against, so GIT_CONFIRMED is
+    #     persisted immediately with NO remote read. Re-reading it would be a
+    #     redundant network call and a second source of truth for a fact the
+    #     push already settled.
+    #   * The remote is read in exactly two situations -- resume of a record
+    #     already persisted at GIT_CONFIRMED or later, and a rejected/ambiguous
+    #     push -- and both run the same A/B/C/D classifier.
+    #   * C and D stay distinct. C means the remote was READ and holds an
+    #     unexpected state; D means the remote could not be read and we
+    #     therefore assert nothing. Neither is ever re-parented onto.
+    #
+    # Publication-not-configured is NOT a shortcut past this stage. It advances
+    # to GIT_CONFIRMED as a local no-op with zero Git subprocesses, so resume
+    # and recovery have one code path.
 
-    def _publish_live_source(self, project_id, state, expected_name,
-                             source_revision, approval):
-        """Publish the exact tested snapshot commit of this LIVE revision.
+    def _publication_config(self, state):
+        """``{'repo', 'url', 'ssh_key', 'repo_name'}`` or ``None``.
 
-        Returns one of ``"SYNCED"``, ``"SOURCE_SYNC_REQUIRED"`` or ``None``
-        (not attempted: publication is not configured for this installation).
+        ``None`` means publication is not configured for this installation --
+        not configured, not attempted, not a failure. An operator who has not
+        supplied a remote, a branch resolver or a deploy key must not see every
+        publish reported as an unsynchronised source.
 
-        Never rolls production back, never re-smokes, never un-transitions
-        LIVE. A failure is recorded in ``state.repository`` so an operator can
-        see that the published branch is behind the live site.
+        Deliberately NOT the branch: the branch is resolved once at PREPARED
+        and travels in the pending record, so the push and the reconcile read
+        the same ref even if a slug binding changes underneath the operation.
         """
-        repo = self.deps.output_repo
-        url = self.deps.source_repo_url
-        if repo is None or not url:
+        if self.deps.output_repo is None or not self.deps.source_repo_url:
             return None
-        branch = None
-        if self.deps.source_branch_for is not None:
-            try:
-                branch = self.deps.source_branch_for(project_id, state, expected_name)
-            except Exception:
-                branch = None
-        if not branch:
-            logger.warning(
-                "LIVE source publication skipped project=%s: no resolvable branch",
-                project_id,
-            )
+        if self.deps.source_branch_for is None:
             return None
-        ssh_key = self.deps.source_ssh_key
-        if not ssh_key:
-            # Not configured, not attempted, not a failure: an operator who
-            # has not installed a deploy key yet must not see every publish
-            # reported as an unsynced source.
-            logger.warning(
-                "LIVE source publication skipped project=%s branch=%s: "
-                "no GitHub deploy key configured",
-                project_id, branch,
-            )
+        if not self.deps.source_ssh_key:
+            return None
+        return {
+            "repo": self.deps.output_repo,
+            "url": self.deps.source_repo_url,
+            "ssh_key": self.deps.source_ssh_key,
+            "repo_name": self._source_repo_name(),
+        }
+
+    def _publication_branch(self, state, expected_name):
+        """The friendly branch for this project, or None.
+
+        Raises ``ReleaseRecordError`` when a branch resolver that was
+        configured declines to name one: an operator who configured
+        publication but cannot resolve the branch has a real problem, and
+        silently treating it as "publication not configured" would drop a
+        release's source history without a word.
+        """
+        try:
+            return self.deps.source_branch_for(
+                state.project_id, state, expected_name)
+        except Exception:
             return None
 
-        # The commit that must be published: the exact TestedSnapshot commit
-        # the approved revision produced. Never re-derived from the mutable
-        # workspace, never recomputed.
-        try:
+    def _prepare_publication(self, state, expected_name, operation_id,
+                             source_revision, approval):
+        """Build the PREPARED pending-publication record. No network access.
+
+        The deterministic intended commit is built and persisted BEFORE the
+        push, so a lost post-push state write is recognisable as case A on
+        restart: the retried build produces a byte-identical commit.
+
+        The trusted tested commit is resolved ONLY when publication is actually
+        configured. An unconfigured installation has no commit to resolve and
+        no reason to demand one -- requiring it would make every deploy-key-less
+        install fail closed over a capability it never asked for.
+        """
+        config = self._publication_config(state)
+        branch = self._publication_branch(state, expected_name) if config else None
+        prepared = None
+        parent = release_contract.resolve_branch_parent(state)
+        if config is not None:
+            if not branch:
+                raise release_contract.ReleaseRecordError(
+                    "No resolvable publication branch")
+            # The exact TestedSnapshot commit bound to this approved preview.
+            # Reused rather than re-derived: it is the single existing trust
+            # path from approval to commit, and a second one would be a second
+            # thing to keep honest.
             git_identity = self._tested_commit_for(
-                state, approval.get("operation_id"), approval=approval)
-        except ValueError as exc:
-            logger.error(
-                "LIVE source publication FAILED project=%s branch=%s (no trusted "
-                "tested commit: %s)", project_id, branch, exc,
-            )
-            self._record_source_sync_required(project_id, branch, "NO_TRUSTED_TESTED_COMMIT")
-            return "SOURCE_SYNC_REQUIRED"
-        previous = (state.repository or {}).get("publication_commit")
-        try:
-            published = repo.publish_project_branch(
-                git_identity["commit"], branch, url,
-                source_revision=source_revision,
-                source_sha256=approval.get("source_sha256"),
-                artifact_sha256=approval.get("artifact_sha256"),
-                previous_publication_commit=previous,
-                ssh_key=ssh_key,
-            )
-        except Exception as exc:
-            # Only the exception TYPE is logged/persisted: a git failure's
-            # message can embed the remote and local filesystem paths.
-            logger.error(
-                "LIVE source publication FAILED project=%s branch=%s (type=%s)",
-                project_id, branch, type(exc).__name__,
-            )
-            self._record_source_sync_required(
-                project_id, branch, "GITHUB_PUBLICATION_FAILED",
-                tested_commit=git_identity["commit"])
-            return "SOURCE_SYNC_REQUIRED"
-
-        self._record_source_sync(
-            project_id, branch,
-            tested_commit=git_identity["commit"],
-            publication_commit=published["publication_commit"],
+                state, operation_id, approval=approval)
+            try:
+                prepared = config["repo"].prepare_publication(
+                    git_identity["commit"], branch, config["url"],
+                    source_revision=source_revision,
+                    source_sha256=approval.get("source_sha256"),
+                    artifact_sha256=approval.get("artifact_sha256"),
+                    previous_publication_commit=parent,
+                    ssh_key=config["ssh_key"],
+                )
+            except Exception as exc:
+                # Only the exception TYPE is logged: a git failure's message can
+                # embed the remote and local filesystem paths. The intended
+                # commit does not exist, so there is nothing to publish and the
+                # operation fails closed at PREPARED.
+                logger.error(
+                    "Publication prepare FAILED project=%s branch=%s (type=%s)",
+                    state.project_id, branch, type(exc).__name__,
+                )
+                raise release_contract.ReleaseRecordError(str(exc)) from exc
+        return release_contract.build_pending_publication(
+            operation_id=operation_id,
             source_revision=source_revision,
+            source_sha256=approval.get("source_sha256"),
+            artifact_sha256=approval.get("artifact_sha256"),
+            prepared=prepared,
+            parent=parent,
+            branch=branch,
+            repo=config["repo_name"] if config else None,
         )
+
+    def _confirm_git(self, project_id, operation_id):
+        """Drive the publication from its current stage to GIT_CONFIRMED.
+
+        The only place a push happens. Three arms:
+
+          * already at GIT_CONFIRMED or later (a resume) -- read the remote head
+            once and require it to be the intended commit. Any other valid head
+            is case C; an unreadable remote is case D. Both fail closed.
+          * PREPARED with publication not configured -- local no-op advance.
+          * PREPARED with publication configured -- one push. Accepted means
+            GIT_CONFIRMED with no remote read; rejected means one A/B/C/D
+            reconciliation, and B retries the exact intended commit once.
+        """
+        state = self.store.load(project_id)
+        if state is None:
+            return OperationResult.fail("NO_PROJECT_STATE", error_code="NO_PROJECT_STATE")
+        pending = self.releases.pending(state)
+        if not pending or pending.get("operation_id") != operation_id:
+            return OperationResult.fail(
+                "PROMOTION_STAGE_LOST", error_code="PROMOTION_STAGE_LOST",
+            )
+        stage = pending.get("stage")
+        publication = pending.get("publication") or {}
+
+        if release_contract.at_least(stage, release_contract.STAGE_GIT_CONFIRMED):
+            # Resume. This process has no push receipt, so the fact has to be
+            # re-derived from the remote -- but only for a configured
+            # publication. A NOT_CONFIGURED record has nothing to re-derive, so
+            # it is simply re-affirmed: the Git side of the operation is not
+            # held for reconciliation, and a Vercel-level ambiguity that a
+            # successful resume has overtaken must not keep the record closed.
+            if publication.get("configured") is not True:
+                try:
+                    self.releases.confirm_publication(project_id, operation_id)
+                except (StaleOperationIntent,
+                        release_contract.ReleaseRecordError) as exc:
+                    logger.error(
+                        "Publication re-affirmation FAILED project=%s (type=%s)",
+                        project_id, type(exc).__name__,
+                    )
+                    return OperationResult.fail(
+                        "PUBLICATION_STAGE_LOST", error_code="PUBLICATION_STAGE_LOST",
+                    )
+                return OperationResult.ok({"stage": stage,
+                                           "verdict": release_contract.PUBLICATION_NOT_CONFIGURED})
+            return self._resume_git(project_id, operation_id, publication)
+
+        if publication.get("configured") is not True:
+            # Local no-op confirmation. No push, no ls-remote, no update-ref:
+            # nothing was published, so there is nothing to confirm, and
+            # publication_head is deliberately left alone.
+            try:
+                self.releases.confirm_publication(project_id, operation_id)
+            except (StaleOperationIntent, release_contract.ReleaseRecordError):
+                return self._git_fail_closed(
+                    project_id, operation_id, "PUBLICATION_STAGE_LOST", terminal=True)
+            return OperationResult.ok({"stage": release_contract.STAGE_GIT_CONFIRMED,
+                                       "verdict": release_contract.PUBLICATION_NOT_CONFIGURED})
+
+        return self._push_git(project_id, operation_id, publication)
+
+    def _push_git(self, project_id, operation_id, publication):
+        """One push of the intended commit, then A/B/C/D on rejection.
+
+        This is the only arm that may ever retry a push (verdict B_RETRY), and
+        only because the record is still at PREPARED: the remote genuinely has
+        not seen this commit, because nothing ever told it to.
+        """
+        config = self._publication_target(project_id, publication)
+        if config is None:
+            # Publication was configured at PREPARED and the configuration
+            # disappeared underneath us. Fail closed rather than pretend the
+            # release was published. Local, so it is not a head conflict.
+            return self._git_fail_closed(
+                project_id, operation_id,
+                release_contract.ERROR_PUBLICATION_INPUT_INVALID, terminal=True)
+        push = config["repo"].push_prepared_publication(
+            config["url"], publication.get("intended_commit"), config["branch"],
+            ssh_key=config["ssh_key"],
+        )
+        if push.success:
+            # An accepted push IS the proof. No remote read.
+            return self._git_confirmed(project_id, operation_id, publication)
+
+        if (push.data or {}).get("rejected_as") != "NON_FAST_FORWARD":
+            # A conclusive refusal (auth, hook, permissions, or a local mirror
+            # write that failed after an accepted push). Re-pushing would
+            # repeat the identical failure, and the branch is not ours to move
+            # or to roll back.
+            return self._git_fail_closed(
+                project_id, operation_id,
+                push.error_code or release_contract.ERROR_PUSH_FAILED, terminal=True)
+
+        # Rejected as non-fast-forward: the remote moved under us. Reconcile
+        # once, and only ever along the A/B/C/D matrix.
+        reconciled = self._reconcile_head(project_id, publication, config)
+        if reconciled.success:
+            verdict = (reconciled.data or {}).get("verdict")
+            if verdict == release_contract.VERDICT_A_ADOPT:
+                return self._git_confirmed(
+                    project_id, operation_id, publication,
+                    remote_head=(reconciled.data or {}).get("remote_head"))
+            # B_RETRY: push the EXACT intended commit, once. It was built
+            # against a parent the remote still holds, so this is a clean
+            # fast-forward, not a re-parent.
+            retry = config["repo"].push_prepared_publication(
+                config["url"], publication.get("intended_commit"), config["branch"],
+                ssh_key=config["ssh_key"],
+            )
+            if retry.success:
+                return self._git_confirmed(project_id, operation_id, publication)
+            return self._git_fail_closed(
+                project_id, operation_id, release_contract.ERROR_PUSH_FAILED, terminal=True)
+        return self._git_fail_closed(
+            project_id, operation_id, reconciled.error_code,
+            reconciliation_required=True)
+
+    def _resume_git(self, project_id, operation_id, publication):
+        """Re-verify a publication a previous process already confirmed.
+
+        One remote read, one decision, and never a push:
+
+          * head == intended_commit -> continue (case A).
+          * any other valid head    -> case C, fail closed. Somebody moved the
+            branch to something we did not publish -- including BACK to
+            ``intended_parent``, which is not a rewind we get to "fix"; that is
+            a conflict to report, never a commit to build on top of.
+          * unreadable remote       -> case D, fail closed. We assert nothing
+            about a state we could not read.
+
+        B_RETRY is unreachable here and deliberately so. The persisted stage
+        says the push already landed; if the remote no longer holds the
+        intended commit, the remote changed after that confirmation, and
+        re-pushing would be a second publication of a record that already
+        claims it published once. A rejected initial push (still at PREPARED)
+        is the only place a retry is licensed, and that is ``_push_git``.
+        """
+        config = self._publication_target(project_id, publication)
+        if config is None:
+            # The target vanished under a record that says it published. Local,
+            # so it is not a head conflict and not a remote read.
+            return self._git_fail_closed(
+                project_id, operation_id,
+                release_contract.ERROR_PUBLICATION_INPUT_INVALID,
+                reconciliation_required=True)
+        reconciled = self._reconcile_head(
+            project_id, publication, config, already_confirmed=True)
+        if reconciled.success:
+            return self._git_confirmed(
+                project_id, operation_id, publication,
+                remote_head=(reconciled.data or {}).get("remote_head"))
+        return self._git_fail_closed(
+            project_id, operation_id, reconciled.error_code,
+            reconciliation_required=True)
+
+    def _publication_target(self, project_id, publication):
+        """The push target for a pending record: config plus its OWN branch.
+
+        The branch comes from the pending record, not from a fresh resolve. The
+        branch name was written into the durable publication intent at
+        PREPARED; re-resolving it here would let a mid-operation slug change
+        send this operation's commit to a different ref than the one the
+        reconcile and every later read use.
+        """
+        state = self.store.load(project_id)
+        if state is None:
+            return None
+        config = self._publication_config(state)
+        if config is None:
+            return None
+        branch = (publication or {}).get("branch")
+        if not branch:
+            return None
+        return {**config, "branch": branch}
+
+    def _reconcile_head(self, project_id, publication, config,
+                        already_confirmed=False):
+        """The single remote read: classify the branch head as A/B/C/D.
+
+        ``already_confirmed`` narrows the matrix to resume semantics (A/C/D,
+        never a retry); see ``reconcile_publication_head`` for why that
+        narrowing is a safety property.
+        """
+        return config["repo"].reconcile_publication_head(
+            config["url"], config["branch"],
+            publication.get("intended_commit"),
+            publication.get("intended_parent"),
+            ssh_key=config["ssh_key"],
+            already_confirmed=already_confirmed,
+        )
+
+    def _git_confirmed(self, project_id, operation_id, publication, *, remote_head=None):
+        """Persist GIT_CONFIRMED (and advance the branch parent authority)."""
+        try:
+            self.releases.confirm_publication(
+                project_id, operation_id, remote_head=remote_head)
+        except (StaleOperationIntent, release_contract.ReleaseRecordError) as exc:
+            logger.error(
+                "Publication confirmation FAILED project=%s (type=%s)",
+                project_id, type(exc).__name__,
+            )
+            return OperationResult.fail(
+                "PUBLICATION_STAGE_LOST", error_code="PUBLICATION_STAGE_LOST")
         logger.info(
-            "LIVE source published project=%s branch=%s tested=%s publication=%s",
-            project_id, branch, git_identity["commit"],
-            published["publication_commit"],
+            "Publication confirmed project=%s branch=%s commit=%s",
+            project_id, publication.get("branch"), publication.get("intended_commit"),
         )
-        return "SYNCED"
+        return OperationResult.ok({
+            "stage": release_contract.STAGE_GIT_CONFIRMED,
+            "verdict": release_contract.VERDICT_A_ADOPT,
+        })
+
+    def _git_fail_closed(self, project_id, operation_id, error_code, *,
+                         terminal: bool = False, reconciliation_required: bool = False):
+        """Record a Git-stage failure and return it.
+
+        ``terminal`` fails the lifecycle (a conclusive refusal). The default
+        HOLDS PUBLISHING with the intent intact, because a C or D verdict means
+        the remote state is unresolved -- not that the release is known bad.
+        Holding is also what blocks a new operation from superseding this one.
+        """
+        logger.error(
+            "Publication FAILED project=%s operation=%s code=%s terminal=%s",
+            project_id, operation_id, error_code, terminal,
+        )
+        try:
+            if reconciliation_required:
+                self.releases.mark_reconciliation_required(
+                    project_id, operation_id, error_code)
+            else:
+                self.releases.mark_terminal_failure(
+                    project_id, operation_id, error_code,
+                    publication_failed=not reconciliation_required,
+                )
+        except (StaleOperationIntent, release_contract.ReleaseStageError):
+            pass
+        if terminal:
+            self._fail(project_id, "PUBLICATION_FAILED", error_code)
+        return OperationResult.fail(error_code, error_code=error_code)
+
+    def _mark_publication_terminal_failure(self, project_id, operation_id,
+                                           error_code, smoke=None):
+        """Best-effort pending-publication failure bookkeeping."""
+        try:
+            self.releases.mark_terminal_failure(
+                project_id, operation_id, error_code, smoke=smoke)
+        except (StaleOperationIntent, release_contract.ReleaseStageError):
+            pass
+
+    def _mark_publication_reconciliation_required(self, project_id, operation_id,
+                                                  error_code):
+        """Hold the pending publication open for reconciliation."""
+        try:
+            self.releases.mark_reconciliation_required(
+                project_id, operation_id, error_code)
+        except (StaleOperationIntent, release_contract.ReleaseStageError):
+            pass
 
     @staticmethod
     def _tested_commit_for(state, operation_id, approval=None):
@@ -1217,21 +1871,6 @@ class PromotionOrchestrator:
                 raise ValueError("tested commit artifact hash does not match approval")
         return git_identity
 
-    def _record_source_sync(self, project_id, branch, *, tested_commit,
-                            publication_commit, source_revision):
-        with self.store.acquire_writer(project_id) as state:
-            state.repository = {
-                "provider": "github",
-                "repo": self._source_repo_name(),
-                "branch": branch,
-                "tested_commit": tested_commit,
-                "publication_commit": publication_commit,
-                "source_revision": source_revision,
-                "sync_status": "SYNCED",
-                "synced_at": time.time(),
-            }
-            self.store.save(state)
-
     def _source_repo_name(self):
         """``owner/name`` for the configured remote, or None.
 
@@ -1243,32 +1882,6 @@ class PromotionOrchestrator:
             return None
         match = re.fullmatch(r"git@github\.com:([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)\.git", url)
         return f"{match.group(1)}/{match.group(2)}" if match else None
-
-    def _record_source_sync_required(self, project_id, branch, error_code,
-                                     tested_commit=None):
-        """Record that the published branch is behind the live site.
-
-        ``tested_commit`` is the revision's source that SHOULD be in the
-        branch, which is what an operator needs to reconcile. No
-        ``publication_commit`` is written, because none was confirmed to
-        exist on the remote, and the previous one is deliberately PRESERVED:
-        it is the parent authority for the next publication and names the
-        last revision that genuinely reached the remote.
-        """
-        with self.store.acquire_writer(project_id) as state:
-            record = dict(state.repository or {})
-            record.update({
-                "provider": "github",
-                "repo": self._source_repo_name() or record.get("repo"),
-                "branch": branch,
-                "sync_status": "SOURCE_SYNC_REQUIRED",
-                "last_error_code": error_code,
-                "recorded_at": time.time(),
-            })
-            if tested_commit:
-                record["tested_commit"] = tested_commit
-            state.repository = record
-            self.store.save(state)
 
     # ------------------------------------------------------------------
     # Internals

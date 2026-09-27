@@ -29,6 +29,81 @@ DISPATCH_EVENT_RETENTION = 500
 PENDING_REVISION_RETENTION = 50
 
 
+# ---------------------------------------------------------------------------
+# R2 release-identity migration (lazy, on load)
+# ---------------------------------------------------------------------------
+# R1 recorded the LIVE release across TWO independent fields with nothing binding
+# them: ``deployment.last_live_deployment`` and ``state.repository``. R2 replaces
+# both with ``deployment.last_live_release`` as the single authoritative LIVE
+# release, and ``deployment.publication_head`` as the single branch-parent
+# authority. The migration is applied lazily, on every load, so an existing
+# state file needs no batch upgrade and no second writer can race one.
+#
+# What it deliberately does NOT do:
+#
+#   * Invent a LIVE release. With no ``last_live_deployment`` there is no
+#     evidence a release ever happened, so no record is created -- not even a
+#     partial one.
+#   * Upgrade a partial record to a complete one. A derived record carries
+#     only what R1 actually persisted; every field R1 never wrote stays None.
+#     There is no evidence to upgrade with, and an inferred tree or hash would
+#     be indistinguishable from a proven one at every later read.
+#   * Write anything back. This is a pure read-time projection: the next
+#     ordinary ``save`` persists it, and until then the on-disk file is
+#     untouched.
+
+
+def _migrate_release_identity(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Project pre-R2 release state onto the R2 release-identity contract."""
+    # Imported here, not at module scope: app.projects.release depends on this
+    # module for ProjectStateStore, and a top-level import would be circular.
+    from app.projects.release import legacy_live_release
+
+    deployment = data.get("deployment")
+    if not isinstance(deployment, dict):
+        return data
+    repository = data.get("repository")
+    if not isinstance(repository, dict):
+        repository = {}
+
+    # Already migrated: never re-derive over an R2-written record, and never
+    # downgrade a COMPLETE release to LEGACY_PARTIAL. The retirement below
+    # still applies, because a project can reach this branch with repository
+    # contents still on disk from before the upgrade.
+    if not isinstance(deployment.get("last_live_release"), dict):
+        last_live = deployment.get("last_live_deployment")
+        if isinstance(last_live, dict) and last_live.get("operation_id"):
+            try:
+                deployment["last_live_release"] = legacy_live_release(
+                    last_live, repository)
+            except Exception:
+                # A malformed legacy record must not make the whole project
+                # unreadable. Falling back to no release record is the
+                # fail-closed direction: readers see "release identity unknown"
+                # rather than a half-derived one.
+                deployment.pop("last_live_release", None)
+
+        # Branch parent authority: the last publication commit R1 confirmed on
+        # the remote branch. A root publication (R1 recorded no commit) leaves
+        # it absent, which ``resolve_branch_parent`` reads as "no parent".
+        head_commit = repository.get("publication_commit")
+        if isinstance(head_commit, str) and re.fullmatch(r"[0-9a-f]{40}", head_commit):
+            deployment["publication_head"] = {
+                "commit": head_commit,
+                "branch": repository.get("branch"),
+                "confirmed_at": repository.get("synced_at"),
+            }
+
+    # ``state.repository`` is retired. The dataclass field stays (so
+    # ``from_dict(**data)`` never breaks on an old file) but its contents are
+    # dropped for EVERY record, migrated or not: nothing reads it, and a stale
+    # copy is a second source of truth for the branch head. This touches no
+    # release identity -- ``last_live_release`` and ``publication_head`` above
+    # are the only things derived, and only from an un-migrated record.
+    data["repository"] = {}
+    return data
+
+
 @dataclass
 class RevisionState:
     """Revision tracking per canonical spec §20."""
@@ -181,6 +256,7 @@ class ProjectState:
         # malformed so every shared authorization gate fails closed.
         if "roles" not in data:
             data["roles"] = {"owner": data.get("owner_id"), "reviewers": [], "viewers": []}
+        data = _migrate_release_identity(data)
         return cls(**data)
 
 
