@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional
 
+from app.core import credentials
+
 # Fixed viewport sizes per canonical Phase 8 spec.
 DESKTOP_VIEWPORT = (1440, 900)
 MOBILE_VIEWPORT = (390, 844)
@@ -141,6 +143,13 @@ def _run_browser_command(argv: List[str], timeout: int) -> subprocess.CompletedP
                 text=True,
                 timeout=timeout,
                 check=False,
+                # R2-B1: the browser helper is a generated-project shell, so
+                # it gets the strict build allowlist — no model credential and
+                # no deployment credential. Without this it inherited the
+                # full parent environment. No project identity variables are
+                # set: this call site has no project/workspace context, and
+                # inventing one would be worse than omitting them.
+                env=credentials.shell_env(),
             )
         except subprocess.TimeoutExpired as exc:
             sink.seek(0)

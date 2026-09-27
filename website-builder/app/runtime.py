@@ -67,6 +67,7 @@ def _diag_log(tag: str) -> None:
 
 from app.channels.dispatch import AuthenticatedTelegramContext, TelegramDispatcher
 from app.channels.telegram import NormalizedMessage, TelegramNormalizer
+from app.core import credentials
 from app.core.intake import IntakeProcessor
 from app.core.state import ProjectStateStore, reconcile_stranded_projects
 from app.core.registry import ConversationRegistryStore, DuplicateProjectName, slugify_display_name
@@ -436,6 +437,9 @@ def preflight_node_toolchain(starter_dir: Optional[Path] = None) -> None:
             text=True,
             timeout=10,
             check=True,
+            # R2-B1: benign system variables only. A version probe must never
+            # be the process that carries a deploy credential.
+            env=credentials.shell_env(),
         )
         node_version_str = res.stdout.strip()
     except Exception as exc:
@@ -484,6 +488,7 @@ def preflight_node_toolchain(starter_dir: Optional[Path] = None) -> None:
             text=True,
             timeout=10,
             check=True,
+            env=credentials.shell_env(),
         )
         npm_version_str = res_npm.stdout.strip()
     except Exception as exc:
@@ -568,10 +573,30 @@ def preflight_role_validation(config: RuntimeConfig) -> bool:
     never invents operator configuration, and never starts the runtime when
     any role is missing or malformed.
 
+    Also gates the generation profile itself: the ``hermes -z`` child loads
+    ``$HERMES_HOME/.env`` unfiltered with ``override=True`` and can read any
+    absolute path, so a profile carrying a privileged credential would hand it
+    to a role that holds file and terminal tools. Reporting that at STARTUP
+    (with a value-free, actionable message) is far better than discovering it
+    at the first FRONTEND build, which is where the per-spawn guard lives.
+
     Returns True only when every required role resolves (and VISION passes
-    the image-input capability gate).
+    the image-input capability gate) and the profile is clean.
     """
+    from app.core import credentials
     from app.hermes.adapter import HermesAdapter
+
+    try:
+        credentials.assert_profile_dotenv_clean(config.hermes_home)
+        credentials.assert_profile_home_clean(config.hermes_home)
+    except ValueError as exc:
+        logger.error(
+            "Website Builder Hermes profile carries credential material a "
+            "generation agent could read — refusing to start."
+        )
+        logger.error("  %s", exc)
+        logger.error("Profile path: %s", config.hermes_home)
+        return False
 
     probe = HermesAdapter(store=None, hermes_home=config.hermes_home)  # type: ignore[arg-type]
     report = probe.validate_role_configuration()
@@ -757,10 +782,22 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
     smoke_tester = PreviewSmokeTester(config.smoke_browser_factory)
 
     # PHASE E: project-scoped Vercel automation-bypass provisioning. The
-    # secret store lives under HERMES_HOME, SEPARATE from all project/
-    # conversation state, keyed by immutable Vercel project id. Future
+    # secret store lives in the application's own state root, SEPARATE from
+    # all project/conversation state and — deliberately — separate from the
+    # Hermes profile home, keyed by immutable Vercel project id. Future
     # projects never require manual dashboard setup.
-    bypass_store = BypassSecretStore(config.hermes_home / "vercel-bypass")
+    #
+    # It must NOT live under `hermes_home`: the FRONTEND generation agent is
+    # launched with HERMES_HOME pointing there, holds file + terminal tools,
+    # runs with HERMES_YOLO_MODE=1 (no human approval gate), and is told the
+    # profile path verbatim by the website-builder-environment skill. A
+    # credential stored there is readable by a generation role regardless of
+    # process-environment isolation. The pre-migration location is retained as
+    # a read-only legacy root so an existing provisioned secret is not lost.
+    bypass_store = BypassSecretStore(
+        config.state_root / "vercel-bypass",
+        legacy_roots=[config.hermes_home / "vercel-bypass"],
+    )
     bypass_provisioner = BypassProvisioner(vercel, bypass_store)
 
     def _ensure_bypass(app_id, vercel_project, *, expected_name=None,

@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from app.core import credentials
 from app.core.state import ProjectStateStore
 
 logger = logging.getLogger(__name__)
@@ -478,13 +479,72 @@ class HermesAdapter:
             for skill in skills:
                 cmd.extend(["--skills", skill])
 
-        # Build environment
-        env = os.environ.copy()
+        # Build environment. R2-B1: the environment is role-scoped by the
+        # shared credential policy, NOT an ``os.environ.copy()``. A
+        # generation agent — FRONTEND especially, which holds file and
+        # terminal tools — must never inherit a privileged credential
+        # (GitHub / Vercel / Hostinger / Strix / Telegram / WhatsApp) from the
+        # parent process. The model credential it legitimately needs is still
+        # present; the deploy credentials are not.
+        #
+        # `provider` is this role's already-resolved provider (set above from
+        # the profile's role mapping). Passing it lets the policy inject just
+        # that provider's credential names instead of the whole provider set.
+        # An unrecognised provider falls back to the full set — never starve a
+        # role of its model key.
+        env = credentials.agent_env(role or "FAST", provider=provider)
         env["HERMES_HOME"] = str(self.hermes_home)
         env["HERMES_YOLO_MODE"] = "1"
         env["HERMES_ACCEPT_HOOKS"] = "1"
         if env_extra:
             env.update(env_extra)
+
+        # Fail closed. A generation agent that can be handed a deploy
+        # credential is a broken boundary, and the correct response is to
+        # refuse to spawn rather than to run with a weakened environment.
+        # The child has file and terminal tools.
+        try:
+            credentials.assert_no_privileged(env)
+        except ValueError as exc:
+            return HermesResult(False, error=str(exc), exit_code=1)
+
+        # The scoped environment is necessary but not sufficient: the child
+        # re-runs load_hermes_dotenv(), which loads this profile's own .env
+        # unfiltered with override=True, INSIDE the child. A privileged
+        # credential written there never passes through agent_env, so the
+        # scoping above cannot catch it. Refuse to spawn against such a profile.
+        try:
+            credentials.assert_profile_dotenv_clean(self.hermes_home)
+            credentials.assert_profile_home_clean(self.hermes_home)
+        except ValueError as exc:
+            return HermesResult(False, error=str(exc), exit_code=1)
+
+        # Residual, reported rather than refused. Every REGISTERED provider's
+        # key is already stripped from any shell the agent's terminal tool
+        # spawns (Hermes' _HERMES_PROVIDER_ENV_BLOCKLIST, which env_passthrough
+        # refuses to re-allow). Anything named here survived that scrub and
+        # would therefore be printable with `env` from a terminal call.
+        #
+        # The usual cause is the FALLBACK path — the role's provider did not
+        # resolve in either Hermes registry, so the full provider set was
+        # forwarded instead of one provider's names. That path is deliberate:
+        # refusing to spawn would break provider resolution, which is a worse
+        # failure than bounded extra breadth. Names only, never values.
+        uncovered = credentials.model_credentials_not_shell_protected(env)
+        if uncovered:
+            narrowed = credentials._provider_env_names_for(provider) is not None
+            logger.warning(
+                "Model credential(s) visible to the %s terminal tool: %s. "
+                "The role can still authenticate. %s",
+                role or "FAST", ", ".join(uncovered),
+                "The role's provider is registered, so this is an upstream gap "
+                "in Hermes' terminal scrub — report it upstream."
+                if narrowed else
+                "The role's provider ('%s') is not in either Hermes provider "
+                "registry, so the full provider set was forwarded rather than "
+                "that provider's own names. Register the provider to remove "
+                "this residual." % (provider or "unset"),
+            )
 
         # Run in the specified working directory
         cwd = cwd or self.repo_root

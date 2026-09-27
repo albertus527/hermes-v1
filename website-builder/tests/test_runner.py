@@ -183,18 +183,56 @@ class TestProjectRunner(unittest.TestCase):
             del os.environ["VERCEL_TOKEN"]
             del os.environ["NINEROUTER_API_KEY"]
 
-    def test_hermes_env_preserves_credentials(self):
-        """Hermes platform environment MAY receive credentials."""
+    def test_hermes_env_is_role_scoped(self):
+        """R2-B1: the Hermes generation-agent environment is role-scoped.
+
+        This env goes to FRONTEND, which holds file and terminal tools. It
+        receives benign system variables, the platform HERMES_HOME and
+        PROJECT_ID — but it is NOT a copy of the parent environment, so an
+        operator's platform/messaging/deploy credentials do not flow into a
+        child that can read files and run commands.
+        """
         os.environ["TELEGRAM_BOT_TOKEN"] = "secret-token-123"
         os.environ["NINEROUTER_API_KEY"] = "9router-key-000"
+        os.environ["VERCEL_TOKEN"] = "CANARY_VERCEL_SECRET"
         try:
             env = self.runner.build_hermes_env("proj-hermes")
-            self.assertIn("TELEGRAM_BOT_TOKEN", env)
-            self.assertIn("NINEROUTER_API_KEY", env)
             self.assertIn("HERMES_HOME", env)
+            self.assertIn("PROJECT_ID", env)
+            self.assertIn("PATH", env)
+            for leaked in ("TELEGRAM_BOT_TOKEN", "VERCEL_TOKEN"):
+                self.assertNotIn(leaked, env)
         finally:
             del os.environ["TELEGRAM_BOT_TOKEN"]
             del os.environ["NINEROUTER_API_KEY"]
+            del os.environ["VERCEL_TOKEN"]
+
+    def test_hermes_env_keeps_the_model_credential_it_needs(self):
+        """The role-scoped env must still carry a model credential.
+
+        Scoping that removed the provider key would make every role fail
+        closed at runtime; that is a regression, not isolation. The
+        allowlist is derived from Hermes' own provider registry, so this
+        asserts the real resolution contract rather than a literal name.
+        """
+        from app.core import credentials
+
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "canary-model-key"}):
+            env = self.runner.build_hermes_env("proj-hermes")
+        self.assertIn("OPENAI_API_KEY", env)
+        self.assertEqual(env["OPENAI_API_KEY"], "canary-model-key")
+        credentials.assert_no_privileged(env)
+
+    def test_build_hermes_env_does_not_mutate_the_parent(self):
+        """Isolation is per-child, never a global deletion.
+
+        Requirement 7: the solution must not delete variables from the
+        parent process. The parent keeps its own credentials for its own use;
+        only the child's view is scoped.
+        """
+        with patch.dict(os.environ, {"VERCEL_TOKEN": "CANARY_VERCEL_SECRET"}):
+            self.runner.build_hermes_env("proj-hermes")
+            self.assertEqual(os.environ["VERCEL_TOKEN"], "CANARY_VERCEL_SECRET")
 
     def test_source_repo_clean_check(self):
         """Source repo protection uses git status --porcelain."""

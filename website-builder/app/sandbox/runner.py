@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
+from app.core import credentials
 from app.core.state import ProjectStateStore
 
 
@@ -289,6 +290,7 @@ class ProjectRunner:
         - 9Router API keys (NINEROUTER_*)
         - Telegram tokens
         - Vercel credentials
+        - GitHub / Hostinger / Strix deployment credentials
         - domain provider credentials
         - unrelated platform secrets
 
@@ -298,70 +300,35 @@ class ProjectRunner:
         - WORKSPACE_ROOT
         - PATH, HOME, and other basic system vars
 
-        SECURITY: a prefix *denylist* cannot enumerate every credential an
-        operator's Hermes profile may define (GEMINI_/GOOGLE_/DEEPSEEK_/GMI_/
-        MOONSHOT_/NVIDIA_/XAI_/MISTRAL_/STRIPE_/AWS_/NPM_TOKEN/...). A
-        compromised or buggy build dependency (postinstall script) would then
-        exfiltrate any non-listed secret. Use a strict *allowlist* of benign
-        system variables instead, so credentials never flow into generated
-        project subprocesses by default.
+        R2-B1: the allowlist itself now lives in ``app.core.credentials`` so
+        every role boundary derives from ONE audited list instead of
+        drifting per-caller copies. The content is unchanged — this method
+        previously carried the same allowlist inline, and still delegates to
+        that single definition.
         """
-        # Minimal, benign system variables needed to run node/npm and resolve
-        # the toolchain on POSIX + Windows. Anything not in this allowlist is
-        # dropped, so no credential can leak through merely because its name
-        # was not anticipated.
-        _ALLOWED_EXACT = {
-            "PATH", "PATHEXT",
-            "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
-            "TEMP", "TMP", "TMPDIR",
-            "SYSTEMROOT", "WINDIR", "COMSPEC", "SYSTEMDRIVE",
-            "SHELL", "TERM", "COLORTERM",
-            "LANG", "LC_ALL", "LC_CTYPE", "TZ",
-            "NUMBER_OF_PROCESSORS",
-            "OS", "PROCESSOR_ARCHITECTURE",
-            # nvm / node version managers sometimes need these to resolve the
-            # selected toolchain when invoked inside a subprocess.
-            "NVM_DIR", "NVM_BIN", "NVM_HOME", "NVM_SYMLINK",
-            "VOLTA_HOME", "FNM_DIR", "FNM_MULTISHELL_PATH",
-        }
-        # Explicitly allowed prefixes for toolchain/runtime resolution only.
-        # These prefixes do not carry application credentials.
-        _ALLOWED_PREFIXES = (
-            "XDG_",          # XDG_DATA_HOME etc. — cache/config dirs, not secrets
-            "PROGRAMFILES",  # Windows Program Files / Program Files (x86)
-            "PROGRAMDATA",   # Windows ProgramData
-            "LOCALAPPDATA",  # Windows per-user app data
-            "APPDATA",       # Windows roaming app data
-        )
-        env: Dict[str, str] = {}
-        for key, value in os.environ.items():
-            if key in _ALLOWED_EXACT or key.upper() in _ALLOWED_EXACT:
-                env[key] = value
-            elif key.upper().startswith(tuple(p.upper() for p in _ALLOWED_PREFIXES)):
-                env[key] = value
-
-        # Set project-specific vars
-        env["HERMES_HOME"] = str(workspace / ".hermes")
-        env["PROJECT_ID"] = project_id
-        env["WORKSPACE_ROOT"] = str(workspace)
-
-        if extra:
-            env.update(extra)
-
-        return env
+        return credentials.build_env(project_id, workspace, extra)
 
     def build_hermes_env(
         self,
         project_id: str,
         extra: Optional[Dict[str, str]] = None,
+        provider: Optional[str] = None,
     ) -> Dict[str, str]:
-        """Build environment for Hermes platform processes.
+        """Build environment for a Hermes generation-agent invocation.
 
-        Hermes invocation MAY receive platform credentials because it needs
-        them for model/provider resolution. This is separate from the
-        generated-project environment.
+        R2-B1: this is a GENERATION role boundary, so it is role-scoped like
+        FAST/FRONTEND/VISION. It receives the model credential it needs and
+        benign system variables — but never a privileged credential, even
+        though a generation role legitimately uses model credentials. The
+        previous ``os.environ.copy()`` handed the child every deploy token in
+        the parent process; that is the leak this closes.
+
+        *provider* optionally narrows the model credential to that provider's
+        own names. A caller that has already resolved the FRONTEND role's
+        provider should pass it; one that has not gets the full provider set,
+        unchanged from R2-B1.
         """
-        env = os.environ.copy()
+        env = credentials.agent_env("FRONTEND", provider=provider)
         env["HERMES_HOME"] = str(self.hermes_home)
         env["PROJECT_ID"] = project_id
         if extra:
@@ -449,6 +416,10 @@ class ProjectRunner:
                 capture_output=True,
                 text=True,
                 timeout=10,
+                # R2-B1: this is a Git operation, so it gets the Git
+                # adapter's scoped environment (benign system variables plus
+                # Git/SSH configuration) — not the full parent environment.
+                env=credentials.git_env(),
             )
             return result.returncode == 0 and not result.stdout.strip()
         except Exception:

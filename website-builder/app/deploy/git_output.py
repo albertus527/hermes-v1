@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from app.core import credentials
 from app.deploy.snapshot import TestedSnapshot
 
 # A friendly publication branch is a single lower-case Git ref path component,
@@ -57,8 +58,18 @@ class OutputGitRepository:
         if self._run(['rev-parse', '--is-bare-repository']).strip() != b'true':
             raise ValueError('Output must be bare')
 
-    def _run(self, args, data=None, extra=None, init=False, check=True):
-        env = {k: v for k, v in os.environ.items() if not k.upper().startswith('GIT_')}
+    def _run(self, args, data=None, extra=None, init=False, check=True, credentials_env=None):
+        # R2-B1: the base environment is role-scoped. This is the Git
+        # adapter, so it may receive ONLY Git/SSH configuration plus benign
+        # system variables — never a Vercel/Hostinger/Strix deployment
+        # credential, and never a model credential. The previous
+        # ``os.environ`` pass-through handed every deploy token in the parent
+        # process to every git invocation.
+        env = credentials.git_env(source=credentials_env)
+        # Unset any inherited GIT_* first, so the deterministic values below
+        # are authoritative. Unchanged behaviour; only the base env is scoped.
+        for key in [k for k in list(env) if k.upper().startswith('GIT_')]:
+            del env[key]
         env.update({'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': os.devnull,
                     'GIT_TERMINAL_PROMPT': '0', 'GIT_AUTHOR_NAME': 'Website Builder',
                     'GIT_AUTHOR_EMAIL': 'builder@localhost', 'GIT_COMMITTER_NAME': 'Website Builder',
@@ -155,12 +166,15 @@ class OutputGitRepository:
         any state. ``BatchMode=yes`` is mandatory: without it a missing key
         or an unknown host makes ssh prompt, which would hang the single
         project worker instead of failing the publication.
+
+        R2-B1: the Git adapter remains the ONLY place a deploy key is
+        referenced. The key is a PATH; the material is never read, exported
+        into any generation-role environment, or made model-visible.
         """
         if not ssh_key:
             return None
-        return {'GIT_SSH_COMMAND': (
-            'ssh -o BatchMode=yes -o IdentitiesOnly=yes -i ' + str(ssh_key)
-        )}
+        command = credentials.git_env(ssh_key=ssh_key, source={})['GIT_SSH_COMMAND']
+        return {'GIT_SSH_COMMAND': command}
 
     def _has_commit(self, revision):
         result = self._run(['cat-file', '-e', str(revision) + '^{commit}'], check=False)
