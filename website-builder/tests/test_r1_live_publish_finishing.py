@@ -268,9 +268,10 @@ class _Vercel(FakeVercel):
 
 
 class _UnresolvableCanonicalVercel(_Vercel):
-    def canonical_production_url(self, app_id, project, *, expected_name=None):
-        return OperationResult.fail("CANONICAL_URL_UNRESOLVED",
-                                    error_code="CANONICAL_URL_UNRESOLVED")
+    def canonical_production_url(self, app_id, project, *, expected_name=None,
+                                 expected_deployment_id=None):
+        return OperationResult.fail("CANONICAL_PRODUCTION_URL_UNRESOLVED",
+                                    error_code="CANONICAL_PRODUCTION_URL_UNRESOLVED")
 
 
 class _RevisionLandsMidFlightVercel(_Vercel):

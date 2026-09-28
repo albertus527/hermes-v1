@@ -425,14 +425,18 @@ class FakeVercel:
         self.reconcile_external_calls.append(dict(intended_identity))
         return OperationResult.ok({"status": "PROMOTED_UNPROVEN", "deployment_id": None})
 
-    def canonical_production_url(self, app_id, project, *, expected_name=None):
+    def canonical_production_url(self, app_id, project, *, expected_name=None,
+                                 expected_deployment_id=None):
         """The project's own public default domain (never the deployment host)."""
         self.project = getattr(self, "project", None) or {}
         name = expected_name or self.project.get("name") or "site"
+        alias = getattr(self, "production_alias", None)
+        host = alias or "{}.vercel.app".format(name)
         return OperationResult.ok({
-            "canonical_production_url": "https://{}.vercel.app/".format(name),
-            "canonical_source": "VERCEL_PROJECT_DOMAIN",
+            "canonical_production_url": "https://{}/".format(host),
+            "canonical_source": "VERCEL_PRODUCTION_ALIAS" if alias else "VERCEL_PROJECT_DOMAIN",
             "project_name": name,
+            "canonical_host": host,
         })
 
 

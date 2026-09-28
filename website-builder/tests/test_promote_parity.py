@@ -434,13 +434,15 @@ class P9Vercel:
     def lookup_project(self, app_id, *, expected_name=None):
         return OperationResult.ok({'project': self._project, 'app_id': app_id})
 
-    def canonical_production_url(self, app_id, project, *, expected_name=None):
+    def canonical_production_url(self, app_id, project, *, expected_name=None,
+                                 expected_deployment_id=None):
         """The project's own public default domain, never the deployment host."""
         name = expected_name or self._project['name']
         return OperationResult.ok({
             'canonical_production_url': 'https://{}.vercel.app/'.format(name),
             'canonical_source': 'VERCEL_PROJECT_DOMAIN',
             'project_name': name,
+            'canonical_host': f'{name}.vercel.app',
         })
 
     def find_production_deployment(self, app_id, project, *, expected_name=None):

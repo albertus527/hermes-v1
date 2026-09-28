@@ -188,18 +188,24 @@ class FakeVercel:
             'state': 'READY',
         })
 
-    def canonical_production_url(self, app_id, project, *, expected_name=None):
+    def canonical_production_url(self, app_id, project, *, expected_name=None,
+                                 expected_deployment_id=None):
         """The project's own public default domain.
 
         Mirrors the real adapter: the name is the verified project name, and
         the host is that name's default domain -- never the deployment host.
         """
         self.expected_names.append(expected_name)
+        self.expected_deployment_ids = getattr(self, "expected_deployment_ids", [])
+        self.expected_deployment_ids.append(expected_deployment_id)
         name = expected_name or self._project['name']
+        alias = getattr(self, "production_alias", None)
+        host = alias or f'{name}.vercel.app'
         return OperationResult.ok({
-            'canonical_production_url': f'https://{name}.vercel.app/',
-            'canonical_source': 'VERCEL_PROJECT_DOMAIN',
+            'canonical_production_url': f'https://{host}/',
+            'canonical_source': 'VERCEL_PRODUCTION_ALIAS' if alias else 'VERCEL_PROJECT_DOMAIN',
             'project_name': name,
+            'canonical_host': host,
         })
 
 
@@ -231,9 +237,11 @@ class FakeSmoke:
     def __init__(self, success=True):
         self.success = success
         self.calls = 0
+        self.target_urls = []
 
     def run(self, url, out_dir):
         self.calls += 1
+        self.target_urls.append(url)
         Path(out_dir).mkdir(parents=True, exist_ok=True)
         return OperationResult(success=self.success,
                                data={'url': url, 'failures': [] if self.success else ['x']},
@@ -1145,3 +1153,242 @@ def test_bl5_rollback_uses_persisted_identity_not_recomputed(tmp_path):
     intent = store.load('proj').deployment['promotion_intent']
     assert intent['previous_production']['deployment_id'] == 'dpl_old'
     assert intent['previous_production']['artifact_sha256'] == 'c' * 64
+
+
+# ---------------------------------------------------------------------------
+# Canonical production URL resolution regressions (Batch C acceptance E2E)
+# ---------------------------------------------------------------------------
+from app.deploy.adapters import HttpResponse, VercelAdapter
+
+
+class _FakeTransport:
+    def __init__(self, routes):
+        self.routes = routes
+        self.calls = []
+
+    def request(self, method, url, **kwargs):
+        self.calls.append((method, url, kwargs))
+        for (pattern, resp) in self.routes:
+            if pattern in url:
+                status, body = resp
+                return HttpResponse(status, json.dumps(body).encode())
+        return HttpResponse(404, b'{"error":"not found"}')
+
+
+def _make_adapter(routes):
+    return VercelAdapter('secret', 'team_1', 'installation', _FakeTransport(routes))
+
+
+def _valid_project(name='testbakery', project_id='prj_1'):
+    a = VercelAdapter('secret', 'team_1', 'installation', _FakeTransport([]))
+    return {
+        'id': project_id,
+        'name': name,
+        'accountId': 'team_1',
+        'env': [{'key': 'WEBSITE_BUILDER_OWNER', 'value': a._marker('app'), 'type': 'plain'}],
+    }
+
+
+def test_regression_adapter_case_a_disjoint_name_and_production_host():
+    """Regression Test A (adapter): project_name='testbakery', Vercel production alias
+    is 'testbakery-eight.vercel.app'.
+    Must resolve https://testbakery-eight.vercel.app/ and never testbakery.vercel.app."""
+    routes = [
+        ('/v13/deployments/dpl_promoted', (200, {
+            'id': 'dpl_promoted',
+            'projectId': 'prj_1',
+            'teamId': 'team_1',
+            'alias': ['testbakery-eight.vercel.app'],
+            'aliasAssigned': True,
+        })),
+    ]
+    adapter = _make_adapter(routes)
+    proj = _valid_project('testbakery', 'prj_1')
+    result = adapter.canonical_production_url(
+        'app', proj, expected_name='testbakery', expected_deployment_id='dpl_promoted',
+    )
+    assert result.success
+    assert result.data['canonical_production_url'] == 'https://testbakery-eight.vercel.app/'
+    assert result.data['canonical_host'] == 'testbakery-eight.vercel.app'
+    assert result.data['canonical_source'] == 'VERCEL_PRODUCTION_ALIAS'
+
+
+def test_regression_adapter_case_b_matching_name_and_host():
+    """Regression Test B (adapter): project name and production hostname happen to match."""
+    routes = [
+        ('/v13/deployments/dpl_promoted', (200, {
+            'id': 'dpl_promoted',
+            'projectId': 'prj_1',
+            'teamId': 'team_1',
+            'alias': ['mysite.vercel.app'],
+            'aliasAssigned': True,
+        })),
+    ]
+    adapter = _make_adapter(routes)
+    proj = _valid_project('mysite', 'prj_1')
+    result = adapter.canonical_production_url(
+        'app', proj, expected_name='mysite', expected_deployment_id='dpl_promoted',
+    )
+    assert result.success
+    assert result.data['canonical_production_url'] == 'https://mysite.vercel.app/'
+    assert result.data['canonical_host'] == 'mysite.vercel.app'
+
+
+def test_regression_adapter_case_c_no_verified_alias_fails_closed():
+    """Regression Test C (adapter): provider returns no verified production alias ->
+    fail closed with CANONICAL_PRODUCTION_URL_UNRESOLVED; do not guess <project_name>.vercel.app."""
+    routes = [
+        ('/v13/deployments/dpl_promoted', (200, {
+            'id': 'dpl_promoted',
+            'projectId': 'prj_1',
+            'teamId': 'team_1',
+            'alias': [],
+        })),
+        ('/v9/projects/testbakery', (200, {
+            'id': 'prj_1',
+            'name': 'testbakery',
+            'alias': [],
+            'targets': {'production': {'id': 'dpl_promoted', 'alias': []}},
+        })),
+        ('/v9/projects/testbakery/domains', (200, {
+            'domains': [],
+        })),
+    ]
+    adapter = _make_adapter(routes)
+    proj = _valid_project('testbakery', 'prj_1')
+    result = adapter.canonical_production_url(
+        'app', proj, expected_name='testbakery', expected_deployment_id='dpl_promoted',
+    )
+    assert not result.success
+    assert result.error_code == 'CANONICAL_PRODUCTION_URL_UNRESOLVED'
+
+
+def test_regression_adapter_case_d_alias_belonging_to_another_deployment_rejected():
+    """Regression Test D (adapter): provider returns an alias belonging to another project/deployment -> reject."""
+    routes = [
+        # Deployment returns no alias
+        ('/v13/deployments/dpl_promoted', (200, {
+            'id': 'dpl_promoted',
+            'projectId': 'prj_1',
+            'teamId': 'team_1',
+            'alias': [],
+        })),
+        # Project has an alias but it points to a DIFFERENT deployment
+        ('/v9/projects/testbakery', (200, {
+            'id': 'prj_1',
+            'name': 'testbakery',
+            'alias': [{
+                'domain': 'other.vercel.app',
+                'target': 'PRODUCTION',
+                'environment': 'production',
+                'deployment': {'id': 'dpl_SOME_OTHER_DEPLOYMENT'},
+            }],
+        })),
+        ('/v9/projects/testbakery/domains', (200, {
+            'domains': [],
+        })),
+    ]
+    adapter = _make_adapter(routes)
+    proj = _valid_project('testbakery', 'prj_1')
+    result = adapter.canonical_production_url(
+        'app', proj, expected_name='testbakery', expected_deployment_id='dpl_promoted',
+    )
+    assert not result.success
+    assert result.error_code == 'CANONICAL_PRODUCTION_URL_UNRESOLVED'
+
+
+def test_regression_orchestrator_case_a_disjoint_name_smoke_targets_actual_host(tmp_path):
+    """Regression Test A (orchestrator): project_name='testbakery', actual alias='testbakery-eight.vercel.app'.
+    Production smoke MUST target testbakery-eight.vercel.app and NEVER testbakery.vercel.app."""
+    runner, store = _runner(tmp_path)
+    ws = _make_workspace(tmp_path)
+    _approved_state(store, 'proj')
+    vercel = FakeVercel()
+    vercel.production_alias = 'testbakery-eight.vercel.app'
+    smoke = FakeSmoke(success=True)
+    deps = _deps(vercel=vercel, smoke=smoke)
+    orch = PromotionOrchestrator(runner, store, deps)
+    assert orch.approve('proj', principal_id=OWNER).success
+
+    result = orch.promote('proj', ws, principal_id=OWNER)
+    assert result.success
+
+    # Smoke targeted the actual verified production host
+    assert smoke.target_urls == ['https://testbakery-eight.vercel.app/']
+    assert 'https://testbakery.vercel.app/' not in smoke.target_urls
+    state = store.load('proj')
+    assert state.production_url == 'https://testbakery-eight.vercel.app/'
+    assert vercel.expected_deployment_ids[-1] == 'dpl_1'
+
+
+def test_regression_orchestrator_case_c_unresolved_canonical_fails_closed(tmp_path):
+    """Regression Test C (orchestrator): unresolvable canonical URL fails closed without guessing."""
+    runner, store = _runner(tmp_path)
+    ws = _make_workspace(tmp_path)
+    _approved_state(store, 'proj')
+
+    class UnresolvableVercel(FakeVercel):
+        def canonical_production_url(self, app_id, project, *, expected_name=None,
+                                     expected_deployment_id=None):
+            return OperationResult.fail('CANONICAL_PRODUCTION_URL_UNRESOLVED',
+                                        error_code='CANONICAL_PRODUCTION_URL_UNRESOLVED')
+
+    smoke = FakeSmoke(success=True)
+    deps = _deps(vercel=UnresolvableVercel(), smoke=smoke)
+    orch = PromotionOrchestrator(runner, store, deps)
+    assert orch.approve('proj', principal_id=OWNER).success
+
+    result = orch.promote('proj', ws, principal_id=OWNER)
+    assert not result.success
+    assert result.error_code == 'CANONICAL_PRODUCTION_URL_UNRESOLVED'
+    assert smoke.calls == 0
+    assert smoke.target_urls == []  # Smoke never called
+    state = store.load('proj')
+    assert state.failure['error_code'] == 'CANONICAL_PRODUCTION_URL_UNRESOLVED'
+
+
+def test_regression_orchestrator_case_e_redrive_from_production_confirmed_reuses_verified_host(tmp_path):
+    """Regression Test E (orchestrator): crash/re-drive from PRODUCTION_CONFIRMED reuses
+    the verified production host recorded in promotion_intent rather than re-resolving or re-synthesizing."""
+    runner, store = _runner(tmp_path)
+    ws = _make_workspace(tmp_path)
+    _approved_state(store, 'proj')
+
+    vercel = FakeVercel()
+    vercel.production_alias = 'testbakery-eight.vercel.app'
+    smoke = FakeSmoke(success=True)
+    deps = _deps(vercel=vercel, smoke=smoke)
+    orch = PromotionOrchestrator(runner, store, deps)
+    assert orch.approve('proj', principal_id=OWNER).success
+
+    # First run resolves and persists canonical_production_url in promotion_intent
+    result = orch.promote('proj', ws, principal_id=OWNER)
+    assert result.success
+
+    # Verify the intent persisted the canonical production url
+    state = store.load('proj')
+    intent = state.deployment['promotion_intent']
+    assert intent['canonical_production_url'] == 'https://testbakery-eight.vercel.app/'
+    assert intent['canonical_deployment_id'] == 'dpl_1'
+    assert intent['canonical_host'] == 'testbakery-eight.vercel.app'
+
+    # Now simulate a re-drive: if canonical_production_url is called again, make it fail
+    class RejectReResolutionVercel(FakeVercel):
+        def canonical_production_url(self, app_id, project, *, expected_name=None,
+                                     expected_deployment_id=None):
+            raise AssertionError('canonical_production_url must not be re-resolved on re-drive!')
+
+    orch_redrive = PromotionOrchestrator(runner, store, _deps(vercel=RejectReResolutionVercel(), smoke=smoke))
+    smoke.target_urls.clear()
+    smoke.calls = 0
+
+    # Reset lifecycle to PUBLISHING to simulate resuming at STAGE_PRODUCTION_CONFIRMED
+    with store.acquire_writer('proj') as s:
+        s.lifecycle = 'PUBLISHING'
+        s.deployment['promotion_intent']['stage'] = 'promoted'
+        store.save(s)
+
+    redrive_result = orch_redrive.promote('proj', ws, principal_id=OWNER)
+    assert redrive_result.success
+    # Re-drive reused the persisted canonical host without re-resolving
+    assert smoke.target_urls == ['https://testbakery-eight.vercel.app/']

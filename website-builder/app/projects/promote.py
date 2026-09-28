@@ -1222,32 +1222,68 @@ class PromotionOrchestrator:
         # production binding is confirmed. This is the URL the user will see
         # and the URL that must be proven reachable, so it is resolved BEFORE
         # the smoke check rather than after it.
-        canonical = self._resolve_canonical(app_id, vercel_project, expected_name)
-        if canonical is None:
-            # Fail closed, and do it through the ordinary promotion-phase
-            # failure record: that keeps the durable ``promotion_intent``
-            # (including its previous-production identity) intact, which is
-            # exactly what makes this SAME operation resumable. Deliberately
-            # NOT a rollback: the remote promotion is confirmed good and the
-            # site may well be serving; only our own URL resolution failed.
-            # Rolling back a working site over a local formatting problem
-            # would be a worse outcome than the problem.
-            self._mark_publication_terminal_failure(
+        #
+        # Re-drive / recovery: promotion_intent is the sole durable authority.
+        # If the verified canonical URL for this exact deployment_id is already
+        # recorded in promotion_intent, reuse it rather than re-resolving.
+        state_for_intent = self.store.load(project_id)
+        intent = (state_for_intent.deployment.get("promotion_intent") or {}) if state_for_intent else {}
+        recorded_url = intent.get("canonical_production_url")
+        recorded_dep_id = intent.get("canonical_deployment_id")
+
+        if (recorded_url and isinstance(recorded_url, str)
+                and recorded_dep_id == intended_identity["deployment_id"]):
+            host = intent.get("canonical_host") or urlsplit(recorded_url).hostname
+            canonical = {
+                "canonical_production_url": recorded_url,
+                "canonical_source": intent.get("canonical_source", "VERCEL_PRODUCTION_ALIAS"),
+                "canonical_host": host,
+                "project_name": expected_name,
+            }
+            logger.info(
+                "Canonical production URL reused from intent project=%s source=%s url=%s host=%s",
+                project_id, canonical.get("canonical_source"),
+                canonical.get("canonical_production_url"), host,
+            )
+        else:
+            canonical = self._resolve_canonical(
+                app_id, vercel_project, expected_name,
+                deployment_id=intended_identity["deployment_id"],
+            )
+            if canonical is None:
+                # Fail closed, and do it through the ordinary promotion-phase
+                # failure record: that keeps the durable ``promotion_intent``
+                # (including its previous-production identity) intact, which is
+                # exactly what makes this SAME operation resumable. Deliberately
+                # NOT a rollback: the remote promotion is confirmed good and the
+                # site may well be serving; only our own URL resolution failed.
+                # Rolling back a working site over a local formatting problem
+                # would be a worse outcome than the problem.
+                self._mark_publication_terminal_failure(
+                    project_id, operation_id,
+                    "CANONICAL_PRODUCTION_URL_UNRESOLVED",
+                )
+                self._fail(
+                    project_id, "CANONICAL_PRODUCTION_URL_UNRESOLVED",
+                    "CANONICAL_PRODUCTION_URL_UNRESOLVED",
+                )
+                return OperationResult.fail(
+                    "CANONICAL_PRODUCTION_URL_UNRESOLVED",
+                    error_code="CANONICAL_PRODUCTION_URL_UNRESOLVED",
+                )
+            host = canonical.get("canonical_host") or urlsplit(canonical["canonical_production_url"]).hostname
+            self._update_intent(
                 project_id, operation_id,
-                "CANONICAL_PRODUCTION_URL_UNRESOLVED",
+                canonical_production_url=canonical["canonical_production_url"],
+                canonical_source=canonical.get("canonical_source"),
+                canonical_host=host,
+                canonical_deployment_id=intended_identity["deployment_id"],
             )
-            self._fail(
-                project_id, "CANONICAL_PRODUCTION_URL_UNRESOLVED",
-                "CANONICAL_PRODUCTION_URL_UNRESOLVED",
+            logger.info(
+                "Canonical production URL resolved project=%s source=%s url=%s host=%s",
+                project_id, canonical.get("canonical_source"),
+                canonical.get("canonical_production_url"), host,
             )
-            return OperationResult.fail(
-                "CANONICAL_PRODUCTION_URL_UNRESOLVED",
-                error_code="CANONICAL_PRODUCTION_URL_UNRESOLVED",
-            )
-        logger.info(
-            "Canonical production URL resolved project=%s source=%s",
-            project_id, canonical.get("canonical_source"),
-        )
 
         # ---- 3. Mandatory production smoke check, against the CANONICAL
         # url. The deployment-specific hostname may sit behind Deployment
@@ -1430,29 +1466,36 @@ class PromotionOrchestrator:
     # Canonical public production URL
     # ------------------------------------------------------------------
 
-    def _resolve_canonical(self, app_id, vercel_project, expected_name):
+    def _resolve_canonical(self, app_id, vercel_project, expected_name, deployment_id=None):
         """The canonical public production URL, or None when unresolvable.
 
-        Delegates to the adapter, which proves project ownership and then
-        reads authoritative project/domain state, falling back to the
-        deterministic ``https://<verified name>.vercel.app/`` form. A
-        collaborator that predates the helper (or raises) is treated as
-        unresolvable rather than silently degrading to a deployment hostname:
-        there is no honest URL to return in that case.
+        Delegates strictly to the adapter's ``canonical_production_url`` with
+        ``expected_deployment_id``. A collaborator that fails or returns an
+        invalid result is treated as unresolvable rather than silently degrading
+        to a deployment hostname: there is no honest URL to return in that case.
         """
         helper = getattr(self.deps.vercel, "canonical_production_url", None)
         if not callable(helper):
             return None
-        try:
-            result = helper(app_id, vercel_project, expected_name=expected_name)
-        except Exception:
-            return None
+        result = helper(
+            app_id, vercel_project,
+            expected_name=expected_name,
+            expected_deployment_id=deployment_id,
+        )
         if not getattr(result, "success", False):
             return None
         data = result.data or {}
         url = data.get("canonical_production_url")
-        if (not isinstance(url, str) or not url.startswith("https://")
-                or "vercel.app" not in url or url.rstrip("/") == "https://vercel.app"):
+        if not isinstance(url, str) or not url.startswith("https://"):
+            return None
+        try:
+            p = urlsplit(url)
+            if (p.scheme != "https" or p.port not in (None, 443)
+                    or p.username or p.password or p.fragment
+                    or not p.hostname
+                    or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.vercel\.app", p.hostname)):
+                return None
+        except Exception:
             return None
         return data
 

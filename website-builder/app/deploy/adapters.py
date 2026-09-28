@@ -1460,36 +1460,24 @@ class VercelAdapter:
     # 100 characters.
     _VERCEL_PROJECT_NAME_RE = re.compile(r'[a-z0-9][a-z0-9-]{0,99}')
 
-    def canonical_production_url(self, app_id, project, *, expected_name=None):
+    def canonical_production_url(self, app_id, project, *, expected_name=None,
+                                 expected_deployment_id=None):
         """Resolve the project's canonical PUBLIC production URL.
 
-        Resolution order:
+        Authority order:
+          a. Alias explicitly attached to the exact promoted deployment_id
+             (read from the validated deployment body on Vercel).
+          b. Project production alias explicitly proven to target that same
+             deployment and project (read from project.alias / targets).
+          c. Verified project domain only when Vercel provider data proves
+             it is the production target.
 
-          1. Prove ownership with the same marker check as every other
-             call (``_project_valid``); a name alone never proves anything.
-          2. Read the project's own domain list and use the default domain
-             the provider positively PROVES: a record whose ``name`` is
-             exactly ``<project-name>.vercel.app`` with ``verified is True``.
-          3. Otherwise fall back to the deterministic
-             ``https://<name>.vercel.app/`` form. This is legitimate only
-             because ``name`` has already been verified against the OWNED
-             project above (it is the same value ``lookup_project`` was
-             called with, and ``_project_valid`` re-asserted it) -- the
-             fallback formats a name we own, it never invents a host from a
-             response.
+        Deterministic sorting may only break ties among already-proven
+        equivalent production aliases.
 
-        A domain read that is unavailable, ambiguous, or simply does not
-        prove the default domain is NOT a failure: the project name is
-        already proven, so the canonical host is known. Only a project with
-        no usable name at all fails closed (``CANONICAL_URL_UNRESOLVED``).
-
-        A verified CUSTOM domain is deliberately NOT preferred here. It is
-        recorded and smoke-verified by the custom-domain flow, but the
-        canonical production URL is always the project's own default
-        domain, so publication never becomes coupled to that flow or to its
-        deployment-protection bypass scoping.
-
-        Read-only. Never mints, mutates, or trusts a deployment hostname.
+        If binding cannot be proven, fail closed with
+        CANONICAL_PRODUCTION_URL_UNRESOLVED. Never synthesize or guess
+        <project_name>.vercel.app.
         """
         try:
             if not self._project_valid(project, app_id, expected_name=expected_name):
@@ -1497,38 +1485,102 @@ class VercelAdapter:
             name = expected_name or self.project_name_for(app_id)
             if (not isinstance(name, str)
                     or not self._VERCEL_PROJECT_NAME_RE.fullmatch(name)):
-                # No provable project name -> no provable canonical host.
-                # Never fall back to a deployment hostname here.
-                return _fail('CANONICAL_URL_UNRESOLVED')
-            proven = self._default_domain_verified(name, project)
-            if proven:
-                return OperationResult.ok({
-                    'canonical_production_url': f'https://{name}.vercel.app/',
-                    'canonical_source': 'VERCEL_PROJECT_DOMAIN',
-                    'project_name': name,
-                })
+                return _fail('CANONICAL_PRODUCTION_URL_UNRESOLVED')
+
+            candidates = []
+
+            # (a) Check alias explicitly attached to the exact promoted deployment_id
+            if expected_deployment_id:
+                try:
+                    status, body = self._call('GET', '/v13/deployments/' + quote(expected_deployment_id, safe=''))
+                    if status == 200 and isinstance(body, dict) and body.get('id') == expected_deployment_id:
+                        team = body.get('teamId') or (body.get('team') or {}).get('id')
+                        project_id_field = body.get('projectId') or (body.get('project') or {}).get('id')
+                        if project_id_field == project['id'] and team == self.team_id:
+                            raw_aliases = body.get('alias')
+                            if isinstance(raw_aliases, list):
+                                for a in raw_aliases:
+                                    if isinstance(a, str) and _safe_origin(f'https://{a}/'):
+                                        candidates.append(a)
+                except Exception:
+                    pass
+
+            # (b) Project production alias explicitly proven to target that same deployment/project
+            if not candidates:
+                try:
+                    status, fresh = self._call('GET', '/v9/projects/' + quote(name, safe=''))
+                    if status == 200 and isinstance(fresh, dict) and fresh.get('id') == project['id']:
+                        for entry in fresh.get('alias', []):
+                            if not isinstance(entry, dict):
+                                continue
+                            domain = entry.get('domain')
+                            target = entry.get('target') or ''
+                            env = entry.get('environment') or ''
+                            if target != 'PRODUCTION' and env != 'production':
+                                continue
+                            if entry.get('redirect'):
+                                continue
+                            dep = entry.get('deployment') or {}
+                            dep_id = dep.get('id') if isinstance(dep, dict) else None
+                            if expected_deployment_id and dep_id and dep_id != expected_deployment_id:
+                                continue
+                            if expected_deployment_id and not dep_id:
+                                continue
+                            if isinstance(domain, str) and _safe_origin(f'https://{domain}/'):
+                                candidates.append(domain)
+
+                        if not candidates:
+                            prod_target = fresh.get('targets', {}).get('production', {})
+                            if isinstance(prod_target, dict):
+                                prod_dep_id = prod_target.get('id')
+                                if not expected_deployment_id or prod_dep_id == expected_deployment_id:
+                                    prod_aliases = prod_target.get('alias', [])
+                                    if isinstance(prod_aliases, list):
+                                        for a in prod_aliases:
+                                            if isinstance(a, str) and _safe_origin(f'https://{a}/'):
+                                                candidates.append(a)
+                except Exception:
+                    pass
+
+            # (c) Verified project domain only when Vercel provider data proves it is the production target
+            if not candidates:
+                try:
+                    status, dom_body = self._call('GET', '/v9/projects/' + quote(name, safe='') + '/domains', production='true')
+                    if status == 200 and isinstance(dom_body, dict):
+                        for entry in dom_body.get('domains', []):
+                            if not isinstance(entry, dict):
+                                continue
+                            if entry.get('verified') is not True:
+                                continue
+                            if entry.get('projectId') and entry.get('projectId') != project['id']:
+                                continue
+                            if entry.get('redirect'):
+                                continue
+                            if entry.get('gitBranch'):
+                                continue
+                            tgt = entry.get('target') or entry.get('environment')
+                            if tgt and tgt.lower() != 'production':
+                                continue
+                            domain = entry.get('name')
+                            if isinstance(domain, str) and _safe_origin(f'https://{domain}/'):
+                                candidates.append(domain)
+                except Exception:
+                    pass
+
+            if not candidates:
+                return _fail('CANONICAL_PRODUCTION_URL_UNRESOLVED')
+
+            unique_candidates = sorted(set(candidates))
+            selected_host = unique_candidates[0]
+
             return OperationResult.ok({
-                'canonical_production_url': f'https://{name}.vercel.app/',
-                'canonical_source': 'VERIFIED_PROJECT_NAME',
+                'canonical_production_url': f'https://{selected_host}/',
+                'canonical_source': 'VERCEL_PRODUCTION_ALIAS',
                 'project_name': name,
+                'canonical_host': selected_host,
             })
         except Exception:
-            return _fail('CANONICAL_URL_UNRESOLVED')
-
-    def _default_domain_verified(self, name, project):
-        """True only when the provider PROVES the project's own default
-        domain is attached and verified.
-
-        Any doubt -- unreadable response, non-list payload, absent record, a
-        record that is not the default domain, or a non-boolean ``verified``
-        -- is False, which routes the caller to the deterministic fallback.
-        Never raises and never partially trusts a malformed body.
-        """
-        try:
-            status, body = self._call(
-                'GET', '/v9/projects/' + quote(name, safe='') + '/domains')
-        except Exception:
-            return False
+            return _fail('CANONICAL_PRODUCTION_URL_UNRESOLVED')
         if status != 200 or not isinstance(body, dict):
             return False
         domains = body.get('domains')

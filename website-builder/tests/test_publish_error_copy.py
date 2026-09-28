@@ -49,6 +49,8 @@ PUBLISH_CODES = (
     "PROJECT_IDENTITY_MISMATCH",
     "INVALID_DEPLOYMENT_ID",
     "INVALID_PRODUCTION_URL",
+    "CANONICAL_PRODUCTION_URL_UNRESOLVED",
+    "PRODUCTION_SMOKE_FAILED",
     "ROLLBACK_FAILED",
     "ROLLBACK_RECONCILIATION_REQUIRED",
     "ROLLBACK_TARGET_IDENTITY_INCOMPLETE",
@@ -60,6 +62,16 @@ SUCCESS_CLAIMS = ("berhasil", "sukses", "sudah live", "udah tayang", "selesai")
 
 def test_incomplete_lookup_renders_the_exact_p9_copy():
     assert render_error_message("INCOMPLETE_LOOKUP") == P9_COPY
+
+
+def test_production_smoke_failed_exact_copy():
+    expected = (
+        "Website sudah berhasil dipromosikan ke production, tapi pemeriksaan "
+        "akhir di alamat production belum lolos. Preview kamu tetap aman. "
+        "Status production belum akan ditandai selesai sampai pemeriksaan "
+        "ini berhasil."
+    )
+    assert render_error_message("PRODUCTION_SMOKE_FAILED") == expected
 
 
 @pytest.mark.parametrize("code", PUBLISH_CODES)

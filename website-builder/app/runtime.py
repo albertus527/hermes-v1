@@ -1206,6 +1206,12 @@ ERROR_MESSAGES: Dict[str, str] = {
         "belum bisa aku pastikan, jadi aku tidak mau menyatakan berhasil. "
         "Preview kamu tetap aman dan belum berubah — sudah dicatat untuk diperiksa."
     ),
+    "PRODUCTION_SMOKE_FAILED": (
+        "Website sudah berhasil dipromosikan ke production, tapi pemeriksaan "
+        "akhir di alamat production belum lolos. Preview kamu tetap aman. "
+        "Status production belum akan ditandai selesai sampai pemeriksaan "
+        "ini berhasil."
+    ),
     "ROLLBACK_FAILED": (
         "Ada kendala saat publish, dan efforts untuk mengembalikan website "
         "sebelumnya belum berhasil. Aku tidak mau menebak statusnya. "
@@ -2406,8 +2412,14 @@ User message:
                 project_id,
                 result.error_code,
             )
+            err_code = (
+                "PRODUCTION_SMOKE_FAILED"
+                if (isinstance(getattr(result, "data", None), dict) and result.data.get("production_smoke_failed") is True)
+                   or result.error_code == "PRODUCTION_SMOKE_FAILED"
+                else result.error_code
+            )
             self._send_error_reply(
-                state.conversation_id if state else None, result.error_code
+                state.conversation_id if state else None, err_code
             )
 
     def _send_approval_ack_once(self, project_id: str, conversation_id) -> None:
@@ -2532,7 +2544,13 @@ User message:
                 project_id,
                 result.error_code,
             )
-            self._send_error_reply(conversation_id, result.error_code)
+            err_code = (
+                "PRODUCTION_SMOKE_FAILED"
+                if (isinstance(getattr(result, "data", None), dict) and result.data.get("production_smoke_failed") is True)
+                   or result.error_code == "PRODUCTION_SMOKE_FAILED"
+                else result.error_code
+            )
+            self._send_error_reply(conversation_id, err_code)
 
     def _send_preview_status_once(self, project_id, chat_id, diagnostics):
         if not isinstance(diagnostics, dict):
