@@ -203,6 +203,52 @@ def _previous_identity_complete(identity) -> bool:
     )
 
 
+def _promoted_production_binding(intent, pending) -> Optional[str]:
+    """The deployment id that is AUTHORITATIVELY production for this
+    operation once the promotion boundary has been crossed, else None.
+
+    A promote-by-creation mints a NEW deployment id (``B``) that becomes the
+    production binding; the approved preview id (``A``) stays in the intent
+    only as provenance and as the rollback source. Reading ``A`` as the
+    production binding after that boundary is what made an already-promoted,
+    already-smoked operation unrecoverable: every reconciliation compared the
+    provider's production binding against a deployment that is no longer, and
+    never was meant to be, the production one.
+
+    The boundary test is the durable pending publication's stage, not the
+    intent's own ``stage`` string: the stage is the record of how far this
+    operation actually got, and it is written under the same lock as the
+    promoted id. Below ``PRODUCTION_CONFIRMED`` the promotion has provably not
+    been applied, so there is no promoted binding to honour and pre-promotion
+    semantics stay exactly as they were.
+
+    Returns None when there is no promoted id, when it is not a usable
+    string, when the intent and the pending record do not belong to the same
+    operation, or when the stage does not prove the boundary was crossed.
+    """
+    if not isinstance(intent, dict) or not isinstance(pending, dict):
+        return None
+    promoted = intent.get("promoted_deployment_id")
+    if not isinstance(promoted, str) or not promoted:
+        return None
+    # The promoted id and the stage that proves the boundary must describe
+    # ONE operation; a pending record left over from a different operation
+    # proves nothing about this intent's promotion.
+    if pending.get("operation_id") != intent.get("operation_id"):
+        return None
+    stage = pending.get("stage")
+    if not isinstance(stage, str) or not stage:
+        return None
+    try:
+        if not release_contract.at_least(
+                stage, release_contract.STAGE_PRODUCTION_CONFIRMED):
+            return None
+    except release_contract.ReleaseStageError:
+        # An unrecognised stage cannot prove the boundary was crossed.
+        return None
+    return promoted
+
+
 def _classify_previous_production(result):
     """Classify the current production deployment as
     ``(kind, rollback_identity)``.
@@ -620,12 +666,23 @@ class PromotionOrchestrator:
         if not previous_result.success:
             return previous_result
         previous_class, fresh_previous = _classify_previous_production(previous_result)
+        # On an already-promoted recovery the fresh lookup reads POST-promotion
+        # provider truth, so it will classify the promoted deployment itself as
+        # "previous production". That is a read-only observation, never a
+        # rollback target: the persisted intent's previous-production record is
+        # the only authority for what production was BEFORE this operation.
+        promoted_binding = _promoted_production_binding(
+            state.deployment.get("promotion_intent") or {},
+            state.deployment.get("pending_publication") or {},
+        )
         logger.info(
-            "Previous production classified=%s project=%s deployment=%s",
+            "Previous production classified=%s project=%s deployment=%s%s",
             previous_class,
             project_id,
             (fresh_previous or {}).get("deployment_id")
             or (previous_result.data or {}).get("deployment_id"),
+            " (read-only post-promotion observation; promoted binding=%s)"
+            % promoted_binding if promoted_binding else "",
         )
         if previous_class == PREVIOUS_PRODUCTION_UNKNOWN:
             # A production deployment exists but cannot be positively
@@ -741,13 +798,25 @@ class PromotionOrchestrator:
 
                 # The exact trusted identity of the deployment we intended to
                 # promote. Reconciliation compares the COMPLETE tuple -- never
-                # a URL or a bare deployment_id.
+                # a URL or a bare deployment_id.  This is the APPROVAL identity
+                # (preview deployment A) and is retained as durable provenance:
+                # it is the rollback source and the record of what was
+                # approved.  It must NEVER be mutated in place.
                 intended_identity = {
                     "deployment_id": deployment_id,
                     "operation_id": operation_id,
                     "source_revision": source_revision,
                     "artifact_sha256": artifact_sha256,
                 }
+
+                # AUTHORITATIVE re-read, from the SETTLED locked state. The
+                # pre-lock value above only annotated the log; a NEW operation
+                # rebuilds both records inside this lock, so anything read
+                # before it could describe a superseded operation.
+                promoted_binding = _promoted_production_binding(
+                    locked.deployment.get("promotion_intent") or {},
+                    locked.deployment.get("pending_publication") or {},
+                )
 
         if prepare_failed:
             self._fail(
@@ -758,6 +827,19 @@ class PromotionOrchestrator:
                 release_contract.ERROR_NO_TRUSTED_TESTED_COMMIT,
                 error_code=release_contract.ERROR_NO_TRUSTED_TESTED_COMMIT,
             )
+
+        # When the promotion boundary has already been crossed (a promoted
+        # deployment id is persisted AND the pending stage proves it), the
+        # AUTHORITATIVE production identity is the promoted deployment (B),
+        # not the approval preview (A).  Derive a separate production_identity
+        # that carries B as its deployment_id; leave intended_identity
+        # untouched so the original approval/promotion provenance survives
+        # every recovery read.
+        if promoted_binding:
+            production_identity = dict(intended_identity)
+            production_identity["deployment_id"] = promoted_binding
+        else:
+            production_identity = intended_identity
 
         # ---- Writer lock RELEASED. Every remote call happens from here on.
         #
@@ -802,9 +884,12 @@ class PromotionOrchestrator:
         resume_identity = None
         resume_deployment_url = None
         if is_same_operation:
+            # Use production_identity (promoted B) for reconciliation when the
+            # boundary is crossed; otherwise intended_identity (preview A).
+            reconcile_identity = production_identity if promoted_binding else intended_identity
             decision, adopted, adopted_url = self._adopt_external_promotion(
-                project_id, app_id, vercel_project, intended_identity, expected_name,
-                recovery=recovery,
+                project_id, app_id, vercel_project, reconcile_identity, expected_name,
+                recovery=recovery, preserve_stage=bool(promoted_binding),
             )
             if decision == "unproven":
                 return OperationResult.fail(
@@ -815,16 +900,50 @@ class PromotionOrchestrator:
                 resume_deployment_url = adopted_url
             else:
                 reconcile = self.deps.vercel.reconcile_production_deployment(
-                    app_id, vercel_project, intended_identity, expected_name=expected_name,
+                    app_id, vercel_project, reconcile_identity, expected_name=expected_name,
                 )
                 status = (reconcile.data or {}).get("status") if reconcile.success else None
                 if status == "PROMOTED":
-                    resume_identity = intended_identity
+                    # The identity we reconciled IS the production binding.
+                    # When the boundary was crossed that is the promoted
+                    # deployment (B); otherwise it is the approval preview
+                    # (A). Recording the reconciled identity (rather than
+                    # always the approval one) keeps the two cases identical
+                    # pre-boundary and correct post-boundary.
+                    resume_identity = reconcile_identity
                     resume_deployment_url = (reconcile.data or {}).get("deployment_url")
                 elif status == "NOT_PROMOTED":
-                    # Conclusively not promoted: fall through to the normal
-                    # promote below (safe -- the provider itself reports this
-                    # promotion job as terminally failed).
+                    # Conclusively not promoted: normally we fall through to
+                    # the promote below, which is safe because the provider
+                    # itself reports this promotion job as terminally failed.
+                    #
+                    # NOT when the promotion boundary was already crossed.
+                    # There the durable record says this operation's promoted
+                    # deployment (B) reached production, and the provider now
+                    # claims the job failed. Those two statements contradict
+                    # each other, and re-promoting would mint a THIRD
+                    # deployment -- a new deployment, a rebuild and a
+                    # re-promote, none of which an already-promoted recovery
+                    # is allowed to perform. Fail closed and leave the state
+                    # reconcilable for a human decision.
+                    if promoted_binding:
+                        logger.error(
+                            "Promoted deployment contradicts provider job state "
+                            "project=%s operation=%s promoted=%s",
+                            project_id, operation_id, promoted_binding,
+                        )
+                        self._mark_publication_reconciliation_required(
+                            project_id, operation_id,
+                            "PROMOTION_RECONCILIATION_REQUIRED",
+                        )
+                        self._fail_reconciliation_required(
+                            project_id, "PROMOTION_RECONCILIATION_REQUIRED",
+                            reconcile_identity, "promote",
+                        )
+                        return OperationResult.fail(
+                            "PROMOTION_RECONCILIATION_REQUIRED",
+                            error_code="PROMOTION_RECONCILIATION_REQUIRED",
+                        )
                     pass
                 else:
                     # Ambiguous resume: do NOT blindly re-promote.
@@ -856,10 +975,15 @@ class PromotionOrchestrator:
                 "Promotion confirmed deployment=%s (reconciled)",
                 resume_identity["deployment_id"],
             )
-            self._update_intent(
-                project_id, operation_id, stage="promoted",
-                deployment_url=resume_deployment_url,
-            )
+            # When the promotion boundary was already crossed, the durable
+            # stage evidence ("smoked" etc.) must survive: rewriting it to
+            # "promoted" would walk the record backwards and destroy the
+            # evidence of how far the operation actually got.
+            if not promoted_binding:
+                self._update_intent(
+                    project_id, operation_id, stage="promoted",
+                    deployment_url=resume_deployment_url,
+                )
             return self._post_promote(
                 project_id, workspace, app_id, vercel_project,
                 previous_identity,
@@ -971,7 +1095,8 @@ class PromotionOrchestrator:
 
     def _adopt_external_promotion(self, project_id, app_id, vercel_project,
                                   intended_identity, expected_name, *,
-                                  recovery: bool = False):
+                                  recovery: bool = False,
+                                  preserve_stage: bool = False):
         """Reconcile remote truth for a SAME-OPERATION resume and adopt a
         promotion that has ALREADY been applied, with zero promote POSTs.
 
@@ -1014,11 +1139,16 @@ class PromotionOrchestrator:
                 "Promotion adopted deployment=%s proof=%s project=%s",
                 adopted, data.get("proof"), project_id,
             )
-            self._update_intent(
-                project_id, intended_identity["operation_id"], stage="promoted",
-                promoted_deployment_id=adopted,
-                deployment_url=data.get("production_url"),
-            )
+            # When the promotion boundary was already crossed, the durable
+            # stage evidence ("smoked" etc.) must survive: rewriting it to
+            # "promoted" would walk the record backwards and destroy the
+            # evidence of how far the operation actually got.
+            if not preserve_stage:
+                self._update_intent(
+                    project_id, intended_identity["operation_id"], stage="promoted",
+                    promoted_deployment_id=adopted,
+                    deployment_url=data.get("production_url"),
+                )
             return "adopted", identity, data.get("production_url")
         if status == "PROMOTED_UNPROVEN":
             if not recovery:

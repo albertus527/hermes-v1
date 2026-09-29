@@ -368,6 +368,49 @@ def test_external_promotion_adopts_by_provider_lineage():
     assert result.data['deployment_id'] == 'dpl_cli'
 
 
+def test_promoted_deployment_adopts_by_direct_identity():
+    """The p16 shape at the adapter boundary: the production binding is the
+    PROMOTED deployment ``B`` minted by promote-by-creation, and the identity
+    we reconcile is ``B`` (not the approved preview ``A``).
+
+    ``B`` carries the ``wb*`` metadata that ``_promote_by_creation`` stamped
+    onto it, so the meta check passes and the direct proof holds. Reconciling
+    ``A`` against a binding of ``B`` is what produced PROMOTED_UNPROVEN and
+    made an already-promoted operation unrecoverable.
+    """
+    a, t = adapter()
+    t.responses = [
+        (200, bound(a, 'dpl_prod_B')),
+        (200, deployment(a, 'dpl_prod_B', aliasAssigned=True)),
+    ]
+    result = a.reconcile_external_promotion(
+        'app', project(a), identity(a, deployment_id='dpl_prod_B'))
+    assert result.success
+    assert result.data['status'] == 'PROMOTED'
+    assert result.data['proof'] == 'DIRECT_IDENTITY'
+    assert result.data['deployment_id'] == 'dpl_prod_B'
+
+
+def test_preview_identity_against_a_promoted_binding_is_unproven():
+    """The bug, pinned at the adapter boundary: reconciling the approved
+    preview ``A`` while the binding is the promoted ``B`` proves nothing.
+
+    ``B``'s metadata belongs to the promoted deployment, so comparing it
+    against ``A``'s identity must not succeed -- and it must not be read as
+    "promoted" either.
+    """
+    a, t = adapter()
+    t.responses = [
+        (200, bound(a, 'dpl_prod_B')),
+        (200, deployment(a, 'dpl_prod_B', aliasAssigned=True)),
+    ]
+    result = a.reconcile_external_promotion(
+        'app', project(a), identity(a, deployment_id='dpl_preview_A'))
+    assert result.success
+    assert result.data['status'] == 'PROMOTED_UNPROVEN'
+    assert result.data['deployment_id'] == 'dpl_prod_B'
+
+
 def test_wrong_remote_deployment_is_never_adopted():
     a, t = adapter()
     t.responses = [(200, bound(a, 'dpl_unrelated'))]
