@@ -33,6 +33,7 @@ from app.runtime import (
     TelegramProviderError,
     TelegramReceiveLoop,
     _run_reconcile_publish,
+    _run_inspect_canonical_url,
     compose,
     load_runtime_config,
     main,
@@ -1241,6 +1242,89 @@ class TestReconcilePublishEntrypoint:
         assert _run_reconcile_publish(
             composition, ['--reconcile-publish', 'tg-6329821361-p9', '--as', 'owner-1'],
         ) == 1
+
+
+class TestInspectCanonicalUrlEntrypoint:
+    """``--inspect-canonical-url`` is the operator's READ-ONLY door onto the
+    canonical-identity evidence. It reports; it never acts. Pinned here so it
+    cannot quietly grow a mutation path or a principal-gated recovery."""
+
+    PROMOTED = 'dpl_9guwEUjg4fd1vvrywvf3QmeRZc6j'
+
+    @staticmethod
+    def _state(slug_owner=True, promoted=PROMOTED):
+        state = MagicMock()
+        state.conversation_id = 'conv-1'
+        state.deployment = {}
+        if promoted is not None:
+            state.deployment = {'promotion_intent': {
+                'operation_id': 'op-1', 'promoted_deployment_id': promoted,
+            }}
+        return state
+
+    @staticmethod
+    def _composition(state, entry=None, lookup=None, evidence=None):
+        composition = MagicMock()
+        composition.store.load.return_value = state
+        composition.registry_store.load_or_create.return_value.find_by_id.return_value = (
+            entry if entry is not None else MagicMock(vercel_slug='mopsypeyshop'))
+        composition.vercel.lookup_project.return_value = (
+            lookup if lookup is not None else OperationResult.ok(
+                {'project': {'id': 'prj_1', 'name': 'mopsypeyshop'}}))
+        composition.vercel.inspect_canonical_evidence.return_value = (
+            evidence if evidence is not None else OperationResult.ok(
+                {'expected_deployment_id': TestInspectCanonicalUrlEntrypoint.PROMOTED}))
+        return composition
+
+    def test_missing_project_id_is_a_usage_error(self):
+        assert _run_inspect_canonical_url(self._composition(self._state()), []) == 2
+
+    def test_unknown_project_fails_closed(self):
+        composition = self._composition(None)
+        assert _run_inspect_canonical_url(composition, ['--inspect-canonical-url', 'p17']) == 1
+        composition.vercel.inspect_canonical_evidence.assert_not_called()
+
+    def test_unbound_slug_fails_closed(self):
+        """A slug derived fresh here would report against an identity that may
+        not exist remotely, so an unbound project is refused instead."""
+        composition = self._composition(self._state(), entry=MagicMock(vercel_slug=None))
+        assert _run_inspect_canonical_url(composition, ['--inspect-canonical-url', 'p17']) == 1
+        composition.vercel.inspect_canonical_evidence.assert_not_called()
+
+    def test_unknown_promoted_deployment_fails_closed(self):
+        composition = self._composition(self._state(promoted=None))
+        assert _run_inspect_canonical_url(composition, ['--inspect-canonical-url', 'p17']) == 1
+        composition.vercel.inspect_canonical_evidence.assert_not_called()
+
+    def test_falls_back_to_the_committed_release_deployment(self):
+        state = self._state(promoted=None)
+        state.deployment = {'last_live_release': {'deployment_id': self.PROMOTED}}
+        composition = self._composition(state)
+        assert _run_inspect_canonical_url(composition, ['--inspect-canonical-url', 'p17']) == 0
+        _, kwargs = composition.vercel.inspect_canonical_evidence.call_args
+        assert kwargs['expected_deployment_id'] == self.PROMOTED
+
+    def test_reports_evidence_for_the_bound_project(self, capsys):
+        composition = self._composition(self._state())
+        assert _run_inspect_canonical_url(composition, ['--inspect-canonical-url', 'p17']) == 0
+        composition.vercel.lookup_project.assert_called_once_with(
+            'p17', expected_name='mopsypeyshop')
+        composition.vercel.inspect_canonical_evidence.assert_called_once()
+        assert json.loads(capsys.readouterr().out)['expected_deployment_id'] == self.PROMOTED
+
+    def test_unreadable_provider_state_fails_closed(self):
+        composition = self._composition(self._state(), evidence=OperationResult.fail(
+            'CANONICAL_PRODUCTION_URL_UNRESOLVED',
+            error_code='CANONICAL_PRODUCTION_URL_UNRESOLVED'))
+        assert _run_inspect_canonical_url(composition, ['--inspect-canonical-url', 'p17']) == 1
+
+    def test_no_principal_is_required_and_none_is_accepted(self):
+        """Read-only: it must not be gated on --as, and a stray --as must not
+        change what it does."""
+        composition = self._composition(self._state())
+        assert _run_inspect_canonical_url(
+            composition, ['--inspect-canonical-url', 'p17', '--as', 'stranger']) == 0
+        composition.promote.resume_publish.assert_not_called()
 
 
 

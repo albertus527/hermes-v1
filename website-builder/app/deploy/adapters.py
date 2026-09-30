@@ -1581,18 +1581,193 @@ class VercelAdapter:
             })
         except Exception:
             return _fail('CANONICAL_PRODUCTION_URL_UNRESOLVED')
-        if status != 200 or not isinstance(body, dict):
-            return False
-        domains = body.get('domains')
-        if not isinstance(domains, list):
-            return False
-        for entry in domains:
-            if not isinstance(entry, dict):
-                return False
-            if entry.get('name') != name + '.vercel.app':
-                continue
-            return entry.get('verified') is True
-        return False
+
+    # ------------------------------------------------------------------
+    # PHASE R1-A — canonical identity evidence (READ-ONLY diagnostic)
+    # ------------------------------------------------------------------
+    #
+    # Answers one question: which production host does Vercel actually
+    # prove for this project, and which provider field proves it. It is a
+    # diagnostic, not a resolver: ``canonical_production_url`` remains the
+    # sole authority for what is published, and nothing here feeds it.
+    #
+    # BOUNDED AND ALLOWLISTED BY CONSTRUCTION. Every value that leaves this
+    # method is projected field-by-field from a fixed table of provider
+    # fields, coerced to a primitive, and length- and count-capped:
+    #
+    #   project     id, name, accountId, targets.production.{id, alias[]}
+    #   domain      name, projectId, verified, redirect, gitBranch,
+    #               customEnvironmentId
+    #   deployment  id, projectId, teamId, url, alias[]
+    #
+    # Nothing else is ever read or returned -- no ``env``, no ``meta``, no
+    # ``lastAliasRequest``, no protection bypass, no pagination, no error
+    # body, no token. A malformed value degrades to None; it is never
+    # passed through as an object or a repr.
+
+    _EVIDENCE_MAX_RECORDS = 20
+    _EVIDENCE_MAX_STRING = 128
+
+    @classmethod
+    def _evidence_string(cls, value):
+        """A provider string, capped, or None. Never an object or a repr."""
+        if not isinstance(value, str) or not value:
+            return None
+        if len(value) > cls._EVIDENCE_MAX_STRING:
+            return value[:cls._EVIDENCE_MAX_STRING] + '...'
+        return value
+
+    @classmethod
+    def _evidence_strings(cls, value):
+        """A capped list of provider strings. Never more than the cap."""
+        if not isinstance(value, list):
+            return []
+        out = []
+        for item in value[:cls._EVIDENCE_MAX_RECORDS]:
+            text = cls._evidence_string(item)
+            if text is not None:
+                out.append(text)
+        return out
+
+    @classmethod
+    def _evidence_flag(cls, value):
+        """A provider boolean, or None. Truthiness is never inferred."""
+        return value if isinstance(value, bool) else None
+
+    @classmethod
+    def _evidence_project(cls, project):
+        if not isinstance(project, dict):
+            return None
+        targets = project.get('targets')
+        production = targets.get('production') if isinstance(targets, dict) else None
+        production = production if isinstance(production, dict) else {}
+        return {
+            'id': cls._evidence_string(project.get('id')),
+            'name': cls._evidence_string(project.get('name')),
+            'account_id': cls._evidence_string(project.get('accountId')),
+            'production_target_id': cls._evidence_string(production.get('id')),
+            'production_target_aliases': cls._evidence_strings(production.get('alias')),
+        }
+
+    @classmethod
+    def _evidence_domain(cls, entry):
+        if not isinstance(entry, dict):
+            return None
+        return {
+            'name': cls._evidence_string(entry.get('name')),
+            'project_id': cls._evidence_string(entry.get('projectId')),
+            'verified': cls._evidence_flag(entry.get('verified')),
+            'redirect': cls._evidence_string(entry.get('redirect')),
+            'git_branch': cls._evidence_string(entry.get('gitBranch')),
+            'custom_environment_id': cls._evidence_string(entry.get('customEnvironmentId')),
+        }
+
+    @classmethod
+    def _evidence_deployment(cls, body):
+        if not isinstance(body, dict):
+            return None
+        return {
+            'id': cls._evidence_string(body.get('id')),
+            'project_id': cls._evidence_string(
+                body.get('projectId') or (body.get('project') or {}).get('id')),
+            'team_id': cls._evidence_string(
+                body.get('teamId') or (body.get('team') or {}).get('id')),
+            'url': cls._evidence_string(body.get('url')),
+            'alias': cls._evidence_strings(body.get('alias')),
+        }
+
+    def inspect_canonical_evidence(self, app_id, project, *, expected_name=None,
+                                   expected_deployment_id=None):
+        """READ-ONLY, allowlisted report of the canonical-identity evidence.
+
+        Never mutates anything, never mints a hostname, and never decides a
+        publication: the current resolver is invoked afterwards purely so the
+        report can state what it would return today, and that answer is
+        labelled ``resolver`` rather than being derived here.
+
+        Fails closed with ``CANONICAL_PRODUCTION_URL_UNRESOLVED`` when
+        project ownership cannot be proven -- the same gate the resolver
+        applies -- so the probe can never report on a project that is not
+        ours.
+        """
+        try:
+            if not self._project_valid(project, app_id, expected_name=expected_name):
+                return _fail('PROJECT_IDENTITY_MISMATCH')
+            name = expected_name or self.project_name_for(app_id)
+            if (not isinstance(name, str)
+                    or not self._VERCEL_PROJECT_NAME_RE.fullmatch(name)):
+                return _fail('CANONICAL_PRODUCTION_URL_UNRESOLVED')
+
+            project_evidence = None
+            production_binding = None
+            try:
+                status, fresh = self._call('GET', '/v9/projects/' + quote(name, safe=''))
+                if status == 200 and isinstance(fresh, dict) and fresh.get('id') == project['id']:
+                    project_evidence = self._evidence_project(fresh)
+                    production_binding = (
+                        (project_evidence or {}).get('production_target_id'))
+            except Exception:
+                pass
+
+            domain_evidence = []
+            try:
+                status, dom_body = self._call(
+                    'GET', '/v9/projects/' + quote(name, safe='') + '/domains',
+                    production='true')
+                if status == 200 and isinstance(dom_body, dict):
+                    entries = dom_body.get('domains')
+                    if isinstance(entries, list):
+                        for entry in entries[:self._EVIDENCE_MAX_RECORDS]:
+                            projected = self._evidence_domain(entry)
+                            if projected is not None:
+                                domain_evidence.append(projected)
+            except Exception:
+                pass
+
+            deployment_evidence = None
+            if expected_deployment_id:
+                try:
+                    status, body = self._call(
+                        'GET', '/v13/deployments/' + quote(expected_deployment_id, safe=''))
+                    if status == 200 and isinstance(body, dict):
+                        deployment_evidence = self._evidence_deployment(body)
+                except Exception:
+                    pass
+
+            resolver = self.canonical_production_url(
+                app_id, project, expected_name=expected_name,
+                expected_deployment_id=expected_deployment_id,
+            )
+            selected = None
+            if getattr(resolver, 'success', False):
+                data = resolver.data or {}
+                selected = {
+                    'canonical_production_url': self._evidence_string(
+                        data.get('canonical_production_url')),
+                    'canonical_host': self._evidence_string(data.get('canonical_host')),
+                    'canonical_source': self._evidence_string(data.get('canonical_source')),
+                }
+
+            return OperationResult.ok({
+                'project_name': name,
+                'expected_deployment_id': self._evidence_string(expected_deployment_id),
+                # True only when the provider's own production binding IS the
+                # deployment this operation promoted. Nothing may be called
+                # canonical on a project whose binding is someone else's.
+                'production_binding_matches': bool(
+                    expected_deployment_id
+                    and production_binding
+                    and production_binding == expected_deployment_id),
+                'project': project_evidence,
+                'domains': domain_evidence,
+                'deployment': deployment_evidence,
+                'resolver': selected,
+                'resolver_error_code': (
+                    None if selected else
+                    self._evidence_string(getattr(resolver, 'error_code', None))),
+            })
+        except Exception:
+            return _fail('CANONICAL_PRODUCTION_URL_UNRESOLVED')
 
     def _valid_hostname_for_api(self, hostname):
         return valid_custom_hostname(hostname)

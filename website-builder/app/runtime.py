@@ -682,6 +682,12 @@ class RuntimeComposition:
     preview: PreviewOrchestrator
     telegram_out: TelegramAdapter
     dispatcher: TelegramDispatcher
+    # Read-only boundary objects for operator diagnostics (--inspect-canonical-url).
+    # Exposed so a diagnostic can resolve the bound slug and read provider truth
+    # through the SAME adapters the mutating paths use, instead of rebuilding
+    # them with a second credential/identity path.
+    vercel: VercelAdapter
+    registry_store: ConversationRegistryStore
 
 
 def compose(config: RuntimeConfig) -> RuntimeComposition:
@@ -989,6 +995,8 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
         preview=preview,
         telegram_out=telegram_out,
         dispatcher=dispatcher,
+        vercel=vercel,
+        registry_store=registry_store,
     )
 
 
@@ -2723,6 +2731,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     if "--reconcile-publish" in argv:
         return _run_reconcile_publish(composition, argv)
 
+    # ---- Operator-only, strictly READ-ONLY canonical-identity evidence:
+    #   python -m app --inspect-canonical-url <project_id>
+    #
+    # No ``--as`` and no Telegram: this reports, it never acts. It exists so
+    # "which production host does Vercel actually prove for this project" is
+    # answerable from provider evidence instead of inferred from a hostname.
+    if "--inspect-canonical-url" in argv:
+        return _run_inspect_canonical_url(composition, argv)
+
     loop = TelegramReceiveLoop(
         bot_token=config.telegram_bot_token,
         dispatcher=composition.dispatcher,
@@ -2801,6 +2818,83 @@ def _run_reconcile_publish(composition, argv) -> int:
         "Publish recovery complete project=%s lifecycle=LIVE production_url=%s",
         project_id, (result.data or {}).get("production_url"),
     )
+    return 0
+
+
+def _inspect_promoted_deployment_id(state):
+    """The deployment this project last PROVED was production, or None.
+
+    The promoted id is the authoritative production identity once the
+    promotion boundary was crossed; before that, the committed LIVE release
+    is the only record of what production actually is. A deployment id is
+    never inferred from a URL or a hostname.
+    """
+    deployment = (getattr(state, "deployment", None) or {}) if state else {}
+    intent = deployment.get("promotion_intent")
+    promoted = intent.get("promoted_deployment_id") if isinstance(intent, dict) else None
+    if isinstance(promoted, str) and promoted:
+        return promoted
+    release = deployment.get("last_live_release")
+    released = release.get("deployment_id") if isinstance(release, dict) else None
+    return released if isinstance(released, str) and released else None
+
+
+def _run_inspect_canonical_url(composition, argv) -> int:
+    """Operator entry point for the READ-ONLY canonical-identity evidence.
+
+    Strictly read-only: no principal, no mutation, no Telegram, no receive
+    loop. Fails closed on anything it cannot prove -- a missing project id,
+    an unknown project, or a conversation with no bound slug -- rather than
+    reporting on identity it had to guess.
+
+    Everything printed is the adapter's ALLOWLISTED, capped projection of
+    provider identity fields. This is not a Vercel payload viewer and never
+    emits credentials, environment values, or filesystem paths.
+    """
+    project_id = _flag_value(argv, "--inspect-canonical-url")
+    if not project_id:
+        logger.error("Usage: python -m app --inspect-canonical-url <project_id>")
+        return 2
+    state = composition.store.load(project_id)
+    if state is None:
+        logger.error("No project state for project=%s", project_id)
+        return 1
+    conversation_id = getattr(state, "conversation_id", None)
+    if not conversation_id:
+        logger.error("Project has no conversation registry project=%s", project_id)
+        return 1
+    registry = composition.registry_store.load_or_create(conversation_id)
+    entry = registry.find_by_id(project_id)
+    # Only the ALREADY-BOUND slug is used. Deriving a fresh candidate here
+    # would report against a project identity that may not exist remotely.
+    slug = entry.vercel_slug if entry is not None else None
+    expected_deployment_id = _inspect_promoted_deployment_id(state)
+    if not slug or not expected_deployment_id:
+        logger.error(
+            "Nothing provable to inspect project=%s slug_bound=%s promoted_known=%s",
+            project_id, bool(slug), bool(expected_deployment_id),
+        )
+        return 1
+    lookup = composition.vercel.lookup_project(project_id, expected_name=slug)
+    if not lookup.success:
+        logger.error(
+            "Project lookup failed project=%s error_code=%s",
+            project_id, lookup.error_code,
+        )
+        return 1
+    result = composition.vercel.inspect_canonical_evidence(
+        project_id, lookup.data["project"], expected_name=slug,
+        expected_deployment_id=expected_deployment_id,
+    )
+    if not result.success:
+        logger.error(
+            "Canonical evidence unavailable project=%s error_code=%s",
+            project_id, result.error_code,
+        )
+        return 1
+    # Bounded by construction: the adapter caps record counts and string
+    # lengths before anything reaches here.
+    print(json.dumps(result.data, indent=2, sort_keys=True))
     return 0
 
 

@@ -1392,3 +1392,211 @@ def test_regression_orchestrator_case_e_redrive_from_production_confirmed_reuses
     assert redrive_result.success
     # Re-drive reused the persisted canonical host without re-resolving
     assert smoke.target_urls == ['https://testbakery-eight.vercel.app/']
+
+
+# ---------------------------------------------------------------------------
+# Canonical identity evidence probe (operator diagnostic, read-only)
+# ---------------------------------------------------------------------------
+
+
+def _evidence_routes():
+    """A provider fixture carrying every field the probe must NOT surface:
+    env, meta, lastAliasRequest, protection bypass, pagination, error body."""
+    return [
+        ('/v13/deployments/dpl_promoted', (200, {
+            'id': 'dpl_promoted',
+            'projectId': 'prj_1',
+            'teamId': 'team_1',
+            'url': 'mopsypeyshop-g3bo8i3m6-albert-a121.vercel.app',
+            'alias': ['mopsypeyshop-albert-a121.vercel.app'],
+            'aliasAssigned': True,
+            'meta': {'wbOperation': 'op-1', 'wbArtifact': 'SECRETISH'},
+            'protectionBypass': 'BYPASS-SECRET-VALUE',
+            'env': 'ENV-LEAK-MARKER',
+            'readySubstate': 'PROMOTED',
+        })),
+        ('/v9/projects/mopsypeyshop/domains', (200, {
+            'domains': [
+                {'name': 'mopsypeyshop.vercel.app', 'apexName': 'mopsypeyshop.vercel.app',
+                 'projectId': 'prj_1', 'verified': True, 'redirect': None,
+                 'gitBranch': None, 'customEnvironmentId': None,
+                 'verification': [{'type': 'TXT', 'domain': 'x', 'value': 'TXT-SECRET'}]},
+                {'name': 'shop.example.com', 'apexName': 'example.com',
+                 'projectId': 'prj_1', 'verified': False, 'redirect': 'https://other.test',
+                 'gitBranch': 'main', 'customEnvironmentId': 'env_x'},
+            ],
+            'pagination': {'count': 2, 'next': 'PAGE-TOKEN'},
+        })),
+        ('/v9/projects/mopsypeyshop', (200, {
+            'id': 'prj_1',
+            'name': 'mopsypeyshop',
+            'accountId': 'team_1',
+            'targets': {'production': {
+                'id': 'dpl_promoted',
+                'alias': ['mopsypeyshop-albert-a121.vercel.app'],
+            }},
+            'lastAliasRequest': {'toDeploymentId': 'dpl_promoted', 'jobStatus': 'succeeded'},
+            'env': [{'key': 'WEBSITE_BUILDER_OWNER', 'value': 'MARKER-VALUE',
+                     'type': 'plain'}],
+            'protectionBypass': {'alias': 'mopsypeyshop.vercel.app',
+                                 'protectionBypass': 'BYPASS-SECRET-VALUE'},
+        })),
+    ]
+
+
+def test_evidence_probe_reports_the_allowlisted_identity_fields():
+    adapter = _make_adapter(_evidence_routes())
+    proj = _valid_project('mopsypeyshop', 'prj_1')
+    result = adapter.inspect_canonical_evidence(
+        'app', proj, expected_name='mopsypeyshop', expected_deployment_id='dpl_promoted')
+    assert result.success
+    data = result.data
+    assert data['expected_deployment_id'] == 'dpl_promoted'
+    assert data['production_binding_matches'] is True
+    assert data['project'] == {
+        'id': 'prj_1',
+        'name': 'mopsypeyshop',
+        'account_id': 'team_1',
+        'production_target_id': 'dpl_promoted',
+        'production_target_aliases': ['mopsypeyshop-albert-a121.vercel.app'],
+    }
+    assert data['domains'][0] == {
+        'name': 'mopsypeyshop.vercel.app',
+        'project_id': 'prj_1',
+        'verified': True,
+        'redirect': None,
+        'git_branch': None,
+        'custom_environment_id': None,
+    }
+    assert data['domains'][1]['verified'] is False
+    assert data['deployment']['url'] == 'mopsypeyshop-g3bo8i3m6-albert-a121.vercel.app'
+    assert data['deployment']['alias'] == ['mopsypeyshop-albert-a121.vercel.app']
+
+
+def _all_keys(value):
+    """Every mapping key reachable in a projected payload."""
+    keys = set()
+    if isinstance(value, dict):
+        for key, item in value.items():
+            keys.add(key)
+            keys |= _all_keys(item)
+    elif isinstance(value, list):
+        for item in value:
+            keys |= _all_keys(item)
+    return keys
+
+
+def test_evidence_probe_never_leaks_unallowlisted_payload():
+    """The projection is the security boundary: a provider body carrying
+    secrets, owner markers, env, paging tokens and bypass values must yield
+    none of them -- and must not even echo the raw provider field names it
+    was asked to prove identity from."""
+    adapter = _make_adapter(_evidence_routes())
+    proj = _valid_project('mopsypeyshop', 'prj_1')
+    result = adapter.inspect_canonical_evidence(
+        'app', proj, expected_name='mopsypeyshop', expected_deployment_id='dpl_promoted')
+    keys = _all_keys(result.data)
+    for forbidden in ('env', 'meta', 'lastAliasRequest', 'protectionBypass',
+                      'pagination', 'verification', 'apexName', 'readySubstate',
+                      'aliasAssigned', 'redirectStatusCode',
+                      'accountId', 'projectId', 'teamId', 'gitBranch'):
+        assert forbidden not in keys, forbidden
+    blob = json.dumps(result.data)
+    for secret in ('SECRETISH', 'BYPASS-SECRET-VALUE', 'TXT-SECRET', 'MARKER-VALUE',
+                   'PAGE-TOKEN', 'ENV-LEAK-MARKER'):
+        assert secret not in blob, secret
+    # The allowlisted identity fields themselves ARE reported.
+    assert '"custom_environment_id": "env_x"' in blob
+
+
+def test_evidence_probe_caps_records_and_strings():
+    long_domain = 'x' * 300
+    routes = [
+        ('/v13/deployments/dpl_promoted', (200, {
+            'id': 'dpl_promoted', 'projectId': 'prj_1', 'teamId': 'team_1',
+            'url': long_domain, 'alias': [long_domain],
+        })),
+        ('/v9/projects/mopsypeyshop/domains', (200, {
+            'domains': [{'name': f'h{i}.vercel.app', 'projectId': 'prj_1',
+                         'verified': True} for i in range(40)],
+        })),
+        ('/v9/projects/mopsypeyshop', (200, {'id': 'prj_1', 'name': 'mopsypeyshop'})),
+    ]
+    adapter = _make_adapter(routes)
+    result = adapter.inspect_canonical_evidence(
+        'app', _valid_project('mopsypeyshop', 'prj_1'),
+        expected_name='mopsypeyshop', expected_deployment_id='dpl_promoted')
+    assert len(result.data['domains']) <= VercelAdapter._EVIDENCE_MAX_RECORDS
+    assert len(result.data['deployment']['url']) <= VercelAdapter._EVIDENCE_MAX_STRING + 3
+
+
+def test_evidence_probe_coerces_non_conforming_values_to_none():
+    """A malformed value degrades to None; it is never passed through as an
+    object, a bool-ish truthy value, or a repr."""
+    routes = [
+        ('/v13/deployments/dpl_promoted', (200, {
+            'id': 'dpl_promoted', 'projectId': 'prj_1', 'teamId': 'team_1',
+            'url': 12345, 'alias': 'not-a-list', 'project': None,
+        })),
+        ('/v9/projects/mopsypeyshop/domains', (200, {'domains': [
+            {'name': 'd.vercel.app', 'projectId': 'prj_1', 'verified': 'true'},
+            'not-a-dict',
+        ]})),
+        ('/v9/projects/mopsypeyshop', (200, {
+            'id': 'prj_1', 'name': 'mopsypeyshop', 'targets': 'not-a-dict',
+        })),
+    ]
+    adapter = _make_adapter(routes)
+    result = adapter.inspect_canonical_evidence(
+        'app', _valid_project('mopsypeyshop', 'prj_1'),
+        expected_name='mopsypeyshop', expected_deployment_id='dpl_promoted')
+    assert result.data['deployment']['url'] is None
+    assert result.data['deployment']['alias'] == []
+    assert result.data['project']['production_target_id'] is None
+    assert result.data['domains'][0]['verified'] is None
+    assert len(result.data['domains']) == 1
+
+
+def test_evidence_probe_agrees_with_the_resolver():
+    """The probe reports; it never decides. Whatever the resolver returns is
+    echoed under ``resolver`` and nothing else is asserted canonical."""
+    adapter = _make_adapter(_evidence_routes())
+    proj = _valid_project('mopsypeyshop', 'prj_1')
+    evidence = adapter.inspect_canonical_evidence(
+        'app', proj, expected_name='mopsypeyshop', expected_deployment_id='dpl_promoted')
+    resolved = adapter.canonical_production_url(
+        'app', proj, expected_name='mopsypeyshop', expected_deployment_id='dpl_promoted')
+    assert evidence.data['resolver'] == {
+        'canonical_production_url': resolved.data['canonical_production_url'],
+        'canonical_host': resolved.data['canonical_host'],
+        'canonical_source': resolved.data['canonical_source'],
+    }
+    # A domain the resolver has NOT proven is reported but not selected: the
+    # pretty host appearing in the evidence is never enough on its own.
+    assert evidence.data['domains'][0]['name'] == 'mopsypeyshop.vercel.app'
+    assert evidence.data['resolver']['canonical_host'] != 'mopsypeyshop.vercel.app'
+
+
+def test_evidence_probe_reports_binding_mismatch_without_claiming_production():
+    routes = _evidence_routes()
+    project_route = [r for r in routes if r[0] == '/v9/projects/mopsypeyshop'][0]
+    project_route[1][1]['targets']['production']['id'] = 'dpl_someone_else'
+    adapter = _make_adapter(routes)
+    result = adapter.inspect_canonical_evidence(
+        'app', _valid_project('mopsypeyshop', 'prj_1'),
+        expected_name='mopsypeyshop', expected_deployment_id='dpl_promoted')
+    assert result.data['production_binding_matches'] is False
+
+
+def test_evidence_probe_fails_closed_on_foreign_project():
+    """Ownership is the same gate the resolver applies: the probe can never
+    report on a project this app_id does not own."""
+    adapter = _make_adapter(_evidence_routes())
+    foreign = _valid_project('mopsypeyshop', 'prj_1')
+    foreign['accountId'] = 'team_someone_else'
+    result = adapter.inspect_canonical_evidence(
+        'app', foreign, expected_name='mopsypeyshop', expected_deployment_id='dpl_promoted')
+    assert not result.success
+    assert result.error_code == 'PROJECT_IDENTITY_MISMATCH'
+    # No provider read was reported, so nothing about that project leaked.
+    assert not result.data
