@@ -194,6 +194,9 @@ class FakeVercel:
 
         Mirrors the real adapter: the name is the verified project name, and
         the host is that name's default domain -- never the deployment host.
+        ``production_alias`` models a project whose real production host is
+        not the bare project domain; ``canonical_source`` overrides the
+        reported evidence class so a test can model each of the three.
         """
         self.expected_names.append(expected_name)
         self.expected_deployment_ids = getattr(self, "expected_deployment_ids", [])
@@ -201,9 +204,11 @@ class FakeVercel:
         name = expected_name or self._project['name']
         alias = getattr(self, "production_alias", None)
         host = alias or f'{name}.vercel.app'
+        source = (getattr(self, "canonical_source", None)
+                  or ('VERCEL_PRODUCTION_ALIAS' if alias else 'VERCEL_PROJECT_DOMAIN'))
         return OperationResult.ok({
             'canonical_production_url': f'https://{host}/',
-            'canonical_source': 'VERCEL_PRODUCTION_ALIAS' if alias else 'VERCEL_PROJECT_DOMAIN',
+            'canonical_source': source,
             'project_name': name,
             'canonical_host': host,
         })
@@ -1210,7 +1215,11 @@ def test_regression_adapter_case_a_disjoint_name_and_production_host():
     assert result.success
     assert result.data['canonical_production_url'] == 'https://testbakery-eight.vercel.app/'
     assert result.data['canonical_host'] == 'testbakery-eight.vercel.app'
-    assert result.data['canonical_source'] == 'VERCEL_PRODUCTION_ALIAS'
+    # The host came from the deployment's own alias list, and the label now
+    # says so. The pre-2026-09 resolver hardcoded VERCEL_PRODUCTION_ALIAS on
+    # every path, which made a deployment-bound alias indistinguishable from a
+    # project-level one in the durable record.
+    assert result.data['canonical_source'] == 'VERCEL_DEPLOYMENT_ALIAS'
 
 
 def test_regression_adapter_case_b_matching_name_and_host():
@@ -1395,6 +1404,175 @@ def test_regression_orchestrator_case_e_redrive_from_production_confirmed_reuses
 
 
 # ---------------------------------------------------------------------------
+# Canonical provenance end-to-end (p17)
+# ---------------------------------------------------------------------------
+
+
+def _publish_once(tmp_path, vercel=None, smoke=None):
+    """Approve + promote to LIVE, returning (orchestrator, store, workspace,
+    smoke, telegram)."""
+    runner, store = _runner(tmp_path)
+    ws = _make_workspace(tmp_path)
+    _approved_state(store, 'proj')
+    vercel = vercel or FakeVercel()
+    smoke = smoke or FakeSmoke(success=True)
+    telegram = FakeTelegram()
+    deps = _deps(vercel=vercel, smoke=smoke, telegram=telegram)
+    orch = PromotionOrchestrator(runner, store, deps)
+    assert orch.approve('proj', principal_id=OWNER).success
+    assert orch.promote('proj', ws, principal_id=OWNER).success
+    return orch, store, ws, smoke, telegram
+
+
+def test_p17_project_domain_reaches_the_user_and_is_recorded_with_provenance(tmp_path):
+    """The p17 outcome: the verified project domain is the host the user is
+    told, the smoke target, the persisted production_url, AND the recorded
+    evidence class -- all from one resolution, against the promoted
+    deployment."""
+    vercel = FakeVercel()
+    vercel.production_alias = 'mopsypeyshop.vercel.app'
+    vercel.canonical_source = 'VERCEL_PROJECT_DOMAIN'
+    _, store, _, smoke, telegram = _publish_once(tmp_path, vercel)
+
+    assert smoke.target_urls == ['https://mopsypeyshop.vercel.app/']
+    assert store.load('proj').production_url == 'https://mopsypeyshop.vercel.app/'
+    assert telegram.sent[-1] == ('123', '🚀 Live: https://mopsypeyshop.vercel.app/')
+    intent = store.load('proj').deployment['promotion_intent']
+    assert intent['canonical_source'] == 'VERCEL_PROJECT_DOMAIN'
+    assert intent['canonical_resolution_version'] == 2
+    # The canonical URL is a presentation choice; the deployment identity it
+    # was proven against is the promoted one, never the approval preview.
+    assert intent['canonical_deployment_id'] == intent['promoted_deployment_id']
+
+
+def test_canonical_resolution_is_always_persisted_with_a_recognized_class(tmp_path):
+    for alias, source in ((None, 'VERCEL_PROJECT_DOMAIN'),
+                          ('mopsypeyshop-albert-a121.vercel.app', 'VERCEL_PRODUCTION_ALIAS'),
+                          ('mopsypeyshop.vercel.app', 'VERCEL_DEPLOYMENT_ALIAS')):
+        path = tmp_path / ('case-' + str(source))
+        path.mkdir()
+        vercel = FakeVercel()
+        vercel.production_alias = alias
+        vercel.canonical_source = source
+        _, store, _, _, _ = _publish_once(path, vercel)
+        intent = store.load('proj').deployment['promotion_intent']
+        assert intent['canonical_source'] == source
+        assert intent['canonical_resolution_version'] == 2
+        assert intent['canonical_deployment_id'] == 'dpl_1'
+
+
+def test_unrecognized_canonical_source_is_never_persisted(tmp_path):
+    """A collaborator reporting a class this orchestrator does not understand
+    is treated as unresolvable, so an unreadable label can never enter the
+    durable intent."""
+    vercel = FakeVercel()
+    vercel.canonical_source = 'VERCEL_SOMETHING_NEW'
+    runner, store = _runner(tmp_path)
+    ws = _make_workspace(tmp_path)
+    _approved_state(store, 'proj')
+    orch = PromotionOrchestrator(runner, store, _deps(vercel=vercel, smoke=FakeSmoke()))
+    assert orch.approve('proj', principal_id=OWNER).success
+
+    result = orch.promote('proj', ws, principal_id=OWNER)
+
+    assert not result.success
+    assert result.error_code == 'CANONICAL_PRODUCTION_URL_UNRESOLVED'
+    intent = store.load('proj').deployment['promotion_intent']
+    assert 'canonical_production_url' not in intent
+
+
+class TestCanonicalReuseGating:
+    """A recorded canonical URL is a cache. It may be reused only when it is
+    still about THIS deployment AND its evidence class is trustworthy."""
+
+    @staticmethod
+    def _publish_and_reopen(tmp_path):
+        """Publish to LIVE once, then reopen the same operation for a re-drive."""
+        _, store, ws, smoke, _ = _publish_once(tmp_path)
+        with store.acquire_writer('proj') as s:
+            s.lifecycle = 'PUBLISHING'
+            s.deployment['promotion_intent']['stage'] = 'promoted'
+            store.save(s)
+        smoke.target_urls.clear()
+        return store, ws, smoke
+
+    def test_version_2_with_recognized_label_is_reused(self, tmp_path):
+        store, ws, smoke = self._publish_and_reopen(tmp_path)
+        calls = {'n': 0}
+
+        class CountingVercel(FakeVercel):
+            def canonical_production_url(self, *a, **kw):
+                calls['n'] += 1
+                return super().canonical_production_url(*a, **kw)
+
+        runner, _ = _runner(tmp_path)
+        orch = PromotionOrchestrator(runner, store, _deps(
+            vercel=CountingVercel(), smoke=smoke))
+        assert orch.promote('proj', ws, principal_id=OWNER).success
+        assert calls['n'] == 0
+        assert smoke.target_urls == ['https://wb.vercel.app/']
+
+    def test_legacy_record_without_version_is_re_resolved(self, tmp_path):
+        store, ws, smoke = self._publish_and_reopen(tmp_path)
+        with store.acquire_writer('proj') as s:
+            intent = s.deployment['promotion_intent']
+            # A version-1 record: the old resolver wrote this label regardless
+            # of which provider record it read, so it proves no class at all.
+            intent.pop('canonical_resolution_version', None)
+            intent['canonical_source'] = 'VERCEL_PRODUCTION_ALIAS'
+            store.save(s)
+        runner, _ = _runner(tmp_path)
+        vercel = FakeVercel()
+        vercel.production_alias = 'mopsypeyshop.vercel.app'
+        vercel.canonical_source = 'VERCEL_PROJECT_DOMAIN'
+        orch = PromotionOrchestrator(runner, store, _deps(vercel=vercel, smoke=smoke))
+
+        assert orch.promote('proj', ws, principal_id=OWNER).success
+
+        assert vercel.expected_deployment_ids[-1] == 'dpl_1'
+        assert smoke.target_urls == ['https://mopsypeyshop.vercel.app/']
+        intent = store.load('proj').deployment['promotion_intent']
+        assert intent['canonical_source'] == 'VERCEL_PROJECT_DOMAIN'
+        assert intent['canonical_resolution_version'] == 2
+
+    def test_unrecognized_label_is_re_resolved_not_relabelled(self, tmp_path):
+        store, ws, smoke = self._publish_and_reopen(tmp_path)
+        with store.acquire_writer('proj') as s:
+            s.deployment['promotion_intent']['canonical_source'] = 'VERCEL_SOMETHING_ELSE'
+            store.save(s)
+        runner, _ = _runner(tmp_path)
+        vercel = FakeVercel()
+        orch = PromotionOrchestrator(runner, store, _deps(vercel=vercel, smoke=smoke))
+        assert orch.promote('proj', ws, principal_id=OWNER).success
+        assert vercel.expected_deployment_ids[-1] == 'dpl_1'
+        assert store.load('proj').deployment['promotion_intent']['canonical_source'] \
+            == 'VERCEL_PROJECT_DOMAIN'
+
+    def test_record_for_a_different_deployment_is_never_reused(self, tmp_path):
+        """The binding check is absolute: a URL proven for another deployment
+        says nothing about this one."""
+        store, ws, smoke = self._publish_and_reopen(tmp_path)
+        with store.acquire_writer('proj') as s:
+            s.deployment['promotion_intent']['canonical_deployment_id'] = 'dpl_some_other'
+            store.save(s)
+        runner, _ = _runner(tmp_path)
+        vercel = FakeVercel()
+        orch = PromotionOrchestrator(runner, store, _deps(vercel=vercel, smoke=smoke))
+        assert orch.promote('proj', ws, principal_id=OWNER).success
+        assert vercel.expected_deployment_ids[-1] == 'dpl_1'
+
+
+def test_promote_label_vocabulary_matches_the_adapter():
+    """The orchestrator never imports the adapter (it is an injected boundary
+    object), so the two label vocabularies are pinned together here instead."""
+    from app.projects.promote import (
+        CANONICAL_RESOLUTION_VERSION, _RECOGNIZED_CANONICAL_SOURCES,
+    )
+    assert _RECOGNIZED_CANONICAL_SOURCES == VercelAdapter.CANONICAL_SOURCES
+    assert CANONICAL_RESOLUTION_VERSION == 2
+
+
+# ---------------------------------------------------------------------------
 # Canonical identity evidence probe (operator diagnostic, read-only)
 # ---------------------------------------------------------------------------
 
@@ -1571,10 +1749,239 @@ def test_evidence_probe_agrees_with_the_resolver():
         'canonical_host': resolved.data['canonical_host'],
         'canonical_source': resolved.data['canonical_source'],
     }
-    # A domain the resolver has NOT proven is reported but not selected: the
-    # pretty host appearing in the evidence is never enough on its own.
-    assert evidence.data['domains'][0]['name'] == 'mopsypeyshop.vercel.app'
-    assert evidence.data['resolver']['canonical_host'] != 'mopsypeyshop.vercel.app'
+
+
+# ---------------------------------------------------------------------------
+# Canonical candidate CLASSES (p17)
+# ---------------------------------------------------------------------------
+#
+# The p17 incident, on the real provider:
+#
+#   project domain        mopsypeyshop.vercel.app        (verified, this project)
+#   targets.production    dpl_9guwEUjg4fd1vvrywvf3QmeRZc6j  <- the promoted deployment
+#   production aliases    mopsypeyshop.vercel.app, mopsypeyshop-albert-a121.vercel.app
+#   deployment aliases    mopsypeyshop.vercel.app, mopsypeyshop-albert-a121.vercel.app
+#
+# The user-facing host is mopsypeyshop.vercel.app. The old resolver consulted
+# the deployment's alias list FIRST and sorted it lexicographically, and since
+# '-' (0x2D) sorts before '.' (0x2E) it returned mopsypeyshop-albert-a121 --
+# while labelling the result VERCEL_PRODUCTION_ALIAS no matter what it read.
+
+P17_PROMOTED = 'dpl_9guwEUjg4fd1vvrywvf3QmeRZc6j'
+P17_PRETTY = 'mopsypeyshop.vercel.app'
+P17_SCOPE_ALIAS = 'mopsypeyshop-albert-a121.vercel.app'
+P17_DEPLOYMENT_URL = 'mopsypeyshop-g3bo8i3m6-albert-a121.vercel.app'
+
+
+def _p17_routes(domain_verified=True, binding_id=P17_PROMOTED, domain_project='prj_1',
+                include_domain=True, production_aliases=None):
+    return [
+        ('/v13/deployments/' + P17_PROMOTED, (200, {
+            'id': P17_PROMOTED,
+            'projectId': 'prj_1',
+            'teamId': 'team_1',
+            'url': P17_DEPLOYMENT_URL,
+            'alias': [P17_PRETTY, P17_SCOPE_ALIAS],
+        })),
+        ('/v9/projects/mopsypeyshop/domains', (200, {
+            'domains': ([{
+                'name': P17_PRETTY, 'projectId': domain_project,
+                'verified': domain_verified,
+            }] if include_domain else []),
+        })),
+        ('/v9/projects/mopsypeyshop', (200, {
+            'id': 'prj_1', 'name': 'mopsypeyshop',
+            'targets': {'production': {
+                'id': binding_id,
+                'alias': [P17_PRETTY, P17_SCOPE_ALIAS] if production_aliases is None
+                         else production_aliases,
+            }},
+        })),
+    ]
+
+
+def _resolve_p17(routes, name='mopsypeyshop', deployment_id=P17_PROMOTED):
+    adapter = _make_adapter(routes)
+    return adapter.canonical_production_url(
+        'app', _valid_project(name, 'prj_1'),
+        expected_name=name, expected_deployment_id=deployment_id)
+
+
+def _bare_routes(name, deployment_id, host, domains=(), project=None, aliases=None):
+    """Minimal, fully-specified provider fixture for the class-precedence tests."""
+    return [
+        ('/v13/deployments/' + deployment_id, (200, {
+            'id': deployment_id, 'projectId': 'prj_1', 'teamId': 'team_1',
+            'url': f'{host}-g3bo8i3m6-albert-a121.vercel.app',
+            'alias': list(aliases),
+        })),
+        ('/v9/projects/' + name + '/domains', (200, {'domains': list(domains)})),
+        ('/v9/projects/' + name, (200, project)),
+    ]
+
+
+def test_p17_prefers_verified_project_domain_over_every_alias():
+    """Class 1 wins even though the deployment alias list ALSO contains it:
+    the same host is reached through the most user-facing class, and the
+    reported evidence class is the one that actually won."""
+    result = _resolve_p17(_p17_routes())
+    assert result.success
+    assert result.data['canonical_production_url'] == f'https://{P17_PRETTY}/'
+    assert result.data['canonical_host'] == P17_PRETTY
+    assert result.data['canonical_source'] == 'VERCEL_PROJECT_DOMAIN'
+
+
+def test_p17_never_returns_the_immutable_deployment_url():
+    """The deployment's own ``url`` is a build identifier and is excluded even
+    when a provider also listed it as an alias."""
+    routes = _p17_routes(include_domain=False, production_aliases=[])
+    routes[0][1][1]['alias'] = [P17_PRETTY, P17_SCOPE_ALIAS, P17_DEPLOYMENT_URL]
+    result = _resolve_p17(routes)
+    assert result.data['canonical_host'] != P17_DEPLOYMENT_URL
+    assert result.data['canonical_host'] in (P17_PRETTY, P17_SCOPE_ALIAS)
+
+
+def test_p17_project_domain_requires_binding_to_the_promoted_deployment():
+    """A verified domain on its own proves nothing: it must also be attached to
+    a project whose CURRENT production target is the promoted deployment. With
+    the binding pointing elsewhere, the domain AND the project's production
+    alias list are both unproven, and the resolver falls through to the
+    deployment's own alias rather than returning an unproven pretty host."""
+    result = _resolve_p17(_p17_routes(binding_id='dpl_someone_else'))
+    assert result.success
+    assert result.data['canonical_source'] == 'VERCEL_DEPLOYMENT_ALIAS'
+    assert result.data['canonical_host'] in (P17_PRETTY, P17_SCOPE_ALIAS)
+
+
+def test_p17_project_domain_rejected_when_unverified_or_foreign():
+    for kwargs in ({'domain_verified': False}, {'domain_project': 'prj_other'}):
+        result = _resolve_p17(_p17_routes(**kwargs))
+        assert result.data['canonical_source'] != 'VERCEL_PROJECT_DOMAIN', kwargs
+        assert result.data['canonical_host'] != P17_PRETTY, kwargs
+
+
+def test_canonical_prefers_stable_production_alias_over_deployment_alias():
+    """Class 2 over class 3: the project-level alias is the more stable name,
+    so it is preferred when no verified project domain exists."""
+    routes = _p17_routes(include_domain=False)
+    routes[0][1][1]['alias'] = [P17_SCOPE_ALIAS]
+    result = _resolve_p17(routes)
+    assert result.data['canonical_source'] == 'VERCEL_PRODUCTION_ALIAS'
+    assert result.data['canonical_host'] == P17_SCOPE_ALIAS
+
+
+def test_canonical_production_alias_requires_the_promoted_deployment_id():
+    """A project alias bound to a DIFFERENT deployment is not a candidate, even
+    though the project's production environment currently points elsewhere."""
+    routes = _p17_routes(include_domain=False, production_aliases=[])
+    routes[2][1][1]['alias'] = [{
+        'domain': 'other.vercel.app', 'target': 'PRODUCTION',
+        'environment': 'production', 'deployment': {'id': 'dpl_other'},
+    }]
+    result = _resolve_p17(routes)
+    assert result.data['canonical_source'] == 'VERCEL_DEPLOYMENT_ALIAS'
+    assert result.data['canonical_host'] == P17_SCOPE_ALIAS
+
+
+def test_canonical_deployment_alias_is_the_last_resort():
+    result = _resolve_p17(_bare_routes(
+        'x', 'dpl_promoted', 'x',
+        project={'id': 'prj_1', 'name': 'x', 'alias': []},
+        aliases=['x-albert-a121.vercel.app'],
+    ), name='x', deployment_id='dpl_promoted')
+    assert result.data['canonical_source'] == 'VERCEL_DEPLOYMENT_ALIAS'
+    assert result.data['canonical_host'] == 'x-albert-a121.vercel.app'
+
+
+def test_canonical_requires_an_expected_deployment_id():
+    """With no promoted deployment to prove attachment against, no class may be
+    trusted -- including a perfectly verified project domain."""
+    adapter = _make_adapter(_p17_routes())
+    result = adapter.canonical_production_url(
+        'app', _valid_project('mopsypeyshop', 'prj_1'), expected_name='mopsypeyshop')
+    assert not result.success
+    assert result.error_code == 'CANONICAL_PRODUCTION_URL_UNRESOLVED'
+
+
+def test_canonical_intra_class_tiebreak_never_crosses_classes():
+    """Two verified production domains on ONE project. The winner is stable for
+    a given candidate set and is drawn from that set only: the tie-break is a
+    deterministic ordering INSIDE one class, never a comparison across classes
+    and never a 'prefer the bare name' heuristic smuggled in as a preference."""
+    def two_domain_routes():
+        routes = _p17_routes()
+        routes[1][1][1]['domains'].append(
+            {'name': P17_SCOPE_ALIAS, 'projectId': 'prj_1', 'verified': True})
+        return routes
+
+    first = _resolve_p17(two_domain_routes())
+    second = _resolve_p17(two_domain_routes())
+    assert first.data == second.data
+    # The winner is one of the two PROVEN project domains -- a host that exists
+    # only in the deployment alias list could not have been chosen here.
+    assert first.data['canonical_host'] in (P17_PRETTY, P17_SCOPE_ALIAS)
+    assert first.data['canonical_source'] == 'VERCEL_PROJECT_DOMAIN'
+    # Removing one candidate changes the answer only by changing the set.
+    narrowed = _resolve_p17(_p17_routes())
+    assert narrowed.data['canonical_host'] == P17_PRETTY
+
+
+def test_canonical_rejects_malformed_domain_payload():
+    """A malformed record is not a candidate, and it never becomes one by being
+    partially understood."""
+    for domains in ([{'name': 'x.vercel.app', 'projectId': 'prj_1', 'verified': 'true'}],
+                    [{'name': 'x.vercel.app', 'projectId': 'prj_1', 'verified': True,
+                      'gitBranch': 'main'}],
+                    [{'name': 'x.vercel.app', 'projectId': 'prj_1', 'verified': True,
+                      'redirect': 'https://elsewhere.test'}],
+                    [{'name': 'x.vercel.app', 'projectId': 'prj_1', 'verified': True,
+                      'customEnvironmentId': 'env_x'}],
+                    'not-a-list',
+                    [{'name': 'shop.example.com', 'projectId': 'prj_1', 'verified': True}]):
+        routes = _bare_routes(
+            'x', 'dpl_promoted', 'x',
+            project={'id': 'prj_1', 'name': 'x', 'alias': []},
+            aliases=['x-albert-a121.vercel.app'],
+        )
+        routes[1] = ('/v9/projects/x/domains', (200, {'domains': domains}))
+        result = _resolve_p17(routes, name='x', deployment_id='dpl_promoted')
+        assert result.data['canonical_source'] == 'VERCEL_DEPLOYMENT_ALIAS', domains
+        assert result.data['canonical_host'] == 'x-albert-a121.vercel.app', domains
+
+
+def test_canonical_fails_closed_and_never_synthesises_a_hostname():
+    """With nothing proven the resolver says so. It never falls back to
+    composing <project_name>.vercel.app, which is the p16/p17 failure class."""
+    routes = [
+        ('/v13/deployments/dpl_promoted', (200, {
+            'id': 'dpl_promoted', 'projectId': 'prj_1', 'teamId': 'team_1',
+            'alias': [],
+        })),
+        ('/v9/projects/mopsypeyshop/domains', (200, {'domains': []})),
+        ('/v9/projects/mopsypeyshop', (200, {
+            'id': 'prj_1', 'name': 'mopsypeyshop', 'alias': []})),
+    ]
+    result = _resolve_p17(routes, deployment_id='dpl_promoted')
+    assert not result.success
+    assert result.error_code == 'CANONICAL_PRODUCTION_URL_UNRESOLVED'
+    assert not result.data
+
+
+def test_canonical_source_label_is_distinct_per_class():
+    """One label per evidence class, and no label reused for a class it does not
+    describe."""
+    domain = _resolve_p17(_p17_routes())
+    routes = _p17_routes(include_domain=False)
+    routes[0][1][1]['alias'] = [P17_SCOPE_ALIAS]
+    alias = _resolve_p17(routes)
+    deployment = _resolve_p17(_bare_routes(
+        'x', 'dpl_promoted', 'x',
+        project={'id': 'prj_1', 'name': 'x', 'alias': []},
+        aliases=['x-albert-a121.vercel.app'],
+    ), name='x', deployment_id='dpl_promoted')
+    labels = {domain.data['canonical_source'], alias.data['canonical_source'],
+              deployment.data['canonical_source']}
+    assert labels == VercelAdapter.CANONICAL_SOURCES
 
 
 def test_evidence_probe_reports_binding_mismatch_without_claiming_production():

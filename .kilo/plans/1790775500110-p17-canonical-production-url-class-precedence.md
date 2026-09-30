@@ -101,21 +101,38 @@ Delivered:
 
 Remaining from the original step list: step 1 (route the probe through a shared `_canonical_candidates` helper) is deliberately **deferred to Task 3**, so the resolver stays byte-for-byte unchanged until the p17 evidence is in. Step 4 is implemented.
 
-### Task 2 — Run the probe against p17 and record the outcome — **BLOCKED on the operator**
+### Task 2 — Run the probe against p17 and record the outcome — **CONFIRMED**
 
-Cannot be executed from the implementation machine: there is no `.website-builder` state root here, no Vercel credentials configured, and the p17 state lives on the operator host (`/home/albertus527/.website-builder/state`). Requires running, on the operator host:
+Provider truth on the real host:
 
-```
-python -m app --inspect-canonical-url tg-6329821361-p17
-```
+| field | value |
+|---|---|
+| `expected_deployment_id` | `dpl_9guwEUjg4fd1vvrywvf3QmeRZc6j` |
+| `production_binding_matches` | `true` |
+| verified project domain | `mopsypeyshop.vercel.app` (project `prj_YfY8s75Zlbwsa8VZjCjpwUb4CEv6`) |
+| `targets.production.id` | `dpl_9guwEUjg4fd1vvrywvf3QmeRZc6j` |
+| `targets.production.alias` | `mopsypeyshop.vercel.app`, `mopsypeyshop-albert-a121.vercel.app` |
+| `deployment.alias` | `mopsypeyshop.vercel.app`, `mopsypeyshop-albert-a121.vercel.app` |
 
-Then answer in the PR description:
+Both defects confirmed as one incident: the old resolver consulted the deployment alias list first, and because `-` (0x2D) sorts before `.` (0x2E) it returned `mopsypeyshop-albert-a121.vercel.app` while labelling the result `VERCEL_PRODUCTION_ALIAS`. The pretty project domain was present, verified, and provably bound to the promoted deployment the whole time.
 
-- Does `mopsypeyshop.vercel.app` appear in `GET /v9/projects/mopsypeyshop/domains` (with which `project_id`/`verified`/`redirect`/`git_branch`/`custom_environment_id`), in `targets.production_aliases`, or in the promoted deployment's `alias`?
-- If present with `project_id` = this project and `verified: true` and `production_binding_matches: true` → the patch changes p17's resolution path (the URL is re-resolved on the next promote; the already-committed value stays).
-- If absent → p17's recorded URL is the provider-correct production host and the user's expectation is unsatisfiable without claiming a foreign domain. **Report that; do not synthesise.**
+---
 
-Do not apply Tasks 3-5 before this output exists.
+### Task 3 — Rewrite the resolver — **DONE**
+
+`VercelAdapter.canonical_production_url` now builds three labelled candidate classes in contract order and takes the first non-empty. One `/v9/projects/{name}` read serves classes 1 and 2. Class 1 requires `targets.production.id == expected_deployment_id`; a missing `expected_deployment_id` fails closed before any read.
+
+### Task 4 — Label + version provenance — **DONE**
+
+`CANONICAL_RESOLUTION_VERSION = 2` persisted with every fresh resolution; `_reusable_recorded_canonical` requires version 2 + a recognized label + the promoted deployment id; `_resolve_canonical` rejects an unrecognized label outright. Committed releases untouched.
+
+### Task 5 — Test doubles — **DONE, no changes needed**
+
+All four remaining fakes (`r1_harness.py`, `test_promote_parity.py`, `test_promote_bootstrap_classification.py`, `test_r1_live_publish_finishing.py`) already report a label consistent with the class they model, or fail closed. `test_promote_label_vocabulary_matches_the_adapter` pins the orchestrator's copy of the vocabulary to the adapter's across the injection seam.
+
+### Task 6 — Tests — **DONE**
+
+Full `website-builder` suite: `2166 passed, 23 skipped`. New coverage: class precedence (p17 real shape), binding-proof requirement, foreign/unverified domain rejection, immutable deployment URL exclusion, per-class labels, intra-class tie-break determinism, fail-closed with no synthesis, malformed domain payloads, missing `expected_deployment_id`, unrecognized source never persisted, four-way reuse gating, and the p16 contract that the canonical URL is proven against promoted deployment B.
 
 ---
 

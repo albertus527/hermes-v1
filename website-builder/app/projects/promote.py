@@ -94,6 +94,38 @@ from app.sandbox.runner import ProjectRunner
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Canonical production-URL provenance
+# ---------------------------------------------------------------------------
+# The canonical URL is resolved from provider evidence AFTER the production
+# binding is confirmed, and the durable intent caches the answer so a re-drive
+# cannot re-resolve against a moving target. That cache is only trustworthy if
+# it records WHICH KIND of evidence produced it, so a recorded value carries a
+# version and a class label alongside the URL.
+#
+# Version 1 (implicit) is the pre-2026-09 resolver, which reported the single
+# hardcoded label VERCEL_PRODUCTION_ALIAS no matter which provider record it had
+# actually read. Such a record is NOT class provenance: the string can be true
+# of all three classes and therefore distinguishes none of them. Version 2 is
+# the class-aware resolver, whose label is the class that actually won.
+#
+# Consequence, and it is deliberate: a legacy record is RE-RESOLVED rather
+# than reused. Re-resolution is read-only, happens after the binding is already
+# confirmed, and runs against the promoted deployment -- so it costs one
+# provider read and cannot weaken the fail-closed contract. Guessing which
+# class a legacy label meant would be exactly the kind of inference this
+# codebase refuses everywhere else.
+#
+# The label vocabulary is the adapter's; the orchestrator never imports the
+# adapter (it receives it as an injected boundary object), so it keeps its own
+# copy and a contract test pins the two together.
+CANONICAL_RESOLUTION_VERSION = 2
+_RECOGNIZED_CANONICAL_SOURCES = frozenset({
+    "VERCEL_PROJECT_DOMAIN",
+    "VERCEL_PRODUCTION_ALIAS",
+    "VERCEL_DEPLOYMENT_ALIAS",
+})
+
+# ---------------------------------------------------------------------------
 # Previous-production classification
 # ---------------------------------------------------------------------------
 # "Is there a previous production deployment?" has FOUR honest answers, not
@@ -1354,22 +1386,20 @@ class PromotionOrchestrator:
         # the smoke check rather than after it.
         #
         # Re-drive / recovery: promotion_intent is the sole durable authority.
-        # If the verified canonical URL for this exact deployment_id is already
-        # recorded in promotion_intent, reuse it rather than re-resolving.
+        # A recorded canonical URL is reused ONLY when it is still provably the
+        # answer for this deployment AND its evidence class is trustworthy --
+        # a recognized label written by the class-aware resolver. A legacy
+        # record (no version, or the old hardcoded label) carries no class
+        # provenance, so it is re-resolved rather than assumed. See
+        # CANONICAL_RESOLUTION_VERSION above.
         state_for_intent = self.store.load(project_id)
         intent = (state_for_intent.deployment.get("promotion_intent") or {}) if state_for_intent else {}
-        recorded_url = intent.get("canonical_production_url")
-        recorded_dep_id = intent.get("canonical_deployment_id")
+        recorded = self._reusable_recorded_canonical(
+            intent, intended_identity["deployment_id"])
 
-        if (recorded_url and isinstance(recorded_url, str)
-                and recorded_dep_id == intended_identity["deployment_id"]):
-            host = intent.get("canonical_host") or urlsplit(recorded_url).hostname
-            canonical = {
-                "canonical_production_url": recorded_url,
-                "canonical_source": intent.get("canonical_source", "VERCEL_PRODUCTION_ALIAS"),
-                "canonical_host": host,
-                "project_name": expected_name,
-            }
+        if recorded is not None:
+            canonical = recorded
+            host = canonical["canonical_host"]
             logger.info(
                 "Canonical production URL reused from intent project=%s source=%s url=%s host=%s",
                 project_id, canonical.get("canonical_source"),
@@ -1408,6 +1438,7 @@ class PromotionOrchestrator:
                 canonical_source=canonical.get("canonical_source"),
                 canonical_host=host,
                 canonical_deployment_id=intended_identity["deployment_id"],
+                canonical_resolution_version=CANONICAL_RESOLUTION_VERSION,
             )
             logger.info(
                 "Canonical production URL resolved project=%s source=%s url=%s host=%s",
@@ -1596,6 +1627,50 @@ class PromotionOrchestrator:
     # Canonical public production URL
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _reusable_recorded_canonical(intent, deployment_id):
+        """The recorded canonical URL when it may be reused verbatim, else None.
+
+        Reuse is allowed only when the record is still about THIS deployment
+        and its evidence class is trustworthy:
+
+          * ``canonical_deployment_id`` is the deployment being promoted --
+            the promoted deployment, not the approval preview;
+          * ``canonical_resolution_version`` is the current version, so the
+            label was written by a resolver that actually distinguished the
+            evidence classes;
+          * ``canonical_source`` is one of the recognized class labels.
+
+        A record that fails any of these is not "probably still right". It is
+        re-resolved, which is read-only and cannot weaken the fail-closed
+        contract. An unrecognized label in particular must never be coerced
+        into a known one: a new evidence class is a reason to re-read the
+        provider, not to relabel history.
+        """
+        if not isinstance(intent, dict):
+            return None
+        url = intent.get("canonical_production_url")
+        if not isinstance(url, str) or not url:
+            return None
+        if intent.get("canonical_deployment_id") != deployment_id:
+            return None
+        if intent.get("canonical_resolution_version") != CANONICAL_RESOLUTION_VERSION:
+            return None
+        source = intent.get("canonical_source")
+        if source not in _RECOGNIZED_CANONICAL_SOURCES:
+            return None
+        host = intent.get("canonical_host")
+        if not isinstance(host, str) or not host:
+            try:
+                host = urlsplit(url).hostname
+            except Exception:
+                return None
+        return {
+            "canonical_production_url": url,
+            "canonical_source": source,
+            "canonical_host": host,
+        }
+
     def _resolve_canonical(self, app_id, vercel_project, expected_name, deployment_id=None):
         """The canonical public production URL, or None when unresolvable.
 
@@ -1603,6 +1678,12 @@ class PromotionOrchestrator:
         ``expected_deployment_id``. A collaborator that fails or returns an
         invalid result is treated as unresolvable rather than silently degrading
         to a deployment hostname: there is no honest URL to return in that case.
+
+        The returned evidence class is validated too. A result whose
+        ``canonical_source`` is not a recognized label describes a contract
+        this orchestrator does not understand, and persisting it would put an
+        unreadable label into the durable intent that the reuse gate later has
+        to reason about.
         """
         helper = getattr(self.deps.vercel, "canonical_production_url", None)
         if not callable(helper):
@@ -1617,6 +1698,8 @@ class PromotionOrchestrator:
         data = result.data or {}
         url = data.get("canonical_production_url")
         if not isinstance(url, str) or not url.startswith("https://"):
+            return None
+        if data.get("canonical_source") not in _RECOGNIZED_CANONICAL_SOURCES:
             return None
         try:
             p = urlsplit(url)

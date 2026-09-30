@@ -1449,35 +1449,68 @@ class VercelAdapter:
     # (``<project>-<hash>-<team>.vercel.app``). It identifies one immutable
     # build, is useful for reconciliation/rollback/diagnostics, and may sit
     # behind Deployment Protection -- so it is never the user-facing public
-    # production URL. The PUBLIC URL is the project's own default domain,
-    # ``<project-name>.vercel.app``, which follows the project, not the build.
+    # production URL. The PUBLIC URL is a host the provider has actually
+    # ASSIGNED to this project, which follows the project, not the build.
     #
     # These are two distinct concepts and are never derived from each other:
     # the canonical URL is NEVER produced by stripping suffixes off a
-    # deployment hostname.
+    # deployment hostname, and never by composing a project name into a
+    # hostname. Vercel decides which ``.vercel.app`` host a project gets
+    # (``<project>.vercel.app``, ``<project>-<scope>.vercel.app``, ...), and
+    # the resolver reports what it was given -- nothing more.
     #
     # A Vercel project name is a single lower-case DNS label, no longer than
     # 100 characters.
     _VERCEL_PROJECT_NAME_RE = re.compile(r'[a-z0-9][a-z0-9-]{0,99}')
 
+    # The three classes of VERIFIED candidate, most user-facing first. A
+    # project domain is the host a human sees in the Vercel dashboard and
+    # types; a production alias is a stable project-level name; a
+    # deployment-bound alias is whatever the provider happens to have
+    # assigned to THIS build. All three serve the same promoted deployment,
+    # so the order is a presentation preference, not a correctness one --
+    # but it is the whole point of the resolution: the pretty project domain
+    # is what was asked for, and it must be able to WIN.
+    CANONICAL_SOURCE_PROJECT_DOMAIN = 'VERCEL_PROJECT_DOMAIN'
+    CANONICAL_SOURCE_PRODUCTION_ALIAS = 'VERCEL_PRODUCTION_ALIAS'
+    CANONICAL_SOURCE_DEPLOYMENT_ALIAS = 'VERCEL_DEPLOYMENT_ALIAS'
+    CANONICAL_SOURCES = frozenset({
+        CANONICAL_SOURCE_PROJECT_DOMAIN,
+        CANONICAL_SOURCE_PRODUCTION_ALIAS,
+        CANONICAL_SOURCE_DEPLOYMENT_ALIAS,
+    })
+
     def canonical_production_url(self, app_id, project, *, expected_name=None,
                                  expected_deployment_id=None):
         """Resolve the project's canonical PUBLIC production URL.
 
-        Authority order:
-          a. Alias explicitly attached to the exact promoted deployment_id
-             (read from the validated deployment body on Vercel).
-          b. Project production alias explicitly proven to target that same
-             deployment and project (read from project.alias / targets).
-          c. Verified project domain only when Vercel provider data proves
-             it is the production target.
+        Exactly three candidate classes exist, and they are considered in
+        this order, each gated on proof that it serves the promoted
+        deployment:
 
-        Deterministic sorting may only break ties among already-proven
-        equivalent production aliases.
+          1. VERCEL_PROJECT_DOMAIN -- a verified domain on THIS project,
+             attached to the project's production environment.
+          2. VERCEL_PRODUCTION_ALIAS -- a project-level production alias
+             explicitly bound to the promoted deployment.
+          3. VERCEL_DEPLOYMENT_ALIAS -- an alias the provider has assigned
+             to the promoted deployment itself.
 
-        If binding cannot be proven, fail closed with
+        The first class with a proven candidate wins, and its label is what
+        ``canonical_source`` reports. The previous implementation consulted
+        class 3 FIRST and hardcoded class 2's label on every path, so a
+        verified project domain could never win and the recorded evidence
+        class did not describe what was actually read.
+
+        Sorting is INTRA-class only: it picks a stable winner among aliases
+        the provider has already proven equivalent for this deployment. It
+        is never allowed to compare across classes, and no "prefer the bare
+        name" preference is encoded -- every candidate string comes from a
+        provider field, never from the project name.
+
+        A missing ``expected_deployment_id`` proves nothing, so nothing is a
+        candidate and the call fails closed with
         CANONICAL_PRODUCTION_URL_UNRESOLVED. Never synthesize or guess
-        <project_name>.vercel.app.
+        ``<project_name>.vercel.app``.
         """
         try:
             if not self._project_valid(project, app_id, expected_name=expected_name):
@@ -1486,101 +1519,188 @@ class VercelAdapter:
             if (not isinstance(name, str)
                     or not self._VERCEL_PROJECT_NAME_RE.fullmatch(name)):
                 return _fail('CANONICAL_PRODUCTION_URL_UNRESOLVED')
-
-            candidates = []
-
-            # (a) Check alias explicitly attached to the exact promoted deployment_id
-            if expected_deployment_id:
-                try:
-                    status, body = self._call('GET', '/v13/deployments/' + quote(expected_deployment_id, safe=''))
-                    if status == 200 and isinstance(body, dict) and body.get('id') == expected_deployment_id:
-                        team = body.get('teamId') or (body.get('team') or {}).get('id')
-                        project_id_field = body.get('projectId') or (body.get('project') or {}).get('id')
-                        if project_id_field == project['id'] and team == self.team_id:
-                            raw_aliases = body.get('alias')
-                            if isinstance(raw_aliases, list):
-                                for a in raw_aliases:
-                                    if isinstance(a, str) and _safe_origin(f'https://{a}/'):
-                                        candidates.append(a)
-                except Exception:
-                    pass
-
-            # (b) Project production alias explicitly proven to target that same deployment/project
-            if not candidates:
-                try:
-                    status, fresh = self._call('GET', '/v9/projects/' + quote(name, safe=''))
-                    if status == 200 and isinstance(fresh, dict) and fresh.get('id') == project['id']:
-                        for entry in fresh.get('alias', []):
-                            if not isinstance(entry, dict):
-                                continue
-                            domain = entry.get('domain')
-                            target = entry.get('target') or ''
-                            env = entry.get('environment') or ''
-                            if target != 'PRODUCTION' and env != 'production':
-                                continue
-                            if entry.get('redirect'):
-                                continue
-                            dep = entry.get('deployment') or {}
-                            dep_id = dep.get('id') if isinstance(dep, dict) else None
-                            if expected_deployment_id and dep_id and dep_id != expected_deployment_id:
-                                continue
-                            if expected_deployment_id and not dep_id:
-                                continue
-                            if isinstance(domain, str) and _safe_origin(f'https://{domain}/'):
-                                candidates.append(domain)
-
-                        if not candidates:
-                            prod_target = fresh.get('targets', {}).get('production', {})
-                            if isinstance(prod_target, dict):
-                                prod_dep_id = prod_target.get('id')
-                                if not expected_deployment_id or prod_dep_id == expected_deployment_id:
-                                    prod_aliases = prod_target.get('alias', [])
-                                    if isinstance(prod_aliases, list):
-                                        for a in prod_aliases:
-                                            if isinstance(a, str) and _safe_origin(f'https://{a}/'):
-                                                candidates.append(a)
-                except Exception:
-                    pass
-
-            # (c) Verified project domain only when Vercel provider data proves it is the production target
-            if not candidates:
-                try:
-                    status, dom_body = self._call('GET', '/v9/projects/' + quote(name, safe='') + '/domains', production='true')
-                    if status == 200 and isinstance(dom_body, dict):
-                        for entry in dom_body.get('domains', []):
-                            if not isinstance(entry, dict):
-                                continue
-                            if entry.get('verified') is not True:
-                                continue
-                            if entry.get('projectId') and entry.get('projectId') != project['id']:
-                                continue
-                            if entry.get('redirect'):
-                                continue
-                            if entry.get('gitBranch'):
-                                continue
-                            tgt = entry.get('target') or entry.get('environment')
-                            if tgt and tgt.lower() != 'production':
-                                continue
-                            domain = entry.get('name')
-                            if isinstance(domain, str) and _safe_origin(f'https://{domain}/'):
-                                candidates.append(domain)
-                except Exception:
-                    pass
-
-            if not candidates:
+            if not expected_deployment_id:
+                # Without the promoted deployment id there is nothing to prove
+                # a candidate is attached to, so no class may be trusted.
                 return _fail('CANONICAL_PRODUCTION_URL_UNRESOLVED')
 
-            unique_candidates = sorted(set(candidates))
-            selected_host = unique_candidates[0]
+            # ONE project read serves classes 1 and 2: it carries the
+            # provider's own production binding (the proof a domain record,
+            # which has no deployment id of its own, is composed with) and
+            # the project-level production aliases.
+            fresh = None
+            production_target = {}
+            try:
+                status, body = self._call('GET', '/v9/projects/' + quote(name, safe=''))
+                if status == 200 and isinstance(body, dict) and body.get('id') == project['id']:
+                    fresh = body
+                    targets = body.get('targets')
+                    candidate = targets.get('production') if isinstance(targets, dict) else None
+                    if isinstance(candidate, dict):
+                        production_target = candidate
+            except Exception:
+                pass
 
-            return OperationResult.ok({
-                'canonical_production_url': f'https://{selected_host}/',
-                'canonical_source': 'VERCEL_PRODUCTION_ALIAS',
-                'project_name': name,
-                'canonical_host': selected_host,
-            })
+            classed = (
+                (self.CANONICAL_SOURCE_PROJECT_DOMAIN,
+                 self._project_production_domains(name, project, production_target,
+                                                  expected_deployment_id)),
+                (self.CANONICAL_SOURCE_PRODUCTION_ALIAS,
+                 self._project_production_aliases(fresh, production_target,
+                                                  expected_deployment_id)),
+                (self.CANONICAL_SOURCE_DEPLOYMENT_ALIAS,
+                 self._deployment_aliases(project, expected_deployment_id)),
+            )
+            for source, hosts in classed:
+                if not hosts:
+                    continue
+                # Intra-class tie-break only: a stable pick among aliases the
+                # provider has already proven equivalent for this deployment.
+                selected_host = sorted(set(hosts))[0]
+                return OperationResult.ok({
+                    'canonical_production_url': f'https://{selected_host}/',
+                    'canonical_source': source,
+                    'project_name': name,
+                    'canonical_host': selected_host,
+                })
+            return _fail('CANONICAL_PRODUCTION_URL_UNRESOLVED')
         except Exception:
             return _fail('CANONICAL_PRODUCTION_URL_UNRESOLVED')
+
+    def _project_production_domains(self, name, project, production_target,
+                                    expected_deployment_id):
+        """Class 1: verified project production domains.
+
+        A domain record carries NO deployment id, so "this host serves the
+        deployment we promoted" cannot be read off it directly. It is proven
+        by composition, and every part is required:
+
+          * the project's CURRENT production target is the promoted
+            deployment (``targets.production.id``) -- so whatever the
+            project's production environment is currently serving, is the
+            artifact this operation released;
+          * the domain is attached to THIS project (``projectId``) and
+            ``verified is True``, so the provider will actually serve it;
+          * the read is server-scoped to production domains and the record
+            is not a redirect, not bound to a git branch, and not bound to a
+            custom environment.
+
+        Anything missing leaves the domain unproven, and it is then not a
+        candidate at all -- the next class decides.
+        """
+        if production_target.get('id') != expected_deployment_id:
+            return []
+        try:
+            status, body = self._call(
+                'GET', '/v9/projects/' + quote(name, safe='') + '/domains',
+                production='true')
+        except Exception:
+            return []
+        if status != 200 or not isinstance(body, dict):
+            return []
+        entries = body.get('domains')
+        if not isinstance(entries, list):
+            return []
+        hosts = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get('verified') is not True:
+                continue
+            if entry.get('projectId') and entry.get('projectId') != project['id']:
+                continue
+            if entry.get('redirect') or entry.get('gitBranch'):
+                continue
+            if entry.get('customEnvironmentId'):
+                continue
+            # A domain record is not documented to carry target/environment;
+            # when one is present and says otherwise, believe it. Absent is
+            # already covered by the server-side ``production=true`` filter.
+            target = entry.get('target') or entry.get('environment')
+            if target and str(target).lower() != 'production':
+                continue
+            domain = entry.get('name')
+            if isinstance(domain, str) and _safe_origin(f'https://{domain}/'):
+                hosts.append(domain)
+        return hosts
+
+    def _project_production_aliases(self, fresh, production_target,
+                                    expected_deployment_id):
+        """Class 2: the project's own stable production aliases.
+
+        Two provider shapes, both requiring the same binding proof:
+
+          * ``project.alias[]`` entries -- each must name the PRODUCTION
+            target and carry the promoted deployment id explicitly;
+          * ``targets.production.alias[]`` -- the current production
+            binding's own alias list, usable only when that binding IS the
+            promoted deployment.
+        """
+        hosts = []
+        if isinstance(fresh, dict):
+            entries = fresh.get('alias')
+            if isinstance(entries, list):
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    target = entry.get('target') or ''
+                    environment = entry.get('environment') or ''
+                    if target != 'PRODUCTION' and environment != 'production':
+                        continue
+                    if entry.get('redirect') or entry.get('gitBranch'):
+                        continue
+                    deployment = entry.get('deployment') or {}
+                    deployment_id = (deployment.get('id')
+                                     if isinstance(deployment, dict) else None)
+                    if deployment_id != expected_deployment_id:
+                        continue
+                    domain = entry.get('domain')
+                    if isinstance(domain, str) and _safe_origin(f'https://{domain}/'):
+                        hosts.append(domain)
+        if production_target.get('id') == expected_deployment_id:
+            aliases = production_target.get('alias')
+            if isinstance(aliases, list):
+                for alias in aliases:
+                    if isinstance(alias, str) and _safe_origin(f'https://{alias}/'):
+                        hosts.append(alias)
+        return hosts
+
+    def _deployment_aliases(self, project, expected_deployment_id):
+        """Class 3: aliases the provider assigned to the promoted deployment.
+
+        Proven by the deployment read itself: the body must be the promoted
+        deployment, in this project, on this team. The deployment's own
+        immutable ``url`` is excluded -- it is a build identifier that may
+        sit behind Deployment Protection, never the public production host.
+        """
+        try:
+            status, body = self._call(
+                'GET', '/v13/deployments/' + quote(expected_deployment_id, safe=''))
+        except Exception:
+            return []
+        if (status != 200 or not isinstance(body, dict)
+                or body.get('id') != expected_deployment_id):
+            return []
+        team = body.get('teamId') or (body.get('team') or {}).get('id')
+        project_id_field = body.get('projectId') or (body.get('project') or {}).get('id')
+        if project_id_field != project['id'] or team != self.team_id:
+            return []
+        raw = body.get('url')
+        try:
+            deployment_host = urlsplit(raw if isinstance(raw, str) else '').hostname
+        except ValueError:
+            deployment_host = None
+        aliases = body.get('alias')
+        if not isinstance(aliases, list):
+            return []
+        hosts = []
+        for alias in aliases:
+            if not isinstance(alias, str) or not _safe_origin(f'https://{alias}/'):
+                continue
+            if deployment_host and alias == deployment_host:
+                continue
+            hosts.append(alias)
+        return hosts
 
     # ------------------------------------------------------------------
     # PHASE R1-A — canonical identity evidence (READ-ONLY diagnostic)

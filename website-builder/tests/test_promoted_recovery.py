@@ -264,6 +264,42 @@ def test_recovery_binds_promoted_deployment_not_preview(tmp_path):
     assert state.failure is None
 
 
+def test_canonical_url_is_proven_against_the_promoted_deployment(tmp_path):
+    """The canonical host is a PRESENTATION choice; the deployment it is
+    proven against is an IDENTITY one. Recovery must resolve it against the
+    promoted deployment B and record B as the binding -- never the approval
+    preview A, and never a URL carried over from an earlier resolution.
+
+    p17 added a second way this can go wrong: the record also carries the
+    evidence class it came from, and a legacy record (no resolution version)
+    proves nothing, so it is re-resolved rather than reused.
+    """
+    vercel = P16Vercel('promoted_b')
+    orch, store = _orchestrator(tmp_path, vercel)
+    _seed_p16_state(store)
+    # A legacy record from the pre-class-aware resolver: a URL plus the
+    # hardcoded label that resolver emitted for every evidence class.
+    with store.acquire_writer(P16) as state:
+        state.deployment['promotion_intent'].update({
+            'canonical_production_url': 'https://stale-legacy.vercel.app/',
+            'canonical_source': 'VERCEL_PRODUCTION_ALIAS',
+            'canonical_deployment_id': P16_PROMOTED_DEPLOYMENT_ID,
+        })
+        store.save(state)
+
+    result = orch.resume_publish(P16, _workspace(tmp_path), principal_id=OWNER)
+
+    assert result.success, result.error_code
+    assert vercel.canonical_calls == [P16_PROMOTED_DEPLOYMENT_ID]
+    intent = store.load(P16).deployment['promotion_intent']
+    assert intent['canonical_deployment_id'] == P16_PROMOTED_DEPLOYMENT_ID
+    assert intent['canonical_deployment_id'] != P16_PREVIEW_DEPLOYMENT_ID
+    assert intent['canonical_production_url'] == P16_CANONICAL_URL
+    assert intent['canonical_source'] == 'VERCEL_PROJECT_DOMAIN'
+    assert intent['canonical_resolution_version'] == 2
+    assert store.load(P16).production_url == P16_CANONICAL_URL
+
+
 def test_recovery_preserves_provenance_and_previous_production_evidence(tmp_path):
     """Durable provenance is NEVER rewritten: the intent's deployment_id stays
     the preview A, its promoted_deployment_id stays B, and the persisted
