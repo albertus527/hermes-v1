@@ -999,6 +999,53 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
         registry_store=registry_store,
     )
 
+@dataclass
+class ReadOnlyComposition:
+    """The minimum boundary objects a strictly READ-ONLY operator probe needs.
+
+    Deliberately NOT a subset field of :class:`RuntimeComposition`: a probe
+    must be physically unable to reach a mutating collaborator (runner,
+    promote, preview, builder, revise, domain, dispatcher, telegram_out).
+    This composition exposes only the three things
+    ``--inspect-canonical-url`` reads through:
+
+      * ``store``          — project state (read via ``load`` only)
+      * ``registry_store`` — conversation registry (read via ``load`` only)
+      * ``vercel``         — provider truth (read-only lookups)
+    """
+
+    config: RuntimeConfig
+    store: ProjectStateStore
+    vercel: VercelAdapter
+    registry_store: ConversationRegistryStore
+
+def compose_read_only(config: RuntimeConfig) -> ReadOnlyComposition:
+    """Compose ONLY the read-only boundary objects, with no side effects.
+
+    Contrast with :func:`compose`, which (a) creates hermes/workspace/output
+    directories and (b) constructs mutating collaborators. A read-only probe
+    must not do either: it must not create directories it was never asked to
+    own, and it must not even hold a reference to a mutator.
+
+    The registry store's constructor creates its ``conversations/`` directory
+    only as a parent for future writes; the probe never calls ``save``, and
+    reads go through ``load`` which returns ``None`` when absent rather than
+    materializing anything.
+    """
+    store = ProjectStateStore(config.state_root)
+    registry_store = ConversationRegistryStore(config.state_root / "conversations")
+    vercel = VercelAdapter(
+        token=config.vercel_token,
+        team_id=config.vercel_team_id,
+        ownership_namespace=config.vercel_ownership_namespace,
+    )
+    return ReadOnlyComposition(
+        config=config,
+        store=store,
+        vercel=vercel,
+        registry_store=registry_store,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Telegram receive loop
@@ -2658,6 +2705,39 @@ User message:
 # Entrypoint
 # ---------------------------------------------------------------------------
 
+# Every operator flag the entrypoint understands. Anything else that looks
+# like a flag (``--*``) is refused before config load so that a typo can never
+# fall through into the Telegram receive loop.
+_KNOWN_FLAGS = frozenset({
+    "--help",
+    "--preflight",
+    "--reconcile-publish",
+    "--inspect-canonical-url",
+    "--as",
+})
+
+_USAGE = """\
+Canonical Website Builder runtime.
+
+Usage:
+    python -m app                              Start the Telegram receive loop.
+    python -m app --preflight                  Verify host preconditions, then exit.
+    python -m app --inspect-canonical-url <project_id>
+                                               READ-ONLY: report provider-proven
+                                               canonical identity for a project,
+                                               then exit. Performs no recovery and
+                                               writes nothing.
+    python -m app --reconcile-publish <project_id> --as <principal_id>
+                                               Operator-only publish recovery.
+    python -m app --help                       Show this message.
+
+Environment: TELEGRAM_BOT_TOKEN, VERCEL_TOKEN, VERCEL_TEAM_ID (required).
+"""
+
+def _print_usage(stream=None) -> None:
+    """Print the operator usage block."""
+    print(_USAGE.rstrip("\n"), file=stream or sys.stdout, flush=True)
+
 
 def main(argv: Optional[List[str]] = None) -> int:
     """Canonical Website Builder runtime entrypoint."""
@@ -2670,11 +2750,44 @@ def main(argv: Optional[List[str]] = None) -> int:
         stream=sys.stderr,
     )
 
+    # ---- Argument gate. This MUST run before any composition, preflight, or
+    # polling: an unknown operator flag is a typo, and a typo must never be
+    # silently reinterpreted as "start the Telegram receive loop". Explicit
+    # help is likewise answered here rather than falling through to polling.
+    if "--help" in argv or "-h" in argv:
+        _print_usage()
+        return 0
+    unknown = [a for a in argv if a.startswith("--")
+               and a not in _KNOWN_FLAGS]
+    if unknown:
+        logger.error("Unknown option(s): %s", " ".join(unknown))
+        _print_usage(stream=sys.stderr)
+        return 2
+
     try:
         config = load_runtime_config()
     except ConfigurationError as exc:
         logger.error("Configuration error: %s", exc)
         return 1
+
+    # ---- Operator-only, strictly READ-ONLY canonical-identity evidence:
+    #   python -m app --inspect-canonical-url <project_id>
+    #
+    # Dispatched FIRST, through a read-only composition, and returning
+    # immediately. It must NOT pass through the Node/smoke/role preflights,
+    # the full ``compose`` (which creates directories and mutating
+    # collaborators), or ``reconcile_stranded_projects`` (which mutates
+    # project state). No ``--as`` and no Telegram: this reports, it never
+    # acts. It exists so "which production host does Vercel actually prove
+    # for this project" is answerable from provider evidence instead of
+    # inferred from a hostname.
+    if "--inspect-canonical-url" in argv:
+        try:
+            read_only = compose_read_only(config)
+        except Exception:
+            logger.exception("Failed to compose read-only probe")
+            return 1
+        return _run_inspect_canonical_url(read_only, argv)
 
     # Fail closed BEFORE any polling or composition:
     # 1. Local Node toolchain must satisfy the starter contract.
@@ -2730,15 +2843,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     # the receive loop, so it can never race the running runtime.
     if "--reconcile-publish" in argv:
         return _run_reconcile_publish(composition, argv)
-
-    # ---- Operator-only, strictly READ-ONLY canonical-identity evidence:
-    #   python -m app --inspect-canonical-url <project_id>
-    #
-    # No ``--as`` and no Telegram: this reports, it never acts. It exists so
-    # "which production host does Vercel actually prove for this project" is
-    # answerable from provider evidence instead of inferred from a hostname.
-    if "--inspect-canonical-url" in argv:
-        return _run_inspect_canonical_url(composition, argv)
 
     loop = TelegramReceiveLoop(
         bot_token=config.telegram_bot_token,
@@ -2863,7 +2967,17 @@ def _run_inspect_canonical_url(composition, argv) -> int:
     if not conversation_id:
         logger.error("Project has no conversation registry project=%s", project_id)
         return 1
-    registry = composition.registry_store.load_or_create(conversation_id)
+    # READ-ONLY load. ``load_or_create`` would hand back a fresh in-memory
+    # registry for a missing file -- an object whose every lookup reads as
+    # "unbound" and, worse, one a future edit could persist. Absent registry
+    # data is a fail-closed condition, not an empty result.
+    registry = composition.registry_store.load(conversation_id)
+    if registry is None:
+        logger.error(
+            "No conversation registry data project=%s conversation=%s",
+            project_id, conversation_id,
+        )
+        return 1
     entry = registry.find_by_id(project_id)
     # Only the ALREADY-BOUND slug is used. Deriving a fresh candidate here
     # would report against a project identity that may not exist remotely.

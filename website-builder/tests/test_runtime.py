@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -25,7 +26,7 @@ from app.channels.telegram import TelegramNormalizer
 from app.conversations import ConversationRouter
 from app.core.contracts import OperationResult
 from app.core.registry import ConversationRegistryStore
-from app.core.state import ProjectStateStore
+from app.core.state import ProjectState, ProjectStateStore
 from app.runtime import (
     ConfigurationError,
     ConversationIntent,
@@ -35,6 +36,7 @@ from app.runtime import (
     _run_reconcile_publish,
     _run_inspect_canonical_url,
     compose,
+    compose_read_only,
     load_runtime_config,
     main,
     preflight_node_toolchain,
@@ -645,12 +647,14 @@ class TestMainEntrypoint:
             # Ensure required vars are absent
             for key in ("TELEGRAM_BOT_TOKEN", "VERCEL_TOKEN", "VERCEL_TEAM_ID"):
                 os.environ.pop(key, None)
-            assert main() == 1
+            # ``[]`` = "no operator flags", independent of the ambient
+            # sys.argv (which under pytest contains the runner's own flags).
+            assert main([]) == 1
 
     def test_main_fails_closed_on_compose_error(self, tmp_path):
         with patch.dict(os.environ, _env(), clear=False):
             with patch("app.runtime.compose", side_effect=RuntimeError("boom")):
-                assert main() == 1
+                assert main([]) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1263,11 +1267,16 @@ class TestInspectCanonicalUrlEntrypoint:
         return state
 
     @staticmethod
-    def _composition(state, entry=None, lookup=None, evidence=None):
+    def _composition(state, entry=None, lookup=None, evidence=None, registry_present=True):
         composition = MagicMock()
         composition.store.load.return_value = state
-        composition.registry_store.load_or_create.return_value.find_by_id.return_value = (
+        registry = MagicMock()
+        registry.find_by_id.return_value = (
             entry if entry is not None else MagicMock(vercel_slug='mopsypeyshop'))
+        # The probe must read through the READ-ONLY ``load``; ``load_or_create``
+        # would materialize an empty in-memory registry for missing data.
+        composition.registry_store.load.return_value = (
+            registry if registry_present else None)
         composition.vercel.lookup_project.return_value = (
             lookup if lookup is not None else OperationResult.ok(
                 {'project': {'id': 'prj_1', 'name': 'mopsypeyshop'}}))
@@ -1325,6 +1334,208 @@ class TestInspectCanonicalUrlEntrypoint:
         assert _run_inspect_canonical_url(
             composition, ['--inspect-canonical-url', 'p17', '--as', 'stranger']) == 0
         composition.promote.resume_publish.assert_not_called()
+
+    def test_missing_registry_data_fails_closed(self):
+        """Absent registry bytes are a refusal, not an empty-but-usable
+        registry. The probe must not silently treat 'no registry' as 'unbound'
+        and must not create one."""
+        composition = self._composition(self._state(), registry_present=False)
+        assert _run_inspect_canonical_url(
+            composition, ['--inspect-canonical-url', 'p17']) == 1
+        composition.registry_store.load_or_create.assert_not_called()
+        composition.registry_store.save.assert_not_called()
+        composition.vercel.inspect_canonical_evidence.assert_not_called()
+
+    def test_probe_reads_registry_via_read_only_load(self):
+        """The slug authority is the READ-ONLY load, never load_or_create."""
+        composition = self._composition(self._state())
+        assert _run_inspect_canonical_url(
+            composition, ['--inspect-canonical-url', 'p17']) == 0
+        composition.registry_store.load.assert_called_once_with('conv-1')
+        composition.registry_store.load_or_create.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 17b. --inspect-canonical-url is dispatched as a STRICTLY READ-ONLY probe.
+#
+# Drives the real ``__main__`` module in a subprocess so the actual argument
+# gate, composition choice, and dispatch order are exercised -- not a
+# re-implementation of them.
+# ---------------------------------------------------------------------------
+
+_WB_ROOT = Path(__file__).resolve().parents[1]
+
+class TestInspectCanonicalUrlMainDispatch:
+    """Process-level proof that the probe is read-only and correctly ordered."""
+
+    def _run_app(self, tmp_path, argv, *, env_extra=None):
+        """Run ``python -m app`` in a throwaway state root and return (proc, state_root)."""
+        state_root = tmp_path / 'state'
+        state_root.mkdir(parents=True, exist_ok=True)
+        env = os.environ.copy()
+        env.update({
+            'TELEGRAM_BOT_TOKEN': '123456:ABC-DEF',
+            'VERCEL_TOKEN': 'vercel-token-test',
+            'VERCEL_TEAM_ID': 'team_test123',
+            'HERMES_HOME': str(tmp_path / 'hermes-home'),
+            'WEBSITE_BUILDER_WORKSPACE_ROOT': str(tmp_path / 'workspaces'),
+            'WEBSITE_BUILDER_STATE_ROOT': str(state_root),
+            'WEBSITE_BUILDER_OUTPUT_REPO': str(tmp_path / 'output-repo'),
+        })
+        env.update(env_extra or {})
+        proc = subprocess.run(
+            [sys.executable, '-m', 'app', *argv],
+            cwd=str(_WB_ROOT), env=env,
+            capture_output=True, text=True, timeout=180,
+        )
+        return proc, state_root
+
+    def test_help_is_implemented_and_does_not_poll(self, tmp_path):
+        proc, _ = self._run_app(tmp_path, ['--help'])
+        assert proc.returncode == 0
+        assert 'Usage' in (proc.stdout + proc.stderr)
+
+    def test_unknown_flag_cannot_start_the_runtime(self, tmp_path):
+        proc, _ = self._run_app(tmp_path, ['--inspect-canonical'])
+        assert proc.returncode == 2
+        assert 'Unknown' in (proc.stdout + proc.stderr)
+
+    def test_missing_registry_creates_no_registry_or_state_files(self, tmp_path):
+        """(C) A probe over an empty state root must create nothing under it."""
+        proc, state_root = self._run_app(
+            tmp_path, ['--inspect-canonical-url', 'p17'])
+        assert proc.returncode == 1
+        created = sorted(p.name for p in state_root.rglob('*') if p.is_file())
+        assert created == [], f'probe wrote files: {created}'
+
+
+class TestInspectCanonicalUrlReadOnlyContract:
+    """(A)(B)(D)(E) Driven in-process with the real ``main`` and patched
+    boundaries: prove dispatch order, no polling, and byte-stability."""
+
+    def _config(self, tmp_path):
+        return _make_config(tmp_path)
+
+    def test_does_not_call_reconcile_stranded_projects(self, tmp_path):
+        """(A) reconcile_stranded_projects MUTATES state, so the probe must be
+        dispatched before it and never reach it."""
+        with patch('app.runtime.load_runtime_config', return_value=self._config(tmp_path)), \
+             patch('app.runtime.preflight_node_toolchain') as node, \
+             patch('app.runtime.preflight_smoke_support') as smoke, \
+             patch('app.runtime.preflight_role_validation') as roles, \
+             patch('app.runtime.compose') as compose_full, \
+             patch('app.runtime.reconcile_stranded_projects') as reconcile, \
+             patch('app.runtime._run_inspect_canonical_url', return_value=0) as probe:
+            assert main(['--inspect-canonical-url', 'p17']) == 0
+        probe.assert_called_once()
+        reconcile.assert_not_called()
+        compose_full.assert_not_called()
+        # The read-only probe must not run the host preflights either.
+        node.assert_not_called()
+        smoke.assert_not_called()
+        roles.assert_not_called()
+
+    def test_does_not_start_telegram_polling(self, tmp_path):
+        """(B) No receive loop may be constructed or run for the probe."""
+        with patch('app.runtime.load_runtime_config', return_value=self._config(tmp_path)), \
+             patch('app.runtime.reconcile_stranded_projects') as reconcile, \
+             patch('app.runtime.TelegramReceiveLoop') as loop_cls, \
+             patch('app.runtime._run_inspect_canonical_url', return_value=0):
+            assert main(['--inspect-canonical-url', 'p17']) == 0
+        loop_cls.assert_not_called()
+        reconcile.assert_not_called()
+
+    def test_successful_probe_leaves_project_and_registry_bytes_unchanged(self, tmp_path):
+        """(D) A probe over real files must not rewrite them."""
+        config = self._config(tmp_path)
+        config.state_root.mkdir(parents=True, exist_ok=True)
+
+        store = ProjectStateStore(config.state_root)
+        state = ProjectState(
+            project_id='p17', owner_id='owner-1', conversation_id='conv-1',
+            deployment={'promotion_intent': {
+                'operation_id': 'op-1',
+                'promoted_deployment_id': TestInspectCanonicalUrlEntrypoint.PROMOTED,
+            }},
+        )
+        store.save(state)
+        registry_store = ConversationRegistryStore(config.state_root / 'conversations')
+        registry_store.adopt_project('conv-1', 'p17', 'Mopsypeyshop')
+        registry_store.set_vercel_slug_once('conv-1', 'p17', 'mopsypeyshop')
+
+        project_file = config.state_root / 'p17.json'
+        registry_file = config.state_root / 'conversations' / 'conv-1.json'
+        before_project = project_file.read_bytes()
+        before_registry = registry_file.read_bytes()
+
+        vercel = MagicMock()
+        vercel.lookup_project.return_value = OperationResult.ok(
+            {'project': {'id': 'prj_1', 'name': 'mopsypeyshop'}})
+        vercel.inspect_canonical_evidence.return_value = OperationResult.ok(
+            {'expected_deployment_id': TestInspectCanonicalUrlEntrypoint.PROMOTED})
+
+        with patch('app.runtime.load_runtime_config', return_value=config), \
+             patch('app.runtime.VercelAdapter', return_value=vercel), \
+             patch('app.runtime.reconcile_stranded_projects') as reconcile, \
+             patch('app.runtime.TelegramReceiveLoop') as loop_cls:
+            assert main(['--inspect-canonical-url', 'p17']) == 0
+
+        reconcile.assert_not_called()
+        loop_cls.assert_not_called()
+        assert project_file.read_bytes() == before_project
+        assert registry_file.read_bytes() == before_registry
+        # Nothing new appeared anywhere under the state root.
+        assert not (config.state_root / 'conversations' / 'conv-1.json.tmp').exists()
+
+    def test_probe_does_not_flip_a_stranded_lifecycle(self, tmp_path):
+        """The sharpest form of (A): a QUEUED project is exactly what
+        reconcile_stranded_projects exists to mutate. If the probe ran it, the
+        persisted lifecycle would change. It must not."""
+        config = self._config(tmp_path)
+        config.state_root.mkdir(parents=True, exist_ok=True)
+        store = ProjectStateStore(config.state_root)
+        store.save(ProjectState(
+            project_id='p17', owner_id='owner-1', conversation_id='conv-1',
+            lifecycle='QUEUED',
+            deployment={'promotion_intent': {
+                'operation_id': 'op-1',
+                'promoted_deployment_id': TestInspectCanonicalUrlEntrypoint.PROMOTED,
+            }},
+        ))
+        registry_store = ConversationRegistryStore(config.state_root / 'conversations')
+        registry_store.adopt_project('conv-1', 'p17', 'Mopsypeyshop')
+        registry_store.set_vercel_slug_once('conv-1', 'p17', 'mopsypeyshop')
+
+        vercel = MagicMock()
+        vercel.lookup_project.return_value = OperationResult.ok(
+            {'project': {'id': 'prj_1', 'name': 'mopsypeyshop'}})
+        vercel.inspect_canonical_evidence.return_value = OperationResult.ok(
+            {'expected_deployment_id': TestInspectCanonicalUrlEntrypoint.PROMOTED})
+
+        with patch('app.runtime.load_runtime_config', return_value=config), \
+             patch('app.runtime.VercelAdapter', return_value=vercel):
+            assert main(['--inspect-canonical-url', 'p17']) == 0
+
+        # The real reconciler WOULD move QUEUED -> FAILED. Prove it didn't.
+        assert ProjectStateStore(config.state_root).load('p17').lifecycle == 'QUEUED'
+
+    def test_help_returns_before_config_load(self, tmp_path):
+        """(E) --help is answered without touching config, preflight, or polling."""
+        with patch('app.runtime.load_runtime_config') as load_cfg, \
+             patch('app.runtime.compose') as compose_full, \
+             patch('app.runtime.TelegramReceiveLoop') as loop_cls:
+            assert main(['--help']) == 0
+        load_cfg.assert_not_called()
+        compose_full.assert_not_called()
+        loop_cls.assert_not_called()
+
+    def test_unknown_operator_flag_is_refused_before_config_load(self, tmp_path):
+        """(E) A typo must fail closed, never fall through to the receive loop."""
+        with patch('app.runtime.load_runtime_config') as load_cfg, \
+             patch('app.runtime.TelegramReceiveLoop') as loop_cls:
+            assert main(['--inspect-canonical']) == 2
+        load_cfg.assert_not_called()
+        loop_cls.assert_not_called()
 
 
 

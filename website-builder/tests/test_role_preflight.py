@@ -211,8 +211,10 @@ def test_main_refuses_unresolvable_role_before_composition(profile, monkeypatch,
         monkeypatch.setenv(name, value)
     # Only the external receive loop is replaced. Composition would create
     # directories; refusal must happen before even those local side effects.
+    # ``[]`` = "no operator flags", independent of the ambient sys.argv
+    # (which under pytest contains the runner's own flags).
     with patch("app.runtime.TelegramReceiveLoop") as loop:
-        assert main() == 1
+        assert main([]) == 1
     loop.assert_not_called()
     assert not (home / "state").exists()
     assert not (home / "ws").exists()
