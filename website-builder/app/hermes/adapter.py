@@ -77,6 +77,13 @@ except ImportError as exc:  # pragma: no cover - depends on host environment
     _HERMES_IMPORT_ERROR = str(exc)
 
 
+# Stable classification for a FRONTEND summary that declares failure but
+# carries no usable reason. Callers persist FRONTEND failure diagnostics, so a
+# failure that cannot explain itself must still explain itself: this code is
+# what makes ``state.failure.error`` non-empty instead of blank.
+FRONTEND_RESULT_CONTRACT_INVALID = "FRONTEND_RESULT_CONTRACT_INVALID"
+
+
 @dataclass
 class HermesResult:
     """Result from a Hermes invocation."""
@@ -1801,7 +1808,30 @@ Respond in this exact JSON format, one entry per attached role in order:
     def _parse_frontend_response(
         self, response: str, workspace: Path
     ) -> Dict[str, Any]:
-        """Parse FRONTEND response and load Design DNA from workspace."""
+        """Parse FRONTEND response and load Design DNA from workspace.
+
+        FRONTEND is PROMPTED to answer with
+        ``{"success": true|false, "design_dna_path": "...", "error": "..."}``
+        -- that is, ``error`` is PRESENT AND EMPTY on a successful build. So
+        ``error`` is not a success signal: a blank/whitespace ``error`` means
+        "no reason was reported", never "the build failed".
+
+        The explicit ``success`` field is authoritative whenever the summary
+        carries a boolean one. Previously success was keyed purely off
+        ``error is None``, which reclassified a completed FRONTEND run whose
+        summary said ``"error": ""`` as a failure with a blank reason -- the
+        failure then persisted ``state.failure.error == ""`` and told an
+        operator nothing.
+
+        A declared failure WITHOUT a usable reason is an invalid result
+        contract, not a silent failure: it is classified
+        ``FRONTEND_RESULT_CONTRACT_INVALID`` with a fixed explanatory message,
+        so no caller can ever persist an empty diagnostic.
+
+        A summary with no parseable JSON -- the truncated-response and
+        artifact-recovery path (which passes ``""``) -- declares nothing, and
+        keeps its previous behaviour: the artifacts on disk decide.
+        """
         design_dna = None
         dna_path = workspace / "design-dna.json"
         if dna_path.exists():
@@ -1811,19 +1841,47 @@ Respond in this exact JSON format, one entry per attached role in order:
             except (json.JSONDecodeError, IOError):
                 pass
 
-        error = None
+        declared_success: Optional[bool] = None
+        error: Optional[str] = None
 
         try:
             start = response.find("{")
             end = response.rfind("}") + 1
             if start >= 0 and end > start:
                 data = json.loads(response[start:end])
-                error = data.get("error")
+                if isinstance(data, dict):
+                    if isinstance(data.get("success"), bool):
+                        declared_success = data["success"]
+                    raw_error = data.get("error")
+                    if isinstance(raw_error, str) and raw_error.strip():
+                        error = raw_error
         except (json.JSONDecodeError, ValueError):
             pass
 
-        return {
-            "success": error is None,
+        # Legacy shape: a real reason with no explicit ``success`` field. The
+        # reason IS the failure declaration.
+        if declared_success is None and error is not None:
+            declared_success = False
+
+        # No declaration at all (truncated / empty summary, or an artifact
+        # recovery): artifacts on disk are authoritative.
+        if declared_success is None:
+            return {"success": True, "design_dna": design_dna, "error": None}
+
+        if declared_success:
+            return {"success": True, "design_dna": design_dna, "error": None}
+
+        # Declared failure. A declared failure WITH a usable reason keeps that
+        # reason and is not an invalid contract; one WITHOUT a usable reason is
+        # classified, so a caller can never persist a blank diagnostic.
+        failure: Dict[str, Any] = {
+            "success": False,
             "design_dna": design_dna,
-            "error": error,
+            "error": error or (
+                "FRONTEND reported success=false without a usable error reason "
+                "(invalid result contract)"
+            ),
         }
+        if not error:
+            failure["error_code"] = FRONTEND_RESULT_CONTRACT_INVALID
+        return failure

@@ -719,7 +719,17 @@ Respond with a JSON summary:
                         frontend_result = {"success": False, "error": str(exc)}
 
                 if not frontend_result.get("success"):
-                    err_text = frontend_result.get("error", "Unknown FRONTEND error")
+                    # A result that merely *has* an ``error`` key is not
+                    # enough: a blank/``None`` value is persisted verbatim as
+                    # ``state.failure["error"]`` and would tell an operator
+                    # nothing. Fall through the adapter's own classification
+                    # before the fixed text, which also removes a latent
+                    # ``TypeError`` in the substring test below.
+                    err_text = (
+                        frontend_result.get("error")
+                        or frontend_result.get("error_code")
+                        or "Unknown FRONTEND error"
+                    )
                     # Prefer the adapter's stable supervision code (e.g.
                     # FRONTEND_IDLE_TIMEOUT / FRONTEND_HARD_TIMEOUT) over
                     # re-deriving one from free text. The existing

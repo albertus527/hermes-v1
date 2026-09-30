@@ -69,6 +69,46 @@ from app.sandbox.runner import PointerResolutionError, ProjectRunner
 
 logger = logging.getLogger(__name__)
 
+# Terminal diagnostic used when a FRONTEND revision failure carries no usable
+# signal at all. A persisted failure with an empty ``error`` tells an operator
+# nothing, so the diagnostic is never allowed to be blank.
+_FRONTEND_FAILURE_FALLBACK = (
+    "FRONTEND revision failed without a reported reason"
+)
+
+
+def _frontend_failure_diagnostic(result: Dict[str, Any]) -> str:
+    """Return a NON-EMPTY diagnostic for a failed FRONTEND revision.
+
+    ``_fail`` persists this string verbatim as ``state.failure.error``, so a
+    result that merely *has* an ``error`` key is not enough -- a blank or
+    ``None`` value would be persisted as an empty diagnostic and would hide the
+    failure from operators. Preference order, each source coerced to a non-blank
+    string before use:
+
+    1. ``error`` -- the adapter's own reason.
+    2. ``error_code`` -- the adapter's stable classification.
+    3. ``invocation.outcome`` -- the bounded supervision receipt the adapter
+       already attaches (``frontend_forensics/1``: ids, pid, elapsed, counters;
+       never prompts, source, or model output).
+    4. A fixed fallback naming the class of the failure.
+    """
+    error = result.get("error")
+    if isinstance(error, str) and error.strip():
+        return error
+
+    error_code = result.get("error_code")
+    if isinstance(error_code, str) and error_code.strip():
+        return error_code
+
+    invocation = result.get("invocation")
+    if isinstance(invocation, dict):
+        outcome = invocation.get("outcome")
+        if isinstance(outcome, str) and outcome.strip():
+            return outcome
+
+    return _FRONTEND_FAILURE_FALLBACK
+
 
 @dataclass
 class RevisionResult:
@@ -574,7 +614,7 @@ class RevisionOrchestrator:
             if not frontend_result.get("success"):
                 return self._fail(
                     project_id, seq,
-                    frontend_result.get("error", "FRONTEND revision failed"),
+                    _frontend_failure_diagnostic(frontend_result),
                     frontend_result.get("error_code") or "FRONTEND_REVISION_FAILED",
                 )
 
