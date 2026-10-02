@@ -32,6 +32,20 @@ Two failure modes, two codes
     Deliberately neither of the codes above — we cannot honestly attribute a
     degraded-mode timeout to idle or to the hard fuse.
 
+Operator cancellation
+---------------------
+``FRONTEND_CANCELLED``
+    Application shutdown asked *this* invocation to stop. It is deliberately
+    NOT one of the three codes above and is excluded from
+    :data:`TIMED_OUT_OUTCOMES`: nothing about the run's health is implied, and a
+    cancelled run must never be admitted by the caller's artifact-recovery path.
+
+    The request itself is a bare flag (``app.hermes.cancellation``) set by the
+    signal handler, which never touches the child. The poll loop stays the sole
+    owner of ``proc`` and leaves through the *same* ``_terminate_tree``
+    escalation a timeout uses — SIGTERM, grace, then the strongest kill — on
+    this invocation's own pid and nothing else.
+
 Two clocks, not one
 ------------------
 Observable activity and forward progress are different facts.  ``advance=False``
@@ -84,9 +98,28 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 from hermes_cli.oneshot import PROGRESS_FILE_ENV, PROGRESS_ID_ENV
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
+    # The registry is a control-plane rendezvous, not supervision state: this
+    # module never imports it, it only ever calls register()/release() on
+    # whatever the caller passes. Keeping the import type-only preserves the
+    # module's import surface exactly as it is today.
+    from app.hermes.cancellation import FrontendRunCanceller
 
 try:  # pragma: no cover - exercised wherever the Hermes repo root is importable
     from agent.deadline import kill_process_tree
@@ -203,6 +236,18 @@ FORENSICS_SCHEMA = "frontend_forensics/2"
 OUTCOME_IDLE_TIMEOUT = "FRONTEND_IDLE_TIMEOUT"
 OUTCOME_HARD_TIMEOUT = "FRONTEND_HARD_TIMEOUT"
 OUTCOME_LEGACY_TIMEOUT = "FRONTEND_LEGACY_TIMEOUT"
+
+#: Application shutdown asked this exact invocation to stop. Deliberately NOT a
+#: member of :data:`TIMED_OUT_OUTCOMES`: a cancelled run says nothing about the
+#: run's health, and callers gate artifact recovery on ``timed_out``, so a
+#: cancelled run must never be admitted by that path.
+OUTCOME_CANCELLED = "FRONTEND_CANCELLED"
+
+#: Exit status reported for a cancelled run. 124 is the established timeout
+#: status and stays exclusively that; 130 (128 + SIGINT) is the conventional
+#: "interrupted" status. The authoritative discriminator is the outcome code
+#: itself, so this stays stable regardless of which signal triggered it.
+CANCELLED_EXIT_CODE = 130
 
 TIMED_OUT_OUTCOMES = frozenset(
     {OUTCOME_IDLE_TIMEOUT, OUTCOME_HARD_TIMEOUT, OUTCOME_LEGACY_TIMEOUT}
@@ -1070,6 +1115,7 @@ def _build_receipt(
     outcome: Optional[str],
     returncode: int,
     now: float,
+    cancel_reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Assemble the bounded ``frontend_forensics/2`` receipt.
 
@@ -1078,6 +1124,9 @@ def _build_receipt(
     contents, absolute paths, URLs, or credentials: descriptions are clamped
     and redacted, mutated paths are workspace-relative, and the receipt's own
     location is stored as a bare filename.
+
+    *cancel_reason* is caller-supplied metadata only (which signal asked the run
+    to stop); it is not read back by any decision.
     """
     started = invocation.started_at
     observed = sampler.receipt()
@@ -1088,6 +1137,11 @@ def _build_receipt(
         "build_operation_id": invocation.build_operation_id,
         "pid": invocation.child_pid,
         "outcome": outcome,
+        # Additive within ``/2``: lets an operator tell "an operator stopped
+        # this" from "we gave up on this" without string-matching the outcome.
+        # ``outcome`` already records the fact; these make it legible.
+        "cancelled": outcome == OUTCOME_CANCELLED,
+        "cancel_reason": cancel_reason if outcome == OUTCOME_CANCELLED else None,
         "returncode": int(returncode),
         "elapsed_seconds": round(max(0.0, now - started), 1),
         "idle_for_seconds": round(invocation.no_progress_for(now), 1),
@@ -1213,6 +1267,7 @@ def supervise_frontend_run(
     workspace: Optional[Path] = None,
     artifacts_probe: Optional[Callable[[], bool]] = None,
     write_receipt: Optional[Callable[[Path, str, Mapping[str, Any]], str]] = None,
+    run_canceller: Optional["FrontendRunCanceller"] = None,
 ) -> SupervisedRun:
     """Run *cmd* as one supervised, activity-aware invocation.
 
@@ -1223,9 +1278,18 @@ def supervise_frontend_run(
     *diagnostics_dir*, *workspace*, *artifacts_probe*, and *write_receipt* are
     the forensic-receipt seam. All four default to ``None``, so every existing
     caller and test runs exactly as before. When *diagnostics_dir* is set, a
-    bounded receipt is written for EVERY terminal path — success and all three
-    timeout codes — and a write failure is swallowed: a receipt must never
-    change the supervision result.
+    bounded receipt is written for EVERY terminal path — success, all three
+    timeout codes, and operator cancellation — and a write failure is swallowed:
+    a receipt must never change the supervision result.
+
+    *run_canceller* is the operator-cancellation seam. It defaults to ``None``,
+    so with no canceller supplied nothing can cancel this run and every existing
+    caller and test behaves byte-for-byte as before. When one is supplied, this
+    invocation registers itself on entry and is released on exit; a shutdown
+    request only ever sets that invocation's own event, and this poll loop —
+    the sole owner of ``proc`` — performs the teardown through the existing
+    ``_terminate_tree`` escalation. The registry is also the single source of
+    truth for *why* the run was stopped, which the receipt then records.
     """
     if kill_process_tree is None and kill_tree is None:
         raise WatchdogUnavailable(
@@ -1241,14 +1305,24 @@ def supervise_frontend_run(
     env[PROGRESS_ID_ENV] = invocation_id
 
     start = clock()
-    proc = spawn(
-        list(cmd),
-        cwd=str(cwd),
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        **_spawn_kwargs(),
-    )
+    # Registered BEFORE the child exists. Registering afterwards would leave a
+    # window in which a live child is unreachable from a shutdown request —
+    # which is exactly the orphan this seam exists to prevent.
+    cancel_event = run_canceller.register(invocation_id) if run_canceller else None
+    cancel_reason = ""
+    try:
+        proc = spawn(
+            list(cmd),
+            cwd=str(cwd),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            **_spawn_kwargs(),
+        )
+    except BaseException:
+        if run_canceller is not None:
+            run_canceller.release(invocation_id)
+        raise
     invocation = FrontendInvocation(
         invocation_id=invocation_id,
         project_id=project_id,
@@ -1293,7 +1367,18 @@ def supervise_frontend_run(
             exited = proc.poll() is not None
             if not exited:
                 elapsed = now - invocation.started_at
-                if not invocation.progress_channel_confirmed:
+                # Operator cancellation is evaluated FIRST and outranks every
+                # bound, so a run that is asked to stop is never reported as a
+                # timeout that happened to fire on the same poll. It is still
+                # below the ``exited`` check above: a child that already
+                # finished reports its true result, not a cancellation.
+                if cancel_event is not None and cancel_event.is_set():
+                    outcome = OUTCOME_CANCELLED
+                    # Read the reason NOW, while this invocation is still
+                    # registered; the ``finally`` releases it below.
+                    if run_canceller is not None:
+                        cancel_reason = run_canceller.reason_for(invocation_id)
+                elif not invocation.progress_channel_confirmed:
                     # Mandatory handshake not satisfied: we have no liveness
                     # signal for this child, so supervision degrades to the
                     # pre-watchdog wall-clock bound. Deliberately NOT a
@@ -1340,7 +1425,8 @@ def supervise_frontend_run(
         returncode = proc.poll()
         tree_kill_attempted = False
         if returncode is None:
-            # Timed out: tear down the whole tree, then take the code.
+            # A bound fired or cancellation was requested: tear down the whole
+            # tree through the one existing escalation, then take the code.
             _, tree_kill_attempted = _terminate_tree(
                 proc, terminate_grace_seconds, kill
             )
@@ -1351,6 +1437,11 @@ def supervise_frontend_run(
             except Exception:
                 returncode = -1
     finally:
+        # Release first: the run is over, so a later shutdown signal must not be
+        # able to target it. Cheap and non-blocking, so doing it here cannot
+        # delay the teardown that precedes it.
+        if run_canceller is not None:
+            run_canceller.release(invocation_id)
         # A surviving grandchild can hold the inherited pipe write end open, so
         # a reader may still be blocked. Bound the join and rely on the daemon
         # flag: no pipe handle or thread may outlive this call.
@@ -1379,6 +1470,7 @@ def supervise_frontend_run(
             outcome=outcome,
             returncode=int(returncode),
             now=end,
+            cancel_reason=cancel_reason,
         )
     except Exception:
         logger.warning(
@@ -1414,6 +1506,13 @@ def supervise_frontend_run(
             "FRONTEND legacy-timeout project=%s invocation=%s pid=%s "
             "(no progress channel; fell back to wall-clock bound)",
             project_id, invocation_id, invocation.child_pid,
+        )
+    elif outcome == OUTCOME_CANCELLED:
+        # Never reported as a completion: the child did NOT finish on its own.
+        logger.info(
+            "FRONTEND cancelled project=%s invocation=%s pid=%s reason=%s",
+            project_id, invocation_id, invocation.child_pid,
+            cancel_reason or "unspecified",
         )
     else:
         logger.info(

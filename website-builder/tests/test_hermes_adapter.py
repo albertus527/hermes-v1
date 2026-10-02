@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from app.core.state import ProjectStateStore
+from app.hermes import adapter as adapter_module
 from app.hermes.adapter import HermesAdapter, HermesResult
 
 
@@ -1280,6 +1281,195 @@ class TestFrontendForensicWiring(unittest.TestCase):
         self.assertEqual(
             result.error, "FRONTEND invocation FRONTEND_LEGACY_TIMEOUT"
         )
+
+
+class TestFrontendCancellationMapping(unittest.TestCase):
+    """FRONTEND_CANCELLED must never be dressed as a supervision timeout.
+
+    The load-bearing field is ``timed_out``: ``frontend_build`` uses it to admit
+    artifact recovery, so a cancelled run reported as a timeout would be
+    recovered as a SUCCESS on a workspace that merely looks complete and would
+    carry on into QA/preview during shutdown.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.store = ProjectStateStore(Path(self.tmpdir) / "state")
+        self.adapter = HermesAdapter(
+            self.store,
+            hermes_home=Path(self.tmpdir) / ".hermes-website",
+            repo_root=Path(self.tmpdir) / "repo",
+        )
+        self.workspace = Path(self.tmpdir) / "workspaces" / "proj-cancel"
+        (self.workspace / "src").mkdir(parents=True)
+        starter = (
+            self.adapter.repo_root / "templates" / "frontend-starter" / "src" / "App.tsx"
+        )
+        starter.parent.mkdir(parents=True)
+        starter.write_text("// starter placeholder\n", encoding="utf-8")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _complete_the_workspace(self):
+        """Make the artifacts genuinely complete, so the recovery guard bites."""
+        (self.workspace / "design-dna.json").write_text('{"v": 1}', encoding="utf-8")
+        (self.workspace / "src" / "App.tsx").write_text(
+            "export const App = () => null;\n", encoding="utf-8"
+        )
+
+    @staticmethod
+    def _role_config():
+        """A resolvable FRONTEND role mapping for the real CLI boundary."""
+        return {
+            "model": {"default": "fallback", "provider": "fallback"},
+            "website_builder": {
+                "models": {"FRONTEND": {"model": "frontend-model", "provider": "router"}}
+            },
+        }
+
+    def _supervised(self, outcome):
+        from app.hermes import watchdog as wd
+
+        with patch.object(
+            wd,
+            "supervise_frontend_run",
+            return_value=wd.SupervisedRun(
+                returncode=-15,
+                stdout="",
+                stderr="",
+                outcome=outcome,
+                diagnostics={"elapsed_seconds": 42.0, "outcome": outcome},
+                terminated=True,
+                tree_kill_attempted=True,
+            ),
+        ):
+            return self.adapter._run_hermes_cli_supervised(
+                ["python", "-m", "hermes_cli.main", "-z", "p"],
+                cwd=self.workspace,
+                env={},
+                project_id="proj-cancel",
+                build_operation_id="op-1",
+            )
+
+    def test_supervisor_receives_this_adapters_canceller(self):
+        """The wiring the shutdown handler depends on."""
+        from app.hermes import watchdog as wd
+
+        captured = {}
+
+        def _fake(cmd, **kwargs):
+            captured.update(kwargs)
+            return wd.SupervisedRun(0, "", "")
+
+        with patch.object(wd, "supervise_frontend_run", _fake):
+            self.adapter._run_hermes_cli_supervised(
+                ["x"],
+                cwd=self.workspace,
+                env={},
+                project_id="proj-cancel",
+                build_operation_id="op-1",
+            )
+
+        self.assertIs(captured["run_canceller"], self.adapter.frontend_runs)
+
+    def test_cancelled_supervision_is_not_reported_as_a_timeout(self):
+        from app.hermes import watchdog as wd
+
+        result = self._supervised(wd.OUTCOME_CANCELLED)
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, "FRONTEND_CANCELLED")
+        self.assertFalse(result.timed_out)
+        # 124 is exclusively the timeout status.
+        self.assertNotEqual(result.exit_code, 124)
+        self.assertEqual(result.exit_code, wd.CANCELLED_EXIT_CODE)
+        # The durable invocation channel carries the code for state.failure.
+        self.assertEqual(result.invocation["outcome"], "FRONTEND_CANCELLED")
+
+    def test_the_three_timeout_codes_keep_the_timeout_contract(self):
+        """Cancellation must not have cost the existing timeouts their shape."""
+        from app.hermes import watchdog as wd
+
+        for outcome in (
+            wd.OUTCOME_IDLE_TIMEOUT,
+            wd.OUTCOME_HARD_TIMEOUT,
+            wd.OUTCOME_LEGACY_TIMEOUT,
+        ):
+            with self.subTest(outcome=outcome):
+                result = self._supervised(outcome)
+                self.assertTrue(result.timed_out)
+                self.assertEqual(result.exit_code, 124)
+                self.assertEqual(result.error_code, outcome)
+
+    def test_cancelled_build_is_not_admitted_by_artifact_recovery(self):
+        from app.hermes import watchdog as wd
+
+        self._complete_the_workspace()
+        # Non-vacuous: the recovery path really would admit this workspace.
+        self.assertTrue(
+            self.adapter._has_complete_frontend_artifacts(self.workspace)
+        )
+
+        with patch.object(
+            wd,
+            "supervise_frontend_run",
+            return_value=wd.SupervisedRun(
+                returncode=-15,
+                stdout="",
+                stderr="",
+                outcome=wd.OUTCOME_CANCELLED,
+                diagnostics={"elapsed_seconds": 42.0},
+                terminated=True,
+                tree_kill_attempted=True,
+            ),
+        ), patch.object(
+            adapter_module, "load_config", return_value=self._role_config()
+        ):
+            failure = self.adapter.frontend_build(
+                project_id="proj-cancel",
+                brief={"name": "Northcut", "what": "shop", "why": "visit"},
+                workspace=self.workspace,
+            )
+
+        self.assertFalse(failure["success"])
+        # Reached only if the run actually got as far as being supervised: a
+        # role-resolution failure would carry no error_code at all.
+        self.assertEqual(failure["error_code"], "FRONTEND_CANCELLED")
+
+    def test_cancel_active_frontend_runs_returns_only_live_invocations(self):
+        adapter = self.adapter
+        self.assertEqual(adapter.cancel_active_frontend_runs(), [])
+
+        first = adapter.frontend_runs.register("inv-1")
+        second = adapter.frontend_runs.register("inv-2")
+        self.assertEqual(
+            sorted(adapter.cancel_active_frontend_runs(reason="signal 2")),
+            ["inv-1", "inv-2"],
+        )
+        self.assertTrue(first.is_set())
+        self.assertTrue(second.is_set())
+
+        adapter.frontend_runs.release("inv-1")
+        adapter.frontend_runs.release("inv-2")
+        self.assertEqual(adapter.cancel_active_frontend_runs(), [])
+
+    def test_two_adapters_never_share_a_canceller(self):
+        """Isolation is per process-wide adapter instance, not global."""
+        from app.hermes.cancellation import FrontendRunCanceller
+
+        other = HermesAdapter(
+            self.store,
+            hermes_home=Path(self.tmpdir) / ".hermes-other",
+            repo_root=Path(self.tmpdir) / "repo",
+        )
+        mine = self.adapter.frontend_runs.register("inv-mine")
+        theirs = other.frontend_runs.register("inv-theirs")
+
+        self.adapter.cancel_active_frontend_runs(reason="signal 2")
+
+        self.assertTrue(mine.is_set())
+        self.assertFalse(theirs.is_set())
 
 
 if __name__ == "__main__":

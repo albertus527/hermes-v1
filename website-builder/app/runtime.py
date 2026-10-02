@@ -1150,6 +1150,10 @@ _HARD_PREVIEW_ERRORS = frozenset({
 
 ERROR_MESSAGES: Dict[str, str] = {
     "UNAUTHORIZED_ROLE": "You are not authorized to modify this project.",
+    "FRONTEND_CANCELLED": (
+        "The build was stopped because the service was shutting down. "
+        "Send your request again once the service is back."
+    ),
     "BUILD_NOT_ALLOWED_IN_LIFECYCLE": "The project is not ready to build yet.",
     "DIRECTION_CHOICE_PENDING": "Please choose a design direction first.",
     "EVENT_RECONCILIATION_REQUIRED": "A previous operation needs reconciliation. Please try again.",
@@ -2853,12 +2857,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     # Graceful shutdown on SIGINT/SIGTERM
-    def shutdown(signum, frame):
-        logger.info("Received signal %d, shutting down...", signum)
-        loop.stop()
-
-    signal.signal(signal.SIGINT, shutdown)
-    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, _shutdown_handler_for(loop, composition.hermes))
+    signal.signal(signal.SIGTERM, _shutdown_handler_for(loop, composition.hermes))
 
     try:
         loop.run()
@@ -2868,6 +2868,60 @@ def main(argv: Optional[List[str]] = None) -> int:
         loop.stop()
 
     return 0
+
+
+def handle_shutdown_signal(loop, hermes, signum, _frame=None) -> None:
+    """Request a graceful shutdown after *signum*.
+
+    Two independent jobs, both of them flag-only:
+
+    1. ``loop.stop()`` — unchanged. Ends the Telegram polling loop between
+       updates.
+    2. Cancel the in-flight supervised FRONTEND invocation, if any.
+
+    The second job is not optional. The FRONTEND dispatch chain is synchronous
+    on this same thread, so while a run is active this call is being executed
+    *from inside* that run's watchdog poll loop; ``loop.stop()`` alone cannot
+    reach it, because the loop's stop event is only read between Telegram
+    updates. Worse, the supervised child is spawned into its own process group
+    (``start_new_session`` / ``CREATE_NEW_PROCESS_GROUP``), so the terminal's
+    Ctrl+C never reaches it and it survives this process entirely.
+
+    This function never touches a process itself: it only sets one event per
+    registered invocation. Each supervising poll loop remains the sole owner of
+    its own child and performs the whole-tree teardown, which is what makes a
+    repeated Ctrl+C a harmless no-op and keeps this handler from ever blocking
+    on process teardown.
+
+    Never raises: an exception escaping a signal handler would replace the
+    shutdown path with a traceback.
+    """
+    logger.info("Received signal %d, shutting down...", signum)
+    loop.stop()
+    if hermes is None:
+        return
+    try:
+        cancelled = hermes.cancel_active_frontend_runs(reason=f"signal {signum}")
+    except Exception:
+        logger.warning(
+            "FRONTEND cancellation on signal %d failed", signum, exc_info=True
+        )
+        return
+    if cancelled:
+        logger.warning(
+            "Shutdown requested cancellation of in-flight FRONTEND invocation(s): %s",
+            ", ".join(sorted(cancelled)),
+        )
+
+
+def _shutdown_handler_for(loop, hermes):
+    """Bind :func:`handle_shutdown_signal` into the ``(signum, frame)`` shape
+    ``signal.signal`` requires."""
+
+    def _handler(signum, frame):
+        handle_shutdown_signal(loop, hermes, signum, frame)
+
+    return _handler
 
 
 def _flag_value(argv, flag):

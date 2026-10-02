@@ -35,13 +35,147 @@ from app.runtime import (
     TelegramReceiveLoop,
     _run_reconcile_publish,
     _run_inspect_canonical_url,
+    _shutdown_handler_for,
     compose,
     compose_read_only,
+    handle_shutdown_signal,
     load_runtime_config,
     main,
     preflight_node_toolchain,
     preflight_smoke_support,
 )
+
+
+# ---------------------------------------------------------------------------
+# Graceful shutdown on SIGINT/SIGTERM
+#
+# ``loop.stop()`` alone cannot stop a supervised FRONTEND run: the dispatch chain
+# is synchronous on this same thread, so the receive loop's stop event is not
+# read again until the whole build returns. These tests pin the second half of
+# the handler — requesting cancellation of the in-flight invocation — and that it
+# never blocks on teardown.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingCanceller:
+    def __init__(self, result=None, raises=False):
+        self.calls = []
+        self._result = [] if result is None else result
+        self._raises = raises
+
+    def cancel_active_frontend_runs(self, *, reason=""):
+        self.calls.append(reason)
+        if self._raises:
+            raise RuntimeError("boom")
+        return list(self._result)
+
+
+class _FakeAdapter:
+    def __init__(self, canceller):
+        self.canceller = canceller
+
+    def cancel_active_frontend_runs(self, *, reason=""):
+        return self.canceller.cancel_active_frontend_runs(reason=reason)
+
+
+class _CancellerBackedAdapter:
+    """The real adapter surface, over a real canceller."""
+
+    def __init__(self, canceller):
+        self.canceller = canceller
+
+    def cancel_active_frontend_runs(self, *, reason=""):
+        return self.canceller.cancel_all(reason=reason)
+
+
+def test_shutdown_handler_stops_the_loop_and_cancels_the_active_frontend_run():
+    loop = MagicMock()
+    canceller = _RecordingCanceller(result=["inv-abc", "inv-def"])
+
+    handle_shutdown_signal(loop, _FakeAdapter(canceller), signal.SIGINT)
+
+    loop.stop.assert_called_once_with()
+    assert canceller.calls == ["signal 2"]
+
+
+def test_shutdown_handler_reports_no_active_invocation_without_complaining():
+    loop = MagicMock()
+    canceller = _RecordingCanceller(result=[])
+
+    handle_shutdown_signal(loop, _FakeAdapter(canceller), signal.SIGTERM)
+
+    loop.stop.assert_called_once_with()
+    assert canceller.calls == ["signal 15"]
+
+
+def test_shutdown_handler_never_raises_out_of_signal_context():
+    """A handler that raised would replace the shutdown path with a traceback."""
+    loop = MagicMock()
+    canceller = _RecordingCanceller(raises=True)
+
+    handle_shutdown_signal(loop, _FakeAdapter(canceller), signal.SIGINT)
+
+    # The loop is still stopped: the cancellation failure is non-fatal.
+    loop.stop.assert_called_once_with()
+
+
+def test_shutdown_handler_without_an_adapter_still_stops_the_loop():
+    loop = MagicMock()
+
+    handle_shutdown_signal(loop, None, signal.SIGINT)
+
+    loop.stop.assert_called_once_with()
+
+
+def test_repeated_shutdown_signals_are_idempotent():
+    """The p19 evidence is several Ctrl+C in a row; each must be harmless."""
+    from app.hermes.cancellation import FrontendRunCanceller
+
+    loop = MagicMock()
+    canceller = FrontendRunCanceller()
+    # Exercise the real canceller, not a recording double.
+    adapter = _CancellerBackedAdapter(canceller)
+    event = canceller.register("inv-abc")
+
+    for _ in range(4):
+        handle_shutdown_signal(loop, adapter, signal.SIGINT)
+
+    assert loop.stop.call_count == 4
+    # Setting an already-set event is a no-op, so no escalation or second teardown
+    # can be triggered by a repeated signal.
+    assert event.is_set()
+
+
+def test_shutdown_handler_binding_reaches_both_signals():
+    """``_shutdown_handler_for`` is what ``main`` installs for SIGINT/SIGTERM.
+
+    A ``(signum, frame)`` callable built from it must stop the loop AND request
+    cancellation, for either signal.
+    """
+    loop = MagicMock()
+    cancellers = {}
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        cancellers[sig] = _RecordingCanceller(result=[])
+
+    for sig, canceller in cancellers.items():
+        _shutdown_handler_for(loop, _FakeAdapter(canceller))(sig, None)
+
+    assert loop.stop.call_count == 2
+    assert cancellers[signal.SIGINT].calls == ["signal 2"]
+    assert cancellers[signal.SIGTERM].calls == ["signal 15"]
+
+
+def test_cancelled_code_has_specific_user_copy():
+    """runtime.py's own rule: every emittable error code gets deliberate copy."""
+    from app.runtime import ERROR_MESSAGES, render_error_message
+
+    assert "FRONTEND_CANCELLED" in ERROR_MESSAGES
+    rendered = render_error_message("FRONTEND_CANCELLED")
+    assert rendered == ERROR_MESSAGES["FRONTEND_CANCELLED"]
+    # It must not read as a generic failure the user cannot act on.
+    from app.runtime import _FALLBACK_ERROR_TEXT
+
+    assert rendered != _FALLBACK_ERROR_TEXT
 
 
 # ---------------------------------------------------------------------------

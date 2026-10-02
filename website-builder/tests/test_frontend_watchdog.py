@@ -12,8 +12,10 @@ import io
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -40,16 +42,31 @@ class FakeClock:
 
 
 class FakeChild:
-    """Minimal Popen stand-in with a scripted exit time."""
+    """Minimal Popen stand-in with a scripted exit time.
+
+    ``survive_sigterm`` models a child that ignores SIGTERM, so ``wait()`` keeps
+    reporting "still running" until the strongest signal lands. It is what lets a
+    test pin the full SIGTERM -> grace -> strongest escalation; the default keeps
+    every pre-existing test's behaviour identical.
+    """
 
     _next_pid = 41000
 
-    def __init__(self, clock: FakeClock, exit_at=None, stdout: str = "", stderr: str = ""):
+    def __init__(
+        self,
+        clock: FakeClock,
+        exit_at=None,
+        stdout: str = "",
+        stderr: str = "",
+        survive_sigterm: bool = False,
+    ):
         FakeChild._next_pid += 1
         self.pid = FakeChild._next_pid
         self._clock = clock
         self._exit_at = exit_at
         self._done = False
+        self._killed = False
+        self.survive_sigterm = survive_sigterm
         self.killed = False
         self.wait_calls = 0
         self.stdout = io.StringIO(stdout)
@@ -65,11 +82,15 @@ class FakeChild:
 
     def wait(self, timeout=None):
         self.wait_calls += 1
+        if self.survive_sigterm and not self._killed:
+            # SIGTERM was ignored; the caller must escalate.
+            return None
         self._done = True
         return 0
 
     def kill(self):
         self.killed = True
+        self._killed = True
         self._done = True
 
 
@@ -147,6 +168,14 @@ class Harness:
         self.child: FakeChild = None  # type: ignore[assignment]
         self.killed: list = []
         self.spawn_kwargs: dict = {}
+        # Additive hook: called at the end of every injected sleep. Default
+        # None keeps every pre-existing test's behaviour untouched; the
+        # cancellation tests use it to request a shutdown mid-run exactly the
+        # way the signal handler does.
+        self.sleep_hook = None
+        # Additive: make the fake child ignore SIGTERM so a test can pin the
+        # full SIGTERM -> grace -> strongest escalation.
+        self.survive_sigterm = False
 
     def _sleep(self, delta: float) -> None:
         upcoming = [
@@ -157,6 +186,8 @@ class Harness:
         else:
             self.clock.now += delta
         self.script.flush()
+        if self.sleep_hook is not None:
+            self.sleep_hook()
 
     def _spawn(self, cmd, **kwargs):
         self.spawn_kwargs = kwargs
@@ -165,13 +196,18 @@ class Harness:
             exit_at=self._exit_at,
             stdout=self._stdout,
             stderr=self._stderr,
+            survive_sigterm=self.survive_sigterm,
         )
         return self.child
 
     def _kill_tree(self, pid, *, sig=None) -> bool:
         self.killed.append((pid, sig))
         if self.child is not None:
-            self.child.kill()
+            # A real whole-tree kill reaches the child. SIGTERM ends a
+            # cooperative child; the strongest signal is what finally ends one
+            # that ignores SIGTERM.
+            if sig is None or not self.child.survive_sigterm:
+                self.child.kill()
         return True
 
     def run(
@@ -186,6 +222,7 @@ class Harness:
         workspace=None,
         artifacts_probe=None,
         write_receipt=None,
+        run_canceller=None,
     ):
         self._exit_at = exit_at
         self._stdout = stdout
@@ -211,6 +248,7 @@ class Harness:
             workspace=workspace,
             artifacts_probe=artifacts_probe,
             write_receipt=write_receipt,
+            run_canceller=run_canceller,
         )
 
 
@@ -1604,9 +1642,15 @@ def test_timeout_leaves_no_orphan_tree(tmp_path):
     # The in-flight MODEL operation is what protected the run past the idle
     # bound, so the backstop is the bound that must have fired.
     assert run.diagnostics["active_operation"] == "MODEL"
-    assert run.diagnostics["elapsed_seconds"] == pytest.approx(
-        policy.max_single_operation_seconds, abs=1.5
-    )
+    # ``elapsed_seconds`` spans launch through the END of the whole-tree
+    # teardown, not just the decision: on Windows the teardown spawns
+    # ``taskkill /F /T``, which alone costs ~2s. The bound must have fired (the
+    # window starts at it), and the only slack allowed is a bounded teardown,
+    # so a much later termination still fails here.
+    teardown_allowance = wd.TERMINATE_GRACE_SECONDS
+    elapsed = run.diagnostics["elapsed_seconds"]
+    assert elapsed >= policy.max_single_operation_seconds
+    assert elapsed <= policy.max_single_operation_seconds + teardown_allowance
 
     # Give the OS a moment to reap, then confirm neither PID survives.
     deadline = time.monotonic() + 10.0
@@ -1618,3 +1662,492 @@ def test_timeout_leaves_no_orphan_tree(tmp_path):
 
     assert not _alive(child_pid), f"child {child_pid} orphaned"
     assert not _alive(grandchild_pid), f"grandchild {grandchild_pid} orphaned"
+
+
+# ---------------------------------------------------------------------------
+# Operator cancellation (application shutdown).
+#
+# A supervised child is spawned into its own process group, so a Ctrl+C aimed at
+# the runtime never reaches it and it survives the runtime's own exit. Shutdown
+# therefore has to ask the supervisor to stop the exact invocation it is
+# running. These tests pin that request, the code it produces, and the fact that
+# it terminates ONLY the invocation that was asked to stop.
+# ---------------------------------------------------------------------------
+
+
+def _canceller():
+    from app.hermes.cancellation import FrontendRunCanceller
+
+    return FrontendRunCanceller()
+
+
+def _keep_alive_script(harness, invocation_id, every=30.0, until=600.0):
+    """Channel handshake plus steady progress, so no bound can fire."""
+    harness.script.ready(0, invocation_id)
+    harness.script.at(0, invocation_id, "MODEL", "started")
+    t = every
+    while t < until:
+        harness.script.at(t, invocation_id, "TOOL", "started").at(
+            t, invocation_id, "TOOL", "completed"
+        )
+        t += every
+
+
+def test_cancellation_terminates_the_tree_and_reports_its_own_code(harness):
+    """Cancellation leaves through the SAME escalation a timeout uses.
+
+    SIGTERM -> grace -> strongest kill, on this invocation's own pid and nothing
+    else. That is the reuse requirement: no second teardown implementation.
+    The fake child ignores SIGTERM here so the escalation is pinned end to end.
+    """
+    canceller = _canceller()
+    harness.survive_sigterm = True
+    _keep_alive_script(harness, "inv-cancel")
+    harness.sleep_hook = lambda: canceller.cancel("inv-cancel", reason="signal 2")
+
+    run = harness.run("inv-cancel", exit_at=None, run_canceller=canceller)
+
+    assert run.outcome == wd.OUTCOME_CANCELLED
+    assert run.terminated is True
+    assert run.tree_kill_attempted is True
+    assert harness.killed == [
+        (harness.child.pid, signal.SIGTERM),
+        (harness.child.pid, None),
+    ]
+
+
+def test_cancellation_that_is_accepted_on_sigterm_does_not_escalate(harness):
+    """A cooperative child needs no strongest-kill: escalation stays bounded."""
+    canceller = _canceller()
+    harness.script.ready(0, "inv-soft")
+    harness.sleep_hook = lambda: canceller.cancel("inv-soft", reason="signal 2")
+
+    run = harness.run("inv-soft", exit_at=None, run_canceller=canceller)
+
+    assert run.outcome == wd.OUTCOME_CANCELLED
+    assert harness.killed == [(harness.child.pid, signal.SIGTERM)]
+
+
+def test_cancellation_is_distinct_from_every_timeout_code():
+    """A cancelled run is not a timeout and must never be counted as one."""
+    assert wd.OUTCOME_CANCELLED not in wd.TIMED_OUT_OUTCOMES
+    assert wd.OUTCOME_CANCELLED not in {
+        wd.OUTCOME_IDLE_TIMEOUT,
+        wd.OUTCOME_HARD_TIMEOUT,
+        wd.OUTCOME_LEGACY_TIMEOUT,
+    }
+
+
+def test_cancellation_outranks_a_bound_that_fires_on_the_same_poll(tmp_path):
+    """A run that is asked to stop is never reported as a coincidental timeout.
+
+    The control arm proves the hard fuse really does fire on that tick, so this
+    is a precedence assertion rather than a tautology.
+    """
+    policy = fast_policy(hard_max_runtime_seconds=60.0)
+
+    def _drive(invocation_id, canceller):
+        made = Harness(tmp_path, policy)
+        try:
+            made.script.ready(0, invocation_id).at(0, invocation_id, "MODEL", "started")
+            made.script.at(60, invocation_id, "TOOL", "started")
+            if canceller is not None:
+                made.sleep_hook = lambda: canceller.cancel(
+                    invocation_id, reason="signal 15"
+                )
+            return made.run(invocation_id, exit_at=None, run_canceller=canceller)
+        finally:
+            made.script.close()
+
+    # Control: same script, no cancellation -> the hard fuse fires.
+    assert _drive("inv-control", None).outcome == wd.OUTCOME_HARD_TIMEOUT
+
+    canceller = _canceller()
+    run = _drive("inv-race", canceller)
+    assert run.outcome == wd.OUTCOME_CANCELLED
+    assert run.outcome != wd.OUTCOME_HARD_TIMEOUT
+
+
+def test_a_child_that_exits_before_cancellation_is_not_reported_as_cancelled(harness):
+    """A real exit always wins. A cancel that lands in the same window must not
+    overwrite a run that genuinely finished."""
+    canceller = _canceller()
+    harness.script.ready(0, "inv-done")
+    harness.sleep_hook = lambda: canceller.cancel("inv-done", reason="signal 2")
+
+    run = harness.run("inv-done", exit_at=1, run_canceller=canceller)
+
+    assert run.outcome is None
+    assert run.returncode == 0
+    assert harness.killed == []
+
+
+def test_cancelled_run_records_cancellation_in_its_receipt(harness, tmp_path):
+    """The durable forensic channel says an operator stopped this, and why.
+
+    The reason comes from the registry that requested the stop, so the receipt
+    names the actual trigger (which signal) rather than a caller-supplied
+    literal that could drift from it.
+    """
+    canceller = _canceller()
+    diagnostics = tmp_path / "diagnostics"
+    harness.script.ready(0, "inv-rec")
+    harness.sleep_hook = lambda: canceller.cancel("inv-rec", reason="signal 2")
+
+    run = harness.run(
+        "inv-rec",
+        exit_at=None,
+        run_canceller=canceller,
+        diagnostics_dir=diagnostics,
+    )
+
+    receipt = json.loads(
+        (diagnostics / "inv-rec.json").read_text(encoding="utf-8")
+    )
+    assert receipt["outcome"] == wd.OUTCOME_CANCELLED
+    assert receipt["cancelled"] is True
+    assert receipt["cancel_reason"] == "signal 2"
+    # The in-memory channel that reaches state.failure carries it too.
+    assert run.diagnostics["forensics"]["cancelled"] is True
+    assert run.diagnostics["forensics"]["outcome"] == wd.OUTCOME_CANCELLED
+
+
+def test_shutdown_signal_reason_reaches_the_receipt(harness, tmp_path):
+    """The production path: ``cancel_all`` is what a signal handler calls."""
+    canceller = _canceller()
+    diagnostics = tmp_path / "diagnostics"
+    harness.script.ready(0, "inv-sig")
+    harness.sleep_hook = lambda: canceller.cancel_all(reason="signal 15")
+
+    harness.run(
+        "inv-sig",
+        exit_at=None,
+        run_canceller=canceller,
+        diagnostics_dir=diagnostics,
+    )
+
+    receipt = json.loads((diagnostics / "inv-sig.json").read_text(encoding="utf-8"))
+    assert receipt["outcome"] == wd.OUTCOME_CANCELLED
+    assert receipt["cancel_reason"] == "signal 15"
+
+
+def test_cancellation_reason_is_absent_from_a_non_cancelled_receipt(harness, tmp_path):
+    """The additive receipt keys must not imply a cancellation on other paths."""
+    canceller = _canceller()
+    diagnostics = tmp_path / "diagnostics"
+    harness.script.ready(0, "inv-ok")
+
+    harness.run(
+        "inv-ok",
+        exit_at=5,
+        run_canceller=canceller,
+        diagnostics_dir=diagnostics,
+    )
+
+    receipt = json.loads((diagnostics / "inv-ok.json").read_text(encoding="utf-8"))
+    assert receipt["outcome"] is None
+    assert receipt["cancelled"] is False
+    assert receipt["cancel_reason"] is None
+
+
+def test_cancelled_run_unlinks_the_progress_file(harness):
+    """The transient progress channel does not outlive a cancelled run.
+
+    The scripted writer's handle is released as part of the same hook that
+    requests cancellation, i.e. BEFORE the poll that observes the cancel. That
+    ordering is what production looks like: the supervisor only ever reads the
+    file (opening and closing it per poll) and the child is gone by teardown
+    time, so nothing holds it open when ``unlink`` runs. Leaving the test-only
+    writer open would block the unlink on Windows for a reason that cannot
+    happen in a real run.
+    """
+    canceller = _canceller()
+    harness.script.ready(0, "inv-clean")
+
+    def _request() -> None:
+        harness.script.close()
+        canceller.cancel("inv-clean", reason="signal 2")
+
+    harness.sleep_hook = _request
+    run = harness.run("inv-clean", exit_at=None, run_canceller=canceller)
+
+    assert run.outcome == wd.OUTCOME_CANCELLED
+    assert not harness.progress_path.exists()
+
+
+def test_registry_is_released_after_success_and_after_cancellation(harness):
+    """A late shutdown signal must never target a finished run."""
+    canceller = _canceller()
+    harness.script.ready(0, "inv-ok")
+    run = harness.run("inv-ok", exit_at=5, run_canceller=canceller)
+    assert run.outcome is None
+    assert canceller.active_ids() == []
+    assert canceller.cancel("inv-ok", reason="signal 2") is False
+
+    _keep_alive_script(harness, "inv-cancel")
+    harness.sleep_hook = lambda: canceller.cancel("inv-cancel", reason="signal 2")
+    run = harness.run("inv-cancel", exit_at=None, run_canceller=canceller)
+    assert run.outcome == wd.OUTCOME_CANCELLED
+    assert canceller.active_ids() == []
+
+
+def test_cancelling_one_invocation_never_requests_another():
+    """Targeting is per registered id, not global."""
+    canceller = _canceller()
+    assert canceller.cancel_all() == []
+    assert canceller.cancel("inv-missing", reason="signal 2") is False
+
+    first = canceller.register("inv-a")
+    second = canceller.register("inv-b")
+
+    assert canceller.cancel("inv-a", reason="signal 2") is True
+    assert first.is_set()
+    assert not second.is_set()
+    assert canceller.active_ids() == ["inv-a", "inv-b"]
+
+    # A shutdown signal asks every LIVE invocation to stop; nothing that has
+    # already been released is reachable.
+    assert canceller.cancel_all(reason="signal 15") == ["inv-a", "inv-b"]
+    assert second.is_set()
+
+    canceller.release("inv-a")
+    canceller.release("inv-b")
+    assert canceller.cancel_all(reason="signal 15") == []
+
+
+def test_cancelled_run_signals_only_its_own_child_pid(harness):
+    """No collateral damage: exactly one distinct pid is ever signalled."""
+    canceller = _canceller()
+    sibling = canceller.register("inv-sibling")
+    harness.script.ready(0, "inv-mine")
+    harness.sleep_hook = lambda: canceller.cancel("inv-mine", reason="signal 2")
+
+    run = harness.run("inv-mine", exit_at=None, run_canceller=canceller)
+
+    assert run.outcome == wd.OUTCOME_CANCELLED
+    assert {pid for pid, _sig in harness.killed} == {harness.child.pid}
+    # The sibling was registered but never asked to stop.
+    assert not sibling.is_set()
+    assert canceller.active_ids() == ["inv-sibling"]
+
+
+def test_a_canceller_that_is_never_used_leaves_behaviour_unchanged(harness):
+    """Supplying a canceller but never signalling it changes nothing."""
+    canceller = _canceller()
+    _keep_alive_script(harness, "inv-calm", until=300.0)
+    run = harness.run("inv-calm", exit_at=250, run_canceller=canceller)
+    assert run.outcome is None
+    assert run.returncode == 0
+    assert harness.killed == []
+
+
+def _write_tree_script(path: Path, tag: str) -> Path:
+    """A child that itself spawns a grandchild, then idles.
+
+    It publishes BOTH pids under ``path`` so a test can observe a live tree
+    while the run is still in flight, not only after it has returned.
+    """
+    script = path / f"tree-{tag}.py"
+    script.write_text(
+        "import os, subprocess, sys, time, pathlib\n"
+        "root = pathlib.Path(sys.argv[1]); tag = sys.argv[2]\n"
+        "(root / (tag + '-self.pid')).write_text(str(os.getpid()))\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])\n"
+        "(root / (tag + '-grandchild.pid')).write_text(str(child.pid))\n"
+        "time.sleep(300)\n",
+        encoding="utf-8",
+    )
+    return script
+
+
+def _tree_argv(path: Path, tag: str):
+    return [sys.executable, str(_write_tree_script(path, tag)), str(path), tag]
+
+
+def _await_pid(path: Path, tag: str, which: str, deadline: float) -> int:
+    return int(_await_file(path / f"{tag}-{which}.pid", deadline))
+
+
+def _write_ready_progress(path: Path, run_id: str) -> Path:
+    """A channel handshake with NO in-flight operation.
+
+    No MODEL/TOOL is ever started, so nothing is protected by the in-flight
+    backstop. Combined with bounds set beyond the test's own lifetime, the ONLY
+    condition that can end the run is cancellation — which is what makes the
+    outcome assertions below unambiguous rather than incidental.
+    """
+    progress = path / "progress.jsonl"
+    progress.write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "event": "channel_ready",
+                "kind": "channel_ready",
+                "phase": "ready",
+                "desc": "",
+                "advance": True,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return progress
+
+
+#: Bounds beyond the real-process tests' own lifetime. No run driven by
+#: cancellation may end for any other reason.
+_CANCEL_ONLY_POLICY = dict(
+    idle_timeout_seconds=600.0,
+    hard_max_runtime_seconds=900.0,
+    max_single_operation_seconds=600.0,
+    legacy_wallclock_seconds=900.0,
+    startup_grace_seconds=5.0,
+    poll_interval_seconds=0.1,
+)
+
+
+def _cancel_when_tree_is_up(canceller, invocation_id, marker: Path, *, budget=30.0):
+    """Injected sleep that requests cancellation once the tree exists.
+
+    The elapsed budget is a safety net only. If two interpreter boots are
+    unusually slow the run still ends, and the orphan assertions then fail with
+    a clear message instead of the test hanging on a bound that can never fire.
+    """
+    started = time.monotonic()
+
+    def _sleep(seconds: float) -> None:
+        if marker.is_file() or (time.monotonic() - started) > budget:
+            canceller.cancel(invocation_id, reason="signal 2")
+        time.sleep(min(seconds, 0.1))
+
+    return _sleep
+
+
+def test_shutdown_cancellation_leaves_no_orphan_tree(tmp_path):
+    """The p19 symptom, end to end with real processes.
+
+    A real invocation tree (child + grandchild) is cancelled the way a Ctrl+C
+    cancels it, and both PIDs must be gone. This is the guarantee mocks cannot
+    make: whole-tree termination of REAL descendants on the cancellation path.
+    """
+    if wd.kill_process_tree is None:  # pragma: no cover
+        pytest.skip("whole-tree termination unavailable")
+
+    canceller = _canceller()
+    tag = "solo"
+    marker = tmp_path / f"{tag}-grandchild.pid"
+
+    run = wd.supervise_frontend_run(
+        _tree_argv(tmp_path, tag),
+        cwd=tmp_path,
+        env={},
+        project_id="cancel",
+        invocation_id="cancel-run",
+        build_operation_id="1",
+        progress_path=_write_ready_progress(tmp_path, "cancel-run"),
+        policy=wd.WatchdogPolicy(**_CANCEL_ONLY_POLICY),
+        sleep=_cancel_when_tree_is_up(canceller, "cancel-run", marker),
+        run_canceller=canceller,
+    )
+
+    assert run.outcome == wd.OUTCOME_CANCELLED
+    assert run.terminated is True
+    assert run.tree_kill_attempted is True
+
+    deadline = time.monotonic() + 10.0
+    child_pid = run.diagnostics["pid"]
+    grandchild_pid = _await_pid(tmp_path, tag, "grandchild", deadline)
+
+    while time.monotonic() < deadline and (_alive(child_pid) or _alive(grandchild_pid)):
+        time.sleep(0.1)
+
+    assert not _alive(child_pid), f"child {child_pid} orphaned"
+    assert not _alive(grandchild_pid), f"grandchild {grandchild_pid} orphaned"
+    # Released, so a later shutdown signal cannot target the finished run.
+    assert canceller.active_ids() == []
+
+
+def test_cancelling_one_run_leaves_an_unrelated_run_alive(tmp_path):
+    """Cancellation is scoped to the invocation that was asked to stop.
+
+    Two real trees run concurrently under ONE canceller. Only the targeted run
+    is asked to stop, and the other run's child AND grandchild must both still
+    be alive when the targeted one has been torn down.
+    """
+    if wd.kill_process_tree is None:  # pragma: no cover
+        pytest.skip("whole-tree termination unavailable")
+
+    canceller = _canceller()
+    policy = wd.WatchdogPolicy(**_CANCEL_ONLY_POLICY)
+    b_parked = threading.Event()
+    b_finished = threading.Event()
+
+    def _run_b() -> None:
+        # B is never asked to stop; only its own bound could end it, and no
+        # bound can fire within this test's lifetime.
+        def _sleep(_seconds: float) -> None:
+            b_parked.set()
+            time.sleep(0.05)
+
+        try:
+            wd.supervise_frontend_run(
+                _tree_argv(tmp_path, "b"),
+                cwd=tmp_path,
+                env={},
+                project_id="project-b",
+                invocation_id="run-b",
+                build_operation_id="1",
+                progress_path=_write_ready_progress(tmp_path, "run-b"),
+                policy=policy,
+                sleep=_sleep,
+                run_canceller=canceller,
+            )
+        finally:
+            b_finished.set()
+
+    thread = threading.Thread(target=_run_b, daemon=True)
+    thread.start()
+    try:
+        # Pure event synchronization, not a timing race: B is parked inside its
+        # own poll loop before A is started at all.
+        assert b_parked.wait(60.0), "run B never reached its poll loop"
+        deadline = time.monotonic() + 60.0
+        b_self_pid = _await_pid(tmp_path, "b", "self", deadline)
+        b_grandchild_pid = _await_pid(tmp_path, "b", "grandchild", deadline)
+        assert canceller.active_ids() == ["run-b"]
+
+        run_a = wd.supervise_frontend_run(
+            _tree_argv(tmp_path, "a"),
+            cwd=tmp_path,
+            env={},
+            project_id="project-a",
+            invocation_id="run-a",
+            build_operation_id="1",
+            progress_path=_write_ready_progress(tmp_path, "run-a"),
+            policy=policy,
+            sleep=_cancel_when_tree_is_up(
+                canceller, "run-a", tmp_path / "a-grandchild.pid"
+            ),
+            run_canceller=canceller,
+        )
+        a_self_pid = run_a.diagnostics["pid"]
+        a_grandchild_pid = _await_pid(tmp_path, "a", "grandchild", deadline)
+
+        assert run_a.outcome == wd.OUTCOME_CANCELLED
+        while time.monotonic() < deadline and (
+            _alive(a_self_pid) or _alive(a_grandchild_pid)
+        ):
+            time.sleep(0.1)
+        assert not _alive(a_self_pid), f"targeted child {a_self_pid} orphaned"
+        assert not _alive(a_grandchild_pid), "targeted grandchild orphaned"
+
+        # B was registered the whole time and was never asked to stop.
+        assert canceller.active_ids() == ["run-b"]
+        assert not b_finished.is_set()
+        assert _alive(b_self_pid), f"unrelated child {b_self_pid} was killed"
+        assert _alive(b_grandchild_pid), "unrelated grandchild was killed"
+    finally:
+        # Always tear the survivor down so the test leaves nothing running.
+        canceller.cancel_all(reason="test cleanup")
+        b_finished.wait(60.0)
+        thread.join(10.0)

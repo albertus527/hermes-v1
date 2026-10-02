@@ -39,6 +39,11 @@ from typing import Any, Dict, List, Optional
 
 from app.core import credentials
 from app.core.state import ProjectStateStore
+# Stdlib-only by design (see that module's docstring): importing it at module
+# scope is what keeps the watchdog's ``hermes_cli.oneshot`` import off this
+# module's import path, so the non-supervised CLI-boundary path stays usable
+# where the Hermes tree is only partially available.
+from app.hermes.cancellation import FrontendRunCanceller
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +132,33 @@ class HermesAdapter:
         self.store = store
         self.hermes_home = hermes_home or Path.home() / ".hermes-website"
         self.repo_root = repo_root or Path(__file__).parent.parent.parent.parent
+        # Cancellation rendezvous for the supervised FRONTEND runs this adapter
+        # owns. ONE adapter instance is created per process (see
+        # ``app.runtime.compose``) and injected into the builder, the revision
+        # orchestrator, and — through the builder — every QA orchestrator, so a
+        # single registry covers the initial build, the Phase-7 compile repair,
+        # QA repairs, and revisions with no extra wiring.
+        #
+        # It holds only ``invocation_id -> Event``; it never holds a child
+        # handle, so it cannot influence any supervision decision.
+        self.frontend_runs = FrontendRunCanceller()
+
+    # ------------------------------------------------------------------
+    # Operator cancellation (application shutdown)
+    # ------------------------------------------------------------------
+
+    def cancel_active_frontend_runs(self, *, reason: str = "") -> List[str]:
+        """Ask every supervised FRONTEND run this process owns to stop.
+
+        Called from the SIGINT/SIGTERM handler. Returns the invocation ids that
+        were live and signalled; empty when nothing is running.
+
+        This only sets a flag per invocation. The supervising poll loop stays
+        the sole owner of its own child and performs the whole-tree teardown,
+        so a second Ctrl+C is a harmless no-op and this call never blocks on
+        process teardown.
+        """
+        return self.frontend_runs.cancel_all(reason=reason)
 
     # ------------------------------------------------------------------
     # Profile-local skill sync
@@ -657,6 +689,7 @@ class HermesAdapter:
                 diagnostics_dir=diagnostics_dir,
                 workspace=cwd,
                 artifacts_probe=_artifacts_probe,
+                run_canceller=self.frontend_runs,
             )
         except wd.WatchdogUnavailable as exc:
             # Without whole-tree termination we must not supervise: killing only
@@ -686,12 +719,20 @@ class HermesAdapter:
                 pass
 
         if run.outcome is not None:
+            # Cancellation is NOT a timeout and must not be dressed as one.
+            # ``timed_out`` gates the artifact-recovery path in
+            # ``frontend_build``: a cancelled run reported as a timeout would be
+            # recovered as a SUCCESS on a workspace that merely looks complete,
+            # and the pipeline would carry on into QA/preview during shutdown.
+            # 124 stays exclusively the timeout status (see the
+            # ``timed_out`` invariant documented in ``_run_hermes_cli``).
+            cancelled = run.outcome == wd.OUTCOME_CANCELLED
             return HermesResult(
                 success=False,
                 error=f"FRONTEND invocation {run.outcome} after {run.diagnostics.get('elapsed_seconds')}s",
-                exit_code=124,
+                exit_code=wd.CANCELLED_EXIT_CODE if cancelled else 124,
                 error_code=run.outcome,
-                timed_out=True,
+                timed_out=not cancelled,
                 invocation=run.diagnostics,
             )
 
