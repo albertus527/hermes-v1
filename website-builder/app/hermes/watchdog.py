@@ -32,6 +32,25 @@ Two failure modes, two codes
     Deliberately neither of the codes above — we cannot honestly attribute a
     degraded-mode timeout to idle or to the hard fuse.
 
+Two clocks, not one
+------------------
+Observable activity and forward progress are different facts.  ``advance=False``
+events (poll heartbeats, retry backoff, tool-run keeps, stale-reconnect
+notices, ping-only stream frames) prove the child is alive and say nothing about
+whether it is getting anywhere.  This module therefore keeps two clocks:
+
+``last_activity_at``
+    Any accepted event. Drives ``activity_idle_for_seconds`` and the
+    longest-silence statistics — observation only.
+``last_progress_at``
+    Only events the child marked ``advance=True``: a new operation claimed, an
+    operation completed, a tool ran, or a stream frame that carried model
+    output. Drives ``idle_for_seconds``, the idle bound, and the
+    no-progress backstop.
+
+A keep-alive-heavy run can be 100% active and 0% progressing; only the progress
+clock sees that.
+
 Forensic receipts (observation only)
 ------------------------------------
 A timeout code says a bound fired; it never says *which* non-termination mode
@@ -39,8 +58,9 @@ occurred. The in-memory :meth:`FrontendInvocation.diagnostics` alone cannot
 answer that: it keeps one ``last_progress_kind`` and one event scalar, so the
 kind/phase distribution is discarded and nothing about the workspace is
 recorded. Every supervised run therefore also emits a bounded
-``frontend_forensics/1`` receipt (see :func:`_build_receipt`) that carries the
-kind/phase counters, the longest true silence between two progress signals, a
+``frontend_forensics/2`` receipt (see :func:`_build_receipt`) that carries the
+kind/phase counters, the advancing-vs-keepalive split, the longest true silence
+between two progress signals (and between two activity signals), a
 metadata-only workspace change fingerprint, artifact completeness, and the
 tool names seen.
 
@@ -100,9 +120,16 @@ FRONTEND_IDLE_TIMEOUT_SECONDS = 180.0
 FRONTEND_HARD_MAX_RUNTIME_SECONDS = 2700.0
 
 #: No-progress backstop that applies EVEN WHILE AN OPERATION IS IN FLIGHT.
-#: Measured from the last progress event, never from operation start, so any
-#: valid stream/progress event keeps refreshing liveness. This only fires for an
-#: operation that has genuinely gone silent.
+#: Measured from the last PROGRESS event (never from operation start, and never
+#: from a keep-alive), so any genuine stream/progress event keeps refreshing
+#: liveness.
+#:
+#: Semantics, precisely: this is the maximum duration of **no genuine forward
+#: progress** while an operation remains in flight. It is NOT a maximum
+#: operation duration. A genuinely advancing stream of any length is never cut,
+#: because its progress events keep sliding the window; only the hard elapsed
+#: fuse ends such a run. What this bound does terminate is an operation whose
+#: only output for this long is keep-alive activity.
 FRONTEND_MAX_SINGLE_OPERATION_SECONDS = 900.0
 
 #: Wall-clock bound used when the child never announced a progress channel.
@@ -167,7 +194,10 @@ RECENT_ACTIVITY_LEN = 20
 MAX_RECEIPTS_PER_PROJECT = 20
 
 #: Receipt schema identifier. Bump on any incompatible field change.
-FORENSICS_SCHEMA = "frontend_forensics/1"
+#: v2 adds the ``advance`` split (``counters.advance``/``counters.keepalive``,
+#: ``activity.longest_forward_progress_gap_seconds``,
+#: ``diagnostics.activity_idle_for_seconds``) alongside v1.
+FORENSICS_SCHEMA = "frontend_forensics/2"
 
 #: Watchdog outcome codes.
 OUTCOME_IDLE_TIMEOUT = "FRONTEND_IDLE_TIMEOUT"
@@ -311,6 +341,10 @@ class FrontendInvocation:
     build_operation_id: str
     started_at: float
     last_activity_at: float
+    #: Forward-progress clock. Only an ``advance=True`` event moves it; see the
+    #: module docstring. Initialised to ``started_at`` for the same reason
+    #: ``last_activity_at`` is: before any event the child has proved nothing.
+    last_progress_at: float
     child_pid: Optional[int] = None
     active_operation: Optional[str] = None
     active_operation_started_at: Optional[float] = None
@@ -319,6 +353,8 @@ class FrontendInvocation:
     last_progress_kind: Optional[str] = None
     unknown_activity_count: int = 0
     progress_event_count: int = 0
+    advance_event_count: int = 0
+    keepalive_event_count: int = 0
     stale_event_count: int = 0
     last_logged_activity_at: Optional[float] = None
     # --- Forensic detail. Additive only: nothing above reads any of it, and
@@ -337,25 +373,33 @@ class FrontendInvocation:
     #: ``max_single_operation_seconds``, so a hard-timeout run can still contain
     #: multi-minute gaps.
     longest_activity_gap_seconds: float = 0.0
+    #: Same, restricted to ``advance=True`` events. This is what separates "the
+    #: child was busy" from "the child was making progress", and it is the
+    #: number a reader compares against ``policy.max_single_operation``.
+    longest_forward_progress_gap_seconds: float = 0.0
     recent_activity: Deque[Dict[str, Any]] = field(
         default_factory=lambda: deque(maxlen=RECENT_ACTIVITY_LEN)
     )
     tool_name_counts: Dict[str, int] = field(default_factory=dict)
     tool_name_counts_truncated: bool = False
 
-    def note_activity(self, now: float, kind: str) -> None:
+    def note_activity(self, now: float, kind: str, advance: bool = True) -> None:
         """Record progress from THIS invocation. Refreshes liveness.
 
-        Every accepted event refreshes liveness, including ``UNKNOWN``: an
-        unclassified activity stamp still proves the child is alive, and
-        refusing to count it would let an unrecognised (but healthy) activity
-        description look like a hang. Unknown events are counted separately for
-        observability instead.
+        Every accepted event refreshes *observable activity*, including
+        ``UNKNOWN``: an unclassified activity stamp still proves the child is
+        alive, and refusing to count it would let an unrecognised (but healthy)
+        activity description look like a hang. Unknown events are counted
+        separately for observability instead.
 
-        The gap since the previous accepted event is measured *before*
-        ``last_activity_at`` moves, so ``longest_activity_gap_seconds`` is the
-        real silence between any two progress signals. Liveness itself is
-        unchanged: ``last_activity_at`` is still set to *now*.
+        Only ``advance=True`` events refresh the forward-progress clock that
+        the idle bound and the no-progress backstop read. A missing ``advance``
+        key arrives here as ``True`` (the caller decides), so an older producer
+        behaves exactly as it did before this distinction existed.
+
+        Both gaps are measured *before* their clock moves, so the
+        ``longest_*_gap_seconds`` values are the real silence between two
+        signals of that class.
         """
         gap = max(0.0, now - self.last_activity_at)
         if self.longest_activity_gap_seconds < gap:
@@ -367,6 +411,14 @@ class FrontendInvocation:
         self.progress_event_count += 1
         if kind == _KIND_UNKNOWN:
             self.unknown_activity_count += 1
+        if advance:
+            progress_gap = max(0.0, now - self.last_progress_at)
+            if self.longest_forward_progress_gap_seconds < progress_gap:
+                self.longest_forward_progress_gap_seconds = progress_gap
+            self.last_progress_at = now
+            self.advance_event_count += 1
+        else:
+            self.keepalive_event_count += 1
 
     def note_event_detail(self, now: float, kind: str, phase: str, desc: str) -> None:
         """Fold one accepted event into the forensic counters and ring buffer.
@@ -416,6 +468,10 @@ class FrontendInvocation:
         cause a premature termination.
         """
         if phase == _PHASE_STARTED:
+            # Same-kind re-announcement is a NO-OP, by construction: a poll
+            # heartbeat re-announcing an in-flight MODEL operation must neither
+            # clear it nor restart ``active_operation_started_at``, or an
+            # operation could be re-armed forever.
             if self.active_operation != kind:
                 self.active_operation = kind
                 self.active_operation_started_at = now
@@ -424,14 +480,26 @@ class FrontendInvocation:
             self.active_operation_started_at = None
 
     def no_progress_for(self, now: float) -> float:
+        """Seconds since the last GENUINE FORWARD PROGRESS.
+
+        This is the bound-driving clock: the idle bound and the no-progress
+        backstop both read it. An ``advance=False`` keep-alive never moves it.
+        """
+        return max(0.0, now - self.last_progress_at)
+
+    def no_activity_for(self, now: float) -> float:
+        """Seconds since the last event of ANY kind. Observation only."""
         return max(0.0, now - self.last_activity_at)
 
     def is_in_flight(self, now: float, max_single_operation_seconds: float) -> bool:
-        """True when an operation is in flight AND has recently been heard from.
+        """True when an operation is in flight AND has recently progressed.
 
-        The no-progress backstop bounds how long an operation may stay silent
-        regardless of being "in flight"; it is measured from the last progress
-        event, so legitimate streaming keeps an operation protected.
+        ``max_single_operation_seconds`` is the maximum duration of *no genuine
+        forward progress* while an operation is in flight — not a maximum
+        operation duration. A genuinely advancing stream keeps refreshing the
+        progress clock and stays protected for as long as it keeps advancing;
+        what eventually ends an operation is silence from forward progress,
+        whether or not keep-alive events keep arriving.
         """
         if self.active_operation is None:
             return False
@@ -445,6 +513,10 @@ class FrontendInvocation:
         *forensics* is the receipt built for this invocation. It is attached
         verbatim when supplied and omitted when not, so a direct caller of
         ``diagnostics(now)`` still sees exactly the pre-existing key set.
+
+        ``idle_for_seconds`` is measured from genuine forward progress (it is
+        the number the bounds actually read); ``activity_idle_for_seconds`` is
+        the any-event reading, reported next to it so both are visible.
         """
         data = {
             "invocation_id": self.invocation_id,
@@ -453,7 +525,11 @@ class FrontendInvocation:
             "pid": self.child_pid,
             "elapsed_seconds": round(max(0.0, now - self.started_at), 1),
             "idle_for_seconds": round(self.no_progress_for(now), 1),
+            "activity_idle_for_seconds": round(self.no_activity_for(now), 1),
+            "advance_event_count": self.advance_event_count,
+            "keepalive_event_count": self.keepalive_event_count,
             "active_operation": self.active_operation,
+            "active_operation_started_at": self.active_operation_started_at,
             "last_progress_kind": self.last_progress_kind,
             "progress_event_count": self.progress_event_count,
             "unknown_activity_count": self.unknown_activity_count,
@@ -897,7 +973,13 @@ def _read_progress_events(
             continue
         kind = str(event.get("kind") or _KIND_UNKNOWN)
         phase = str(event.get("phase") or _PHASE_ACTIVE)
-        invocation.note_activity(now, kind)
+        # Absent/invalid ``advance`` means True: a child built before this
+        # distinction existed keeps refreshing the progress clock exactly as
+        # before, so the watchdog can never be stricter than its predecessor
+        # against an older producer.
+        raw_advance = event.get("advance", True)
+        advance = raw_advance if isinstance(raw_advance, bool) else True
+        invocation.note_activity(now, kind, advance)
         invocation.note_operation(now, kind, phase)
         # Forensic detail is recorded after the liveness decision above, so it
         # can observe an event but can never influence whether it was accepted.
@@ -989,7 +1071,7 @@ def _build_receipt(
     returncode: int,
     now: float,
 ) -> Dict[str, Any]:
-    """Assemble the bounded ``frontend_forensics/1`` receipt.
+    """Assemble the bounded ``frontend_forensics/2`` receipt.
 
     The receipt records what kind of activity happened and whether the workspace
     moved. It never records prompts, model responses, tool arguments, file
@@ -1009,6 +1091,7 @@ def _build_receipt(
         "returncode": int(returncode),
         "elapsed_seconds": round(max(0.0, now - started), 1),
         "idle_for_seconds": round(invocation.no_progress_for(now), 1),
+        "activity_idle_for_seconds": round(invocation.no_activity_for(now), 1),
         "channel_confirmed": invocation.progress_channel_confirmed,
         "policy": {
             "idle": policy.idle_timeout_seconds,
@@ -1022,6 +1105,11 @@ def _build_receipt(
             "tool_completed": invocation.tool_completed_count,
             "stream_active": invocation.stream_active_count,
             "unknown_active": invocation.unknown_activity_count,
+            # ``advance`` + ``keepalive`` always equals ``total_progress_events``.
+            # This is the discriminator the p18 investigation needed: a run can
+            # be 100% active and 0% progressing, and these two separate that.
+            "advance": invocation.advance_event_count,
+            "keepalive": invocation.keepalive_event_count,
             "total_progress_events": invocation.progress_event_count,
             "stale_events_discarded": invocation.stale_event_count,
         },
@@ -1034,7 +1122,13 @@ def _build_receipt(
             "last_offset_seconds": round(
                 max(0.0, invocation.last_activity_at - started), 1
             ),
+            "last_progress_offset_seconds": round(
+                max(0.0, invocation.last_progress_at - started), 1
+            ),
             "longest_gap_seconds": round(invocation.longest_activity_gap_seconds, 1),
+            "longest_forward_progress_gap_seconds": round(
+                invocation.longest_forward_progress_gap_seconds, 1
+            ),
             "last_kind": invocation.last_progress_kind,
             "last_phase": invocation.last_progress_phase,
             "active_operation_at_end": invocation.active_operation,
@@ -1160,9 +1254,11 @@ def supervise_frontend_run(
         project_id=project_id,
         build_operation_id=build_operation_id,
         started_at=start,
-        # Until the first progress event the child has proved nothing, so the
-        # idle clock starts at launch rather than at some later confirmation.
+        # Until the first progress event the child has proved nothing, so both
+        # the activity clock and the forward-progress clock start at launch
+        # rather than at some later confirmation.
         last_activity_at=start,
+        last_progress_at=start,
         child_pid=getattr(proc, "pid", None),
     )
 
@@ -1219,12 +1315,21 @@ def supervise_frontend_run(
                         outcome = OUTCOME_LEGACY_TIMEOUT
                 else:
                     if elapsed >= policy.hard_max_runtime_seconds:
+                        # Pathological-run fuse. Raw wall clock, independent of
+                        # both clocks above: a continuously-advancing run still
+                        # ends here and only here.
                         outcome = OUTCOME_HARD_TIMEOUT
                     else:
                         no_progress = invocation.no_progress_for(now)
                         in_flight = invocation.is_in_flight(
                             now, policy.max_single_operation_seconds
                         )
+                        # ``max_single_operation_seconds`` is the maximum
+                        # duration of no genuine forward progress while an
+                        # operation is in flight — NOT a maximum operation
+                        # duration. An advancing stream is never cut here; an
+                        # operation whose only output is keep-alive activity is,
+                        # once its progress has been silent for that long.
                         if no_progress >= policy.idle_timeout_seconds and not in_flight:
                             outcome = OUTCOME_IDLE_TIMEOUT
 

@@ -18,14 +18,23 @@ where they go.
 
 Design rules
 ------------
-* **No content.**  Payloads carry a kind, a phase, and the already-bounded
-  activity description (clamped to ``ACTIVITY_DESCRIPTION_MAX``).  No prompts,
-  no tool arguments, no source, no model output, no credentials.  A consumer
-  that logs these events can never leak a secret.
-* **UNKNOWN is safe.**  An unrecognised description classifies as
-  ``UNKNOWN``/``active``: it refreshes liveness but neither claims nor clears
-  an in-flight operation.  A description this table does not recognise can
-  therefore never cause a premature termination.
+* **No content.**  Payloads carry a kind, a phase, an ``advance`` flag, and the
+  already-bounded activity description (clamped to ``ACTIVITY_DESCRIPTION_MAX``).
+  No prompts, no tool arguments, no source, no model output, no credentials.  A
+  consumer that logs these events can never leak a secret.
+* **Advance is the liveness-with-progress bit.**  ``advance=True`` means "real
+  forward progress happened": a new operation was claimed, an operation
+  completed, a tool ran, or a stream event carried model output.  ``advance=False``
+  means "the process is alive and we are telling you so, but nothing moved" —
+  a retry backoff, a poll heartbeat, a long-operation keep-alive.  A supervisor
+  must refresh its *progress* clock only on ``advance`` events while still
+  counting every event as observable activity.
+* **Fail-safe is forward.**  ``advance`` defaults to ``True`` and an
+  unrecognised description advances, because the two failure directions are not
+  symmetric: an unrecognised-but-healthy description wrongly counted as
+  non-progress would terminate a working run, while one wrongly counted as
+  progress merely loses the chance to end a stuck one early.  The hard elapsed
+  fuse still bounds the second case.
 * **Boundary events are not coalesced here.**  Transport-level rate limiting
   may coalesce ``active`` events, but must never drop ``started``/``completed``
   — those are what let a supervisor distinguish "request in flight" from
@@ -50,6 +59,7 @@ __all__ = [
     "PHASE_COMPLETED",
     "PHASE_STARTED",
     "classify_progress_event",
+    "description_advances",
     "make_progress_payload",
 ]
 
@@ -93,6 +103,48 @@ _SUFFIX_RULES: Tuple[Tuple[str, str, str], ...] = (
     (" completed", KIND_MODEL, PHASE_COMPLETED),
 )
 
+#: Descriptions that are ALWAYS a keep-alive, checked before ``_PREFIX_RULES``.
+#: Only ``advance=False`` (never a kind change) — an unrecognised kind still
+#: degrades to UNKNOWN/active and refreshes observable activity exactly as
+#: before.
+#:
+#: Membership rule: an entry belongs here only if its exact text is emitted by a
+#: timer/heartbeat and NEVER by a genuine boundary. A description shared between
+#: a heartbeat and a real transition (``"waiting for non-streaming API response"``
+#: is the genuine request start *and* the 15s direct-API heartbeat) is
+#: deliberately absent — it must pass ``advance=False`` at its call site instead,
+#: because a description-keyed rule cannot tell the two call sites apart.
+_KEEPALIVE_PREFIX_RULES: Tuple[str, ...] = (
+    # Streaming poll heartbeat: "chunks are flowing, still waiting" (30s cadence).
+    "waiting for stream response (",
+    # Tool executor heartbeats while a long tool is still executing.
+    "sequential tool running (",
+    "concurrent tools running (",
+    # Retry / backoff waits (30s cadence per wait).
+    "retry backoff (",
+    "error retry backoff (",
+    "empty response retry backoff (",
+    # Stale-stream / stale-call kill-and-reconnect notices.
+    "stale stream detected after ",
+    "stale non-streaming call killed after ",
+    "codex stream killed after ",
+    # Bounded stream-retry accounting.
+    "stream retry ",
+)
+
+
+def description_advances(description: Optional[str]) -> bool:
+    """True unless *description* is a known keep-alive.
+
+    The default for ``advance``. Anything not in
+    :data:`_KEEPALIVE_PREFIX_RULES` advances — including an empty or
+    unrecognised description — because advancing is the fail-safe direction.
+    """
+    text = (description or "").strip()
+    if not text:
+        return True
+    return not text.startswith(_KEEPALIVE_PREFIX_RULES)
+
 
 def classify_progress_event(description: Optional[str]) -> Tuple[str, str]:
     """Map an activity description to a ``(kind, phase)`` pair.
@@ -117,11 +169,19 @@ def make_progress_payload(
     *,
     kind: Optional[str] = None,
     phase: Optional[str] = None,
+    advance: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Build the bounded payload for one progress event.
 
     ``kind``/``phase`` may be supplied to bypass classification (used by the
     ``channel_ready`` handshake and by tests).
+
+    ``advance`` is the forward-progress bit and is tri-state:
+
+    * ``None`` (default) — derive it from :func:`description_advances`.
+    * ``True``/``False`` — explicit. Stream emitters MUST pass it explicitly,
+      because ``"receiving stream response"`` cannot say whether the item that
+      arrived carried model output.
     """
     from agent.session_activity import bound_activity_description
 
@@ -129,10 +189,16 @@ def make_progress_payload(
         auto_kind, auto_phase = classify_progress_event(description)
         kind = kind or auto_kind
         phase = phase or auto_phase
+    bounded = bound_activity_description(description)
+    if advance is None:
+        advance = description_advances(description)
     return {
         "kind": kind,
         "phase": phase,
+        # Genuine forward progress vs. observable-but-not-progress. Consumers
+        # must treat an absent key as True so an older producer keeps working.
+        "advance": bool(advance),
         # Already clamped to ACTIVITY_DESCRIPTION_MAX by the shared helper, so
         # the description can never grow into a payload-sized leak.
-        "desc": bound_activity_description(description),
+        "desc": bounded,
     }

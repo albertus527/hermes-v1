@@ -260,7 +260,13 @@ class _OneshotProgressEmitter:
         self._last_active_mono: Optional[float] = None
         self._closed = False
 
-    def _emit(self, kind: str, phase: str, desc: str = "") -> None:
+    def _emit(
+        self,
+        kind: str,
+        phase: str,
+        desc: str = "",
+        advance: Optional[bool] = None,
+    ) -> None:
         if self._closed:
             return
         if phase == "active":
@@ -282,6 +288,9 @@ class _OneshotProgressEmitter:
                     "event": kind if kind == "channel_ready" else "progress",
                     "kind": kind,
                     "phase": phase,
+                    # Forward-progress bit. Absent means True so a supervisor
+                    # driving an older producer keeps its pre-change behaviour.
+                    "advance": True if advance is None else bool(advance),
                     "desc": desc,
                 },
                 separators=(",", ":"),
@@ -302,10 +311,12 @@ class _OneshotProgressEmitter:
                 pass
 
     def on_progress(self, kind: str, payload: dict) -> None:
+        advance = payload.get("advance")
         self._emit(
             str(payload.get("kind") or kind or "UNKNOWN"),
             str(payload.get("phase") or "active"),
             str(payload.get("desc") or ""),
+            advance,
         )
 
     def announce_ready(self) -> None:
@@ -313,7 +324,7 @@ class _OneshotProgressEmitter:
         # announcement, not liveness. Using "active" here would both consume
         # the coalescing window (suppressing the first real event) and let a
         # supervisor count the handshake as activity.
-        self._emit("channel_ready", "ready", "")
+        self._emit("channel_ready", "ready", "", True)
 
     def close(self) -> None:
         if not self._closed:

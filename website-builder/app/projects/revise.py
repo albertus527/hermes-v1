@@ -89,7 +89,7 @@ def _frontend_failure_diagnostic(result: Dict[str, Any]) -> str:
     1. ``error`` -- the adapter's own reason.
     2. ``error_code`` -- the adapter's stable classification.
     3. ``invocation.outcome`` -- the bounded supervision receipt the adapter
-       already attaches (``frontend_forensics/1``: ids, pid, elapsed, counters;
+       already attaches (``frontend_forensics/2``: ids, pid, elapsed, counters;
        never prompts, source, or model output).
     4. A fixed fallback naming the class of the failure.
     """

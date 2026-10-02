@@ -1054,6 +1054,39 @@ def _raise_stream_error(event: Any) -> None:
     )
 
 
+#: Responses SSE frame types that are positively known to carry NO model
+#: output: the transport keep-alive and the pre-generation status frames. Every
+#: real text/reasoning/function-argument delta, every other frame type, and
+#: every type this build does not recognise advances — see
+#: ``_codex_event_advances``.
+#:
+#: ``response.in_progress`` is the frame this repo already documents as a
+#: "valid keepalive / in_progress frame" that refreshes the stream-idle
+#: detector (see the caller in ``agent.chat_completion_helpers``): it is how the
+#: backend says "still working" without producing anything.
+_CODEX_NON_OUTPUT_EVENT_TYPES = frozenset(
+    {"ping", "response.queued", "response.in_progress"}
+)
+
+
+def _codex_event_advances(event: Any) -> bool:
+    """Whether a Responses SSE frame is forward progress.
+
+    DENYLIST of positively-identified non-output frames, so a new real provider
+    delta can never be misclassified as non-progress. An unreadable or
+    unrecognised frame advances: the supervisor's own elapsed fuse is what
+    bounds a run whose frames are all unrecognised, and a premature kill of a
+    healthy run is the only unacceptable failure direction.
+    """
+    try:
+        event_type = _event_field(event, "type", "")
+    except Exception:
+        return True
+    if not isinstance(event_type, str):
+        return True
+    return event_type not in _CODEX_NON_OUTPUT_EVENT_TYPES
+
+
 def _consume_codex_event_stream(
     event_iter: Any,
     *,
@@ -1619,7 +1652,10 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     def _on_event(event: Any) -> None:
         # TTFB watchdog and activity touch — runs once per SSE event.
         agent._codex_stream_last_event_ts = time.time()
-        agent._touch_activity("receiving stream response")
+        agent._touch_activity(
+            "receiving stream response",
+            advance=_codex_event_advances(event),
+        )
 
     for attempt in range(max_stream_retries + 1):
         if agent._interrupt_requested:

@@ -301,7 +301,7 @@ def _frontend_failure_reason(result: Dict[str, Any]) -> Dict[str, Any]:
     surfaced verbatim to the caller), the reason is bounded here because it is
     PERSISTED, not rendered.
 
-    ``invocation`` is the adapter's bounded ``frontend_forensics/1`` receipt:
+    ``invocation`` is the adapter's bounded ``frontend_forensics/2`` receipt:
     activity counters, timestamps, normalized descriptions and hashes. It
     never contains prompts, source, model output, tool arguments, or URLs.
     """

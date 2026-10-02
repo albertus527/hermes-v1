@@ -670,6 +670,57 @@ def _estimate_chunk_bytes(chunk: Any) -> int:
     return size
 
 
+def _openai_chunk_advances(chunk: Any) -> bool:
+    """Whether a Chat Completions chunk is forward progress, not a keep-alive.
+
+    DENYLIST, never an allowlist: only the one shape that is positively known
+    to carry nothing — the terminal usage-only frame (no choices, usage set) —
+    is demoted. Anything with choices advances, including an in-stream
+    error-shape chunk (``choices=None`` with ``error_type`` in ``model_extra``,
+    see the ``_payload_has_error_shape`` handling below), because it is a real
+    state change that ends the stream. Anything unrecognised advances too:
+    a new real provider delta must never be misread as non-progress, and a
+    premature kill is the only unacceptable failure direction.
+    """
+    try:
+        choices = getattr(chunk, "choices", None)
+        if choices:
+            return True
+        if getattr(chunk, "usage", None):
+            return False
+    except Exception:
+        pass
+    return True
+
+
+#: Anthropic Messages SSE frame types that carry NO model output: the
+#: ``ping`` keep-alive and the message/block lifecycle frames. Positively
+#: identified only — every other type, including ``content_block_delta`` of any
+#: subtype (``text_delta``, ``thinking_delta``, ``signature_delta``,
+#: ``input_json_delta``), ``content_block_start``, and any type this build does
+#: not recognise, advances. See ``_anthropic_event_advances``.
+_ANTHROPIC_NON_OUTPUT_EVENT_TYPES = frozenset(
+    {
+        "ping",
+        "message_start",
+        "message_delta",
+        "message_stop",
+        "content_block_stop",
+    }
+)
+
+
+def _anthropic_event_advances(event_type: Optional[str]) -> bool:
+    """Whether an Anthropic stream frame is forward progress.
+
+    DENYLIST of positively-identified non-output frames, so a new real provider
+    delta can never be misclassified as non-progress. ``ping`` is the one the
+    API emits to keep an otherwise-idle connection alive, which is exactly the
+    keep-alive a supervisor must not read as work.
+    """
+    return event_type not in _ANTHROPIC_NON_OUTPUT_EVENT_TYPES
+
+
 def _codex_wait_notice_recovery(
     *,
     stale_timeout: float,
@@ -794,7 +845,8 @@ def _report_stale_nonstream_kill(
 def _touch_stale_kill_activity(agent, elapsed: float) -> None:
     try:
         agent._touch_activity(
-            f"stale non-streaming call killed after {int(elapsed)}s"
+            f"stale non-streaming call killed after {int(elapsed)}s",
+            advance=False,
         )
     except Exception:
         logger.debug("stale activity touch failed", exc_info=True)
@@ -1221,7 +1273,14 @@ def direct_api_call(agent, api_kwargs: dict):
         # ticker only refreshes the activity clock.
         while not activity_hb_stop.wait(_DIRECT_API_ACTIVITY_HEARTBEAT_SECONDS):
             try:
-                agent._touch_activity("waiting for non-streaming API response")
+                # Keep-alive only: the request is still open but nothing has
+                # come back. Observable activity, not forward progress. The
+                # genuine request boundary at the call sites below keeps the
+                # default (advance), so this description's dual use is split
+                # at the call site rather than by a text rule.
+                agent._touch_activity(
+                    "waiting for non-streaming API response", advance=False
+                )
             except Exception:
                 pass
 
@@ -1676,7 +1735,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 f"reconnecting..."
             )
             agent._touch_activity(
-                f"codex stream killed after {int(_elapsed)}s with no first byte"
+                f"codex stream killed after {int(_elapsed)}s with no first byte",
+                advance=False,
             )
             # Wait briefly for the worker to notice the closed connection.
             t.join(timeout=2.0)
@@ -1722,7 +1782,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
             except Exception:
                 pass
             agent._touch_activity(
-                f"codex stream killed after {int(_event_stale_elapsed)}s with no SSE events"
+                f"codex stream killed after {int(_event_stale_elapsed)}s with no SSE events",
+                advance=False,
             )
             t.join(timeout=2.0)
             if result["error"] is None and result["response"] is None:
@@ -4085,7 +4146,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             response=lambda: attempt_stream_response["value"],
         ):
             last_chunk_time["t"] = time.time()
-            agent._touch_activity("receiving stream response")
+            agent._touch_activity(
+                "receiving stream response",
+                advance=_openai_chunk_advances(chunk),
+            )
 
             # Update per-attempt diagnostic counters.  Best-effort —
             # failures are swallowed so the streaming hot path is never
@@ -4609,7 +4673,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             for event in stream:
                 saw_stream_event = True
                 last_chunk_time["t"] = time.time()
-                agent._touch_activity("receiving stream response")
+                # Read the type BEFORE touching activity: the touch must know
+                # whether this frame carried model output.
+                _event_type = getattr(event, "type", None)
+                agent._touch_activity(
+                    "receiving stream response",
+                    advance=_anthropic_event_advances(_event_type),
+                )
                 try:
                     _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
                     if _diag.get("first_chunk_at") is None:
@@ -4620,7 +4690,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 if agent._interrupt_requested:
                     break
 
-                event_type = getattr(event, "type", None)
+                event_type = _event_type
                 if event_type == "content_block_start":
                     block = getattr(event, "content_block", None)
                     if block and getattr(block, "type", None) == "tool_use":
@@ -5167,7 +5237,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # Chunks are flowing — keep the activity tracker fresh but
                 # leave the live display alone.
                 agent._touch_activity(
-                    f"waiting for stream response ({_waiting_secs}s, no chunks yet)"
+                    f"waiting for stream response ({_waiting_secs}s, no chunks yet)",
+                    advance=False,
                 )
 
         # Detect stale streams: connections kept alive by SSE pings
@@ -5225,7 +5296,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 f"reconnecting..."
             )
             agent._touch_activity(
-                f"stale stream detected after {int(_stale_elapsed)}s, reconnecting"
+                f"stale stream detected after {int(_stale_elapsed)}s, reconnecting",
+                advance=False,
             )
 
         if agent._interrupt_requested:

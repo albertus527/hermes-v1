@@ -903,7 +903,8 @@ def _run_sequential_tool_execution_middleware(
                 if elapsed - _last_heartbeat >= 30:
                     _last_heartbeat = elapsed
                     agent._touch_activity(
-                        f"sequential tool running ({elapsed}s): {function_name}"
+                        f"sequential tool running ({elapsed}s): {function_name}",
+                        advance=False,
                     )
 
         if interrupted:
@@ -1673,7 +1674,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         ]
                         agent._touch_activity(
                             f"concurrent tools running ({_conc_elapsed}s, "
-                            f"{len(not_done)} remaining: {', '.join(_still_running[:3])})"
+                            f"{len(not_done)} remaining: {', '.join(_still_running[:3])})",
+                            advance=False,
                         )
             finally:
                 # Belt-and-braces: any exit from the wait loop that abandoned

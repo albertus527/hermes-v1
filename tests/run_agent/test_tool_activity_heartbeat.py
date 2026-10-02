@@ -58,7 +58,7 @@ def _make_agent(monkeypatch):
             self._tool_worker_threads_lock = threading.Lock()
             self._active_children_lock = threading.Lock()
 
-        def _touch_activity(self, desc):
+        def _touch_activity(self, desc, **_kw):
             self._last_activity = time.time()
 
         def _vprint(self, msg, force=False):
@@ -112,7 +112,7 @@ def test_heartbeat_touches_periodically_and_stops():
     stop = threading.Event()
 
     class _Agent:
-        def _touch_activity(self, desc):
+        def _touch_activity(self, desc, **_kw):
             touches.append(desc)
 
     thread = threading.Thread(

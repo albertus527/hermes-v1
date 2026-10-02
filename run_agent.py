@@ -4066,6 +4066,7 @@ class AIAgent:
         *,
         provenance: Optional[ActivityProvenance] = None,
         force_persist: bool = False,
+        advance: Optional[bool] = None,
     ) -> None:
         """Update the last-activity timestamp and description (thread-safe).
 
@@ -4085,6 +4086,17 @@ class AIAgent:
 
         ``force_persist`` bypasses the 60s SessionDB rate limit so a
         terminal stamp (e.g. compression completed) is not dropped.
+
+        ``advance`` is the FORWARD-PROGRESS bit carried on the supervised
+        progress channel only. ``None`` (the default) lets
+        ``agent.progress_events.description_advances`` decide from the text;
+        stream emitters pass it explicitly because they know whether the
+        arriving item carried model output. It deliberately does NOT affect
+        ``_last_activity_ts``: this method stays a plain liveness clock for
+        every in-process consumer (delegation stale monitor, gateway
+        inactivity monitor, compression budget, SessionDB projection), and a
+        keep-alive must keep behaving exactly as it does today there. Only an
+        external supervisor demotes keep-alives to non-progress.
         """
         from agent.session_activity import (
             bound_activity_description,
@@ -4104,7 +4116,9 @@ class AIAgent:
             try:
                 from agent.progress_events import make_progress_payload
 
-                payload = make_progress_payload(self._last_activity_desc)
+                payload = make_progress_payload(
+                    self._last_activity_desc, advance=advance
+                )
                 progress_cb(payload["kind"], payload)
             except Exception:
                 logger.debug("progress_callback notification failed", exc_info=True)

@@ -91,11 +91,17 @@ class ProgressScript:
         kind: str,
         phase: str,
         desc: Optional[str] = None,
+        *,
+        advance: Optional[bool] = None,
     ) -> "ProgressScript":
         # ``desc`` defaults to the old synthetic label so every existing test is
         # unchanged; forensic tests pass a real emitter description.
+        #
+        # ``advance`` is OMITTED from the line when None, on purpose: that is how
+        # an older producer's line looks, and the watchdog must keep treating it
+        # as forward progress. Tests that need a keep-alive pass False.
         self.schedule.setdefault(when, []).append(
-            (run_id, kind, phase, f"{kind.lower()}:{phase}" if desc is None else desc)
+            (run_id, kind, phase, f"{kind.lower()}:{phase}" if desc is None else desc, advance)
         )
         return self
 
@@ -104,17 +110,17 @@ class ProgressScript:
 
     def flush(self) -> None:
         due = self.schedule.pop(self.clock.now, None)
-        for run_id, kind, phase, desc in due or []:
-            line = json.dumps(
-                {
-                    "run_id": run_id,
-                    "event": "channel_ready" if kind == "channel_ready" else "progress",
-                    "kind": kind,
-                    "phase": phase,
-                    "desc": desc,
-                },
-                separators=(",", ":"),
-            ) + "\n"
+        for run_id, kind, phase, desc, advance in due or []:
+            event = {
+                "run_id": run_id,
+                "event": "channel_ready" if kind == "channel_ready" else "progress",
+                "kind": kind,
+                "phase": phase,
+                "desc": desc,
+            }
+            if advance is not None:
+                event["advance"] = advance
+            line = json.dumps(event, separators=(",", ":")) + "\n"
             os.write(self.fd, line.encode("utf-8"))
 
     def close(self) -> None:
@@ -356,6 +362,182 @@ def test_hard_ceiling_terminates_a_pathological_run(harness):
     # Never reported as an idle/stall failure.
     assert run.outcome != wd.OUTCOME_IDLE_TIMEOUT
     assert run.diagnostics["elapsed_seconds"] == pytest.approx(2700.0, abs=2)
+
+
+# ---------------------------------------------------------------------------
+# Observable activity vs. forward progress.
+#
+# ``advance=False`` events prove the child is alive and say nothing about
+# whether it is getting anywhere. The bounds read the forward-progress clock,
+# so a keep-alive-only run ends even though it never stops emitting events.
+#
+# The bound interaction these tests pin down: the idle branch requires
+# ``not in_flight``, and ``is_in_flight`` holds while
+# ``no_progress_for(now) < max_single_operation_seconds``. So a keep-alive-only
+# run WITH a claimed operation is protected until the 900s backstop, and one
+# with NO claimed operation is cut at the 180s idle bound.
+# ---------------------------------------------------------------------------
+
+
+def test_keepalives_do_not_refresh_forward_progress_and_are_cut_at_the_backstop(
+    harness,
+):
+    """The p18 shape: an operation re-announced forever, never progressing.
+
+    A genuine MODEL operation is claimed at t=0, then only keep-alive events
+    follow — the 30s poll heartbeat (which classifies as MODEL/started) and
+    ping-only stream frames. Under the previous behaviour each of those
+    refreshed liveness and only the 45-minute fuse ended the run.
+    """
+    harness.script.ready(0, "inv-A").at(
+        0, "inv-A", "MODEL", "started", desc="starting API call #1", advance=True
+    )
+    for t in range(30, 1500, 30):
+        harness.script.at(
+            t,
+            "inv-A",
+            "MODEL",
+            "started",
+            desc=f"waiting for stream response ({t}s, no chunks yet)",
+            advance=False,
+        )
+        harness.script.at(
+            t, "inv-A", "STREAM", "active", desc="receiving stream response",
+            advance=False,
+        )
+
+    run = harness.run("inv-A", exit_at=None)
+
+    # Cut by the no-progress backstop, NOT at the 180s idle bound: the in-flight
+    # MODEL operation suppresses the idle branch until the backstop elapses too.
+    assert run.outcome == wd.OUTCOME_IDLE_TIMEOUT
+    assert run.diagnostics["active_operation"] == "MODEL"
+    assert run.diagnostics["elapsed_seconds"] == pytest.approx(
+        harness.policy.max_single_operation_seconds, abs=2
+    )
+    assert run.diagnostics["elapsed_seconds"] > harness.policy.idle_timeout_seconds
+    assert run.diagnostics["keepalive_event_count"] > 20
+    assert run.diagnostics["advance_event_count"] == 1
+    # The activity clock never went quiet; only the progress clock did.
+    assert run.diagnostics["activity_idle_for_seconds"] < 5.0
+    assert run.diagnostics["idle_for_seconds"] >= (
+        harness.policy.max_single_operation_seconds - 2
+    )
+
+
+def test_keepalive_re_announcement_does_not_restart_the_operation(harness):
+    """Same-kind re-announcements neither clear nor re-arm the operation."""
+    harness.script.ready(0, "inv-A").at(
+        0, "inv-A", "MODEL", "started", desc="starting API call #1", advance=True
+    )
+    for t in range(30, 1500, 30):
+        harness.script.at(
+            t, "inv-A", "MODEL", "started",
+            desc=f"waiting for stream response ({t}s, no chunks yet)",
+            advance=False,
+        )
+
+    run = harness.run("inv-A", exit_at=None)
+
+    # A poll heartbeat can never restart the operation's start timestamp, which
+    # is what would make an in-flight operation un-terminable.
+    assert run.diagnostics["active_operation_started_at"] == pytest.approx(
+        0.0, abs=2
+    )
+
+
+def test_keepalive_only_run_without_an_operation_is_cut_at_the_idle_bound(harness):
+    """No claimed operation => the 180s idle bound is the one that fires."""
+    harness.script.ready(0, "inv-A")
+    for t in range(30, 1500, 30):
+        harness.script.at(
+            t, "inv-A", "STREAM", "active", desc="receiving stream response",
+            advance=False,
+        )
+
+    run = harness.run("inv-A", exit_at=None)
+
+    assert run.outcome == wd.OUTCOME_IDLE_TIMEOUT
+    assert run.diagnostics["active_operation"] is None
+    assert run.diagnostics["elapsed_seconds"] == pytest.approx(
+        harness.policy.idle_timeout_seconds, abs=2
+    )
+
+
+def test_genuine_progress_is_never_cut_at_any_duration(harness):
+    """``max_single_operation_seconds`` is a no-progress backstop, not a cap.
+
+    An operation that keeps advancing past the backstop and past the old 900s
+    wall clock is never terminated. Only the hard elapsed fuse can end it.
+    """
+    harness.script.ready(0, "inv-A").at(
+        0, "inv-A", "MODEL", "started", desc="starting API call #1", advance=True
+    )
+    for t in range(60, 2100, 60):
+        harness.script.at(
+            t, "inv-A", "STREAM", "active", desc="receiving stream response",
+            advance=True,
+        )
+
+    run = harness.run("inv-A", exit_at=2000)
+
+    assert run.outcome is None
+    assert run.diagnostics["elapsed_seconds"] > 1900
+    assert run.diagnostics["elapsed_seconds"] > (
+        harness.policy.max_single_operation_seconds + 1000
+    )
+
+
+def test_progress_line_without_an_advance_key_still_advances(harness):
+    """Back-compat: an older producer's line must not be demoted."""
+    harness.script.ready(0, "inv-A").at(
+        0, "inv-A", "MODEL", "started", desc="starting API call #1"
+    )
+    for t in range(60, 1500, 60):
+        harness.script.at(t, "inv-A", "STREAM", "active")
+
+    run = harness.run("inv-A", exit_at=1450)
+
+    assert run.outcome is None
+    assert run.diagnostics["keepalive_event_count"] == 0
+    assert run.diagnostics["advance_event_count"] == run.diagnostics[
+        "progress_event_count"
+    ]
+
+
+def test_receipt_separates_advancing_from_keepalive_events(harness, tmp_path):
+    """The counters a reader needs to tell "busy" from "progressing"."""
+    harness.script.ready(0, "inv-A").at(
+        0, "inv-A", "MODEL", "started", desc="starting API call #1", advance=True
+    )
+    for t in range(30, 700, 30):
+        harness.script.at(
+            t, "inv-A", "STREAM", "active", desc="receiving stream response",
+            advance=False,
+        )
+    harness.script.at(700, "inv-A", "MODEL", "completed", desc="API call #1 completed")
+
+    run = harness.run(
+        "inv-A",
+        exit_at=760,
+        diagnostics_dir=tmp_path / "diag",
+        workspace=tmp_path,
+        artifacts_probe=lambda: False,
+    )
+
+    counters = run.diagnostics["forensics"]["counters"]
+    assert counters["advance"] + counters["keepalive"] == counters[
+        "total_progress_events"
+    ]
+    assert counters["keepalive"] > 10
+    assert counters["advance"] == 2
+    activity = run.diagnostics["forensics"]["activity"]
+    # Every event kept the activity clock alive; only two moved the progress
+    # clock, so the forward-progress gap dwarfs the activity gap.
+    assert activity["longest_gap_seconds"] == pytest.approx(30.0, abs=2)
+    assert activity["longest_forward_progress_gap_seconds"] == pytest.approx(
+        700.0, abs=2
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1321,12 +1503,50 @@ def test_no_diagnostics_dir_writes_nothing_but_still_reports_in_memory(harness):
 # ---------------------------------------------------------------------------
 
 
+def _alive(pid: int) -> bool:
+    """True when *pid* is a live process.
+
+    A zombie still answers ``os.kill(pid, 0)`` on POSIX until it is reaped, so a
+    killed-but-unreaped grandchild would read as an orphan. Zombies hold no
+    resources and execute nothing, so they are not survivors.
+    """
+    try:
+        os.kill(pid, 0)
+    except (OSError, ProcessLookupError):
+        return False
+    try:
+        with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as handle:
+            return handle.read().rsplit(")", 1)[-1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return True
+
+
+def _await_file(path: Path, deadline: float) -> str:
+    """Bounded wait for *path* to appear and be readable, then return it."""
+    while time.monotonic() < deadline:
+        try:
+            return path.read_text().strip()
+        except OSError:
+            time.sleep(0.05)
+    raise AssertionError(f"{path} never appeared before the deadline")
+
+
 def test_timeout_leaves_no_orphan_tree(tmp_path):
     """A real invocation tree is fully torn down on timeout.
 
     Spawns a child that itself spawns a grandchild, forces an idle timeout
-    using real (tiny) bounds, and asserts both PIDs are gone. This is the only
+    using real bounds, and asserts both PIDs are gone. This is the only
     guarantee mocks cannot make: whole-tree termination of real descendants.
+
+    The bounds are deliberately loose relative to child startup. The child has
+    to boot an interpreter, spawn a *second* interpreter, and write a marker
+    file, and this test kills it on a wall-clock budget measured from launch —
+    under full-suite parallel load those two boots do not always fit inside a
+    2s window, which made this test flaky for reasons unrelated to
+    supervision. ``max_single_operation_seconds`` sets how long the run is
+    allowed before the backstop fires, so it is the bound that has to clear
+    startup; ``idle_timeout_seconds`` is checked first but is gated on the same
+    backstop having elapsed (see ``is_in_flight``).
     """
     if wd.kill_process_tree is None:  # pragma: no cover
         pytest.skip("whole-tree termination unavailable")
@@ -1344,12 +1564,12 @@ def test_timeout_leaves_no_orphan_tree(tmp_path):
     progress.write_text(
         json.dumps(
             {"run_id": "tree-run", "event": "channel_ready", "kind": "channel_ready",
-             "phase": "ready", "desc": ""}
+             "phase": "ready", "desc": "", "advance": True}
         )
         + "\n"
         + json.dumps(
             {"run_id": "tree-run", "event": "progress", "kind": "MODEL",
-             "phase": "started", "desc": "starting API call #1"}
+             "phase": "started", "desc": "starting API call #1", "advance": True}
         )
         + "\n",
         encoding="utf-8",
@@ -1357,9 +1577,11 @@ def test_timeout_leaves_no_orphan_tree(tmp_path):
 
     policy = wd.WatchdogPolicy(
         idle_timeout_seconds=1.0,
-        # No-progress backstop just above the idle bound, so the invocation is
-        # cut off as IDLE well before the (deliberately distant) hard ceiling.
-        max_single_operation_seconds=2.0,
+        # The no-progress backstop is what has to clear child startup, so it is
+        # the only bound with real headroom. 8s is comfortable for two interpreter
+        # boots under parallel load and still keeps the test short. The hard
+        # ceiling stays deliberately distant.
+        max_single_operation_seconds=8.0,
         hard_max_runtime_seconds=60.0,
         legacy_wallclock_seconds=120.0,
         startup_grace_seconds=5.0,
@@ -1379,18 +1601,17 @@ def test_timeout_leaves_no_orphan_tree(tmp_path):
     assert run.outcome == wd.OUTCOME_IDLE_TIMEOUT
     assert run.terminated is True
     assert run.tree_kill_attempted is True
+    # The in-flight MODEL operation is what protected the run past the idle
+    # bound, so the backstop is the bound that must have fired.
+    assert run.diagnostics["active_operation"] == "MODEL"
+    assert run.diagnostics["elapsed_seconds"] == pytest.approx(
+        policy.max_single_operation_seconds, abs=1.5
+    )
 
     # Give the OS a moment to reap, then confirm neither PID survives.
     deadline = time.monotonic() + 10.0
     child_pid = run.diagnostics["pid"]
-    grandchild_pid = int(grandchild_marker.read_text().strip())
-
-    def _alive(pid: int) -> bool:
-        try:
-            os.kill(pid, 0)
-        except (OSError, ProcessLookupError):
-            return False
-        return True
+    grandchild_pid = int(_await_file(grandchild_marker, deadline))
 
     while time.monotonic() < deadline and (_alive(child_pid) or _alive(grandchild_pid)):
         time.sleep(0.1)

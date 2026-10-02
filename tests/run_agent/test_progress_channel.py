@@ -23,6 +23,7 @@ from agent.progress_events import (
     PHASE_COMPLETED,
     PHASE_STARTED,
     classify_progress_event,
+    description_advances,
     make_progress_payload,
 )
 
@@ -43,7 +44,9 @@ class _Agent:
 
     # Copied structure from run_agent.AIAgent._touch_activity (the notify block
     # is what is under test; the rest is stubbed to avoid a full agent).
-    def _touch_activity(self, desc, *, provenance=None, force_persist=False) -> None:
+    def _touch_activity(
+        self, desc, *, provenance=None, force_persist=False, advance=None
+    ) -> None:
         import logging
         import time
 
@@ -60,7 +63,9 @@ class _Agent:
             try:
                 from agent.progress_events import make_progress_payload
 
-                payload = make_progress_payload(self._last_activity_desc)
+                payload = make_progress_payload(
+                    self._last_activity_desc, advance=advance
+                )
                 progress_cb(payload["kind"], payload)
             except Exception:
                 logging.getLogger(__name__).debug(
@@ -96,7 +101,7 @@ def test_unknown_descriptions_degrade_to_liveness_only():
 
 def test_payload_is_bounded_and_content_free():
     payload = make_progress_payload("x" * 5000)
-    assert set(payload) == {"kind", "phase", "desc"}
+    assert set(payload) == {"kind", "phase", "advance", "desc"}
     assert len(payload["desc"]) <= 120
     assert "args" not in payload and "prompt" not in payload
 
@@ -124,6 +129,99 @@ def test_a_raising_consumer_never_breaks_the_activity_clock():
     agent = _Agent(progress_callback=boom)
     agent._touch_activity("starting API call #1")
     assert agent._last_activity_desc == "starting API call #1"
+
+
+# ---------------------------------------------------------------------------
+# advance: observable activity vs. forward progress.
+#
+# Fail-safe direction: an unrecognised description, an empty one, or an absent
+# ``advance`` all ADVANCE. Only positively-identified keep-alive text, or an
+# explicit ``advance=False`` at a call site, demotes an event.
+# ---------------------------------------------------------------------------
+
+#: Every Group A keep-alive description, each emitted by a timer/heartbeat and
+#: never by a genuine boundary. Encoded as a table so a new keep-alive site
+#: cannot be added without a matching assertion.
+GROUP_A_KEEPALIVE_DESCRIPTIONS = (
+    "waiting for stream response (0s, no chunks yet)",
+    "sequential tool running (30s): terminal",
+    "concurrent tools running (60s, 2 remaining: read_file, terminal)",
+    "retry backoff (1/3), 4s remaining",
+    "error retry backoff (2/5), 8s remaining",
+    "empty response retry backoff (1/2), 3s remaining",
+    "stale stream detected after 180s, reconnecting",
+    "stale non-streaming call killed after 900s",
+    "codex stream killed after 120s with no first byte",
+    "codex stream killed after 120s with no SSE events",
+    "stream retry 1/3 after RemoteProtocolError",
+)
+
+
+@pytest.mark.parametrize("desc", GROUP_A_KEEPALIVE_DESCRIPTIONS)
+def test_group_a_keepalive_descriptions_do_not_advance_by_default(desc):
+    assert description_advances(desc) is False
+    assert make_progress_payload(desc)["advance"] is False
+    # Still observable: the kind classification is untouched by the split.
+    assert make_progress_payload(desc)["kind"] in {KIND_MODEL, KIND_UNKNOWN}
+
+
+@pytest.mark.parametrize(
+    "desc",
+    [
+        "starting API call #3",
+        "API call #3 completed",
+        "waiting for provider response (streaming)",
+        "executing tool: write_file",
+        "tool completed: terminal (1.2s) ok",
+        "receiving stream response",
+        "",
+        None,
+        "a description nobody has seen yet",
+    ],
+)
+def test_genuine_and_unrecognised_descriptions_advance_by_default(desc):
+    assert description_advances(desc) is True
+    assert make_progress_payload(desc)["advance"] is True
+
+
+def test_ambiguous_description_is_not_classified_by_the_default_table():
+    """"waiting for non-streaming API response" is a boundary AND a heartbeat.
+
+    The identical text is the genuine request start and the 15s direct-API
+    heartbeat, so it must NOT be in the keep-alive table: a description-keyed
+    rule cannot tell the two call sites apart. The heartbeat call site is what
+    separates them, by passing ``advance=False`` explicitly.
+    """
+    ambiguous = "waiting for non-streaming API response"
+    assert description_advances(ambiguous) is True
+    assert make_progress_payload(ambiguous)["advance"] is True
+    # The genuine request boundary keeps the default.
+    seen = []
+    agent = _Agent(progress_callback=lambda kind, payload: seen.append(payload))
+    agent._touch_activity(ambiguous)
+    assert seen[-1]["advance"] is True
+    # The heartbeat call site splits it.
+    agent._touch_activity(ambiguous, advance=False)
+    assert seen[-1]["advance"] is False
+
+
+def test_explicit_advance_wins_over_the_default_table():
+    desc = "waiting for stream response (0s, no chunks yet)"
+    assert make_progress_payload(desc, advance=True)["advance"] is True
+    assert make_progress_payload("starting API call #1", advance=False)["advance"] is False
+
+
+def test_a_keepalive_still_stamps_the_activity_clock_and_notifies():
+    """Demotion is about the supervisor's progress timer, not about liveness."""
+    seen = []
+    agent = _Agent(progress_callback=lambda kind, payload: seen.append(payload))
+    before = agent._last_activity_ts
+    agent._touch_activity("retry backoff (1/3), 4s remaining", advance=False)
+
+    assert agent._last_activity_ts > before
+    assert agent._last_activity_desc == "retry backoff (1/3), 4s remaining"
+    assert len(seen) == 1
+    assert seen[0]["advance"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -189,3 +287,27 @@ def test_emitter_survives_an_unwritable_path(monkeypatch):
 
     monkeypatch.setenv(oneshot.PROGRESS_FILE_ENV, os.devnull + "/nope/impossible.jsonl")
     assert oneshot._build_progress_emitter() is None
+
+
+def test_emitter_writes_the_advance_bit_and_defaults_it_to_true(monkeypatch, tmp_path):
+    from hermes_cli import oneshot
+
+    path = tmp_path / "progress.jsonl"
+    monkeypatch.setenv(oneshot.PROGRESS_FILE_ENV, str(path))
+    monkeypatch.setenv(oneshot.PROGRESS_ID_ENV, "inv-1")
+
+    emitter = oneshot._build_progress_emitter()
+    emitter.on_progress(
+        "MODEL",
+        {"kind": "MODEL", "phase": "started", "desc": "d", "advance": False},
+    )
+    # An older producer's payload carries no key at all.
+    emitter.on_progress("MODEL", {"kind": "MODEL", "phase": "completed", "desc": "d"})
+    emitter.close()
+
+    lines = [json.loads(x) for x in path.read_text(encoding="utf-8").splitlines() if x]
+    # The handshake is a capability announcement, not progress.
+    assert lines[0]["advance"] is True
+    assert lines[1]["advance"] is False
+    # Absent means True so a supervisor driving an older child behaves as before.
+    assert lines[2]["advance"] is True

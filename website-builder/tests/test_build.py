@@ -1778,7 +1778,7 @@ class TestPhase7CompileRepair(unittest.TestCase):
 
     def test_repair_failure_persists_bounded_invocation_forensics(self):
         receipt = {
-            "schema": "frontend_forensics/1",
+            "schema": "frontend_forensics/2",
             "returncode": 1,
             "elapsed_seconds": 12.0,
             "counters": {"model_started": 0, "tool_started": 0},

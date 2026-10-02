@@ -3548,7 +3548,8 @@ def run_conversation(
                         if _backoff_touch_counter % 150 == 0:  # 150 × 0.2s = 30s
                             agent._touch_activity(
                                 f"retry backoff ({retry_count}/{max_retries}), "
-                                f"{int(sleep_end - time.time())}s remaining"
+                                f"{int(sleep_end - time.time())}s remaining",
+                                advance=False,
                             )
                     if _retry.restart_with_redirected_messages:
                         break  # rebuild this iteration from the correction
@@ -6693,10 +6694,11 @@ def run_conversation(
                     # monitor knows we're alive during backoff waits.
                     _backoff_touch_counter += 1
                     if _backoff_touch_counter % 150 == 0:  # 150 × 0.2s = 30s
-                        agent._touch_activity(
-                            f"error retry backoff ({retry_count}/{max_retries}), "
-                            f"{int(sleep_end - time.time())}s remaining"
-                        )
+                            agent._touch_activity(
+                                f"error retry backoff ({retry_count}/{max_retries}), "
+                                f"{int(sleep_end - time.time())}s remaining",
+                                advance=False,
+                            )
                 if _retry.restart_with_redirected_messages:
                     # Leave the retry loop — the check right below rebuilds this
                     # iteration from the correction instead of re-firing the
@@ -7977,7 +7979,8 @@ def run_conversation(
                             if _backoff_touch_counter % 150 == 0:  # 150 × 0.2s = 30s
                                 agent._touch_activity(
                                     f"empty response retry backoff ({agent._empty_content_retries}/{_empty_retry_budget}), "
-                                    f"{int(sleep_end - time.time())}s remaining"
+                                    f"{int(sleep_end - time.time())}s remaining",
+                                    advance=False,
                                 )
                         continue
 

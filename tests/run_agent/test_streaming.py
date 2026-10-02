@@ -728,7 +728,9 @@ class TestCodexStreamCallbacks:
         agent.api_mode = "codex_responses"
 
         touch_calls = []
-        agent._touch_activity = lambda desc: touch_calls.append(desc)
+        agent._touch_activity = lambda desc, **kw: touch_calls.append(
+            (desc, kw.get("advance"))
+        )
 
         events = [
             SimpleNamespace(type="response.output_text.delta", delta="Hello"),
@@ -761,7 +763,41 @@ class TestCodexStreamCallbacks:
             client=mock_client,
         )
 
-        assert touch_calls.count("receiving stream response") == len(events)
+        # Every frame still refreshes liveness...
+        assert [d for d, _ in touch_calls].count("receiving stream response") == len(events)
+        # ...and every one of these is real model output, so every one advances.
+        assert all(a is True for _, a in touch_calls)
+
+    def test_codex_keepalive_frames_do_not_advance(self):
+        """``ping``/``in_progress`` prove liveness, not progress."""
+        from agent.codex_runtime import _codex_event_advances
+
+        for event_type in ("ping", "response.queued", "response.in_progress"):
+            assert (
+                _codex_event_advances(SimpleNamespace(type=event_type)) is False
+            ), event_type
+        for event_type in (
+            "response.output_text.delta",
+            "response.reasoning_summary_text.delta",
+            "response.function_call_arguments.delta",
+            "response.created",
+            "response.completed",
+            "a.type.this.build.has.never.seen",
+        ):
+            assert (
+                _codex_event_advances(SimpleNamespace(type=event_type)) is True
+            ), event_type
+
+    def test_codex_unreadable_event_shape_fails_safe_to_advance(self):
+        """Fail-safe is forward: only positively-identified keep-alives demote."""
+        from agent.codex_runtime import _codex_event_advances
+
+        class _Hostile:
+            def __getattr__(self, name):
+                raise RuntimeError("boom")
+
+        assert _codex_event_advances(_Hostile()) is True
+        assert _codex_event_advances(object()) is True
 
 
 class TestAnthropicStreamCallbacks:
@@ -782,7 +818,9 @@ class TestAnthropicStreamCallbacks:
         agent._interrupt_requested = False
 
         touch_calls = []
-        agent._touch_activity = lambda desc: touch_calls.append(desc)
+        agent._touch_activity = lambda desc, **kw: touch_calls.append(
+            (desc, kw.get("advance"))
+        )
 
         events = [
             SimpleNamespace(
@@ -818,8 +856,133 @@ class TestAnthropicStreamCallbacks:
 
         agent._interruptible_streaming_api_call({})
 
-        assert touch_calls.count("receiving stream response") == len(events)
+        assert [d for d, _ in touch_calls].count("receiving stream response") == len(events)
+        assert all(a is True for _, a in touch_calls)
         mock_stream.close.assert_called_once()
+
+    def test_anthropic_ping_only_stream_never_advances(self):
+        """A stream of nothing but ``ping`` frames is a keep-alive storm.
+
+        This is the case the watchdog used to read as continuous work: the touch
+        still fires for every frame (liveness is unaffected), but none of them
+        advances, so a supervisor's forward-progress clock stops moving.
+        """
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "anthropic_messages"
+        agent._interrupt_requested = False
+
+        touch_calls = []
+        agent._touch_activity = lambda desc, **kw: touch_calls.append(
+            (desc, kw.get("advance"))
+        )
+
+        events = [SimpleNamespace(type="ping") for _ in range(5)]
+
+        mock_stream = MagicMock()
+        mock_stream.__enter__ = MagicMock(return_value=mock_stream)
+        mock_stream.__exit__ = MagicMock(return_value=False)
+        mock_stream.__iter__ = MagicMock(return_value=iter(events))
+        mock_stream.get_final_message.return_value = SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="")], stop_reason="end_turn"
+        )
+
+        agent._anthropic_client = MagicMock()
+        agent._anthropic_client.messages.stream.return_value = mock_stream
+        agent._create_request_anthropic_client = lambda *a, **k: agent._anthropic_client
+
+        agent._interruptible_streaming_api_call({})
+
+        # Liveness is untouched: one touch per frame.
+        assert len(touch_calls) == len(events)
+        # But not one of them is forward progress.
+        assert all(a is False for _, a in touch_calls)
+        mock_stream.close.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "event_type",
+        [
+            "ping",
+            "message_start",
+            "message_delta",
+            "message_stop",
+            "content_block_stop",
+        ],
+    )
+    def test_anthropic_non_output_frames_do_not_advance(self, event_type):
+        from agent.chat_completion_helpers import _anthropic_event_advances
+
+        assert _anthropic_event_advances(event_type) is False
+
+    @pytest.mark.parametrize(
+        "event_type",
+        [
+            "content_block_start",
+            "content_block_delta",
+            "a.type.this.build.has.never.seen",
+            None,
+        ],
+    )
+    def test_anthropic_output_and_unknown_frames_advance(self, event_type):
+        """Every ``content_block_delta`` subtype advances — an allowlist of
+        ``text_delta`` alone would misclassify tool-argument and thinking deltas
+        as non-progress, and an unknown future type must never be demoted."""
+        from agent.chat_completion_helpers import _anthropic_event_advances
+
+        assert _anthropic_event_advances(event_type) is True
+
+    def test_openai_chunk_advance_is_a_denylist(self):
+        """Only the known usage-only frame is demoted; everything else advances."""
+        from agent.chat_completion_helpers import _openai_chunk_advances
+
+        usage_only = SimpleNamespace(
+            choices=[], usage=SimpleNamespace(prompt_tokens=10)
+        )
+        assert _openai_chunk_advances(usage_only) is False
+
+        text_delta = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(content="hi", tool_calls=None)
+                )
+            ]
+        )
+        assert _openai_chunk_advances(text_delta) is True
+
+        tool_delta = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        content=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                function=SimpleNamespace(arguments='{"a":', name=None)
+                            )
+                        ],
+                    )
+                )
+            ]
+        )
+        assert _openai_chunk_advances(tool_delta) is True
+
+        # In-stream error shape: choices=None, no usage. A real state change that
+        # ends the stream, so it must NOT be read as a keep-alive.
+        error_shape = SimpleNamespace(
+            choices=None, model_extra={"error_type": "validation"}
+        )
+        assert _openai_chunk_advances(error_shape) is True
+
+        # Unknown shapes fail safe to advancing.
+        assert _openai_chunk_advances(object()) is True
+        assert _openai_chunk_advances(None) is True
 
     @patch("run_agent.AIAgent._rebuild_anthropic_client")
     @patch("run_agent.AIAgent._replace_primary_openai_client")
