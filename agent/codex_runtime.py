@@ -20,9 +20,11 @@ import json
 import logging
 import os
 import time
+from collections.abc import Mapping
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
+from agent.stream_shapes import build_stream_diag, classify_codex_event
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 
 logger = logging.getLogger(__name__)
@@ -1649,17 +1651,46 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     def _on_commentary_message(text: str) -> None:
         agent._fire_streamed_codex_commentary(text)
 
+    # Per-attempt frame counters for the wire-side STREAM diagnostic. Written
+    # from the event hook and reset at the top of every physical attempt, so
+    # ``n`` is an index within ONE attempt rather than a lifetime total. Purely
+    # observational: the ``advance`` bit below still comes from
+    # ``_codex_event_advances`` alone.
+    _diag_wire = getattr(agent, "progress_callback", None) is not None
+    _frame_diag: Dict[str, Any] = {"n": 0, "started_at": 0.0, "prev": None}
+
     def _on_event(event: Any) -> None:
         # TTFB watchdog and activity touch — runs once per SSE event.
-        agent._codex_stream_last_event_ts = time.time()
+        now = time.time()
+        agent._codex_stream_last_event_ts = now
+        stream_diag = None
+        if _diag_wire:
+            stream_diag = build_stream_diag(
+                mode=getattr(agent, "api_mode", "") or "",
+                shape=classify_codex_event(_event_field(event, "type", "")),
+                frame_index=_frame_diag["n"],
+                stream_seconds=now - float(_frame_diag["started_at"] or now),
+                repeat_frame=event is _frame_diag["prev"],
+                mapping_frame=isinstance(event, Mapping),
+                fields=None,
+            )
+        # Counted before the touch so a diagnostic failure cannot freeze the
+        # index. ``n`` is recorded pre-increment, so it names this frame.
+        _frame_diag["n"] = int(_frame_diag["n"]) + 1
+        _frame_diag["prev"] = event
         agent._touch_activity(
             "receiving stream response",
             advance=_codex_event_advances(event),
+            stream_diag=stream_diag,
         )
 
     for attempt in range(max_stream_retries + 1):
         if agent._interrupt_requested:
             raise InterruptedError("Agent interrupted before Codex stream retry")
+
+        _frame_diag["n"] = 0
+        _frame_diag["started_at"] = time.time()
+        _frame_diag["prev"] = None
 
         intercepted_events = []
         writer_token = {"value": None}

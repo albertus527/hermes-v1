@@ -4067,6 +4067,7 @@ class AIAgent:
         provenance: Optional[ActivityProvenance] = None,
         force_persist: bool = False,
         advance: Optional[bool] = None,
+        stream_diag: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Update the last-activity timestamp and description (thread-safe).
 
@@ -4097,6 +4098,11 @@ class AIAgent:
         inactivity monitor, compression budget, SessionDB projection), and a
         keep-alive must keep behaving exactly as it does today there. Only an
         external supervisor demotes keep-alives to non-progress.
+
+        ``stream_diag`` is the optional, purely observational frame-shape object
+        the three receiving-stream emit sites attach (see
+        ``agent/stream_shapes.py``). It rides the same guarded block, changes no
+        clock here, and is absent on every other call site.
         """
         from agent.session_activity import (
             bound_activity_description,
@@ -4117,7 +4123,9 @@ class AIAgent:
                 from agent.progress_events import make_progress_payload
 
                 payload = make_progress_payload(
-                    self._last_activity_desc, advance=advance
+                    self._last_activity_desc,
+                    advance=advance,
+                    stream_diag=stream_diag,
                 )
                 progress_cb(payload["kind"], payload)
             except Exception:

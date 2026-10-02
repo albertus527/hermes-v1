@@ -266,6 +266,7 @@ class _OneshotProgressEmitter:
         phase: str,
         desc: str = "",
         advance: Optional[bool] = None,
+        stream_diag: Optional[dict] = None,
     ) -> None:
         if self._closed:
             return
@@ -282,22 +283,32 @@ class _OneshotProgressEmitter:
         try:
             import json
 
-            line = json.dumps(
-                {
-                    "run_id": self._run_id,
-                    "event": kind if kind == "channel_ready" else "progress",
-                    "kind": kind,
-                    "phase": phase,
-                    # Forward-progress bit. Absent means True so a supervisor
-                    # driving an older producer keeps its pre-change behaviour.
-                    "advance": True if advance is None else bool(advance),
-                    "desc": desc,
-                },
-                separators=(",", ":"),
-            )
+            record = {
+                "run_id": self._run_id,
+                "event": kind if kind == "channel_ready" else "progress",
+                "kind": kind,
+                "phase": phase,
+                # Forward-progress bit. Absent means True so a supervisor
+                # driving an older producer keeps its pre-change behaviour.
+                "advance": True if advance is None else bool(advance),
+                "desc": desc,
+            }
+            # Optional, observational frame shape. Anything that is not a
+            # mapping is dropped rather than serialized: an unexpected type must
+            # not be able to change what the supervisor sees about liveness.
+            if isinstance(stream_diag, dict):
+                record["stream_diag"] = stream_diag
+            line = json.dumps(record, separators=(",", ":"))
             if not line.endswith("\n"):
                 line += "\n"
             data = line.encode("utf-8", "replace")
+            if len(data) > _PROGRESS_MAX_EVENT_BYTES and "stream_diag" in record:
+                # Drop the diagnostic and re-serialize rather than truncate: a
+                # truncated line is unparseable, so the reader discards the whole
+                # event and loses a LIVENESS signal over an optional extra.
+                del record["stream_diag"]
+                line = json.dumps(record, separators=(",", ":")) + "\n"
+                data = line.encode("utf-8", "replace")
             if len(data) > _PROGRESS_MAX_EVENT_BYTES:
                 data = data[: _PROGRESS_MAX_EVENT_BYTES - 1] + b"\n"
             # Single append-mode write: the line lands whole or not at all.
@@ -317,6 +328,7 @@ class _OneshotProgressEmitter:
             str(payload.get("phase") or "active"),
             str(payload.get("desc") or ""),
             advance,
+            payload.get("stream_diag"),
         )
 
     def announce_ready(self) -> None:

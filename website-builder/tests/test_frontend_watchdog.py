@@ -22,6 +22,10 @@ import pytest
 
 from app.hermes import watchdog as wd
 
+#: Sentinel for "the caller did not pass a stream_diag at all", so a test can
+#: pass ``None``/junk and mean it.
+_ABSENT = object()
+
 
 # ---------------------------------------------------------------------------
 # Fake clock, fake child, scripted progress stream.
@@ -93,6 +97,7 @@ class ProgressScript:
         desc: Optional[str] = None,
         *,
         advance: Optional[bool] = None,
+        stream_diag: object = _ABSENT,
     ) -> "ProgressScript":
         # ``desc`` defaults to the old synthetic label so every existing test is
         # unchanged; forensic tests pass a real emitter description.
@@ -100,8 +105,19 @@ class ProgressScript:
         # ``advance`` is OMITTED from the line when None, on purpose: that is how
         # an older producer's line looks, and the watchdog must keep treating it
         # as forward progress. Tests that need a keep-alive pass False.
+        #
+        # ``stream_diag`` is OMITTED unless supplied — including when it is
+        # supplied as something malformed, which is how a producer that sends
+        # junk (or a hostile one) reaches the reader.
         self.schedule.setdefault(when, []).append(
-            (run_id, kind, phase, f"{kind.lower()}:{phase}" if desc is None else desc, advance)
+            (
+                run_id,
+                kind,
+                phase,
+                f"{kind.lower()}:{phase}" if desc is None else desc,
+                advance,
+                stream_diag,
+            )
         )
         return self
 
@@ -110,7 +126,7 @@ class ProgressScript:
 
     def flush(self) -> None:
         due = self.schedule.pop(self.clock.now, None)
-        for run_id, kind, phase, desc, advance in due or []:
+        for run_id, kind, phase, desc, advance, stream_diag in due or []:
             event = {
                 "run_id": run_id,
                 "event": "channel_ready" if kind == "channel_ready" else "progress",
@@ -120,6 +136,8 @@ class ProgressScript:
             }
             if advance is not None:
                 event["advance"] = advance
+            if stream_diag is not _ABSENT:
+                event["stream_diag"] = stream_diag
             line = json.dumps(event, separators=(",", ":")) + "\n"
             os.write(self.fd, line.encode("utf-8"))
 
@@ -769,6 +787,89 @@ def test_real_child_with_real_oneshot_emitter_is_supervised(tmp_path):
     assert real_oneshot.PROGRESS_ID_ENV == "HERMES_ONESHOT_PROGRESS_ID"
 
 
+def test_a_real_childs_frame_shapes_reach_the_receipt(tmp_path):
+    """The whole diagnostic chain, with the real producer on both ends.
+
+    Same child-process harness as above, but the STREAM events carry a
+    ``stream_diag`` built by the real ``agent.stream_shapes`` and attached by the
+    real emitter — so what lands in the receipt is exactly what a supervised
+    FRONTEND run would leave behind for the p19 forensics to read. This is the
+    CI-substitute for reading one real invocation's receipt by hand.
+    """
+    child = tmp_path / "shapes.py"
+    child.write_text(
+        "import sys, time\n"
+        "from hermes_cli import oneshot\n"
+        "from agent.progress_events import make_progress_payload\n"
+        "from agent.stream_shapes import build_stream_diag, classify_openai_chunk\n"
+        "from types import SimpleNamespace as NS\n"
+        "emitter = oneshot._build_progress_emitter()\n"
+        "if emitter is None:\n"
+        "    sys.exit(9)\n"
+        "frames = [\n"
+        "    NS(choices=[NS(delta=NS(content='', tool_calls=None))]),\n"
+        "    NS(choices=[], usage=NS(prompt_tokens=1)),\n"
+        "]\n"
+        "emitter.on_progress('MODEL', make_progress_payload('starting API call #1'))\n"
+        "for i, frame in enumerate(frames):\n"
+        "    emitter.on_progress('STREAM', make_progress_payload(\n"
+        "        'receiving stream response',\n"
+        "        advance=classify_openai_chunk(frame) != 'usage_only',\n"
+        "        stream_diag=build_stream_diag(\n"
+        "            mode='chat_completions',\n"
+        "            shape=classify_openai_chunk(frame),\n"
+        "            frame_index=i,\n"
+        "            stream_seconds=1.0 * i,\n"
+        "        )))\n"
+        "    # Past the emitter's 5s active-event coalescing window, so the\n"
+        "    # second frame's shape survives as its own line.\n"
+        "    time.sleep(5.2)\n"
+        "emitter.on_progress('MODEL', make_progress_payload('API call #1 completed'))\n"
+        "emitter.close()\n",
+        encoding="utf-8",
+    )
+
+    policy = wd.WatchdogPolicy(
+        idle_timeout_seconds=20.0,
+        hard_max_runtime_seconds=120.0,
+        max_single_operation_seconds=60.0,
+        legacy_wallclock_seconds=120.0,
+        startup_grace_seconds=10.0,
+        poll_interval_seconds=0.05,
+    )
+    run = wd.supervise_frontend_run(
+        [sys.executable, str(child)],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2])},
+        project_id="e2e-shapes",
+        invocation_id="e2e-shapes-invocation",
+        build_operation_id="1",
+        progress_path=tmp_path / "progress.jsonl",
+        policy=policy,
+        diagnostics_dir=tmp_path / "diag",
+    )
+
+    assert run.returncode == 0, "child failed to build the real emitter"
+    assert run.outcome is None
+
+    receipt = json.loads(
+        (tmp_path / "diag" / "e2e-shapes-invocation.json").read_text(encoding="utf-8")
+    )
+    frames = receipt["stream_frames"]
+    assert frames["shapes"] == {"empty_delta": 1, "usage_only": 1}
+    # The empty-content keep-alive is the one that kept the run alive — which is
+    # exactly the p19 finding this block exists to make readable.
+    assert frames["advancing_by_shape"] == {"empty_delta": 1}
+    assert frames["api_modes"] == {"chat_completions": 2}
+    assert frames["last_shape"] == "usage_only"
+    assert frames["max_frame_index"] == 1
+    assert receipt["counters"]["stream_active"] == 2
+    # MODEL started + MODEL completed + the one advancing frame.
+    assert receipt["counters"]["advance"] == 3
+    # ... and the only non-advancing event is the terminal usage frame.
+    assert receipt["counters"]["keepalive"] == 1
+
+
 def test_supervisor_propagates_the_progress_env_contract(tmp_path):
     """The env the supervisor sets is the env the oneshot emitter reads."""
     from hermes_cli import oneshot as real_oneshot
@@ -1375,6 +1476,355 @@ def test_receipt_is_bounded_for_a_very_long_noisy_run(tmp_path):
         assert run.outcome is None
     finally:
         made.script.close()
+
+
+# --- STREAM frame shapes ----------------------------------------------------
+#
+# Which post-provider-close frame shape was emitted as STREAM/active/advance=
+# true. A timeout code says a bound fired; only this says the stream was alive
+# AND what it was made of. Nothing here feeds a bound — the counters are folded
+# after the liveness decision, exactly like every other forensic field.
+
+
+def _stream_diag(shape="empty_delta", **overrides):
+    diag = {
+        "mode": "chat_completions",
+        "shape": shape,
+        "n": 1200,
+        "t": 61.2,
+        "rep": False,
+        "map": False,
+        "d": {"content": True, "reasoning": False, "tool": False, "finish": False},
+    }
+    diag.update(overrides)
+    return diag
+
+
+def test_a_shape_carrying_stream_lands_in_the_receipt(harness):
+    """The whole point: WHICH shape kept this stream alive, for how long."""
+    harness.script.ready(0, "inv-A")
+    harness.script.at(
+        1, "inv-A", "STREAM", "active", desc="receiving stream response",
+        advance=True, stream_diag=_stream_diag("text_delta", n=10, t=1.0),
+    )
+    # The keep-alive the denylist lets through as progress, over and over.
+    for i in range(2, 12):
+        harness.script.at(
+            i, "inv-A", "STREAM", "active", desc="receiving stream response",
+            advance=True, stream_diag=_stream_diag("empty_delta", n=10 * i, t=1.0 * i),
+        )
+    # The terminal usage frame is demoted, and is recorded as such.
+    harness.script.at(
+        20, "inv-A", "STREAM", "active", desc="receiving stream response",
+        advance=False, stream_diag=_stream_diag("usage_only", n=120, t=20.0),
+    )
+
+    run = harness.run("inv-A", exit_at=25)
+
+    frames = run.diagnostics["forensics"]["stream_frames"]
+    assert frames["shapes"] == {"text_delta": 1, "empty_delta": 10, "usage_only": 1}
+    # The advance split is the finding: empty_delta is what kept the run alive.
+    assert frames["advancing_by_shape"] == {"text_delta": 1, "empty_delta": 10}
+    assert frames["api_modes"] == {"chat_completions": 12}
+    assert frames["last_shape"] == "usage_only"
+    assert frames["repeat_frame_count"] == 0
+    assert frames["mapping_frame_count"] == 0
+    assert frames["max_frame_index"] == 120
+    assert frames["max_frame_seconds"] == 20.0
+    assert frames["first_offset_seconds"] == 1.0
+    assert frames["last_offset_seconds"] == 20.0
+    assert frames["shapes_truncated"] is False
+    assert frames["api_modes_truncated"] is False
+
+
+def test_the_two_identity_fingerprints_are_counted(harness):
+    """``rep`` and ``map`` are the two findings that change the diagnosis.
+
+    rep: the child saw the same frame OBJECT twice in a row, so a local
+    emitter is re-yielding a cached frame and "the provider is still sending"
+    is false. map: frames arrived as Mappings, so every getattr in the
+    classifier missed and everything advances regardless of content.
+    """
+    harness.script.ready(0, "inv-A")
+    harness.script.at(
+        1, "inv-A", "STREAM", "active", desc="receiving stream response",
+        stream_diag=_stream_diag("empty_delta", rep=True, map=True),
+    )
+    harness.script.at(
+        2, "inv-A", "STREAM", "active", desc="receiving stream response",
+        stream_diag=_stream_diag("unknown", rep=False, map=True),
+    )
+    harness.script.at(
+        3, "inv-A", "STREAM", "active", desc="receiving stream response",
+        stream_diag=_stream_diag("text_delta"),
+    )
+
+    run = harness.run("inv-A", exit_at=6)
+
+    frames = run.diagnostics["forensics"]["stream_frames"]
+    assert frames["repeat_frame_count"] == 1
+    assert frames["mapping_frame_count"] == 2
+    assert frames["shapes"] == {"empty_delta": 1, "unknown": 1, "text_delta": 1}
+    # An api_mode-less diag (or one the validator drops) folds nothing rather
+    # than inventing a key.
+    assert frames["api_modes"] == {"chat_completions": 3}
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        None,
+        "empty_delta",
+        42,
+        ["empty_delta"],
+        {},
+        {"mode": "chat_completions"},
+        {"shape": ""},
+        {"shape": None},
+        {"shape": 7},
+        # Not a taxonomy token: a shape is only useful as an enum member.
+        {"shape": "../../etc/passwd"},
+        {"shape": "Empty Delta"},
+        {"shape": "empty_delta" * 20},
+    ],
+)
+def test_an_unusable_diagnostic_is_ignored_and_changes_no_bound(harness, bad):
+    harness.script.ready(0, "inv-A")
+    harness.script.at(
+        1, "inv-A", "STREAM", "active", desc="receiving stream response",
+        advance=True, stream_diag=bad,
+    )
+    harness.script.at(
+        2, "inv-A", "STREAM", "active", desc="receiving stream response",
+        advance=False, stream_diag=bad,
+    )
+    harness.script.at(5, "inv-A", "TOOL", "started", desc="executing tool: terminal")
+    harness.script.at(6, "inv-A", "TOOL", "completed", desc="tool completed: terminal (0.1s)")
+
+    run = harness.run("inv-A", exit_at=10)
+
+    # Liveness is decided exactly as it would have been: the events are still
+    # accepted, counted, and able to keep the run alive. (2 STREAM + 1 TOOL
+    # start advance; the one demoted STREAM frame is the only keep-alive.)
+    counters = run.diagnostics["forensics"]["counters"]
+    assert counters["stream_active"] == 2
+    assert counters["advance"] == 3
+    assert counters["keepalive"] == 1
+    # Nothing was recorded from the junk.
+    frames = run.diagnostics["forensics"]["stream_frames"]
+    assert frames["shapes"] == {}
+    assert frames["advancing_by_shape"] == {}
+    assert frames["api_modes"] == {}
+    assert frames["last_shape"] is None
+    assert frames["first_offset_seconds"] is None
+
+
+@pytest.mark.parametrize(
+    "bad, dropped",
+    [
+        ({"n": -1}, "n"),
+        ({"n": True}, "n"),
+        ({"t": "61.2"}, "t"),
+        ({"t": float("inf")}, "t"),
+        ({"rep": "yes"}, "rep"),
+        ({"map": 1}, "map"),
+        ({"mode": "m" * 200}, "mode"),
+    ],
+)
+def test_one_unusable_scalar_does_not_discard_the_shape(harness, bad, dropped):
+    """The shape is the finding; a bogus counter beside it is just dropped.
+
+    Discarding a whole diagnostic because its ``n`` arrived as a string would
+    throw away the one thing the receipt exists to record, over a field no
+    reader depends on.
+    """
+    harness.script.ready(0, "inv-A")
+    harness.script.at(
+        1, "inv-A", "STREAM", "active", desc="receiving stream response",
+        stream_diag=_stream_diag("empty_delta", **bad),
+    )
+    harness.script.at(2, "inv-A", "TOOL", "started", desc="executing tool: terminal")
+    harness.script.at(3, "inv-A", "TOOL", "completed", desc="tool completed: terminal (0.1s)")
+
+    run = harness.run("inv-A", exit_at=6)
+
+    frames = run.diagnostics["forensics"]["stream_frames"]
+    assert frames["shapes"] == {"empty_delta": 1}
+    # The unusable scalar is dropped; the well-formed one beside it survives.
+    if dropped == "n":
+        assert frames["last_frame_index"] is None
+        assert frames["max_frame_index"] == 0
+        assert frames["last_frame_seconds"] == 61.2
+    if dropped == "t":
+        assert frames["last_frame_seconds"] is None
+        assert frames["max_frame_seconds"] == 0.0
+        assert frames["last_frame_index"] == 1200
+    if dropped == "mode":
+        assert frames["api_modes"] == {}
+    if dropped == "rep":
+        assert frames["repeat_frame_count"] == 0
+    if dropped == "map":
+        assert frames["mapping_frame_count"] == 0
+
+
+def test_an_absent_diagnostic_still_works_exactly_as_before(harness):
+    """An older child keeps working: absence is not a failure."""
+    harness.script.ready(0, "inv-A")
+    for i in range(1, 6):
+        harness.script.at(
+            i, "inv-A", "STREAM", "active", desc="receiving stream response"
+        )
+    harness.script.at(6, "inv-A", "TOOL", "started", desc="executing tool: terminal")
+    harness.script.at(7, "inv-A", "TOOL", "completed", desc="tool completed: terminal (0.1s)")
+
+    run = harness.run("inv-A", exit_at=10)
+
+    forensics = run.diagnostics["forensics"]
+    assert forensics["counters"]["stream_active"] == 5
+    assert forensics["stream_frames"]["shapes"] == {}
+    assert forensics["stream_frames"]["last_shape"] is None
+
+
+def test_shape_counts_are_capped_and_flagged(harness):
+    """A producer that widens the taxonomy cannot grow the receipt."""
+    harness.script.ready(0, "inv-A")
+    for i in range(wd.MAX_STREAM_SHAPE_KEYS + 5):
+        harness.script.at(
+            i,
+            "inv-A",
+            "STREAM",
+            "active",
+            desc="receiving stream response",
+            stream_diag=_stream_diag(f"shape{i:02d}", n=i, t=float(i)),
+        )
+    for i in range(wd.MAX_API_MODE_KEYS + 3):
+        harness.script.at(
+            wd.MAX_STREAM_SHAPE_KEYS + 5 + i,
+            "inv-A",
+            "STREAM",
+            "active",
+            desc="receiving stream response",
+            stream_diag=_stream_diag("text_delta", mode=f"mode{i}"),
+        )
+
+    run = harness.run("inv-A", exit_at=60)
+
+    frames = run.diagnostics["forensics"]["stream_frames"]
+    assert len(frames["shapes"]) == wd.MAX_STREAM_SHAPE_KEYS
+    assert frames["shapes_truncated"] is True
+    # The advancing split is gated on the same admission, so it can never hold a
+    # key the shape count rejected — one bound, one flag, no second loose dict.
+    assert set(frames["advancing_by_shape"]) <= set(frames["shapes"])
+    assert len(frames["api_modes"]) == wd.MAX_API_MODE_KEYS
+    assert frames["api_modes_truncated"] is True
+
+
+def test_every_shape_the_producer_can_emit_survives_validation():
+    """The taxonomy and this validator must not drift apart.
+
+    The producer's enum is closed; the supervisor matches it with a shape
+    regex and a length cap rather than a copied list. If a new shape could
+    exceed either, it would be silently dropped in the field — the failure this
+    asserts cannot happen.
+    """
+    from agent.stream_shapes import STREAM_SHAPES, STREAM_DIAG_MODE_MAX
+
+    for shape in STREAM_SHAPES:
+        assert wd.normalize_stream_diag({"shape": shape}) == {"shape": shape}, shape
+        assert len(shape) <= wd.STREAM_DIAG_TOKEN_MAX
+    # The api_mode values the three emit sites send are tokens too.
+    for mode in ("chat_completions", "anthropic_messages", "codex_responses"):
+        normalized = wd.normalize_stream_diag({"shape": "empty_delta", "mode": mode})
+        assert normalized["mode"] == mode
+    assert STREAM_DIAG_MODE_MAX <= wd.STREAM_DIAG_TOKEN_MAX
+
+
+def test_stream_shape_counts_are_lower_bounds_not_exact_counts(harness):
+    """Coalescing undercounts; it never misattributes.
+
+    The transport drops any second active event within 5s, so a run's true
+    frame count is at least the recorded one. The shape on a retained line is
+    still the shape that was actually firing — newest event wins.
+    """
+    harness.script.ready(0, "inv-A")
+    for i in range(6):
+        harness.script.at(
+            i * 10, "inv-A", "STREAM", "active", desc="receiving stream response",
+            stream_diag=_stream_diag("empty_delta", n=1000 + i, t=10.0 * i),
+        )
+    harness.script.at(200, "inv-A", "TOOL", "started", desc="executing tool: terminal")
+    harness.script.at(201, "inv-A", "TOOL", "completed", desc="tool completed: terminal (0.1s)")
+
+    run = harness.run("inv-A", exit_at=210)
+
+    frames = run.diagnostics["forensics"]["stream_frames"]
+    # One retained line per distinct second in the script; the emitter's 5s
+    # window would have coalesced any that landed closer than that.
+    assert sum(frames["shapes"].values()) == 6
+    assert frames["shapes"] == {"empty_delta": 6}
+    # ... and it is a lower bound, because ``max_frame_index`` is the child's own
+    # per-attempt index, which ran far ahead of the six frames that survived.
+    assert frames["max_frame_index"] == 1005
+    assert frames["max_frame_seconds"] == 50.0
+
+
+def test_a_shape_carrying_line_still_refreshes_liveness_and_progress(harness):
+    """The diagnostic is observation: it cannot change any decision."""
+    harness.script.ready(0, "inv-A")
+    harness.script.at(
+        1, "inv-A", "MODEL", "started", desc="starting API call #1"
+    )
+    for i in range(2, 30):
+        harness.script.at(
+            i, "inv-A", "STREAM", "active", desc="receiving stream response",
+            advance=True, stream_diag=_stream_diag("empty_delta", n=i * 40, t=float(i)),
+        )
+    harness.script.at(
+        30, "inv-A", "MODEL", "completed", desc="API call #1 completed"
+    )
+    harness.script.at(31, "inv-A", "TOOL", "started", desc="executing tool: terminal")
+    harness.script.at(32, "inv-A", "TOOL", "completed", desc="tool completed: terminal (0.1s)")
+
+    # max_single_operation is 900s in fast_policy, and these keep-alives advance,
+    # so the run is never cut — exactly as it would be with no diagnostics at all.
+    run = harness.run("inv-A", exit_at=40)
+
+    assert run.outcome is None
+    frames = run.diagnostics["forensics"]["stream_frames"]
+    assert frames["shapes"] == {"empty_delta": 28}
+    assert frames["advancing_by_shape"] == {"empty_delta": 28}
+
+
+def test_the_diagnostic_cannot_smuggle_a_payload_into_the_receipt(harness, tmp_path):
+    """A shape is an enum and a counter. Nothing else on the wire is kept.
+
+    Even a producer (or a hostile one) that puts a model delta in an extra key
+    of the diagnostic gets it dropped by the validator, because the receipt
+    records only the closed set of scalar fields.
+    """
+    diag = tmp_path / "diag"
+    secret = "sk-live-CANARY-9f3a2b7c"
+    harness.script.ready(0, "inv-A")
+    harness.script.at(
+        1, "inv-A", "STREAM", "active",
+        desc="receiving stream response",
+        stream_diag={
+            **_stream_diag("empty_delta"),
+            "content": secret,
+            "delta": {"text": secret},
+            "tool_calls": [{"function": {"arguments": secret}}],
+        },
+    )
+    harness.script.at(2, "inv-A", "TOOL", "started", desc="executing tool: terminal")
+    harness.script.at(3, "inv-A", "TOOL", "completed", desc="tool completed: terminal (0.1s)")
+
+    run = harness.run("inv-A", exit_at=6, diagnostics_dir=diag)
+
+    body = (diag / "inv-A.json").read_text(encoding="utf-8")
+    assert secret not in body
+    assert secret not in json.dumps(run.diagnostics)
+    # ... and the finding itself survives.
+    assert run.diagnostics["forensics"]["stream_frames"]["shapes"] == {"empty_delta": 1}
 
 
 def test_pruning_keeps_the_newest_receipts_per_project(tmp_path):
