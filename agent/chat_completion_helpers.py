@@ -24,6 +24,7 @@ import re
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
@@ -44,6 +45,13 @@ from agent.message_sanitization import (
     _repair_tool_call_arguments,
 )
 from agent.reasoning_summaries import separate_glued_reasoning_blocks
+from agent.stream_shapes import (
+    advance_for_shape,
+    build_stream_diag,
+    classify_anthropic_event,
+    classify_openai_chunk,
+    frame_field_presence,
+)
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 from tools.terminal_tool import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
@@ -681,16 +689,13 @@ def _openai_chunk_advances(chunk: Any) -> bool:
     state change that ends the stream. Anything unrecognised advances too:
     a new real provider delta must never be misread as non-progress, and a
     premature kill is the only unacceptable failure direction.
+
+    A thin wrapper over ``stream_shapes.advance_for_shape(classify(...))``:
+    the frame's SHAPE taxonomy is what this decision is *made of*, so the
+    boolean and the recorded name are one classification, not two. The parity
+    between the two is asserted in ``tests/run_agent/test_streaming.py``.
     """
-    try:
-        choices = getattr(chunk, "choices", None)
-        if choices:
-            return True
-        if getattr(chunk, "usage", None):
-            return False
-    except Exception:
-        pass
-    return True
+    return advance_for_shape(classify_openai_chunk(chunk))
 
 
 #: Anthropic Messages SSE frame types that carry NO model output: the
@@ -4141,6 +4146,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     except Exception:
                         pass
 
+        # Wire-side frame diagnostics (STREAM ``stream_diag``). The subscription
+        # check is hoisted out of the loop, so an unsupervised run — every run
+        # that is not driven by a progress channel — pays one attribute read per
+        # STREAM CALL, not a handful per frame, and builds nothing. A supervised
+        # run classifies the frame twice (once for the advance bit, once for the
+        # name it records); both come from the same classifier, so the two
+        # cannot disagree, and ~10 attribute reads is not a cost worth splitting
+        # the hot path to avoid.
+        _diag_wire = getattr(agent, "progress_callback", None) is not None
+        _prev_frame: Dict[str, Any] = {"chunk": None}
+
         for chunk in _iter_provider_stream_chunks(
             stream,
             response=lambda: attempt_stream_response["value"],
@@ -4149,7 +4165,22 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             agent._touch_activity(
                 "receiving stream response",
                 advance=_openai_chunk_advances(chunk),
+                stream_diag=(
+                    build_stream_diag(
+                        mode=getattr(agent, "api_mode", "") or "",
+                        shape=classify_openai_chunk(chunk),
+                        frame_index=_diag.get("chunks", 0),
+                        stream_seconds=last_chunk_time["t"]
+                        - float(_diag.get("started_at") or last_chunk_time["t"]),
+                        repeat_frame=chunk is _prev_frame["chunk"],
+                        mapping_frame=isinstance(chunk, Mapping),
+                        fields=frame_field_presence(chunk),
+                    )
+                    if _diag_wire
+                    else None
+                ),
             )
+            _prev_frame["chunk"] = chunk
 
             # Update per-attempt diagnostic counters.  Best-effort —
             # failures are swallowed so the streaming hot path is never
@@ -4670,6 +4701,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             )
         )
         try:
+            # Wire-side frame diagnostics; see the chat_completions site above.
+            _diag_wire = getattr(agent, "progress_callback", None) is not None
+            _prev_event: Dict[str, Any] = {"event": None}
             for event in stream:
                 saw_stream_event = True
                 last_chunk_time["t"] = time.time()
@@ -4679,7 +4713,22 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 agent._touch_activity(
                     "receiving stream response",
                     advance=_anthropic_event_advances(_event_type),
+                    stream_diag=(
+                        build_stream_diag(
+                            mode=getattr(agent, "api_mode", "") or "",
+                            shape=classify_anthropic_event(_event_type),
+                            frame_index=_diag.get("chunks", 0),
+                            stream_seconds=last_chunk_time["t"]
+                            - float(_diag.get("started_at") or last_chunk_time["t"]),
+                            repeat_frame=event is _prev_event["event"],
+                            mapping_frame=isinstance(event, Mapping),
+                            fields=None,
+                        )
+                        if _diag_wire
+                        else None
+                    ),
                 )
+                _prev_event["event"] = event
                 try:
                     _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
                     if _diag.get("first_chunk_at") is None:

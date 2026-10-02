@@ -301,9 +301,10 @@ def _frontend_failure_reason(result: Dict[str, Any]) -> Dict[str, Any]:
     surfaced verbatim to the caller), the reason is bounded here because it is
     PERSISTED, not rendered.
 
-    ``invocation`` is the adapter's bounded ``frontend_forensics/2`` receipt:
-    activity counters, timestamps, normalized descriptions and hashes. It
-    never contains prompts, source, model output, tool arguments, or URLs.
+    ``invocation`` is the adapter's bounded ``frontend_forensics/3`` receipt:
+    activity counters, timestamps, normalized descriptions, stream frame
+    shapes, and hashes. It never contains prompts, source, model output, tool
+    arguments, or URLs.
     """
     raw_error = result.get("error") or "Unknown FRONTEND error"
     reason = {

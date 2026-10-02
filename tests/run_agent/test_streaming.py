@@ -4,6 +4,7 @@ Tests the unified streaming API call, delta callbacks, tool-call
 suppression, provider fallback, and CLI streaming display.
 """
 import threading
+from collections.abc import Mapping
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -1885,3 +1886,558 @@ class TestBedrockReasoningStaleFloor:
         from agent.chat_completion_helpers import _bedrock_reasoning_stale_floor
 
         assert _bedrock_reasoning_stale_floor(model_id) == expected
+
+
+# ── Stream frame-shape diagnostics ─────────────────────────────────────────
+#
+# The keep-alive classifier is a DENYLIST, so every shape it does not
+# positively recognise emits advance=True and keeps a supervisor's progress
+# clock alive. That is the correct fail-safe, but it leaves the receipt unable
+# to say WHICH shape was doing the refreshing. The taxonomy below names it, and
+# the two properties that make it safe to put on the hot path are asserted
+# here: the boolean is unchanged for every input, and no frame value can reach
+# the produced record.
+
+
+class _RaisingFrame:
+    """An attribute object whose every field access raises."""
+
+    def __getattr__(self, name):
+        raise RuntimeError(f"hostile frame: {name}")
+
+
+class _RaisingMapping(Mapping):
+    """A Mapping-shaped frame whose every key read raises."""
+
+    def __getitem__(self, key):
+        raise RuntimeError(f"hostile mapping: {key}")
+
+    def __iter__(self):
+        return iter(())
+
+    def __len__(self):
+        return 0
+
+
+class _UnsubscribableChoices:
+    """A truthy ``choices`` that cannot be indexed."""
+
+    def __bool__(self):
+        return True
+
+    def __getitem__(self, index):
+        raise RuntimeError("hostile choices")
+
+
+def _choice(*, finish_reason=None, **delta_fields):
+    return SimpleNamespace(
+        index=0,
+        delta=SimpleNamespace(**delta_fields),
+        finish_reason=finish_reason,
+    )
+
+
+def _frame(*choices, **chunk_fields):
+    return SimpleNamespace(choices=list(choices), **chunk_fields)
+
+
+#: One frame per taxonomy category, plus the two shapes the denylist cannot
+#: demote. Attribute objects AND dict frames, because ``map=True`` is itself a
+#: finding: a Mapping frame makes every ``getattr`` in the classifier miss.
+FRAME_TAXONOMY = [
+    ("text_delta", _frame(_choice(content="hi"), usage=None)),
+    (
+        "text_delta",
+        _frame(_choice(content=["part-a", "part-b"]), usage=None),
+    ),
+    ("reasoning_delta", _frame(_choice(reasoning_content="thinking"), usage=None)),
+    ("reasoning_delta", _frame(_choice(reasoning="thinking"), usage=None)),
+    (
+        "tool_call_delta",
+        _frame(_choice(content=None, tool_calls=[{"function": {"arguments": "{"}}])),
+    ),
+    (
+        "tool_call_delta",
+        _frame(_choice(content=None, function_call={"name": "terminal"})),
+    ),
+    (
+        "finish_only",
+        _frame(SimpleNamespace(index=0, delta=None, finish_reason="stop")),
+    ),
+    # F1 hole #1: choices present and empty, no usage. Advances.
+    ("empty_delta", _frame(usage=None)),
+    ("empty_delta", SimpleNamespace(choices=None, usage=None)),
+    # F1 hole #2: a keep-alive whose delta says content="" — the field is
+    # PRESENT, which frame_field_presence reports, but nothing arrived.
+    ("empty_delta", _frame(_choice(content="", tool_calls=None))),
+    ("empty_delta", _frame(_choice(role="assistant"))),
+    ("usage_only", _frame(usage=SimpleNamespace(prompt_tokens=10))),
+    (
+        "error_shape",
+        SimpleNamespace(choices=None, usage=None, model_extra={"error_type": "validation"}),
+    ),
+    ("error_shape", SimpleNamespace(choices=None, error={"code": "rate_limit"})),
+    ("unknown", object()),
+    ("unknown", None),
+    ("unknown", {}),
+    # Dict-shaped frames, classified rather than blowing up.
+    ("empty_delta", {"choices": [{"delta": {"content": ""}}]}),
+    ("text_delta", {"choices": [{"delta": {"content": "hi"}}]}),
+    ("usage_only", {"choices": [], "usage": {"total_tokens": 3}}),
+    ("error_shape", {"choices": None, "error_message": "bad request"}),
+    ("unknown", {"id": "chunk-1", "object": "chat.completion.chunk"}),
+]
+
+#: Inputs whose only requirement is that nothing raises and nothing is decided
+#: by a guess.
+HOSTILE_FRAMES = [
+    _RaisingFrame(),
+    _RaisingMapping(),
+    _UnsubscribableChoices(),
+    SimpleNamespace(choices=_UnsubscribableChoices(), usage=None),
+    SimpleNamespace(choices=[_RaisingFrame()]),
+    SimpleNamespace(choices="not-a-list", usage=None),
+    SimpleNamespace(choices=0, usage=0),
+    SimpleNamespace(choices=False, usage=[]),
+    MagicMock(),
+    [1, 2, 3],
+    "a string frame",
+    42,
+]
+
+#: Distinctive payload values. None of them may appear anywhere in a produced
+#: record — that is the whole safety argument for presence-only classification.
+CANARY = "sk-live-CANARY-9f3a2b7c-do-not-log"
+
+
+class TestStreamFrameShapeTaxonomy:
+    """The 8-way taxonomy, its parity, and its totality."""
+
+    @pytest.mark.parametrize(
+        "expected, frame", FRAME_TAXONOMY, ids=[f"{s}-{i}" for i, (s, _) in enumerate(FRAME_TAXONOMY)]
+    )
+    def test_every_category_is_named_from_field_presence(self, expected, frame):
+        from agent.stream_shapes import classify_openai_chunk
+
+        assert classify_openai_chunk(frame) == expected
+
+    def test_the_taxonomy_is_closed(self):
+        from agent.stream_shapes import OPENAI_CHUNK_SHAPES, classify_openai_chunk
+
+        observed = {classify_openai_chunk(frame) for _, frame in FRAME_TAXONOMY}
+        assert observed <= OPENAI_CHUNK_SHAPES
+        # Every member of the enum is reachable, so the taxonomy cannot drift
+        # into a category nothing produces.
+        assert OPENAI_CHUNK_SHAPES == {
+            "text_delta",
+            "reasoning_delta",
+            "tool_call_delta",
+            "finish_only",
+            "empty_delta",
+            "usage_only",
+            "error_shape",
+            "unknown",
+        }
+
+    @pytest.mark.parametrize(
+        "frame",
+        [frame for _, frame in FRAME_TAXONOMY] + HOSTILE_FRAMES,
+        ids=lambda f: type(f).__name__,
+    )
+    def test_the_advance_bit_is_unchanged_for_every_input(self, frame):
+        """The load-bearing invariant: naming a frame changes no decision.
+
+        ``_openai_chunk_advances`` is now a wrapper over the taxonomy, so this
+        is not a coincidence to be re-established by hand — it is the property
+        the wrapper exists to guarantee.
+        """
+        from agent.chat_completion_helpers import _openai_chunk_advances
+        from agent.stream_shapes import advance_for_shape, classify_openai_chunk
+
+        assert advance_for_shape(classify_openai_chunk(frame)) is (
+            _openai_chunk_advances(frame)
+        )
+
+    def test_only_the_usage_frame_is_demoted(self):
+        from agent.stream_shapes import (
+            OPENAI_CHUNK_SHAPES,
+            advance_for_shape,
+        )
+
+        demoted = {shape for shape in OPENAI_CHUNK_SHAPES if not advance_for_shape(shape)}
+        assert demoted == {"usage_only"}
+
+    @pytest.mark.parametrize("frame", HOSTILE_FRAMES, ids=lambda f: type(f).__name__)
+    def test_hostile_input_classifies_without_raising(self, frame):
+        """A frame nobody can read is a label, never an exception.
+
+        These are the frames whose classification decides whether a run is
+        killed, so "raise" and "guess from a mock's auto-attributes" are both
+        unacceptable: the loop must survive, and the answer must come from the
+        shared enum.
+        """
+        from agent.stream_shapes import (
+            OPENAI_CHUNK_SHAPES,
+            classify_openai_chunk,
+            frame_field_presence,
+        )
+
+        assert classify_openai_chunk(frame) in OPENAI_CHUNK_SHAPES
+        presence = frame_field_presence(frame)
+        assert set(presence) == {"content", "reasoning", "tool", "finish"}
+        assert all(isinstance(value, bool) for value in presence.values())
+
+    @pytest.mark.parametrize("frame", HOSTILE_FRAMES, ids=lambda f: type(f).__name__)
+    def test_a_mapping_frame_is_classified_not_dropped(self, frame):
+        """``getattr`` on a Mapping misses everything, so the shape must not.
+
+        A frame that arrives as a mapping is exactly the F1 hole: every
+        attribute read in the historical classifier returns nothing, so
+        everything advances. The classifier has to still name it, and the
+        diagnostic has to still report ``map=True``.
+        """
+        from agent.stream_shapes import (
+            OPENAI_CHUNK_SHAPES,
+            build_stream_diag,
+            classify_openai_chunk,
+        )
+
+        assert classify_openai_chunk(frame) in OPENAI_CHUNK_SHAPES
+        assert build_stream_diag(mapping_frame=isinstance(frame, Mapping))["map"] is (
+            isinstance(frame, Mapping)
+        )
+
+    def test_no_payload_value_reaches_any_produced_record(self):
+        """The safety invariant: presence, never value."""
+        import json
+
+        from agent.stream_shapes import (
+            build_stream_diag,
+            classify_openai_chunk,
+            frame_field_presence,
+        )
+
+        frame = _frame(
+            _choice(
+                content=CANARY,
+                reasoning_content=CANARY,
+                tool_calls=[{"function": {"arguments": CANARY}}],
+            ),
+            usage=SimpleNamespace(prompt_tokens=CANARY),
+        )
+        produced = json.dumps(
+            {
+                "shape": classify_openai_chunk(frame),
+                "fields": frame_field_presence(frame),
+                "diag": build_stream_diag(
+                    mode="chat_completions",
+                    shape=classify_openai_chunk(frame),
+                    frame_index=CANARY,
+                    stream_seconds=CANARY,
+                    repeat_frame=CANARY,
+                    mapping_frame=CANARY,
+                    fields=frame_field_presence(frame),
+                ),
+            }
+        )
+        assert CANARY not in produced
+
+    def test_field_presence_distinguishes_empty_content_from_no_delta(self):
+        """``d.content=True`` with ``shape=empty_delta`` IS the keep-alive."""
+        from agent.stream_shapes import classify_openai_chunk, frame_field_presence
+
+        keep_alive = _frame(_choice(content="", tool_calls=None))
+        assert classify_openai_chunk(keep_alive) == "empty_delta"
+        assert frame_field_presence(keep_alive)["content"] is True
+
+        role_only = _frame(_choice(role="assistant"))
+        assert classify_openai_chunk(role_only) == "empty_delta"
+        assert frame_field_presence(role_only)["content"] is False
+
+
+class TestStreamShapeWireObject:
+    """``build_stream_diag`` is fixed-key, bounded, and serialisable."""
+
+    def test_keys_are_fixed_and_values_are_bounded_scalars(self):
+        from agent.stream_shapes import build_stream_diag
+
+        diag = build_stream_diag(
+            mode="chat_completions" * 50,
+            shape="empty_delta",
+            frame_index=10**12,
+            stream_seconds=61.24,
+            repeat_frame=False,
+            mapping_frame=True,
+            fields={"content": True, "reasoning": False, "tool": False, "finish": False},
+        )
+        assert set(diag) == {"mode", "shape", "n", "t", "rep", "map", "d"}
+        assert diag["n"] == 10**9  # clamped, not rejected
+        assert diag["t"] == 61.2
+        assert isinstance(diag["rep"], bool) and diag["rep"] is False
+        assert set(diag["d"]) == {"content", "reasoning", "tool", "finish"}
+
+    @pytest.mark.parametrize(
+        "shape, expected",
+        [
+            ("empty_delta", "empty_delta"),
+            ("a:content_block_delta", "a:content_block_delta"),
+            ("c:response.in_progress", "c:response.in_progress"),
+            # Anything outside the closed taxonomy collapses, so the wire key
+            # space can never be widened by a producer.
+            ("../../etc/passwd", "unknown"),
+            ("", "unknown"),
+            (None, "unknown"),
+            (object(), "unknown"),
+        ],
+    )
+    def test_shape_is_confined_to_the_closed_taxonomy(self, shape, expected):
+        from agent.stream_shapes import build_stream_diag
+
+        assert build_stream_diag(shape=shape)["shape"] == expected
+
+    def test_the_wire_form_fits_the_progress_line_budget(self):
+        """~130 bytes is the design budget inside the 1024-byte line cap."""
+        import json
+
+        from agent.stream_shapes import build_stream_diag
+
+        line = json.dumps(
+            {
+                "run_id": "inv-0" * 4,
+                "event": "progress",
+                "kind": "STREAM",
+                "phase": "active",
+                "advance": True,
+                "desc": "receiving stream response",
+                "stream_diag": build_stream_diag(
+                    mode="chat_completions",
+                    shape="empty_delta",
+                    frame_index=123456,
+                    stream_seconds=3611.7,
+                    repeat_frame=True,
+                    mapping_frame=True,
+                    fields={"content": True},
+                ),
+            },
+            separators=(",", ":"),
+        )
+        from hermes_cli.oneshot import _PROGRESS_MAX_EVENT_BYTES
+
+        assert len(line.encode("utf-8")) < _PROGRESS_MAX_EVENT_BYTES
+
+
+class TestStreamShapeEventNormalisation:
+    """Anthropic/Responses shapes are a bounded echo of the event type."""
+
+    @pytest.mark.parametrize(
+        "event_type, expected",
+        [
+            ("content_block_delta", "a:content_block_delta"),
+            ("content_block_start", "a:content_block_start"),
+            ("ping", "a:ping"),
+            ("message_stop", "a:message_stop"),
+            # "a new type nobody has seen" and "I could not read the type" are
+            # different findings, so they stay apart.
+            ("a.type.this.build.has.never.seen", "a:other"),
+            (None, "a:unreadable"),
+            ("", "a:unreadable"),
+            (123, "a:unreadable"),
+            ("x" * 100, "a:unreadable"),
+        ],
+    )
+    def test_anthropic_event_types_normalise(self, event_type, expected):
+        from agent.stream_shapes import classify_anthropic_event
+
+        assert classify_anthropic_event(event_type) == expected
+
+    @pytest.mark.parametrize(
+        "event_type, expected",
+        [
+            ("response.in_progress", "c:response.in_progress"),
+            ("response.queued", "c:response.queued"),
+            ("ping", "c:ping"),
+            ("error", "c:error"),
+            ("response.output_text.delta", "c:output_text_delta"),
+            ("response.reasoning_summary_text.delta", "c:reasoning"),
+            ("response.function_call_arguments.delta", "c:function_call"),
+            ("response.function_call_arguments.done", "c:function_call"),
+            ("response.output_item.done", "c:response.output_item.done"),
+            ("response.completed", "c:response.completed"),
+            ("response.brand.new", "c:other"),
+            (None, "c:unreadable"),
+            ({}, "c:unreadable"),
+        ],
+    )
+    def test_codex_event_types_normalise(self, event_type, expected):
+        from agent.stream_shapes import classify_codex_event
+
+        assert classify_codex_event(event_type) == expected
+
+    def test_every_normalised_shape_is_inside_the_wire_taxonomy(self):
+        from agent.stream_shapes import (
+            STREAM_SHAPES,
+            classify_anthropic_event,
+            classify_codex_event,
+        )
+
+        for event_type in ("ping", "content_block_delta", None, "", "brand.new"):
+            assert classify_anthropic_event(event_type) in STREAM_SHAPES
+        for event_type in ("ping", "response.in_progress", None, "brand.new"):
+            assert classify_codex_event(event_type) in STREAM_SHAPES
+
+
+class TestStreamShapeEmitSites:
+    """The diagnostic rides the existing progress channel, and only on it."""
+
+    def _agent(self, progress_callback=None):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+        agent.progress_callback = progress_callback
+        return agent
+
+    def _stream_agent(self, chunks, progress_callback):
+        from unittest.mock import MagicMock, patch
+
+        agent = self._agent(progress_callback)
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = iter(chunks)
+        with patch.object(
+            type(agent), "_create_request_openai_client", return_value=mock_client
+        ), patch.object(type(agent), "_close_request_openai_client"):
+            agent._interruptible_streaming_api_call({})
+        return agent
+
+    def test_a_shape_carrying_stream_names_every_frame_it_received(self):
+        seen = []
+        # content="" is the keep-alive the denylist lets through as progress.
+        chunks = [
+            _make_stream_chunk(content="real text"),
+            _make_stream_chunk(content=""),
+            _make_empty_chunk(usage=SimpleNamespace(prompt_tokens=10)),
+        ]
+        self._stream_agent(chunks, lambda kind, payload: seen.append(payload))
+
+        stream_payloads = [p for p in seen if p.get("kind") == "STREAM"]
+        assert len(stream_payloads) == len(chunks)
+        shapes = [p["stream_diag"]["shape"] for p in stream_payloads]
+        assert shapes == ["text_delta", "empty_delta", "usage_only"]
+        # The advance bit is untouched by the diagnostic: the keep-alive still
+        # advances, the terminal usage frame still does not.
+        assert [p["advance"] for p in stream_payloads] == [True, True, False]
+        # ``n`` is a per-attempt frame index; ``mode`` names the emit site.
+        assert [p["stream_diag"]["n"] for p in stream_payloads] == [0, 1, 2]
+        assert {p["stream_diag"]["mode"] for p in stream_payloads} == {"chat_completions"}
+        assert stream_payloads[1]["stream_diag"]["d"]["content"] is True
+        assert all(p["stream_diag"]["rep"] is False for p in stream_payloads)
+        assert all(p["stream_diag"]["map"] is False for p in stream_payloads)
+
+    def test_a_repeated_frame_object_is_reported_as_such(self):
+        """``rep`` is what separates a provider keep-alive from a local re-emitter."""
+        seen = []
+        # The same object yielded twice: the iterator is real, the payload is not
+        # new. A local emitter doing this makes the "the provider is still
+        # sending" premise false, and that has to be visible in the record.
+        frame = _make_stream_chunk(content="x", finish_reason="stop")
+        self._stream_agent([frame, frame], lambda kind, payload: seen.append(payload))
+
+        stream_payloads = [p for p in seen if p.get("kind") == "STREAM"]
+        assert [p["stream_diag"]["rep"] for p in stream_payloads] == [False, True]
+        # A frame is only "repeated" against the one immediately before it.
+        assert [p["stream_diag"]["n"] for p in stream_payloads] == [0, 1]
+
+    def test_mapping_frames_are_reported_as_mappings(self):
+        """The ``map`` fingerprint is the F1 "getattr-on-dict" hole.
+
+        A frame that arrives as a Mapping still classifies — so it still
+        advances — but every ``getattr`` in the historical classifier missed on
+        it, and a reader has to be able to see that rather than infer it.
+        """
+        from agent.stream_shapes import build_stream_diag, classify_openai_chunk
+
+        for frame, expected in (
+            ({"choices": [{"delta": {"content": "hi"}}]}, "text_delta"),
+            ({"choices": [{"delta": {"content": ""}}]}, "empty_delta"),
+            ({"choices": [], "usage": {"total_tokens": 3}}, "usage_only"),
+        ):
+            diag = build_stream_diag(
+                shape=classify_openai_chunk(frame),
+                mapping_frame=isinstance(frame, Mapping),
+            )
+            assert diag["map"] is True
+            assert diag["shape"] == expected
+
+    def test_no_diagnostic_is_built_when_nothing_is_subscribed(self):
+        """The unsupervised hot path pays nothing per frame."""
+        touch_calls = []
+        agent = self._agent(progress_callback=None)
+        agent._touch_activity = lambda desc, **kw: touch_calls.append((desc, kw))
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = iter(
+            [_make_stream_chunk(content="a"), _make_stream_chunk(content="")]
+        )
+        with patch.object(
+            type(agent), "_create_request_openai_client", return_value=mock_client
+        ), patch.object(type(agent), "_close_request_openai_client"):
+            agent._interruptible_streaming_api_call({})
+
+        stream_touches = [kw for desc, kw in touch_calls if desc == "receiving stream response"]
+        assert len(stream_touches) == 2
+        assert all(kw.get("stream_diag") is None for kw in stream_touches)
+        # The decision itself is still made, and unchanged.
+        assert [kw["advance"] for kw in stream_touches] == [True, True]
+
+    def test_anthropic_frames_report_the_event_type_they_already_read(self):
+        from unittest.mock import MagicMock
+
+        from run_agent import AIAgent
+
+        seen = []
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "anthropic_messages"
+        agent._interrupt_requested = False
+        agent.progress_callback = lambda kind, payload: seen.append(payload)
+
+        events = [
+            SimpleNamespace(type="message_start"),
+            SimpleNamespace(type="content_block_delta"),
+            SimpleNamespace(type="ping"),
+        ]
+        mock_stream = MagicMock()
+        mock_stream.__enter__ = MagicMock(return_value=mock_stream)
+        mock_stream.__exit__ = MagicMock(return_value=False)
+        mock_stream.__iter__ = MagicMock(return_value=iter(events))
+        mock_stream.get_final_message.return_value = SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="")], stop_reason="end_turn"
+        )
+        agent._anthropic_client = MagicMock()
+        agent._anthropic_client.messages.stream.return_value = mock_stream
+        agent._create_request_anthropic_client = lambda *a, **k: agent._anthropic_client
+
+        agent._interruptible_streaming_api_call({})
+
+        stream_payloads = [p for p in seen if p.get("kind") == "STREAM"]
+        assert [p["stream_diag"]["shape"] for p in stream_payloads] == [
+            "a:message_start",
+            "a:content_block_delta",
+            "a:ping",
+        ]
+        # The ping is still demoted: naming it changes nothing.
+        assert [p["advance"] for p in stream_payloads] == [False, True, False]
+

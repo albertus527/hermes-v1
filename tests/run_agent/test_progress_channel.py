@@ -45,7 +45,13 @@ class _Agent:
     # Copied structure from run_agent.AIAgent._touch_activity (the notify block
     # is what is under test; the rest is stubbed to avoid a full agent).
     def _touch_activity(
-        self, desc, *, provenance=None, force_persist=False, advance=None
+        self,
+        desc,
+        *,
+        provenance=None,
+        force_persist=False,
+        advance=None,
+        stream_diag=None,
     ) -> None:
         import logging
         import time
@@ -64,7 +70,9 @@ class _Agent:
                 from agent.progress_events import make_progress_payload
 
                 payload = make_progress_payload(
-                    self._last_activity_desc, advance=advance
+                    self._last_activity_desc,
+                    advance=advance,
+                    stream_diag=stream_diag,
                 )
                 progress_cb(payload["kind"], payload)
             except Exception:
@@ -311,3 +319,110 @@ def test_emitter_writes_the_advance_bit_and_defaults_it_to_true(monkeypatch, tmp
     assert lines[1]["advance"] is False
     # Absent means True so a supervisor driving an older child behaves as before.
     assert lines[2]["advance"] is True
+
+
+# ---------------------------------------------------------------------------
+# stream_diag: the optional frame-shape object.
+#
+# It rides the SAME channel and the SAME line — no new file, no new env var, no
+# second transport. Every other event must stay byte-identical, because a
+# supervisor reading this channel cannot be made to care about a key it has
+# never heard of.
+# ---------------------------------------------------------------------------
+
+
+def _diag():
+    from agent.stream_shapes import build_stream_diag
+
+    return build_stream_diag(
+        mode="chat_completions",
+        shape="empty_delta",
+        frame_index=1234,
+        stream_seconds=61.2,
+        repeat_frame=False,
+        mapping_frame=True,
+        fields={"content": True, "reasoning": False, "tool": False, "finish": False},
+    )
+
+
+def test_stream_diag_is_absent_unless_a_mapping_is_supplied():
+    """Every non-stream call site must be byte-identical to before."""
+    assert "stream_diag" not in make_progress_payload("starting API call #1")
+    assert "stream_diag" not in make_progress_payload("x" * 5000)
+    # A non-mapping is dropped rather than forwarded, so a caller that passes
+    # the wrong type cannot change what a supervisor sees.
+    for wrong in (None, "empty_delta", 7, ["empty_delta"]):
+        assert "stream_diag" not in make_progress_payload(
+            "receiving stream response", stream_diag=wrong
+        )
+
+
+def test_stream_diag_rides_the_payload_when_supplied():
+    diag = _diag()
+    payload = make_progress_payload(
+        "receiving stream response", advance=True, stream_diag=diag
+    )
+    assert payload["stream_diag"] == diag
+    assert set(payload) == {"kind", "phase", "advance", "desc", "stream_diag"}
+
+
+def test_stream_diag_reaches_the_transport_under_the_line_cap(monkeypatch, tmp_path):
+    from hermes_cli import oneshot
+
+    path = tmp_path / "progress.jsonl"
+    monkeypatch.setenv(oneshot.PROGRESS_FILE_ENV, str(path))
+    monkeypatch.setenv(oneshot.PROGRESS_ID_ENV, "inv-1")
+
+    emitter = oneshot._build_progress_emitter()
+    emitter.on_progress(
+        "STREAM",
+        {
+            "kind": "STREAM",
+            "phase": "active",
+            "desc": "receiving stream response",
+            "advance": True,
+            "stream_diag": _diag(),
+        },
+    )
+    emitter.close()
+
+    raw = path.read_bytes()
+    assert len(raw) <= oneshot._PROGRESS_MAX_EVENT_BYTES
+    lines = raw.decode("utf-8").splitlines()
+    event = json.loads(lines[-1])
+    assert event["stream_diag"]["shape"] == "empty_delta"
+    assert event["stream_diag"]["map"] is True
+
+
+def test_an_oversized_diagnostic_costs_the_diagnostic_not_the_liveness_event(
+    monkeypatch, tmp_path
+):
+    """A pathological diag must never truncate the line into unparseable JSON.
+
+    The reader discards a line it cannot parse, so truncating would lose a
+    LIVENESS signal to save an optional extra. The extra is what gets dropped.
+    """
+    from hermes_cli import oneshot
+
+    path = tmp_path / "progress.jsonl"
+    monkeypatch.setenv(oneshot.PROGRESS_FILE_ENV, str(path))
+    monkeypatch.setenv(oneshot.PROGRESS_ID_ENV, "inv-1")
+
+    emitter = oneshot._build_progress_emitter()
+    emitter.on_progress(
+        "STREAM",
+        {
+            "kind": "STREAM",
+            "phase": "active",
+            "desc": "receiving stream response",
+            "stream_diag": {"shape": "empty_delta", "junk": "x" * 5000},
+        },
+    )
+    emitter.close()
+
+    raw = path.read_bytes()
+    assert len(raw) <= oneshot._PROGRESS_MAX_EVENT_BYTES
+    lines = raw.decode("utf-8").splitlines()
+    event = json.loads(lines[-1])  # parses: not truncated
+    assert "stream_diag" not in event
+    assert event["kind"] == "STREAM"

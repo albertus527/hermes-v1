@@ -66,17 +66,24 @@ A keep-alive-heavy run can be 100% active and 0% progressing; only the progress
 clock sees that.
 
 Forensic receipts (observation only)
-------------------------------------
+-------------------------------------
 A timeout code says a bound fired; it never says *which* non-termination mode
 occurred. The in-memory :meth:`FrontendInvocation.diagnostics` alone cannot
 answer that: it keeps one ``last_progress_kind`` and one event scalar, so the
 kind/phase distribution is discarded and nothing about the workspace is
 recorded. Every supervised run therefore also emits a bounded
-``frontend_forensics/2`` receipt (see :func:`_build_receipt`) that carries the
+``frontend_forensics/3`` receipt (see :func:`_build_receipt`) that carries the
 kind/phase counters, the advancing-vs-keepalive split, the longest true silence
 between two progress signals (and between two activity signals), a
-metadata-only workspace change fingerprint, artifact completeness, and the
-tool names seen.
+metadata-only workspace change fingerprint, artifact completeness, the tool
+names seen, and the ``stream_frames`` block: which STREAM frame shape was being
+emitted as active/advancing, how many frames of each shape, the within-attempt
+frame index and elapsed time reached, and the two identity fingerprints
+(``repeat_frame_count`` — the child saw the same frame object twice in a row —
+and ``mapping_frame_count`` — frames arrived as mappings, which makes every
+``getattr`` in the classifier miss). That block exists because "the stream was
+alive" and "the stream was producing output" are different facts, and only the
+frame shape tells them apart after the fact.
 
 This is observation, not control. Nothing in the receipt is read back by the
 supervision decision, no bound, prompt, toolset, skill, or convergence rule
@@ -220,6 +227,25 @@ MAX_MUTATED_PATHS = 50
 #: Ceiling on distinct tool names counted. Names are not arguments.
 MAX_TOOL_NAME_DISTINCT = 32
 
+#: Ceiling on distinct STREAM frame shapes counted. The producer's taxonomy is a
+#: closed enum (see ``agent/stream_shapes.py``); the cap is here so a future
+#: producer that widens it cannot grow the receipt, and so a hostile one cannot
+#: either.
+MAX_STREAM_SHAPE_KEYS = 12
+
+#: Ceiling on distinct ``api_mode`` values counted. Realistically 1-2 per run.
+MAX_API_MODE_KEYS = 4
+
+#: Ceiling on one wire ``stream_diag`` shape/mode string, mirroring
+#: ``agent.stream_shapes.STREAM_DIAG_MODE_MAX``.
+STREAM_DIAG_TOKEN_MAX = 40
+
+#: A shape string is a lower-case enum token, optionally namespaced by its API
+#: (``empty_delta``, ``a:content_block_delta``, ``c:response.in_progress``).
+#: Anything else is ignored rather than guessed at: a shape is only useful as a
+#: taxonomy member, and an unrecognisable key would be a false finding.
+_STREAM_DIAG_TOKEN_RE = re.compile(r"^[a-z][a-z0-9_]*(?::[a-z0-9_.\-]{1,40})?$")
+
 #: Most recent normalized activity events retained for the receipt.
 RECENT_ACTIVITY_LEN = 20
 
@@ -230,7 +256,9 @@ MAX_RECEIPTS_PER_PROJECT = 20
 #: v2 adds the ``advance`` split (``counters.advance``/``counters.keepalive``,
 #: ``activity.longest_forward_progress_gap_seconds``,
 #: ``diagnostics.activity_idle_for_seconds``) alongside v1.
-FORENSICS_SCHEMA = "frontend_forensics/2"
+#: v3 adds the ``stream_frames`` block — WHICH post-close frame shape was being
+#: emitted as STREAM/active/advance=true. Additive alongside v2.
+FORENSICS_SCHEMA = "frontend_forensics/3"
 
 #: Watchdog outcome codes.
 OUTCOME_IDLE_TIMEOUT = "FRONTEND_IDLE_TIMEOUT"
@@ -359,6 +387,70 @@ class WatchdogUnavailable(RuntimeError):
     """Whole-tree termination is unavailable; supervision must not be attempted."""
 
 
+# ---------------------------------------------------------------------------
+# STREAM frame-shape diagnostics (observation only).
+#
+# The child may attach a small ``stream_diag`` object to a STREAM event naming
+# the shape of the frame that arrived, so a receipt can answer "which frame kept
+# this stream alive" instead of only "the stream was alive". It is built by
+# ``agent/stream_shapes.py`` and is a closed enum plus counters — no content.
+#
+# The validation below is deliberately paranoid and TOTAL: the child is another
+# process, the object arrives once per stream frame, and a malformed one must
+# never be able to raise into the poll loop or to change any bound. A value that
+# does not fit the shape of the record is simply not recorded.
+# ---------------------------------------------------------------------------
+
+
+def _normalize_diag_token(raw: Any) -> Optional[str]:
+    """Return a bounded enum token, or ``None`` if *raw* is not one."""
+    if not isinstance(raw, str) or len(raw) > STREAM_DIAG_TOKEN_MAX:
+        return None
+    if not _STREAM_DIAG_TOKEN_RE.match(raw):
+        return None
+    return raw
+
+
+def _normalize_diag_number(raw: Any) -> Optional[float]:
+    """Return a finite, non-negative number, or ``None``."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    value = float(raw)
+    if value != value or value in (float("inf"), float("-inf")) or value < 0:
+        return None
+    return value
+
+
+def normalize_stream_diag(raw: Any) -> Optional[Dict[str, Any]]:
+    """Validate one wire ``stream_diag`` object. Never raises.
+
+    Returns ``None`` — meaning "record nothing" — for a missing, non-mapping,
+    wrong-typed, or over-long value, and for one whose ``shape`` is not a
+    taxonomy token. Absent stays absent: a child built before this object
+    existed keeps working exactly as before.
+    """
+    if not isinstance(raw, Mapping):
+        return None
+    try:
+        shape = _normalize_diag_token(raw.get("shape"))
+        if shape is None:
+            return None
+        diag: Dict[str, Any] = {"shape": shape}
+        mode = raw.get("mode")
+        if isinstance(mode, str) and len(mode) <= STREAM_DIAG_TOKEN_MAX:
+            diag["mode"] = mode
+        for key in ("rep", "map"):
+            if isinstance(raw.get(key), bool):
+                diag[key] = raw[key]
+        for key in ("n", "t"):
+            value = _normalize_diag_number(raw.get(key))
+            if value is not None:
+                diag[key] = value
+        return diag
+    except Exception:  # pragma: no cover - Mapping .get on a hostile subclass
+        return None
+
+
 @dataclass
 class WatchdogPolicy:
     """Resolved bounds for one supervised invocation."""
@@ -427,6 +519,35 @@ class FrontendInvocation:
     )
     tool_name_counts: Dict[str, int] = field(default_factory=dict)
     tool_name_counts_truncated: bool = False
+    # --- STREAM frame shapes. Additive forensics: which post-provider-close
+    # --- frame shape was emitted as STREAM/active/advance=true. Counts are
+    # --- LOWER BOUNDS — the transport coalesces active events inside a 5s
+    # --- window (hermes_cli/oneshot.py), so a run's true frame count is at
+    # --- least these numbers, never fewer. They are attributed correctly
+    # --- (newest event wins, and the shape recorded on a retained line is the
+    # --- shape that was firing), they are just undercounted.
+    stream_shape_counts: Dict[str, int] = field(default_factory=dict)
+    stream_shape_advance_counts: Dict[str, int] = field(default_factory=dict)
+    stream_shape_counts_truncated: bool = False
+    api_mode_counts: Dict[str, int] = field(default_factory=dict)
+    api_mode_counts_truncated: bool = False
+    #: Frames the child saw as the SAME object as the one before it, and frames
+    #: that arrived as a Mapping. Both falsy in a healthy run: a repeated
+    #: object means a local re-emitter, and a Mapping frame makes every
+    #: ``getattr`` in the classifier miss.
+    repeat_frame_count: int = 0
+    mapping_frame_count: int = 0
+    last_stream_shape: Optional[str] = None
+    stream_shape_first_offset: Optional[float] = None
+    stream_shape_last_offset: Optional[float] = None
+    #: Newest observed frame index within an attempt, and the largest
+    #: within-attempt elapsed time and frame index seen. Together these are
+    #: what separates "the provider was still streaming real output" from
+    #: "N content-free keep-alives arrived over T seconds".
+    stream_frame_index: Optional[float] = None
+    stream_frame_seconds: Optional[float] = None
+    stream_max_frame_seconds: float = 0.0
+    stream_max_frame_index: float = 0.0
 
     def note_activity(self, now: float, kind: str, advance: bool = True) -> None:
         """Record progress from THIS invocation. Refreshes liveness.
@@ -465,7 +586,16 @@ class FrontendInvocation:
         else:
             self.keepalive_event_count += 1
 
-    def note_event_detail(self, now: float, kind: str, phase: str, desc: str) -> None:
+    def note_event_detail(
+        self,
+        now: float,
+        kind: str,
+        phase: str,
+        desc: str,
+        *,
+        advance: bool = True,
+        stream_diag: Optional[Mapping[str, Any]] = None,
+    ) -> None:
         """Fold one accepted event into the forensic counters and ring buffer.
 
         Called after :meth:`note_activity` and :meth:`note_operation` so the
@@ -484,6 +614,8 @@ class FrontendInvocation:
                 self.tool_completed_count += 1
         elif kind == _KIND_STREAM and phase == _PHASE_ACTIVE:
             self.stream_active_count += 1
+
+        self._note_stream_shape(now, advance, stream_diag)
 
         # The tool name is parsed from the RAW description (before redaction)
         # because a name is not an argument; only the clamped, redacted form is
@@ -504,6 +636,61 @@ class FrontendInvocation:
                 "desc": normalize_forensic_desc(desc),
             }
         )
+
+    def _note_stream_shape(
+        self,
+        now: float,
+        advance: bool,
+        stream_diag: Optional[Mapping[str, Any]],
+    ) -> None:
+        """Fold one validated ``stream_diag`` into the frame-shape counters.
+
+        A no-op for an absent or unvalidated object, which is what an older
+        child sends. Nothing here is read by a bound: the whole point is to
+        record, after the fact, WHICH shape a keep-alive-looking stream was
+        actually made of.
+        """
+        if not isinstance(stream_diag, Mapping):
+            return
+        shape = stream_diag.get("shape")
+        if not isinstance(shape, str):
+            return
+        offset = max(0.0, now - self.started_at)
+        # The shape dict is the admission gate for BOTH counters, so the
+        # advancing split can never hold a key the shape count rejected — one
+        # bound, one truncation flag, and no second unbounded dict.
+        known = shape in self.stream_shape_counts
+        if known or len(self.stream_shape_counts) < MAX_STREAM_SHAPE_KEYS:
+            self.stream_shape_counts[shape] = self.stream_shape_counts.get(shape, 0) + 1
+        else:
+            self.stream_shape_counts_truncated = True
+        if advance and shape in self.stream_shape_counts:
+            self.stream_shape_advance_counts[shape] = (
+                self.stream_shape_advance_counts.get(shape, 0) + 1
+            )
+        mode = stream_diag.get("mode")
+        if isinstance(mode, str) and mode:
+            known_mode = mode in self.api_mode_counts
+            if known_mode or len(self.api_mode_counts) < MAX_API_MODE_KEYS:
+                self.api_mode_counts[mode] = self.api_mode_counts.get(mode, 0) + 1
+            else:
+                self.api_mode_counts_truncated = True
+        if stream_diag.get("rep") is True:
+            self.repeat_frame_count += 1
+        if stream_diag.get("map") is True:
+            self.mapping_frame_count += 1
+        self.last_stream_shape = shape
+        if self.stream_shape_first_offset is None:
+            self.stream_shape_first_offset = round(offset, 1)
+        self.stream_shape_last_offset = round(offset, 1)
+        index = _normalize_diag_number(stream_diag.get("n"))
+        if index is not None:
+            self.stream_frame_index = index
+            self.stream_max_frame_index = max(self.stream_max_frame_index, index)
+        seconds = _normalize_diag_number(stream_diag.get("t"))
+        if seconds is not None:
+            self.stream_frame_seconds = seconds
+            self.stream_max_frame_seconds = max(self.stream_max_frame_seconds, seconds)
 
     def note_operation(self, now: float, kind: str, phase: str) -> None:
         """Track the in-flight operation from typed boundary events only.
@@ -1028,7 +1215,16 @@ def _read_progress_events(
         invocation.note_operation(now, kind, phase)
         # Forensic detail is recorded after the liveness decision above, so it
         # can observe an event but can never influence whether it was accepted.
-        invocation.note_event_detail(now, kind, phase, str(event.get("desc") or ""))
+        # ``stream_diag`` is optional: absent (an older child) simply folds
+        # nothing, and a malformed one is dropped by the total validator.
+        invocation.note_event_detail(
+            now,
+            kind,
+            phase,
+            str(event.get("desc") or ""),
+            advance=advance,
+            stream_diag=normalize_stream_diag(event.get("stream_diag")),
+        )
 
 
 def _terminate_tree(
@@ -1117,7 +1313,7 @@ def _build_receipt(
     now: float,
     cancel_reason: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Assemble the bounded ``frontend_forensics/2`` receipt.
+    """Assemble the bounded ``frontend_forensics/3`` receipt.
 
     The receipt records what kind of activity happened and whether the workspace
     moved. It never records prompts, model responses, tool arguments, file
@@ -1191,6 +1387,25 @@ def _build_receipt(
             key: value for key, value in observed.items() if key != "artifacts"
         },
         "artifacts": observed["artifacts"],
+        "stream_frames": {
+            # Lower bounds: the transport coalesces active events, so a run's
+            # true frame count is >= these. Attribution is exact — the shape on a
+            # retained line is the shape that was firing.
+            "shapes": dict(invocation.stream_shape_counts),
+            "advancing_by_shape": dict(invocation.stream_shape_advance_counts),
+            "api_modes": dict(invocation.api_mode_counts),
+            "repeat_frame_count": invocation.repeat_frame_count,
+            "mapping_frame_count": invocation.mapping_frame_count,
+            "last_shape": invocation.last_stream_shape,
+            "last_frame_index": invocation.stream_frame_index,
+            "last_frame_seconds": invocation.stream_frame_seconds,
+            "max_frame_index": invocation.stream_max_frame_index,
+            "max_frame_seconds": invocation.stream_max_frame_seconds,
+            "first_offset_seconds": invocation.stream_shape_first_offset,
+            "last_offset_seconds": invocation.stream_shape_last_offset,
+            "shapes_truncated": invocation.stream_shape_counts_truncated,
+            "api_modes_truncated": invocation.api_mode_counts_truncated,
+        },
         "tool_names": dict(invocation.tool_name_counts),
         "tool_names_truncated": invocation.tool_name_counts_truncated,
         "recent_activity": [dict(entry) for entry in invocation.recent_activity],

@@ -39,6 +39,14 @@ Design rules
   may coalesce ``active`` events, but must never drop ``started``/``completed``
   — those are what let a supervisor distinguish "request in flight" from
   "hung".
+* **The optional ``stream_diag`` object is observation, not control.**  A
+  STREAM event may carry a small bounded object naming the SHAPE of the frame
+  that arrived (built by ``agent/stream_shapes.py``: a closed enum, a frame
+  index, an elapsed-seconds scalar, and two identity fingerprints). It exists
+  so a supervisor can record *which* frame kept a stream "alive" — it changes
+  no verdict, is read by no bound, and is absent on every event that is not a
+  receiving-stream frame. Like the rest of the payload it carries no content:
+  field PRESENCE booleans only, never a value, a length, or a body.
 
 This is deliberately *not* ``AIAgent.event_callback``: that channel carries
 low-frequency lifecycle milestones and is fanned out to the gateway's async
@@ -47,6 +55,7 @@ hook bus, which must not receive per-token-rate traffic.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, Dict, Optional, Tuple
 
 __all__ = [
@@ -170,6 +179,7 @@ def make_progress_payload(
     kind: Optional[str] = None,
     phase: Optional[str] = None,
     advance: Optional[bool] = None,
+    stream_diag: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build the bounded payload for one progress event.
 
@@ -182,6 +192,12 @@ def make_progress_payload(
     * ``True``/``False`` — explicit. Stream emitters MUST pass it explicitly,
       because ``"receiving stream response"`` cannot say whether the item that
       arrived carried model output.
+
+    ``stream_diag`` is an OPTIONAL, purely observational object attached by the
+    three receiving-stream emit sites to name the shape of the frame that
+    arrived (see ``agent/stream_shapes.py``). The key is absent unless a mapping
+    is supplied, so every other call site is byte-identical to before, and a
+    supervisor driving an older producer sees no change at all.
     """
     from agent.session_activity import bound_activity_description
 
@@ -192,7 +208,7 @@ def make_progress_payload(
     bounded = bound_activity_description(description)
     if advance is None:
         advance = description_advances(description)
-    return {
+    payload: Dict[str, Any] = {
         "kind": kind,
         "phase": phase,
         # Genuine forward progress vs. observable-but-not-progress. Consumers
@@ -202,3 +218,6 @@ def make_progress_payload(
         # the description can never grow into a payload-sized leak.
         "desc": bounded,
     }
+    if isinstance(stream_diag, Mapping):
+        payload["stream_diag"] = stream_diag
+    return payload
