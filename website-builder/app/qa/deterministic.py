@@ -6,25 +6,22 @@ that belongs to VISION. Keeps checks small and stdlib-only.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from app.core.design_dna import load_persisted_design_dna
 from app.qa.findings import DeterministicFindings
 from app.qa.screenshot import DESKTOP_VIEWPORT, MOBILE_VIEWPORT, ScreenshotSet
 
 
 def check_design_dna(workspace: Path) -> bool:
-    """design-dna.json exists and is valid JSON."""
-    dna_path = workspace / "design-dna.json"
-    if not dna_path.is_file():
-        return False
-    try:
-        with dna_path.open("r", encoding="utf-8") as f:
-            json.load(f)
-        return True
-    except (json.JSONDecodeError, IOError):
-        return False
+    """design-dna.json is readable as a Design DNA document.
+
+    Same reader every other consumer uses, so QA cannot pass a document the
+    build rejected — or fail one the build accepted — by disagreeing about what
+    the file contains.
+    """
+    return load_persisted_design_dna(workspace / "design-dna.json") is not None
 
 
 def check_source_present(workspace: Path) -> bool:

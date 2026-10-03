@@ -23,41 +23,64 @@ It captures the concrete design decisions made by FRONTEND.
 - Revisions update Design DNA where relevant rather than accumulating
   disconnected prompts.
 
+## Persisted Shape
+
+`design-dna.json` is a **flat JSON object whose fields are at the top level**.
+
+Do NOT wrap it in a `design_dna` key. The application reads `typography`,
+`reference_synthesis` and `version` from the top level, so a wrapped document
+reads as an empty one: typography validation is silently skipped and
+reference-bearing projects fail with "Missing or invalid reference evidence".
+
+Correct:
+
+```json
+{ "version": 1, "typography": { "heading_font": "Inter" } }
+```
+
+Wrong — every field becomes invisible:
+
+```json
+{ "design_dna": { "version": 1, "typography": { "heading_font": "Inter" } } }
+```
+
 ## Minimal Fields
 
 ```yaml
-design_dna:
-  version: 1
-  brand_personality: '' # e.g., "premium, modern, approachable"
-  palette:
-    primary: '' # e.g., "#1a1a2e"
-    secondary: ''
-    accent: ''
-    background: ''
-    text: ''
-  typography:
-    heading_font: ''
-    body_font: ''
-    scale: '' # e.g., "1.25"
-  spacing:
-    density: '' # e.g., "comfortable", "compact"
-    unit: '' # e.g., "8px"
-  page_inventory: [] # e.g., ["home", "services", "contact"]
-  layout:
-    navigation: '' # e.g., "top-bar", "sidebar"
-    max_width: '' # e.g., "1280px"
-  motion:
-    enabled: true
-    duration: '' # e.g., "300ms"
-    easing: '' # e.g., "ease-out"
-  primary_cta:
-    label: ''
-    destination: '' # e.g., "https://wa.me/..."
-    style: '' # e.g., "primary-button"
-  assets: [] # list of asset references
-  verified_content: {} # facts verified by user
-  unresolved_facts: [] # facts still needed
+version: 1
+brand_personality: '' # e.g., "premium, modern, approachable"
+palette:
+  primary: '' # e.g., "#1a1a2e"
+  secondary: ''
+  accent: ''
+  background: ''
+  text: ''
+typography:
+  heading_font: ''
+  body_font: ''
+  scale: '' # e.g., "1.25"
+spacing:
+  density: '' # e.g., "comfortable", "compact"
+  unit: '' # e.g., "8px"
+page_inventory: [] # e.g., ["home", "services", "contact"]
+layout:
+  navigation: '' # e.g., "top-bar", "sidebar"
+  max_width: '' # e.g., "1280px"
+motion:
+  enabled: true
+  duration: '' # e.g., "300ms"
+  easing: '' # e.g., "ease-out"
+primary_cta:
+  label: ''
+  destination: '' # e.g., "https://wa.me/..."
+  style: '' # e.g., "primary-button"
+assets: [] # list of asset references
+verified_content: {} # facts verified by user
+unresolved_facts: [] # facts still needed
 ```
+
+Omit fields you have no decision for; the list is a minimum set, not a template
+to fill with placeholders. `typography` may name at most 2 font families.
 
 ## Rules
 

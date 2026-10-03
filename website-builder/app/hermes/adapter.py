@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from app.core import credentials
+from app.core.design_dna import load_persisted_design_dna
 from app.core.state import ProjectStateStore
 # Stdlib-only by design (see that module's docstring): importing it at module
 # scope is what keeps the watchdog's ``hermes_cli.oneshot`` import off this
@@ -87,7 +88,6 @@ except ImportError as exc:  # pragma: no cover - depends on host environment
 # failure that cannot explain itself must still explain itself: this code is
 # what makes ``state.failure.error`` non-empty instead of blank.
 FRONTEND_RESULT_CONTRACT_INVALID = "FRONTEND_RESULT_CONTRACT_INVALID"
-
 
 @dataclass
 class HermesResult:
@@ -1359,23 +1359,20 @@ Respond in this exact JSON format:
         # Parse FRONTEND response for Design DNA
         return self._parse_frontend_response(result.response, workspace)
 
+
     def _has_complete_frontend_artifacts(self, workspace: Path) -> bool:
         """Deterministically validate that Phase 7 artifacts were produced.
 
         Checks:
-        - design-dna.json exists and contains valid JSON
+        - design-dna.json exists and reads as a Design DNA document
         - src/App.tsx exists
         - src/App.tsx is no longer the untouched fixed-starter placeholder
 
-        Returns True only when all conditions hold.
+        Returns True only when all conditions hold. This is the ONE definition
+        of a complete Phase 7; the success postcondition and the timeout-recovery
+        branch both defer to it rather than re-deriving completeness.
         """
-        dna_path = workspace / "design-dna.json"
-        if not dna_path.is_file():
-            return False
-        try:
-            with dna_path.open("r", encoding="utf-8") as f:
-                json.load(f)
-        except (json.JSONDecodeError, IOError):
+        if load_persisted_design_dna(workspace / "design-dna.json") is None:
             return False
 
         app_path = workspace / "src" / "App.tsx"
@@ -1873,14 +1870,12 @@ Respond in this exact JSON format, one entry per attached role in order:
         artifact-recovery path (which passes ``""``) -- declares nothing, and
         keeps its previous behaviour: the artifacts on disk decide.
         """
-        design_dna = None
-        dna_path = workspace / "design-dna.json"
-        if dna_path.exists():
-            try:
-                with dna_path.open("r", encoding="utf-8") as f:
-                    design_dna = json.load(f)
-            except (json.JSONDecodeError, IOError):
-                pass
+        # One canonical reader for every persisted Design DNA document: it
+        # returns the flat shape the validators and state expect, unwrapping a
+        # legacy nested artifact if that is what is on disk. Reading the raw JSON
+        # here is what let a nested document through as "no typography", which
+        # every top-level reader then read as valid.
+        design_dna = load_persisted_design_dna(workspace / "design-dna.json")
 
         declared_success: Optional[bool] = None
         error: Optional[str] = None
