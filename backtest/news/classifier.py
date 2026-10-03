@@ -12,9 +12,15 @@ performs a live LLM call, and no backtest replay does either (§21 item 18).
 
 The exact pinned model identifier is an EXTERNAL BLOCKER (§11.5 [MISSING
 SOURCE CONTENT]): it must arrive via config (``backtest.pinned_model``)
-as ``openrouter/<provider>/<model>@<version>``. Nothing here invents or
+as ``<provider>/<vendor>/<model>[@<version>]``. Nothing here invents or
 defaults to a concrete identifier; an empty pin fails closed with
 :class:`PinnedModelMissing`.
+
+The canonical pin is the persisted model identity (``model_version``). The
+leading ``<provider>/`` segment is NOT part of the provider's wire model ID
+— ``call_llm(provider=...)`` already selects the endpoint — so
+:func:`parse_pinned_model_parts` returns the wire provider and the stripped
+wire model ID alongside the untouched canonical pin.
 """
 
 from __future__ import annotations
@@ -36,6 +42,12 @@ from backtest.news.cache import (
 
 # §11.5: temperature is pinned at 0 for reproducibility.
 CLASSIFICATION_TEMPERATURE = 0.0
+
+# Provider segments a canonical pin may carry that this client can actually
+# wire to. A pin naming any other provider fails closed rather than being
+# silently reinterpreted as an OpenRouter route. This is a set of ENDPOINT
+# names, never a list of models — model/vendor names are never hardcoded.
+SUPPORTED_WIRE_PROVIDERS: tuple[str, ...] = ("openrouter",)
 
 # The strict news_schema_v3 JSON schema handed to the model via
 # response_format (structured output). Effect fields only — the model must
@@ -72,14 +84,21 @@ class RouteMismatchError(Exception):
     (plan §14 item 9: never rely on auto resolution)."""
 
 
-def parse_pinned_model(pinned: str) -> tuple[str, str]:
-    """Split ``openrouter/<provider>/<model>@<version>`` into
-    ``(model_version, model_id)`` where model_version is the full pinned
-    identifier (persisted as ``model_version`` in the cache) and model_id
-    is what is passed to ``call_llm(model=...)``.
+def parse_pinned_model_parts(
+        pinned: str) -> tuple[str, str, str]:
+    """Split ``<provider>/<provider_namespace>/<model>[@<version>]`` into
+    ``(canonical_model_version, wire_provider, wire_model_id)``.
 
-    ``<version>`` may be empty (identifier without an @version suffix) —
-    the whole string is still the cache's model_version.
+    The canonical model identity is the FULL persisted pin (§11.5) — it is
+    what lands in ``news_classifications.model_version`` and every
+    provenance record. The provider segment of that pin is NOT part of the
+    provider's wire model ID: ``provider="openrouter"`` already selects the
+    endpoint, so the wire ID is everything after the leading ``
+    <provider>/`` segment, e.g. ``z-ai/glm-5.3-flash``.
+
+    Parsing is GENERIC — no model or vendor name is hardcoded — and fails
+    closed on anything malformed or on a provider this client cannot wire
+    to. Ambiguous strings are never silently reinterpreted.
     """
     pinned = (pinned or "").strip()
     if not pinned:
@@ -87,15 +106,40 @@ def parse_pinned_model(pinned: str) -> tuple[str, str]:
             "backtest.pinned_model is not set — the exact "
             "openrouter/<provider>/<model>@<version> identifier is an "
             "unresolved external prerequisite (§11.5)")
-    if not pinned.startswith("openrouter/"):
+    # Strip an optional @<version> suffix; the rest is provider + model.
+    without_version = pinned.split("@", 1)[0]
+    segments = without_version.split("/")
+    if (len(segments) < 3
+            or any(not seg.strip() or seg != seg.strip() for seg in segments)
+            or without_version.endswith("/")):
         raise PinnedModelMissing(
             f"pinned model {pinned!r} must follow "
-            "'openrouter/<provider>/<model>@<version>'")
-    model_id = pinned.split("@", 1)[0]
-    if not model_id or model_id.endswith("/"):
+            "'<provider>/<vendor>/<model>[@<version>]' "
+            "(e.g. 'openrouter/z-ai/glm-5.3-flash')")
+    wire_provider = segments[0].strip()
+    wire_model_id = "/".join(segments[1:]).strip()
+    if wire_provider not in SUPPORTED_WIRE_PROVIDERS:
         raise PinnedModelMissing(
-            f"pinned model {pinned!r} has no <provider>/<model> part")
-    return pinned, model_id
+            f"pinned model {pinned!r} names provider {wire_provider!r}, "
+            f"which this classifier cannot wire to "
+            f"(supported: {', '.join(SUPPORTED_WIRE_PROVIDERS)})")
+    return pinned, wire_provider, wire_model_id
+
+
+def parse_pinned_model(pinned: str) -> tuple[str, str]:
+    """``(model_version, wire_model_id)`` for a §11.5 pin.
+
+    ``model_version`` is the FULL canonical pin (persisted as
+    ``model_version`` in the cache and in provenance); ``model_id`` is the
+    PROVIDER WIRE model ID passed to ``call_llm(model=...)`` — i.e. the
+    canonical pin with its leading provider segment removed, because the
+    provider is already selected by ``call_llm(provider=...)``.
+
+    ``<version>`` may be empty (identifier without an @version suffix) —
+    the whole string is still the cache's model_version.
+    """
+    canonical, _provider, wire_model_id = parse_pinned_model_parts(pinned)
+    return canonical, wire_model_id
 
 
 def build_messages(ticker: str, headline_text: str) -> list[dict[str, str]]:
@@ -143,7 +187,12 @@ class NewsClassifierClient:
 
     def __init__(self, pinned_model: str,
                  llm_call: Callable[..., Any] | None = None):
-        self.model_version, self.model_id = parse_pinned_model(pinned_model)
+        # ``model_version`` is the FULL canonical pin and is the ONLY value
+        # persisted (cache ``model_version``, provenance). ``model_id`` is
+        # the provider wire ID: the canonical pin minus its leading provider
+        # segment, which the wire call selects via ``provider=`` instead.
+        (self.model_version, self.provider,
+         self.model_id) = parse_pinned_model_parts(pinned_model)
         self.schema_version = SCHEMA_VERSION_V3
         self._llm_call = llm_call
 
@@ -156,7 +205,7 @@ class NewsClassifierClient:
         from agent.auxiliary_client import call_llm  # lazy: population only
         route_info: dict[str, str] = {}
         response = call_llm(
-            provider="openrouter",
+            provider=self.provider,
             model=self.model_id,
             messages=messages,
             temperature=CLASSIFICATION_TEMPERATURE,
@@ -169,11 +218,18 @@ class NewsClassifierClient:
             route_info=route_info,
         )
         # Verify the resolved route matched the pin (never trust auto).
-        if route_info.get("model") not in (None, self.model_id,
-                                           f"openrouter/{self.model_id}"):
+        # Accept the wire ID or either provider-qualified form of this pin —
+        # the route must BE this pin, nothing else.
+        accepted_routes = {
+            self.model_id,
+            self.model_version,
+            f"{self.provider}/{self.model_id}",
+            self.model_version.split("@", 1)[0],
+        }
+        if route_info.get("model") not in (None, *accepted_routes):
             raise RouteMismatchError(
                 f"resolved route {route_info!r} does not match pinned "
-                f"model {self.model_id!r}")
+                f"model {self.model_version!r}")
         return response
 
     def classify(self, *, ticker: str, headline_text: str,

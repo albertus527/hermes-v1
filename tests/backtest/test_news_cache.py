@@ -261,7 +261,7 @@ class TestNoLiveLLMInReplay:
         model_version, model_id = parse_pinned_model(
             "openrouter/x/y@v1")
         assert model_version == "openrouter/x/y@v1"
-        assert model_id == "openrouter/x/y"
+        assert model_id == "x/y"
 
 
 # --------------------------------------------------------------------------
