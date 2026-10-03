@@ -521,10 +521,22 @@ class HermesAdapter:
         # default profile.
         with self._hermes_home_scope():
             for role in list(roles):
+                # Preflight must reason about the SAME model the runtime will
+                # launch. A role may name its model by alias, and the runtime
+                # resolves that alias (see _run_fast_programmatic and the
+                # supervised CLI path) before it reaches resolve_runtime_provider.
+                # Passing the raw alias here resolved the preflight proof —
+                # credentials, provider enablement, capability lookup — against
+                # a name no catalog contains, so preflight could pass on a model
+                # the run would then fail to resolve, or fail a VISION role whose
+                # real model supports image input. `model` stays the configured
+                # alias for diagnostics and config identity; only the runtime
+                # seam sees the resolved id.
+                resolved_model = roles[role]["resolved_model"]
                 try:
                     runtime = resolve_runtime_provider(
                         requested=roles[role]["provider"],
-                        target_model=roles[role]["model"],
+                        target_model=resolved_model,
                     )
                     self._require_runtime_credentials(runtime)
                 except Exception:
@@ -543,7 +555,6 @@ class HermesAdapter:
                 # An explicit ``model.context_length`` is the documented escape
                 # hatch: the runtime honours it, so the model does have known
                 # metadata and this check must not fire.
-                resolved_model = roles[role]["resolved_model"]
                 if (
                     resolved_model != roles[role]["model"]
                     and not _model_has_static_context_metadata(resolved_model)
@@ -560,11 +571,12 @@ class HermesAdapter:
                     continue
 
                 # Vision capability gate: the logical VISION role name is not
-                # proof of capability. Resolve through the real provider seam
-                # and verify image input support exactly as the runtime
-                # VISION path does.
+                # proof of capability, and neither is an alias that names it.
+                # Resolve through the real provider seam and verify image input
+                # support exactly as the runtime VISION path does — against the
+                # resolved model, since that is what will be launched.
                 try:
-                    supports = self._role_vision_support(runtime, roles["VISION"]["model"], cfg)
+                    supports = self._role_vision_support(runtime, roles["VISION"]["resolved_model"], cfg)
                 except Exception:
                     supports = None
                 if supports is not True:

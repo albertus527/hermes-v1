@@ -252,6 +252,192 @@ class TestPreflightFailsClosedOnAliasMetadata(unittest.TestCase):
         self.assertTrue(report["ok"], report)
 
 
+class TestPreflightResolvesAliasesBeforeReachingTheRuntime(unittest.TestCase):
+    """Preflight must prove the model the RUNTIME will launch, not the alias.
+
+    Both launch paths — the supervised CLI boundary and the programmatic
+    ``_run_fast_programmatic`` — resolve ``model_aliases`` before the model
+    reaches ``resolve_runtime_provider`` or the vision capability lookup.
+    Preflight computed the same resolved id for its metadata gate but then
+    handed the RAW ALIAS to both of those seams, so the preflight proof was
+    about a name no catalog contains while the run used a real model id. That
+    divergence is a wrong answer in both directions: preflight could fail a
+    resolvable model, or pass one whose real model cannot resolve or lacks
+    image input.
+    """
+
+    def setUp(self):
+        self.tmpdir_obj = tempfile.TemporaryDirectory()
+        self.tmpdir = Path(self.tmpdir_obj.name)
+        self.home = self.tmpdir / ".hermes-website"
+        (self.home / "skills").mkdir(parents=True)
+        self.adapter = HermesAdapter(
+            _store(self.tmpdir), hermes_home=self.home, repo_root=self.tmpdir / "repo"
+        )
+
+    def tearDown(self):
+        self.tmpdir_obj.cleanup()
+
+    def _write(self, **kwargs):
+        (self.home / "config.yaml").write_text(_profile(**kwargs), encoding="utf-8")
+
+    def _runtime(self):
+        return {
+            "api_key": "k", "provider": "openrouter", "requested_provider": "openrouter",
+            "base_url": "https://example.invalid", "api_mode": "chat_completions",
+        }
+
+    def _preflight(self):
+        """Run preflight, recording every model each seam actually received."""
+        resolved: list = []
+        vision: list = []
+
+        def _resolve(**kwargs):
+            resolved.append(kwargs.get("target_model"))
+            return self._runtime()
+
+        def _vision(_runtime_arg, model, _cfg):
+            vision.append(model)
+            return True
+
+        with patch("app.hermes.adapter.resolve_runtime_provider", side_effect=_resolve), \
+                patch.object(HermesAdapter, "_role_vision_support", side_effect=_vision):
+            report = self.adapter._validate_role_configuration()
+
+        return report, resolved, vision
+
+    def test_no_role_reaches_runtime_resolution_with_the_literal_alias(self):
+        self._write(aliases={ALIAS_NAME: CATALOGUED_ALIAS_TARGET})
+
+        report, resolved, _ = self._preflight()
+
+        self.assertTrue(report["ok"], report)
+        self.assertTrue(resolved, "preflight resolved no role at all")
+        for target in resolved:
+            with self.subTest(target=target):
+                self.assertNotEqual(target, ALIAS_NAME)
+                self.assertEqual(target, CATALOGUED_ALIAS_TARGET)
+
+    def test_aliased_vision_capability_lookup_receives_the_resolved_model(self):
+        self._write(aliases={ALIAS_NAME: CATALOGUED_ALIAS_TARGET})
+
+        _, _, vision = self._preflight()
+
+        self.assertTrue(vision, "VISION capability lookup never ran")
+        for model in vision:
+            with self.subTest(model=model):
+                self.assertEqual(model, CATALOGUED_ALIAS_TARGET)
+                self.assertNotEqual(model, ALIAS_NAME)
+
+    def test_a_literal_role_model_still_reaches_the_runtime_verbatim(self):
+        """The fix must not resolve or rewrite a role that names a model."""
+        self._write(frontend="z-ai/glm-5.3", fast="z-ai/glm-5.3", vision="z-ai/glm-5.3")
+
+        _, resolved, vision = self._preflight()
+
+        self.assertEqual(resolved, ["z-ai/glm-5.3"] * 3)
+        self.assertEqual(vision, ["z-ai/glm-5.3"])
+
+    def test_configured_alias_is_retained_for_diagnostics(self):
+        """`model` is config identity and must still read as the operator wrote it."""
+        self._write(aliases={ALIAS_NAME: CATALOGUED_ALIAS_TARGET})
+
+        report, _, _ = self._preflight()
+
+        self.assertEqual(report["roles"]["FRONTEND"]["model"], ALIAS_NAME)
+        self.assertEqual(report["roles"]["FRONTEND"]["resolved_model"],
+                         CATALOGUED_ALIAS_TARGET)
+
+
+class TestLaunchPathsAreUnaffectedByThePreflightFix(unittest.TestCase):
+    """Preflight is a gate, not a launch seam. Both launch paths must not move."""
+
+    def setUp(self):
+        self.tmpdir_obj = tempfile.TemporaryDirectory()
+        self.tmpdir = Path(self.tmpdir_obj.name)
+        self.home = self.tmpdir / ".hermes-website"
+        (self.home / "skills").mkdir(parents=True)
+        self.adapter = HermesAdapter(
+            _store(self.tmpdir), hermes_home=self.home, repo_root=self.tmpdir / "repo"
+        )
+
+    def tearDown(self):
+        self.tmpdir_obj.cleanup()
+
+    def test_the_cli_boundary_argv_is_unchanged_for_an_aliased_role(self):
+        (self.home / "config.yaml").write_text(
+            _profile(aliases={ALIAS_NAME: CATALOGUED_ALIAS_TARGET}), encoding="utf-8"
+        )
+        captured = {}
+
+        def _run(cmd, **kwargs):
+            captured["cmd"] = list(cmd)
+            return _CompletedProcess()
+
+        with patch.object(self.adapter, "sync_skills_to_profile"), \
+                patch("app.hermes.adapter.subprocess.run", side_effect=_run), \
+                patch("app.hermes.adapter.credentials.assert_no_privileged"), \
+                patch("app.hermes.adapter.credentials.assert_profile_dotenv_clean"), \
+                patch("app.hermes.adapter.credentials.assert_profile_home_clean"), \
+                patch("app.hermes.adapter.credentials.agent_env", return_value={}):
+            self.adapter._run_hermes_cli(prompt="p", role="FRONTEND")
+
+        cmd = captured["cmd"]
+        self.assertEqual(cmd[cmd.index("--model") + 1], CATALOGUED_ALIAS_TARGET)
+        self.assertEqual(cmd[cmd.index("--provider") + 1], "openrouter")
+
+    def test_the_programmatic_path_still_resolves_an_alias_for_the_agent(self):
+        """FAST/VISION launch behaviour is independent of preflight."""
+        (self.home / "config.yaml").write_text(
+            _profile(aliases={ALIAS_NAME: CATALOGUED_ALIAS_TARGET}), encoding="utf-8"
+        )
+
+        with patch.object(self.adapter, "sync_skills_to_profile"), \
+                patch("app.hermes.adapter.resolve_runtime_provider",
+                      return_value=self._runtime()), \
+                patch.object(HermesAdapter, "_role_vision_support", return_value=True), \
+                patch("app.hermes.adapter.AIAgent") as constructor:
+            constructor.return_value.run_conversation.return_value = {
+                "final_response": "ok"
+            }
+            result = self.adapter._run_fast_programmatic("test", role="FAST")
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(constructor.call_args.kwargs["model"], CATALOGUED_ALIAS_TARGET)
+        self.assertEqual(constructor.call_args.kwargs["enabled_toolsets"], [])
+
+    def test_the_programmatic_vision_gate_still_receives_the_resolved_model(self):
+        (self.home / "config.yaml").write_text(
+            _profile(aliases={ALIAS_NAME: CATALOGUED_ALIAS_TARGET}), encoding="utf-8"
+        )
+        seen: list = []
+
+        def _vision(_runtime_arg, model, _cfg):
+            seen.append(model)
+            return True
+
+        with patch.object(self.adapter, "sync_skills_to_profile"), \
+                patch("app.hermes.adapter.resolve_runtime_provider",
+                      return_value=self._runtime()), \
+                patch.object(HermesAdapter, "_role_vision_support", side_effect=_vision), \
+                patch("app.hermes.adapter.AIAgent") as constructor:
+            constructor.return_value.run_conversation.return_value = {
+                "final_response": "ok"
+            }
+            result = self.adapter._run_fast_programmatic(
+                "test", role="VISION", require_vision=True
+            )
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(seen, [CATALOGUED_ALIAS_TARGET])
+
+    def _runtime(self):
+        return {
+            "api_key": "k", "provider": "openrouter", "requested_provider": "openrouter",
+            "base_url": "https://example.invalid", "api_mode": "chat_completions",
+        }
+
+
 def _store(tmpdir):
     from app.core.state import ProjectStateStore
 
