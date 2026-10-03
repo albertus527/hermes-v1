@@ -258,7 +258,16 @@ MAX_RECEIPTS_PER_PROJECT = 20
 #: ``diagnostics.activity_idle_for_seconds``) alongside v1.
 #: v3 adds the ``stream_frames`` block — WHICH post-close frame shape was being
 #: emitted as STREAM/active/advance=true. Additive alongside v2.
-FORENSICS_SCHEMA = "frontend_forensics/3"
+#: v4 makes the per-tool counters INVOCATION counts and adds
+#: ``counters.tool_error_count``. v3's ``tool_names`` counted every event that
+#: carried a name, so one sequential invocation contributed twice (its
+#: ``executing tool: X`` and its ``tool completed: X``) and the histogram
+#: totalled ~2x the calls actually made — which is exactly the kind of number a
+#: reader must not build a metric on. ``counters.model_completed`` becomes the
+#: model-call count for the same reason: the classifier's ``" completed"``
+#: suffix rule also matches non-model lifecycle text, so the phase-derived count
+#: over-counted by one per compaction episode.
+FORENSICS_SCHEMA = "frontend_forensics/4"
 
 #: Watchdog outcome codes.
 OUTCOME_IDLE_TIMEOUT = "FRONTEND_IDLE_TIMEOUT"
@@ -296,7 +305,26 @@ _KIND_STREAM = "STREAM"
 # name and a duration by the emitter (see the ``executing tool:`` /
 # ``tool completed:`` sites), never from arguments, so the first
 # whitespace-delimited token after the prefix is a name and not a payload.
-_TOOL_DESC_PREFIXES = ("executing tool: ", "tool completed: ")
+_TOOL_STARTED_DESC_PREFIX = "executing tool: "
+_TOOL_COMPLETED_DESC_PREFIX = "tool completed: "
+_TOOL_DESC_PREFIXES = (_TOOL_STARTED_DESC_PREFIX, _TOOL_COMPLETED_DESC_PREFIX)
+
+#: Suffix the emitter appends to a tool-completion description when the call
+#: returned an error. It is built as
+#: ``f"tool completed: {name} ({duration:.1f}s){' (error)' if is_error else ''}"``.
+#: A refused write therefore reaches the progress channel looking exactly like a
+#: successful one — the same kind/phase, and ``advance=True`` either way — so the
+#: receipt needs its own failure counter or a rejection loop is invisible.
+_TOOL_ERROR_DESC_SUFFIX = " (error)"
+
+#: The model-call completion boundary, emitted as exactly
+#: ``f"API call #{n} completed"``. Matched explicitly instead of by
+#: KIND_MODEL/PHASE_COMPLETED because the classifier's ``" completed"`` SUFFIX
+#: rule is deliberately broad and also matches unrelated lifecycle text —
+#: notably the compression heartbeat's terminal ``"context compression
+#: completed"`` — which would add one phantom model call per compaction episode.
+_MODEL_CALL_DESC_PREFIX = "API call #"
+_MODEL_CALL_DESC_SUFFIX = " completed"
 
 _WATCHDOG_CONFIG_SECTION = ("website_builder", "frontend_watchdog")
 _CONFIG_KEYS = {
@@ -381,6 +409,33 @@ def forensic_tool_name(raw_desc: Optional[str]) -> Optional[str]:
             return token
         return None
     return None
+
+
+def forensic_tool_failed(raw_desc: Optional[str]) -> bool:
+    """Whether a tool-completion description reports the call as failed.
+
+    Only the completion prefix is honoured: a ``started`` description never
+    carries the outcome, so treating one as a failure would be a guess. This is
+    the receipt's only view of tool failure — the progress channel itself
+    classifies a refused call exactly like a successful one.
+    """
+    text = (raw_desc or "").strip()
+    if not text.startswith(_TOOL_COMPLETED_DESC_PREFIX):
+        return False
+    return text.endswith(_TOOL_ERROR_DESC_SUFFIX)
+
+
+def forensic_model_call_completed(raw_desc: Optional[str]) -> bool:
+    """Whether a description is the model-call completion boundary.
+
+    The single source of truth for "one model call happened". Deliberately
+    narrower than KIND_MODEL/PHASE_COMPLETED, which the classifier's
+    ``" completed"`` suffix rule also produces for other lifecycle text.
+    """
+    text = (raw_desc or "").strip()
+    if not text.startswith(_MODEL_CALL_DESC_PREFIX):
+        return False
+    return text.endswith(_MODEL_CALL_DESC_SUFFIX)
 
 
 class WatchdogUnavailable(RuntimeError):
@@ -501,6 +556,10 @@ class FrontendInvocation:
     model_completed_count: int = 0
     tool_started_count: int = 0
     tool_completed_count: int = 0
+    #: Tool invocations the emitter reported as failed. A subset of
+    #: ``tool_completed_count``, and the only thing in the receipt that
+    #: separates a refused call from a successful one.
+    tool_error_count: int = 0
     stream_active_count: int = 0
     first_activity_at: Optional[float] = None
     #: Longest true silence between two accepted progress signals, measured
@@ -600,18 +659,31 @@ class FrontendInvocation:
 
         Called after :meth:`note_activity` and :meth:`note_operation` so the
         liveness decision has already been made; this only records.
+
+        ``model_started_count`` / ``tool_started_count`` count phase events and
+        are NOT invocation counts: several descriptions classify as
+        KIND_MODEL/PHASE_STARTED, and a concurrent batch announces itself once
+        for the whole batch. ``model_completed_count``, ``tool_completed_count``
+        and ``tool_name_counts`` are per-invocation.
         """
         self.last_progress_phase = phase
+        tool_completed = kind == _KIND_TOOL and phase == _PHASE_COMPLETED
         if kind == _KIND_MODEL:
             if phase == _PHASE_STARTED:
                 self.model_started_count += 1
-            elif phase == _PHASE_COMPLETED:
+            # Counted from the boundary description, not from the phase: the
+            # classifier also produces KIND_MODEL/PHASE_COMPLETED for unrelated
+            # lifecycle text ending in " completed", and a model-call count that
+            # includes compaction heartbeats is not a model-call count.
+            if phase == _PHASE_COMPLETED and forensic_model_call_completed(desc):
                 self.model_completed_count += 1
         elif kind == _KIND_TOOL:
             if phase == _PHASE_STARTED:
                 self.tool_started_count += 1
-            elif phase == _PHASE_COMPLETED:
+            elif tool_completed:
                 self.tool_completed_count += 1
+                if forensic_tool_failed(desc):
+                    self.tool_error_count += 1
         elif kind == _KIND_STREAM and phase == _PHASE_ACTIVE:
             self.stream_active_count += 1
 
@@ -619,14 +691,16 @@ class FrontendInvocation:
 
         # The tool name is parsed from the RAW description (before redaction)
         # because a name is not an argument; only the clamped, redacted form is
-        # ever stored.
-        name = forensic_tool_name(desc)
-        if name is not None:
-            known = name in self.tool_name_counts
-            if known or len(self.tool_name_counts) < MAX_TOOL_NAME_DISTINCT:
-                self.tool_name_counts[name] = self.tool_name_counts.get(name, 0) + 1
-            else:
-                self.tool_name_counts_truncated = True
+        # ever stored. Counted on the COMPLETION boundary only, so one
+        # invocation contributes exactly one — a `started` event would double it.
+        if tool_completed:
+            name = forensic_tool_name(desc)
+            if name is not None:
+                known = name in self.tool_name_counts
+                if known or len(self.tool_name_counts) < MAX_TOOL_NAME_DISTINCT:
+                    self.tool_name_counts[name] = self.tool_name_counts.get(name, 0) + 1
+                else:
+                    self.tool_name_counts_truncated = True
 
         self.recent_activity.append(
             {
@@ -1349,10 +1423,19 @@ def _build_receipt(
             "max_single_operation": policy.max_single_operation_seconds,
         },
         "counters": {
+            # ``*_started`` are PHASE-EVENT counts and can exceed the number of
+            # logical calls (several descriptions classify as a model start; a
+            # concurrent batch announces itself once for the whole batch). The
+            # ``*_completed``/``model_completed`` figures and every ``tool_names``
+            # entry are per-invocation, so they are the numbers to reason with.
             "model_started": invocation.model_started_count,
             "model_completed": invocation.model_completed_count,
             "tool_started": invocation.tool_started_count,
             "tool_completed": invocation.tool_completed_count,
+            # Subset of ``tool_completed``: invocations the child reported as
+            # failed. Without it a run whose tool calls were being refused is
+            # indistinguishable from one that made them all.
+            "tool_error_count": invocation.tool_error_count,
             "stream_active": invocation.stream_active_count,
             "unknown_active": invocation.unknown_activity_count,
             # ``advance`` + ``keepalive`` always equals ``total_progress_events``.
@@ -1406,6 +1489,9 @@ def _build_receipt(
             "shapes_truncated": invocation.stream_shape_counts_truncated,
             "api_modes_truncated": invocation.api_mode_counts_truncated,
         },
+        # One entry per COMPLETED invocation, so the values sum to
+        # ``counters.tool_completed`` (modulo truncation) rather than to roughly
+        # twice it. Names only — never arguments, by construction.
         "tool_names": dict(invocation.tool_name_counts),
         "tool_names_truncated": invocation.tool_name_counts_truncated,
         "recent_activity": [dict(entry) for entry in invocation.recent_activity],

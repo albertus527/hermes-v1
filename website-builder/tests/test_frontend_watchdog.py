@@ -1062,6 +1062,10 @@ def test_tool_names_are_counted_capped_and_never_arguments(harness):
         harness.script.at(
             i, "inv-A", "TOOL", "started", desc=f"executing tool: tool{i:02d}"
         )
+        harness.script.at(
+            i, "inv-A", "TOOL", "completed", desc=f"tool completed: tool{i:02d} (0.1s)"
+        )
+    # A second invocation of the first tool must add exactly one more.
     harness.script.at(50, "inv-A", "TOOL", "completed", desc="tool completed: tool00 (0.1s)")
     # An unmapped description must not be mined for a name.
     harness.script.at(60, "inv-A", "UNKNOWN", "active", desc="executing toolX: secret")
@@ -1073,6 +1077,99 @@ def test_tool_names_are_counted_capped_and_never_arguments(harness):
     assert len(names) == wd.MAX_TOOL_NAME_DISTINCT
     assert run.diagnostics["forensics"]["tool_names_truncated"] is True
     assert "secret" not in json.dumps(names)
+
+
+def test_tool_names_count_invocations_not_start_and_complete_events(harness):
+    """One invocation contributes exactly one, never the started event too.
+
+    The v3 histogram counted both, so it totalled ~2x the calls actually made.
+    A number a reader builds a metric on must be the invocation count.
+    """
+    harness.script.ready(0, "inv-A")
+    for i in range(5):
+        harness.script.at(
+            10 + i, "inv-A", "TOOL", "started", desc="executing tool: write_file"
+        )
+        harness.script.at(
+            11 + i, "inv-A", "TOOL", "completed", desc="tool completed: write_file (0.1s)"
+        )
+
+    run = harness.run("inv-A", exit_at=40)
+    forensics = run.diagnostics["forensics"]
+
+    assert forensics["tool_names"]["write_file"] == 5
+    assert sum(forensics["tool_names"].values()) == forensics["counters"]["tool_completed"]
+
+
+def test_refused_tool_call_is_counted_as_an_error(harness):
+    """A refused call looks exactly like a successful one on the wire.
+
+    The progress channel classifies both as an advancing TOOL/completed event,
+    so without its own failure counter a rejection loop is invisible in the
+    receipt.
+    """
+    harness.script.ready(0, "inv-A")
+    for i in range(3):
+        harness.script.at(
+            10 + i, "inv-A", "TOOL", "started", desc="executing tool: write_file"
+        )
+        harness.script.at(
+            11 + i,
+            "inv-A",
+            "TOOL",
+            "completed",
+            desc="tool completed: write_file (0.1s) (error)",
+        )
+    harness.script.at(
+        20, "inv-A", "TOOL", "completed", desc="tool completed: read_file (0.1s)"
+    )
+
+    run = harness.run("inv-A", exit_at=40)
+    counters = run.diagnostics["forensics"]["counters"]
+
+    assert counters["tool_completed"] == 4
+    assert counters["tool_error_count"] == 3
+    assert counters["advance"] == counters["total_progress_events"]
+
+
+def test_a_refused_call_is_still_recorded_by_name(harness):
+    """The failure must not cost the call its place in the histogram."""
+    harness.script.ready(0, "inv-A")
+    harness.script.at(
+        10, "inv-A", "TOOL", "completed", desc="tool completed: patch (0.2s) (error)"
+    )
+
+    run = harness.run("inv-A", exit_at=30)
+
+    assert run.diagnostics["forensics"]["tool_names"]["patch"] == 1
+    assert run.diagnostics["forensics"]["counters"]["tool_error_count"] == 1
+
+
+def test_compression_lifecycle_text_does_not_count_as_a_model_call(harness):
+    """``model_completed`` counts model calls, and nothing else.
+
+    The classifier's ``" completed"`` suffix rule also matches the compression
+    heartbeat's terminal stamp, so deriving the count from the phase counted one
+    phantom model call per compaction episode.
+    """
+    harness.script.ready(0, "inv-A")
+    for i in range(2):
+        harness.script.at(
+            10 + i, "inv-A", "MODEL", "started", desc=f"starting API call #{i + 1}"
+        )
+        harness.script.at(
+            11 + i, "inv-A", "MODEL", "completed", desc=f"API call #{i + 1} completed"
+        )
+    harness.script.at(20, "inv-A", "UNKNOWN", "active", desc="context compression started")
+    harness.script.at(
+        21, "inv-A", "MODEL", "completed", desc="context compression completed"
+    )
+
+    run = harness.run("inv-A", exit_at=30)
+    counters = run.diagnostics["forensics"]["counters"]
+
+    assert counters["model_completed"] == 2
+    assert counters["model_started"] == 2
 
 
 # --- description redaction --------------------------------------------------
@@ -1500,13 +1597,23 @@ def test_receipt_is_bounded_for_a_very_long_noisy_run(tmp_path):
             made.script.at(
                 i * 30, "inv-noisy", "TOOL", "started", desc=f"executing tool: tool{i}"
             )
+            made.script.at(
+                i * 30 + 1,
+                "inv-noisy",
+                "TOOL",
+                "completed",
+                desc=f"tool completed: tool{i} (0.1s)",
+            )
         # 300 events spanning 0..8970s: 301 sampling opportunities, capped at 256.
         run = made.run("inv-noisy", exit_at=9000, diagnostics_dir=diag)
         path = diag / "inv-noisy.json"
         assert path.stat().st_size < RECEIPT_SIZE_CEILING_BYTES
 
         receipt = _read_receipt(diag, "inv-noisy")
-        assert receipt["counters"]["total_progress_events"] == 300
+        # 300 started + 300 completed events.
+        assert receipt["counters"]["total_progress_events"] == 600
+        assert receipt["counters"]["tool_started"] == 300
+        assert receipt["counters"]["tool_completed"] == 300
         assert receipt["workspace"]["samples"] == wd.MAX_SAMPLE_SERIES
         assert len(receipt["recent_activity"]) == wd.RECENT_ACTIVITY_LEN
         assert len(receipt["tool_names"]) == wd.MAX_TOOL_NAME_DISTINCT
