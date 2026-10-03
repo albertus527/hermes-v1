@@ -388,10 +388,30 @@ class TestHermesAdapter(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("model execution fail", result.error)
 
+    def _complete_workspace(self, project_id, design_dna=None):
+        """Materialize a workspace that satisfies the Phase 7 postcondition.
+
+        A declared FRONTEND success is only accepted when the artifacts actually
+        exist, so a test exercising some OTHER seam (the CLI boundary, the
+        prompt) has to hand it a workspace a real run would have produced.
+        """
+        workspace = Path(self.tmpdir) / "workspaces" / project_id
+        (workspace / "src").mkdir(parents=True, exist_ok=True)
+        (workspace / "design-dna.json").write_text(
+            json.dumps(design_dna if design_dna is not None else {"version": 1}),
+            encoding="utf-8",
+        )
+        (workspace / "src" / "App.tsx").write_text(
+            "export default () => null\n", encoding="utf-8"
+        )
+        starter = self.adapter.repo_root / "templates" / "frontend-starter" / "src" / "App.tsx"
+        starter.parent.mkdir(parents=True, exist_ok=True)
+        starter.write_text("// starter placeholder\n", encoding="utf-8")
+        return workspace
+
     def test_frontend_build_uses_cli_boundary(self):
         """FRONTEND uses the scripted CLI boundary with explicit toolsets."""
-        workspace = Path(self.tmpdir) / "workspaces" / "proj-1"
-        workspace.mkdir(parents=True)
+        workspace = self._complete_workspace("proj-1")
 
         with patch.object(self.adapter, "_run_hermes_cli") as mock_cli:
             mock_cli.return_value = HermesResult(
@@ -533,13 +553,8 @@ class TestHermesAdapter(unittest.TestCase):
 
     def test_frontend_build_loads_design_dna(self):
         """FRONTEND build loads Design DNA from workspace."""
-        workspace = Path(self.tmpdir) / "workspaces" / "proj-2"
-        workspace.mkdir(parents=True)
-
         dna = {"version": 1, "brand_personality": "premium"}
-        dna_path = workspace / "design-dna.json"
-        with dna_path.open("w") as f:
-            json.dump(dna, f)
+        workspace = self._complete_workspace("proj-2", design_dna=dna)
 
         with patch.object(self.adapter, "_run_hermes_cli") as mock_cli:
             mock_cli.return_value = HermesResult(

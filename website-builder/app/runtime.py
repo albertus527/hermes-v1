@@ -1154,6 +1154,10 @@ ERROR_MESSAGES: Dict[str, str] = {
         "The build was stopped because the service was shutting down. "
         "Send your request again once the service is back."
     ),
+    "FRONTEND_IMPLEMENTATION_MISSING": (
+        "The build finished without producing the website — only the design was "
+        "written. Nothing was published. Please start the build again."
+    ),
     "BUILD_NOT_ALLOWED_IN_LIFECYCLE": "The project is not ready to build yet.",
     "DIRECTION_CHOICE_PENDING": "Please choose a design direction first.",
     "EVENT_RECONCILIATION_REQUIRED": "A previous operation needs reconciliation. Please try again.",

@@ -89,6 +89,45 @@ except ImportError as exc:  # pragma: no cover - depends on host environment
 # what makes ``state.failure.error`` non-empty instead of blank.
 FRONTEND_RESULT_CONTRACT_INVALID = "FRONTEND_RESULT_CONTRACT_INVALID"
 
+# Stable classification for a FRONTEND run that DECLARED success while leaving
+# the starter placeholder in place. A declared success is a claim about the
+# workspace, so it is checked against the workspace: without this, a run that
+# produced design-dna.json and nothing else was accepted and went on to
+# deterministic checks, QA and preview — on the untouched starter.
+FRONTEND_IMPLEMENTATION_MISSING = "FRONTEND_IMPLEMENTATION_MISSING"
+
+
+def _declared_frontend_result(response: str) -> tuple:
+    """Read the JSON summary's ``(declared_success, error)``.
+
+    Returns ``(None, None)`` when the summary declares nothing — no parseable
+    JSON, or a JSON object with neither a boolean ``success`` nor a usable
+    ``error``. Legacy shape included: a real reason with no explicit
+    ``success`` field IS a failure declaration.
+
+    Split out of :meth:`HermesAdapter._parse_frontend_response` so the
+    declaration is defined once and can be consulted by the caller that checks
+    the claim against the artifacts.
+    """
+    declared_success: Optional[bool] = None
+    error: Optional[str] = None
+    try:
+        start = response.find("{")
+        end = response.rfind("}") + 1
+        if start >= 0 and end > start:
+            data = json.loads(response[start:end])
+            if isinstance(data, dict):
+                if isinstance(data.get("success"), bool):
+                    declared_success = data["success"]
+                raw_error = data.get("error")
+                if isinstance(raw_error, str) and raw_error.strip():
+                    error = raw_error
+    except (json.JSONDecodeError, ValueError):
+        pass
+    if declared_success is None and error is not None:
+        declared_success = False
+    return declared_success, error
+
 @dataclass
 class HermesResult:
     """Result from a Hermes invocation."""
@@ -1357,8 +1396,39 @@ Respond in this exact JSON format:
             return failure
 
         # Parse FRONTEND response for Design DNA
-        return self._parse_frontend_response(result.response, workspace)
+        parsed = self._parse_frontend_response(result.response, workspace)
 
+        # A DECLARED success is a claim about the workspace, so it is checked
+        # against the workspace. Until now only the timeout-recovery branch
+        # consulted the artifacts, which meant a run that declared success
+        # without ever replacing the starter was accepted and went on to
+        # deterministic checks, QA and preview — on a placeholder site.
+        #
+        # This is a postcondition on an already-declared result, not a
+        # convergence guard: it adds no timing, no bound and no supervision
+        # behaviour. A summary that declared NOTHING is deliberately untouched —
+        # that is the truncated-response/artifact-recovery case, where the
+        # artifacts on disk are the answer by design.
+        if (
+            parsed.get("success")
+            and _declared_frontend_result(result.response)[0] is True
+            and not self._has_complete_frontend_artifacts(workspace)
+        ):
+            failure: Dict[str, Any] = {
+                "success": False,
+                "design_dna": parsed.get("design_dna"),
+                "error": (
+                    "FRONTEND declared success but the required Phase 7 artifacts "
+                    "are incomplete: design-dna.json must exist and src/App.tsx must "
+                    "no longer be the untouched starter placeholder"
+                ),
+                "error_code": FRONTEND_IMPLEMENTATION_MISSING,
+            }
+            if result.invocation:
+                failure["invocation"] = result.invocation
+            return failure
+
+        return parsed
 
     def _has_complete_frontend_artifacts(self, workspace: Path) -> bool:
         """Deterministically validate that Phase 7 artifacts were produced.
@@ -1877,27 +1947,7 @@ Respond in this exact JSON format, one entry per attached role in order:
         # every top-level reader then read as valid.
         design_dna = load_persisted_design_dna(workspace / "design-dna.json")
 
-        declared_success: Optional[bool] = None
-        error: Optional[str] = None
-
-        try:
-            start = response.find("{")
-            end = response.rfind("}") + 1
-            if start >= 0 and end > start:
-                data = json.loads(response[start:end])
-                if isinstance(data, dict):
-                    if isinstance(data.get("success"), bool):
-                        declared_success = data["success"]
-                    raw_error = data.get("error")
-                    if isinstance(raw_error, str) and raw_error.strip():
-                        error = raw_error
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-        # Legacy shape: a real reason with no explicit ``success`` field. The
-        # reason IS the failure declaration.
-        if declared_success is None and error is not None:
-            declared_success = False
+        declared_success, error = _declared_frontend_result(response)
 
         # No declaration at all (truncated / empty summary, or an artifact
         # recovery): artifacts on disk are authoritative.
