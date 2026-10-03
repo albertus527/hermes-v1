@@ -1,0 +1,134 @@
+# Website Builder — Design Resource Manifest (Batch D0.1)
+#
+# ONE authoritative declaration of which design resources the builder is
+# configured to use and how each one is resolved. This file is the single
+# source of truth for design-resource configuration: no resource path, skill
+# name, or install mode is spelled anywhere else in the application.
+#
+# What this file is NOT:
+#   * It is not an inventory of what happens to be installed. `required` and
+#     `install_mode` declare INTENT; availability is proven separately by
+#     app/core/design_capabilities.py inspecting the resolved profile.
+#   * It is not an install list. Nothing here causes an install, a clone, or a
+#     network fetch. Batch D0.1-D0.2 provisions nothing.
+#   * It is not read by FRONTEND. Design DNA behavior and prompts are unchanged
+#     by this batch; this is capability plumbing and preflight wiring only.
+#
+# Schema (validated fail-closed by app/core/design_resources.py):
+#   version          int, currently 1
+#   data_entries_max int, bounds each resource's data_entries list
+#   resources        mapping of <resource_id> -> resource declaration
+#     kind           skill | reference | registry | npm_optional  (closed set)
+#     required       bool
+#     resolution     profile_skill | deferred                   (closed set)
+#     skill_name     str, REQUIRED iff kind == skill
+#     install_mode   project_on_demand, permitted iff kind in
+#                    (registry, npm_optional)
+#     data_entries   list of skill-root-relative paths. Each must be relative,
+#                    free of ".." under either separator, and must resolve
+#                    INSIDE the skill directory (symlinks included).
+#
+# Two resources are deliberately required=false at this stage: making them
+# required would block startup on a host that has never been provisioned with
+# them, which is a regression, not a safety property. Only ui_ux_pro_max is
+# load-bearing for R1.
+
+version: 1
+
+# Bounds each resource's data_entries list. A manifest that pins hundreds of
+# files is a snapshot of a directory listing, not a capability contract, and it
+# would make the existence check unbounded work on every startup.
+data_entries_max: 32
+
+resources:
+
+  # --- Skills resolved from the Website profile's skills directory -----------
+  #
+  # Resolution is profile-local ($HERMES_HOME/skills/<skill_name>), which is
+  # how Hermes discovers skills regardless of cwd. The profile home is
+  # supplied by RuntimeConfig.hermes_home -- never a hardcoded user path.
+
+  ui_ux_pro_max:
+    kind: skill
+    required: true
+    resolution: profile_skill
+    skill_name: ui-ux-pro-max
+    # The two canonical artifacts, verified against the real profile layout:
+    # one search entrypoint and one core dataset. A skill whose only verified
+    # artifact is SKILL.md is a placeholder directory -- precisely the case
+    # this manifest exists to distinguish from a usable capability. The full
+    # UI UX Pro Max data set is intentionally NOT pinned; these two are the
+    # D0.2 floor. Availability here means the local layout is statically
+    # verified -- it does NOT mean the search command has been executed.
+    data_entries:
+      - scripts/search.py
+      - data/styles.csv
+
+  impeccable:
+    kind: skill
+    required: false
+    resolution: profile_skill
+    skill_name: impeccable
+    # Not provisioned at this stage. Absent => unavailable_optional, which is
+    # a degraded status and never a startup failure.
+    data_entries: []
+
+  # --- Reference corpora -----------------------------------------------------
+  #
+  # Read-only inspiration/reference sources. Never a build dependency; a
+  # missing reference degrades design quality, never correctness.
+
+  refero:
+    kind: reference
+    required: false
+    resolution: deferred
+
+  twenty_first:
+    kind: reference
+    required: false
+    resolution: deferred
+
+  react_bits:
+    kind: reference
+    required: false
+    resolution: deferred
+
+  transitions_dev:
+    kind: reference
+    required: false
+    resolution: deferred
+
+  # --- Provisioned per project, on demand ------------------------------------
+  #
+  # These are NOT global dependencies. Nothing is installed at bootstrap; each
+  # is added to an individual project when and if that project's design calls
+  # for it. Their absence is therefore the correct resting state and reports
+  # `not_installed` -- NOT `unavailable_optional`. Reporting a permanent
+  # degradation that nobody can act on is a field operators learn to ignore.
+  #
+  # `not_installed` is keyed off this `install_mode` declaration, so the
+  # registry resource (shadcn) reports it exactly as the npm_optional ones do.
+
+  shadcn:
+    kind: registry
+    required: false
+    resolution: deferred
+    install_mode: project_on_demand
+
+  gsap:
+    kind: npm_optional
+    required: false
+    resolution: deferred
+    install_mode: project_on_demand
+
+  three:
+    kind: npm_optional
+    required: false
+    resolution: deferred
+    install_mode: project_on_demand
+
+  lenis:
+    kind: npm_optional
+    required: false
+    resolution: deferred
+    install_mode: project_on_demand

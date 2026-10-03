@@ -39,6 +39,7 @@ from typing import Any, Dict, List, Optional
 
 from app.core import credentials
 from app.core.design_dna import load_persisted_design_dna
+from app.core.design_resources import design_profile_skills_dir
 from app.core.state import ProjectStateStore
 # Stdlib-only by design (see that module's docstring): importing it at module
 # scope is what keeps the watchdog's ``hermes_cli.oneshot`` import off this
@@ -285,8 +286,15 @@ class HermesAdapter:
         return self.repo_root / ".hermes" / "skills"
 
     def _profile_skills_dir(self) -> Path:
-        """Profile-local skills directory ($HERMES_HOME/skills/)."""
-        return self.hermes_home / "skills"
+        """Profile-local skills directory ($HERMES_HOME/skills/).
+
+        Delegates to :func:`app.core.design_resources.design_profile_skills_dir`
+        so that rule is written down exactly once. The design capability
+        resolver reads the same directory, and two independent spellings of
+        "where do profile skills live" is precisely how a capability check ends
+        up verifying a path the runtime never loads from.
+        """
+        return design_profile_skills_dir(self.hermes_home)
 
     @staticmethod
     def _dir_fingerprint(path: Path) -> str:

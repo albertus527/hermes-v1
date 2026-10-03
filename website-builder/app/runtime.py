@@ -68,6 +68,8 @@ def _diag_log(tag: str) -> None:
 from app.channels.dispatch import AuthenticatedTelegramContext, TelegramDispatcher
 from app.channels.telegram import NormalizedMessage, TelegramNormalizer
 from app.core import credentials
+from app.core.design_capabilities import preflight_design_capabilities
+from app.core.design_resources import DesignResourceManifestError
 from app.core.intake import IntakeProcessor
 from app.core.state import ProjectStateStore, reconcile_stranded_projects
 from app.core.registry import ConversationRegistryStore, DuplicateProjectName, slugify_display_name
@@ -2825,6 +2827,17 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # 3. Every model role must resolve against the real profile config
     if not preflight_role_validation(config):
+        return 1
+
+    # 4. Declared design capabilities must actually be present on this host.
+    #    Fails closed for REQUIRED resources only (currently ui_ux_pro_max);
+    #    absent optionals are logged as degraded and never block startup.
+    try:
+        design_report = preflight_design_capabilities(config.hermes_home)
+    except DesignResourceManifestError:
+        # Already logged with a sanitized reason by the preflight itself.
+        return 1
+    if not design_report.ok:
         return 1
 
     try:
