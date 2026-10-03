@@ -128,6 +128,72 @@ def _declared_frontend_result(response: str) -> tuple:
         declared_success = False
     return declared_success, error
 
+
+def _role_model_alias_target(cfg, model):
+    """Resolve a role model through the profile's ``model_aliases``.
+
+    Returns ``(resolved_model, was_alias)``.
+
+    A role may name its model by alias — that is the point of
+    ``model_aliases``, and it is how one slug can be swapped without editing
+    three role blocks. The Hermes oneshot path only consults that table when no
+    ``--provider`` was passed, and the adapter ALWAYS passes one, so an aliased
+    role used to reach the runtime verbatim. The runtime then sized the model's
+    context against an alias NAME instead of a model id: no catalog key matches
+    it, so every lookup fell back to the 256K default and logged a warning the
+    operator had no way to act on. Resolving here puts a real model id on argv.
+
+    Only the MODEL is resolved. The role's ``provider`` is a separate, deliberate
+    declaration; an alias must not silently repoint it.
+
+    Read from the profile config the caller already loaded rather than through
+    ``hermes_cli.model_switch.DIRECT_ALIASES``, which is a process-global lazy
+    cache: populating it from inside a profile-scoped read would leak one
+    profile's aliases into every later caller.
+    """
+    aliases = cfg.get("model_aliases")
+    if not isinstance(aliases, dict):
+        return model, False
+    entry = aliases.get(str(model).strip().lower())
+    if not isinstance(entry, dict):
+        return model, False
+    target = entry.get("model")
+    if not isinstance(target, str) or not target.strip():
+        return model, False
+    return target.strip(), True
+
+
+def _configured_context_length(cfg):
+    """Whether the profile sets an explicit ``model.context_length``.
+
+    The runtime's first and highest-precedence resolution step, and therefore
+    the documented way to size a model Hermes has no catalog entry for.
+    """
+    model_cfg = cfg.get("model")
+    if not isinstance(model_cfg, dict):
+        return False
+    declared = model_cfg.get("context_length")
+    return isinstance(declared, int) and not isinstance(declared, bool) and declared > 0
+
+
+def _model_has_static_context_metadata(model):
+    """Whether Hermes can size this model's context window without a probe.
+
+    Pure and offline: the same longest-key-first substring match the runtime
+    applies as its final resolution step. It answers only "will the runtime warn
+    and fall back to its default", which is all a preflight may ask — it does not
+    claim to know the real window, and it performs no network call.
+    """
+    try:
+        from agent.model_metadata import DEFAULT_CONTEXT_LENGTHS
+    except Exception:
+        return True  # cannot prove otherwise; never fail closed on absence
+    lowered = str(model).strip().lower()
+    if not lowered:
+        return False
+    return any(key in lowered for key in DEFAULT_CONTEXT_LENGTHS)
+
+
 @dataclass
 class HermesResult:
     """Result from a Hermes invocation."""
@@ -439,7 +505,11 @@ class HermesAdapter:
             except ValueError:
                 errors[role] = "missing or malformed role configuration"
                 continue
-            roles[role] = {"model": model, "provider": provider}
+            roles[role] = {
+                "model": model,
+                "provider": provider,
+                "resolved_model": _role_model_alias_target(cfg, model)[0],
+            }
 
         # Real-resolve every well-formed role through the same provider seam
         # the runtime uses. This is a local resolution proof only (credential
@@ -459,6 +529,30 @@ class HermesAdapter:
                     self._require_runtime_credentials(runtime)
                 except Exception:
                     errors[role] = "provider resolution failed"
+                    del roles[role]
+                    continue
+
+                # Alias metadata gate. Scoped to ALIASED roles on purpose: an
+                # alias is a promise that this name resolves to a model the
+                # runtime knows, so if it does not, the run would size the
+                # context against the fallback and warn once per run for the
+                # whole 45 minutes. A role naming a literal slug is not
+                # second-guessed here — an unknown custom model is a legitimate
+                # configuration, and this must not become a gate that blocks one.
+                #
+                # An explicit ``model.context_length`` is the documented escape
+                # hatch: the runtime honours it, so the model does have known
+                # metadata and this check must not fire.
+                resolved_model = roles[role]["resolved_model"]
+                if (
+                    resolved_model != roles[role]["model"]
+                    and not _model_has_static_context_metadata(resolved_model)
+                    and not _configured_context_length(cfg)
+                ):
+                    errors[role] = (
+                        "role model alias does not resolve to a model with known "
+                        "context metadata (set model.context_length to override)"
+                    )
                     del roles[role]
                     continue
 
@@ -518,7 +612,13 @@ class HermesAdapter:
                 # while the real FRONTEND build resolved a different/absent
                 # role. Scope the load exactly as _run_fast_programmatic does.
                 with self._hermes_home_scope():
-                    model, provider = self._role_selection(self._load_role_config(), role)
+                    role_cfg = self._load_role_config()
+                    model, provider = self._role_selection(role_cfg, role)
+                    # Put a real model id on argv, not an alias name (see
+                    # ``_role_model_alias_target``): the runtime's metadata
+                    # lookups match on model id, so an alias name silently
+                    # costs the run its real context window.
+                    model, _ = _role_model_alias_target(role_cfg, model)
             except Exception as exc:
                 return HermesResult(False, error=str(exc), exit_code=1)
         # Ensure profile-local skills are up-to-date so they resolve
@@ -908,6 +1008,9 @@ class HermesAdapter:
 
             if role is not None:
                 model, provider = self._role_selection(cfg, role)
+                # Same alias resolution as the supervised CLI path, so FAST and
+                # FRONTEND cannot disagree about what a role names.
+                model, _ = _role_model_alias_target(cfg, model)
 
             # Resolve effective model: explicit arg -> env var -> config.
             # Mirrors hermes_cli.oneshot._run_agent exactly.
