@@ -17,6 +17,7 @@ No live LLM, browser, or npm is required.
 from __future__ import annotations
 
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -198,6 +199,54 @@ class TestDeclaredSuccessPostcondition(unittest.TestCase):
             )
 
         self.assertEqual(calls, [self.workspace])
+
+
+class TestCompletenessAgainstTheRealStarter(unittest.TestCase):
+    """The postcondition's reference is the shipped template, not a fixture.
+
+    ``_has_complete_frontend_artifacts`` returns False when the starter file is
+    not where it expects — which would make every FRONTEND success a
+    FRONTEND_IMPLEMENTATION_MISSING. That is a total product break, and every
+    other test here uses a synthetic starter, so nothing would have caught it.
+    This asserts a packaging invariant (the template exists where the adapter
+    reads it), not the shape of its contents.
+    """
+
+    def _repo_adapter(self, repo_root):
+        return HermesAdapter(
+            ProjectStateStore(repo_root / "unused-state"),
+            hermes_home=repo_root / "unused-home",
+            repo_root=repo_root,
+        )
+
+    def test_the_shipped_starter_is_where_the_adapter_looks_for_it(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        adapter = self._repo_adapter(repo_root)
+        starter = adapter.repo_root / "templates" / "frontend-starter" / "src" / "App.tsx"
+
+        self.assertTrue(
+            starter.is_file(),
+            f"the starter placeholder is missing at {starter}; every FRONTEND "
+            f"success would be rejected as {FRONTEND_IMPLEMENTATION_MISSING}",
+        )
+
+    def test_the_unchanged_real_starter_is_not_a_complete_build(self):
+        repo_root = Path(__file__).resolve().parents[2]
+        adapter = self._repo_adapter(repo_root)
+        starter = repo_root / "templates" / "frontend-starter" / "src" / "App.tsx"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "src").mkdir()
+            shutil.copy(starter, workspace / "src" / "App.tsx")
+            (workspace / "design-dna.json").write_text(
+                json.dumps(DESIGN_DNA), encoding="utf-8"
+            )
+            # Byte-identical to the real placeholder: what p20 left behind.
+            self.assertFalse(adapter._has_complete_frontend_artifacts(workspace))
+
+            (workspace / "src" / "App.tsx").write_text(IMPLEMENTED_APP, encoding="utf-8")
+            self.assertTrue(adapter._has_complete_frontend_artifacts(workspace))
 
 
 if __name__ == "__main__":  # pragma: no cover
