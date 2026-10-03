@@ -78,9 +78,15 @@ def build_backtest_parser(subparsers, *, cmd_backtest: Callable) -> None:
                              help="exact requested sample size")
     p_worksheet.add_argument("--seed", required=True,
                              help="deterministic selection seed")
-    p_worksheet.add_argument("--strata", default="ticker,year",
+    p_worksheet.add_argument("--strata", default="",
                              help="comma-separated strata fields among "
-                                  "ticker,year,source")
+                                  "ticker,year,source. The DEFAULT (empty) "
+                                  "selects the adjudicated HYBRID policy: "
+                                  "canonical stocks stratify by ticker x "
+                                  "year, canonical ETFs by ticker only "
+                                  "(class read from universe.yaml). Any "
+                                  "non-empty value is an explicit override "
+                                  "applied to every ticker.")
     p_worksheet.add_argument("--manifest-version", default="",
                              help="run-pinned NEWS coverage manifest_version "
                                   "(required for --final)")

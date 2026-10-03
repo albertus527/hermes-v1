@@ -344,10 +344,15 @@ def _verify_whole_window_coverage(conn, requested_tickers, start_dt,
     """Fail closed unless, for EVERY requested ticker, the UNION of
     verified NEWS covered spans (existing ``coverage_manifests``
     semantics, run-pinned manifest versions) covers the ENTIRE requested
-    window. Span-union/gap logic reused from the calibration FINAL guard
-    (``calibration_sampler.verify_corpus_coverage``). Interior gaps fail
-    even when no artifact headline occurs inside them."""
-    import datetime as _dt
+    window. The span-union/gap logic is the SINGLE shared R2.8.1
+    implementation in ``calibration_sampler`` (closed second-resolution
+    intervals: exact one-second adjacency is contiguous, any larger hole
+    is a gap). Interior gaps fail even when no artifact headline occurs
+    inside them."""
+    from backtest.news.calibration_sampler import (
+        merge_verified_spans,
+        uncovered_intervals,
+    )
     evidence = []
     for ticker in requested_tickers:
         spans = []
@@ -358,23 +363,8 @@ def _verify_whole_window_coverage(conn, requested_tickers, start_dt,
                     "AND manifest_version=?", (ticker, mv)).fetchall():
                 spans.append((_parse_iso(a, "span_start"),
                               _parse_iso(b, "span_end")))
-        merged: list[list] = []
-        for a, b in sorted(spans):
-            if merged and a <= merged[-1][1]:
-                merged[-1][1] = max(merged[-1][1], b)
-            else:
-                merged.append([a, b])
-        gaps = []
-        cursor = start_dt
-        for a, b in merged:
-            if a > cursor:
-                gaps.append((cursor.isoformat(), min(a, end_dt).isoformat()))
-            if b > cursor:
-                cursor = b
-            if cursor > end_dt:
-                break
-        if cursor < end_dt:
-            gaps.append((cursor.isoformat(), end_dt.isoformat()))
+        merged = merge_verified_spans(spans)
+        gaps = uncovered_intervals(merged, start_dt, end_dt)
         evidence.append({
             "ticker": ticker,
             "window_start": start_dt.isoformat(),
