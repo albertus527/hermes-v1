@@ -97,6 +97,17 @@ FRONTEND_RESULT_CONTRACT_INVALID = "FRONTEND_RESULT_CONTRACT_INVALID"
 FRONTEND_IMPLEMENTATION_MISSING = "FRONTEND_IMPLEMENTATION_MISSING"
 
 
+def _starter_app_path(repo_root: Path) -> Path:
+    """The shipped frontend starter's ``src/App.tsx``.
+
+    THE one definition of the starter baseline. Two independent decisions need
+    it — "are the Phase 7 artifacts complete?" and "is the run still sitting on
+    the untouched placeholder?" — and they must never drift apart, so neither
+    re-spells the path.
+    """
+    return repo_root / "templates" / "frontend-starter" / "src" / "App.tsx"
+
+
 def _declared_frontend_result(response: str) -> tuple:
     """Read the JSON summary's ``(declared_success, error)``.
 
@@ -828,6 +839,33 @@ class HermesAdapter:
             except Exception:
                 return False
 
+        from app.hermes import watchdog as wd_starter
+
+        def _starter_probe() -> str:
+            """Tri-state: is ``src/App.tsx`` still the untouched starter placeholder?
+
+            Feeds the convergence guard, which decides from deliverable state
+            rather than from liveness.
+
+            TRI-STATE rather than a bool because a bool here would be
+            ambiguous in the dangerous direction: every "cannot tell" case — a
+            missing ``App.tsx``, an unreadable file, a starter missing from the
+            install — would have to collapse into "unchanged", and a transient
+            filesystem error would then read as "no implementation progress" and
+            could end a healthy run. Every failure returns STARTER_UNKNOWN, which
+            can only ever PREVENT a termination, never cause one.
+            """
+            try:
+                current = (Path(cwd) / "src" / "App.tsx").read_bytes()
+                starter = _starter_app_path(self.repo_root).read_bytes()
+            except OSError:
+                return wd_starter.STARTER_UNKNOWN
+            return (
+                wd_starter.STARTER_UNCHANGED
+                if current == starter
+                else wd_starter.STARTER_CHANGED
+            )
+
         try:
             run = wd.supervise_frontend_run(
                 cmd,
@@ -840,6 +878,7 @@ class HermesAdapter:
                 diagnostics_dir=diagnostics_dir,
                 workspace=cwd,
                 artifacts_probe=_artifacts_probe,
+                starter_probe=_starter_probe,
                 run_canceller=self.frontend_runs,
             )
         except wd.WatchdogUnavailable as exc:
@@ -1497,7 +1536,23 @@ Respond in this exact JSON format:
             # supervision timeout (idle, hard fuse, degraded legacy) and still
             # excludes a normal nonzero exit. The completeness check itself is
             # unchanged.
-            if result.timed_out and self._has_complete_frontend_artifacts(workspace):
+            #
+            # FRONTEND_NO_CONVERGENCE is excluded BY NAME, not merely by the fact
+            # that its predicate and this check happen to require opposite starter
+            # states. That coincidence is real but it is a coincidence: this
+            # branch runs on whatever workspace it is handed, and the point of
+            # the code is that a run the supervisor ended for not producing
+            # output must never be recovered into a success. Stating it here
+            # means the exclusion survives any future relaxation of the
+            # completeness check, and keeps the reason legible at the call site.
+            from app.hermes import watchdog as _wd
+
+            recoverable_timeout = result.error_code != _wd.OUTCOME_NO_CONVERGENCE
+            if (
+                result.timed_out
+                and recoverable_timeout
+                and self._has_complete_frontend_artifacts(workspace)
+            ):
                 return self._parse_frontend_response("", workspace)
             failure = {
                 "success": False,
@@ -1564,7 +1619,7 @@ Respond in this exact JSON format:
         if not app_path.is_file():
             return False
 
-        starter_app = self.repo_root / "templates" / "frontend-starter" / "src" / "App.tsx"
+        starter_app = _starter_app_path(self.repo_root)
         if not starter_app.is_file():
             return False
 

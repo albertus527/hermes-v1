@@ -343,6 +343,75 @@ MUTATIONS = [
                 HYDRATION_STAGING_UNAVAILABLE, "staging already exists")""",
         ["tests/test_r2_hydration.py"],
     ),
+    # --- FRONTEND_NO_CONVERGENCE guard -----------------------------------
+    # The first two revert the guard's arming conditions; the next two remove the
+    # fail-closed tri-state handling; the last removes the window reset. Each must
+    # turn the suite red on its own, which is what proves the guard is held by
+    # tests rather than by inspection.
+    (
+        "convergence requires the stall window",
+        "app/hermes/watchdog.py",
+        """    silent_for = sampler.deliverable_silent_for(now)
+    if silent_for is None or silent_for < convergence_seconds:
+        return False""",
+        """    silent_for = sampler.deliverable_silent_for(now)
+    if silent_for is None:
+        return False""",
+        ["tests/test_frontend_watchdog.py"],
+    ),
+    (
+        "convergence requires design-dna.json to exist",
+        "app/hermes/watchdog.py",
+        """    if not sampler.design_dna_present:
+        return False
+    if starter_probe is None:
+        return False""",
+        """    if starter_probe is None:
+        return False""",
+        ["tests/test_frontend_watchdog.py"],
+    ),
+    (
+        "convergence requires POSITIVE proof of the starter (no fail-open)",
+        "app/hermes/watchdog.py",
+        """    return state == STARTER_UNCHANGED""",
+        """    return state != STARTER_CHANGED""",
+        ["tests/test_frontend_watchdog.py"],
+    ),
+    (
+        "a read failure is UNKNOWN, never 'still the starter'",
+        "app/hermes/adapter.py",
+        """            except OSError:
+                return wd_starter.STARTER_UNKNOWN""",
+        """            except OSError:
+                return wd_starter.STARTER_UNCHANGED""",
+        ["tests/test_hermes_adapter.py", "tests/test_frontend_watchdog.py"],
+    ),
+    (
+        "the stall window resets on every deliverable mutation",
+        "app/hermes/watchdog.py",
+        """            if is_src or rel == "design-dna.json":
+                # Every deliverable mutation moves the single convergence anchor,
+                # so a DNA edit and a source edit are equally good proof that the
+                # task is still moving forward.
+                self.last_deliverable_mutation_offset_seconds = offset""",
+        """            if False:
+                self.last_deliverable_mutation_offset_seconds = offset""",
+        ["tests/test_frontend_watchdog.py"],
+    ),
+    (
+        "no-convergence is excluded from artifact recovery by name",
+        "app/hermes/adapter.py",
+        """            recoverable_timeout = result.error_code != _wd.OUTCOME_NO_CONVERGENCE""",
+        """            recoverable_timeout = True""",
+        ["tests/test_hermes_adapter.py"],
+    ),
+    (
+        "the tool-error histogram shares the tool_names admission decision",
+        "app/hermes/watchdog.py",
+        """                if tool_failed and name in self.tool_name_counts:""",
+        """                if tool_failed and name is not None:""",
+        ["tests/test_frontend_watchdog.py"],
+    ),
 ]
 
 

@@ -241,6 +241,7 @@ class Harness:
         artifacts_probe=None,
         write_receipt=None,
         run_canceller=None,
+        starter_probe=None,
     ):
         self._exit_at = exit_at
         self._stdout = stdout
@@ -267,6 +268,7 @@ class Harness:
             artifacts_probe=artifacts_probe,
             write_receipt=write_receipt,
             run_canceller=run_canceller,
+            starter_probe=starter_probe,
         )
 
 
@@ -1145,6 +1147,168 @@ def test_a_refused_call_is_still_recorded_by_name(harness):
     assert run.diagnostics["forensics"]["counters"]["tool_error_count"] == 1
 
 
+# --- per-tool error breakdown (S1 follow-up) -------------------------------
+
+
+def _error_tool(harness, invocation_id, when, name):
+    """One tool invocation the emitter reported as FAILED."""
+    harness.script.at(
+        when,
+        invocation_id,
+        "TOOL",
+        "completed",
+        desc=f"tool completed: {name} (0.2s) (error)",
+    )
+
+
+@pytest.mark.parametrize(
+    "failing", ["terminal", "read_file", "write_file"]
+)
+def test_a_failing_tool_increments_only_its_own_error_key(harness, failing):
+    """One refused call credits exactly one tool, and no other.
+
+    This is the p21 question: a flat ``tool_error_count`` of 17 could not say
+    whether the refusals were ``read_file`` (a retry loop) or ``write_file``
+    (the implementation itself failing). The breakdown has to attribute each
+    error to its own tool and leave every sibling at zero.
+    """
+    harness.script.ready(0, "inv-A")
+    harness.script.at(5, "inv-A", "TOOL", "completed", desc="tool completed: patch (0.1s)")
+    _error_tool(harness, "inv-A", 10, failing)
+
+    run = harness.run("inv-A", exit_at=30)
+    receipt = run.diagnostics["forensics"]
+
+    assert receipt["tool_errors_by_name"] == {failing: 1}
+    # A successful sibling never contributes to the error breakdown.
+    assert "patch" not in receipt["tool_errors_by_name"]
+    # The name still occupies its slot in the all-calls histogram.
+    assert receipt["tool_names"][failing] == 1
+    assert receipt["tool_names"]["patch"] == 1
+
+
+def test_successful_completions_do_not_increment_the_error_histogram(harness):
+    """The whole run can be error-free and the breakdown must stay empty."""
+    harness.script.ready(0, "inv-A")
+    for t in (5, 10, 15, 20):
+        harness.script.at(
+            t, "inv-A", "TOOL", "completed", desc="tool completed: read_file (0.1s)"
+        )
+
+    run = harness.run("inv-A", exit_at=30)
+    receipt = run.diagnostics["forensics"]
+
+    assert receipt["tool_errors_by_name"] == {}
+    assert receipt["counters"]["tool_error_count"] == 0
+    assert receipt["tool_names"]["read_file"] == 4
+
+
+def test_a_mixed_run_totals_correctly_and_attributes_each_error(harness):
+    """``tool_error_count`` stays exact while the breakdown sums to it.
+
+    The p21 shape verbatim: overwhelmingly successful reads, a handful of
+    refused calls. The total must equal the number of ``(error)`` completions,
+    and every one of them must land under the right tool.
+    """
+    harness.script.ready(0, "inv-A")
+    reads_ok, reads_err, writes_err = 6, 3, 2
+    t = 5
+    for _ in range(reads_ok):
+        harness.script.at(t, "inv-A", "TOOL", "completed", desc="tool completed: read_file (0.1s)")
+        t += 1
+    for _ in range(reads_err):
+        _error_tool(harness, "inv-A", t, "read_file")
+        t += 1
+    for _ in range(writes_err):
+        _error_tool(harness, "inv-A", t, "write_file")
+        t += 1
+
+    run = harness.run("inv-A", exit_at=120)
+    receipt = run.diagnostics["forensics"]
+
+    assert receipt["tool_errors_by_name"] == {"read_file": 3, "write_file": 2}
+    # 3 refused reads + 2 refused writes; the 6 clean reads contribute nothing.
+    assert receipt["counters"]["tool_error_count"] == 5
+    assert sum(receipt["tool_errors_by_name"].values()) == (
+        receipt["counters"]["tool_error_count"]
+    )
+    assert receipt["tool_names"]["read_file"] == reads_ok + reads_err
+    assert receipt["tool_names"]["write_file"] == writes_err
+
+
+def test_error_histogram_truncation_is_deterministic_and_shared(harness):
+    """Both histograms drop the SAME keys, so one flag describes both.
+
+    Sharing the admission decision is what makes this deterministic: the error
+    breakdown can never hold a name the all-calls histogram rejected, so the two
+    are always truncated in lockstep rather than drifting apart.
+    """
+    harness.script.ready(0, "inv-A")
+    overflow = wd.MAX_TOOL_NAME_DISTINCT + 5
+    t = 1
+    for index in range(overflow):
+        name = f"tool_{index:03d}"
+        _error_tool(harness, "inv-A", t, name)
+        t += 1
+
+    run = harness.run("inv-A", exit_at=300)
+    receipt = run.diagnostics["forensics"]
+
+    assert len(receipt["tool_names"]) == wd.MAX_TOOL_NAME_DISTINCT
+    assert receipt["tool_names_truncated"] is True
+    # Deterministic: the retained key set is the FIRST N names, every run.
+    assert set(receipt["tool_names"]) == {
+        f"tool_{i:03d}" for i in range(wd.MAX_TOOL_NAME_DISTINCT)
+    }
+    # Lockstep: identical keys, identical truncation flag.
+    assert set(receipt["tool_errors_by_name"]) == set(receipt["tool_names"])
+    assert receipt["tool_errors_by_name_truncated"] is True
+    assert receipt["counters"]["tool_error_count"] == overflow
+    # The total is exact even though the breakdown is a lower bound — it is
+    # counted from the description, never from the dict.
+    assert sum(receipt["tool_errors_by_name"].values()) == (
+        wd.MAX_TOOL_NAME_DISTINCT
+    )
+
+
+def test_an_error_with_no_parsable_name_still_counts_in_the_total(harness):
+    """A refused call the parser cannot name must not vanish from the count.
+
+    ``tool_error_count`` is the honest total precisely because it does not
+    depend on a name being recoverable; the breakdown degrades to a lower bound
+    without lying about the total.
+    """
+    harness.script.ready(0, "inv-A")
+    harness.script.at(
+        10, "inv-A", "TOOL", "completed", desc="tool completed: (error)"
+    )
+
+    run = harness.run("inv-A", exit_at=30)
+    receipt = run.diagnostics["forensics"]
+
+    assert receipt["counters"]["tool_error_count"] == 1
+    assert receipt["tool_errors_by_name"] == {}
+    assert receipt["tool_errors_by_name_truncated"] is False
+
+
+def test_the_error_breakdown_is_observation_only(harness):
+    """Nothing in the receipt's new block can end a run.
+
+    A run that raises errors the whole way through and stays perfectly alive must
+    still complete on its own terms; the breakdown records, it does not decide.
+    """
+    harness.script.ready(0, "inv-A")
+    for t in range(5, 200, 5):
+        _error_tool(harness, "inv-A", t, "read_file")
+
+    run = harness.run("inv-A", exit_at=210)
+
+    assert run.outcome is None
+    assert harness.killed == []
+    assert run.returncode == 0
+    assert run.diagnostics["forensics"]["tool_errors_by_name"]["read_file"] > 0
+
+
 def test_compression_lifecycle_text_does_not_count_as_a_model_call(harness):
     """``model_completed`` counts model calls, and nothing else.
 
@@ -1344,6 +1508,170 @@ def test_sample_series_is_capped(tmp_path):
     assert sampler.samples == wd.MAX_SAMPLE_SERIES
 
 
+# --- deliverable facts: "did the task's own output move?" -------------------
+
+
+def _bare_workspace(tmp_path: Path, name: str = "ws") -> Path:
+    """A workspace with only the untouched starter under src/ and NO DNA yet."""
+    ws = tmp_path / name
+    (ws / "src").mkdir(parents=True)
+    (ws / "src" / "App.tsx").write_text("// starter placeholder\n", encoding="utf-8")
+    return ws
+
+
+def test_design_dna_first_seen_is_recorded_exactly_once(tmp_path):
+    """First observation wins; a file that keeps existing never moves it.
+
+    "When did the design first appear" is a historical fact. Recomputing it on
+    every sample would slide the anchor forward and silently lengthen the window
+    the convergence guard measures against.
+    """
+    ws = _bare_workspace(tmp_path)
+    sampler = wd.WorkspaceSampler(ws, None, started_at=0.0)
+
+    sampler.sample(0.0)
+    assert sampler.design_dna_first_seen_offset_seconds is None
+
+    (ws / "design-dna.json").write_text('{"v": 1}', encoding="utf-8")
+    sampler.sample(30.0)
+    assert sampler.design_dna_first_seen_offset_seconds == 30.0
+
+    # Still present, sampled repeatedly: the anchor must not drift.
+    for t in (60.0, 90.0, 120.0):
+        sampler.sample(t)
+    assert sampler.design_dna_first_seen_offset_seconds == 30.0
+
+
+def test_first_src_mutation_is_sticky(tmp_path):
+    """The FIRST src change anchors "implementation began"; later ones don't move it."""
+    ws = _bare_workspace(tmp_path)
+    (ws / "design-dna.json").write_text('{"v": 1}', encoding="utf-8")
+    sampler = wd.WorkspaceSampler(ws, None, started_at=0.0)
+    sampler.sample(0.0)
+
+    (ws / "src" / "App.tsx").write_text("real implementation\n", encoding="utf-8")
+    sampler.sample(60.0)
+    assert sampler.first_src_mutation_offset_seconds == 60.0
+
+    (ws / "src" / "main.tsx").write_text("more\n", encoding="utf-8")
+    sampler.sample(300.0)
+    assert sampler.first_src_mutation_offset_seconds == 60.0
+    # The *last* deliverable change, by contrast, does keep advancing.
+    assert sampler.last_deliverable_mutation_offset_seconds == 300.0
+
+
+def test_later_src_and_dna_mutations_advance_the_deliverable_anchor(tmp_path):
+    """One anchor for the whole deliverable set: DNA edits count as progress too.
+
+    Each rewrite changes the file's SIZE as well as its content. That is
+    deliberate: the fingerprint is ``(relpath, size, mtime_ns)``, and the module
+    documents that a SAME-SIZE rewrite inside one filesystem mtime tick is
+    invisible to it. Writing a same-length payload here would make this test
+    depend on that tick and flake under load; growing the file keeps it testing
+    the anchor semantics rather than the host's timestamp resolution.
+    """
+    ws = _bare_workspace(tmp_path)
+    sampler = wd.WorkspaceSampler(ws, None, started_at=0.0)
+    sampler.sample(0.0)
+    assert sampler.last_deliverable_mutation_offset_seconds is None
+
+    (ws / "design-dna.json").write_text('{"v": 1}', encoding="utf-8")
+    sampler.sample(30.0)
+    assert sampler.last_deliverable_mutation_offset_seconds == 30.0
+
+    (ws / "src" / "App.tsx").write_text("impl\n", encoding="utf-8")
+    sampler.sample(90.0)
+    assert sampler.last_deliverable_mutation_offset_seconds == 90.0
+
+    # A further DNA refinement is equally good proof of forward progress.
+    (ws / "design-dna.json").write_text('{"v": 2, "note": "refined"}', encoding="utf-8")
+    sampler.sample(150.0)
+    assert sampler.last_deliverable_mutation_offset_seconds == 150.0
+
+
+def test_unrelated_workspace_files_do_not_advance_the_deliverable_anchor(tmp_path):
+    """Activity outside the deliverable set is not deliverable progress.
+
+    The scan covers exactly ``design-dna.json`` and ``src/**``, so a build
+    writing logs or caches elsewhere in the workspace does not move the
+    fingerprint at all. That is stronger than merely not counting it: those
+    writes cannot even look like progress to the guard.
+    """
+    ws = _bare_workspace(tmp_path)
+    (ws / "design-dna.json").write_text('{"v": 1}', encoding="utf-8")
+    sampler = wd.WorkspaceSampler(ws, None, started_at=0.0)
+    sampler.sample(0.0)
+
+    (ws / "notes.log").write_text("scratch\n", encoding="utf-8")
+    (ws / "tmp").mkdir()
+    (ws / "tmp" / "cache.json").write_text("{}", encoding="utf-8")
+    (ws / "package-lock.json").write_text("{}", encoding="utf-8")
+    sampler.sample(60.0)
+
+    assert sampler.last_deliverable_mutation_offset_seconds is None
+    assert sampler.first_src_mutation_offset_seconds is None
+    # The general mutation counter saw nothing either: the scan never looked.
+    assert sampler.last_mutation_offset_seconds is None
+    assert sampler.source_mutation_count == 0
+    assert sampler.distinct_fingerprints == 1
+    # The DNA was present at baseline, so first-seen is a valid anchor and the
+    # window is legitimately measurable from launch — unrelated writes neither
+    # advanced it nor reset it.
+    assert sampler.deliverable_silent_for(60.0) == 60.0
+    assert sampler.deliverable_silent_for(300.0) == 300.0
+
+
+def test_the_initial_starter_copy_is_not_a_runtime_src_mutation(tmp_path):
+    """The launch baseline establishes "before", so the copy is not a mutation.
+
+    This is what stops the guard from misreading a fresh workspace as immediate
+    deliverable progress: ``_copy_starter`` runs BEFORE the child is spawned, so
+    the starter is already in the baseline sample and never appears in ``changed``.
+    """
+    ws = _bare_workspace(tmp_path)
+    sampler = wd.WorkspaceSampler(ws, None, started_at=0.0)
+
+    sampler.sample(0.0)  # baseline: starter already on disk
+
+    assert sampler.source_mutation_count == 0
+    assert sampler.first_src_mutation_offset_seconds is None
+    assert sampler.last_deliverable_mutation_offset_seconds is None
+    assert sampler.mutated_paths() == []
+
+
+def test_deliverable_silent_for_anchors_on_first_seen_when_written_at_setup(tmp_path):
+    """DNA present at launch: first-seen is the anchor, so the window is measurable.
+
+    Otherwise a run whose design landed during setup would have no anchor at all
+    and the guard could never arm for it — silently.
+    """
+    ws = _bare_workspace(tmp_path)
+    (ws / "design-dna.json").write_text('{"v": 1}', encoding="utf-8")
+    sampler = wd.WorkspaceSampler(ws, None, started_at=0.0)
+
+    sampler.sample(0.0)
+    assert sampler.last_deliverable_mutation_offset_seconds is None
+    assert sampler.design_dna_first_seen_offset_seconds == 0.0
+    assert sampler.deliverable_silent_for(400.0) == 400.0
+
+
+def test_the_deliverable_facts_reach_the_receipt(tmp_path):
+    """Observational facts must actually be observable after the fact."""
+    ws = _bare_workspace(tmp_path)
+    sampler = wd.WorkspaceSampler(ws, None, started_at=0.0)
+    sampler.sample(0.0)
+    (ws / "design-dna.json").write_text('{"v": 1}', encoding="utf-8")
+    sampler.sample(30.0)
+    (ws / "src" / "App.tsx").write_text("impl\n", encoding="utf-8")
+    sampler.sample(60.0)
+
+    observed = sampler.receipt()
+
+    assert observed["design_dna_first_seen_offset_seconds"] == 30.0
+    assert observed["first_src_mutation_offset_seconds"] == 60.0
+    assert observed["last_deliverable_mutation_offset_seconds"] == 60.0
+
+
 # --- artifacts probe is observation only -----------------------------------
 
 
@@ -1433,12 +1761,27 @@ def test_first_complete_offset_stays_null_when_never_complete(harness):
 
 
 def test_complete_artifacts_do_not_terminate_a_silent_run(harness):
-    """BOUNDARY LOCK: this is the convergence guard, and it is not implemented.
+    """BOUNDARY LOCK — phase-7 completeness stays strictly observation-only.
 
-    The artifacts are complete from the first sample, and the run then goes
-    silent. It MUST still be terminated by the idle bound. If this test ever
-    fails, someone has wired the probe into the supervision decision — which is
-    the deferred change, not this one.
+    The recorded intent of this tripwire is PRESERVED and now covers BOTH seams
+    it was guarding between. It originally read: "this is the convergence guard
+    and it is not implemented; if this ever fails, someone wired the probe into
+    the supervision decision."
+
+    The convergence guard is now implemented, so that sentence is no longer
+    true as written — but the underlying rule absolutely is, and it is the more
+    precise version of it: there are now TWO distinct filesystem seams, and NEITHER
+    may gate termination.
+
+    * ``artifacts_probe`` — "are the Phase 7 artifacts complete?" — stays
+      observation-only forever. Completeness is a POSTCONDITION on a declared
+      result, not a liveness input.
+    * ``starter_probe`` — "is App.tsx still the untouched starter?" — is the
+      convergence guard's only filesystem input, and it is tri-state.
+
+    This test drives complete artifacts with NO starter probe at all, so the
+    outcome must be the idle timeout. If it ever becomes
+    FRONTEND_NO_CONVERGENCE, completeness has been wired into the decision.
     """
     harness.script.ready(0, "inv-A").at(0, "inv-A", "MODEL", "started")
 
@@ -1449,6 +1792,9 @@ def test_complete_artifacts_do_not_terminate_a_silent_run(harness):
     assert run.outcome == wd.OUTCOME_IDLE_TIMEOUT
     assert run.terminated is True
     assert run.diagnostics["forensics"]["artifacts"]["complete"] is True
+    # And the completeness probe could not have produced this outcome, because
+    # the convergence guard is unreachable without an explicit starter probe.
+    assert run.outcome != wd.OUTCOME_NO_CONVERGENCE
 
 
 def test_complete_artifacts_do_not_end_a_run_that_is_otherwise_alive(harness):
@@ -1465,6 +1811,776 @@ def test_complete_artifacts_do_not_end_a_run_that_is_otherwise_alive(harness):
     assert run.outcome is None
     assert harness.killed == []
     assert run.diagnostics["forensics"]["artifacts"]["first_complete_offset_seconds"] == 300.0
+
+
+# --- FRONTEND_NO_CONVERGENCE ------------------------------------------------
+#
+# A run can be demonstrably ALIVE — model calls streaming, tools executing — and
+# still be making no progress toward its output. p21 is the shape: 966s, 89
+# model calls, 151 tool completions, and exactly one file written.
+#
+# Every other bound reads progress events, so p21 was healthy by all of them.
+# These tests pin the one bound that reads DELIVERABLE state instead.
+#
+# The shape under test throughout: DNA written, App.tsx still the starter,
+# steady activity, no source mutation. The guard needs a probe, so tests pass
+# ``starter_probe`` explicitly; with none supplied it is unreachable by design.
+
+
+def _busy(harness, invocation_id, until, every=10.0):
+    """A run that is unambiguously ALIVE: continuous model and tool activity.
+
+    Continuous ``advance=True`` events keep both liveness clocks warm, so no
+    idle or hard bound can fire. Anything that ends this run ended it on
+    deliverable state alone.
+    """
+    harness.script.ready(0, invocation_id)
+    t = every
+    while t < until:
+        harness.script.at(
+            t, invocation_id, "TOOL", "started", desc="executing tool: read_file"
+        )
+        harness.script.at(
+            t,
+            invocation_id,
+            "TOOL",
+            "completed",
+            desc="tool completed: read_file (1.0s)",
+        )
+        t += every
+
+
+def _stalled_workspace(tmp_path, *, dna=True, name="ws"):
+    """DNA present, ``src/App.tsx`` byte-identical to the starter. p21's end state."""
+    ws = tmp_path / name
+    (ws / "src").mkdir(parents=True)
+    (ws / "src" / "App.tsx").write_text("// starter placeholder\n", encoding="utf-8")
+    if dna:
+        (ws / "design-dna.json").write_text('{"v": 1}', encoding="utf-8")
+    return ws
+
+
+def _unchanged() -> str:
+    return wd.STARTER_UNCHANGED
+
+
+def _schedule(made, actions):
+    """Apply ``(at_seconds, callable)`` actions as the fake clock advances.
+
+    The guard only consults ``starter_probe`` once its window is already
+    satisfied, so a probe cannot be used to drive the workspace — that would make
+    the test depend on the very condition it is trying to vary. Scheduled writes
+    are also simply more faithful: in a real run the CHILD writes the files, and
+    the supervisor only ever reads them.
+    """
+    remaining = list(actions)
+
+    def _hook():
+        while remaining and made.clock.now >= remaining[0][0]:
+            _, action = remaining.pop(0)
+            action()
+
+    made.sleep_hook = _hook
+
+
+def test_a_fresh_starter_with_no_dna_never_arms(harness, tmp_path):
+    """No design yet: the run is legitimately still designing.
+
+    This is the "guard is too eager" failure mode. The design phase is real work
+    and the run must be left entirely alone until the DNA exists.
+    """
+    ws = _stalled_workspace(tmp_path, dna=False)
+    _busy(harness, "inv-A", 1800)
+
+    run = harness.run("inv-A", exit_at=1700, workspace=ws, starter_probe=_unchanged)
+
+    assert run.outcome is None
+    assert harness.killed == []
+    assert run.diagnostics["forensics"]["workspace"][
+        "design_dna_first_seen_offset_seconds"
+    ] is None
+
+
+def test_a_removed_design_dna_disarms_the_guard(harness, tmp_path):
+    """The DNA condition is checked independently of the stall window.
+
+    Without this, "no DNA" would only ever be tested through a run that has NO
+    anchor at all — a shape the stall-window condition already rejects, so the
+    DNA requirement itself could be deleted without any test noticing.
+
+    This isolates it: the design is removed early, and the run then runs well past
+    a full window with the DNA still absent. Removing the file is itself a
+    deliverable change, so the anchor moves to the removal — and 900s after that
+    removal the window IS satisfied. Nothing but the DNA check can be keeping the
+    guard shut, so deleting it turns this test red.
+    """
+    policy = fast_policy(convergence_seconds=300.0)
+    made = Harness(tmp_path, policy, progress_path=tmp_path / "p13.jsonl")
+    try:
+        ws = _stalled_workspace(tmp_path)
+        _busy(made, "inv-A", 2400)
+
+        # The design is removed early and never returns. Removing it does not
+        # advance the deliverable anchor (a deleted path vanishes from ``changed``
+        # entirely), so the window keeps running from first-seen and is fully
+        # elapsed long before this run ends.
+        _schedule(made, [(100.0, lambda: (ws / "design-dna.json").unlink())])
+
+        run = made.run(
+            "inv-A", exit_at=1900, workspace=ws, starter_probe=_unchanged
+        )
+
+        assert run.outcome is None
+        assert made.killed == []
+        workspace = run.diagnostics["forensics"]["workspace"]
+        # The design was seen, then is gone: an anchor exists, the window has long
+        # since elapsed, and the guard is still shut.
+        assert workspace["design_dna_first_seen_offset_seconds"] == 0.0
+        assert workspace["design_dna_present"] is False
+        assert run.diagnostics["elapsed_seconds"] > policy.convergence_seconds
+    finally:
+        made.script.close()
+
+
+def test_a_stall_shorter_than_the_window_does_not_terminate(harness, tmp_path):
+    """Below ``convergence_seconds`` the guard stays shut, however long the run."""
+    policy = fast_policy(convergence_seconds=900.0)
+    made = Harness(tmp_path, policy, progress_path=tmp_path / "p1.jsonl")
+    try:
+        ws = _stalled_workspace(tmp_path)
+        _busy(made, "inv-A", 890)
+
+        run = made.run(
+            "inv-A", exit_at=880, workspace=ws, starter_probe=_unchanged
+        )
+
+        assert run.outcome is None
+        assert made.killed == []
+        # Non-vacuous: the window really was nearly exhausted at the end.
+        assert 870 <= run.diagnostics["elapsed_seconds"] <= 890
+    finally:
+        made.script.close()
+
+
+def test_a_full_window_with_the_starter_in_place_terminates(harness, tmp_path):
+    """THE case: alive, design done, starter untouched, nothing produced.
+
+    Nothing else in the watchdog can end this run — it is advancing constantly.
+    The receipt must still describe the run accurately.
+    """
+    policy = fast_policy(convergence_seconds=900.0)
+    made = Harness(tmp_path, policy, progress_path=tmp_path / "p2.jsonl")
+    try:
+        ws = _stalled_workspace(tmp_path)
+        _busy(made, "inv-A", 1000)
+        # Pin the full escalation: a child that ignores SIGTERM, so the strongest
+        # signal is what finally ends it. The guard reuses this teardown exactly.
+        made.survive_sigterm = True
+
+        run = made.run(
+            "inv-A", exit_at=None, workspace=ws, starter_probe=_unchanged
+        )
+
+        assert run.outcome == wd.OUTCOME_NO_CONVERGENCE
+        assert run.terminated is True
+        # The existing teardown, on this invocation's own pid, nothing else.
+        assert made.killed == [(made.child.pid, signal.SIGTERM), (made.child.pid, None)]
+        assert run.tree_kill_attempted is True
+
+        receipt = run.diagnostics["forensics"]
+        assert receipt["outcome"] == wd.OUTCOME_NO_CONVERGENCE
+        # It genuinely WAS busy: the run was alive the whole time it failed.
+        assert receipt["counters"]["tool_completed"] > 0
+        assert receipt["workspace"]["design_dna_present"] is True
+        assert receipt["workspace"]["first_src_mutation_offset_seconds"] is None
+        assert receipt["policy"]["convergence"] == 900.0
+    finally:
+        made.script.close()
+
+
+def test_a_src_change_before_the_window_disarms_the_guard(harness, tmp_path):
+    """Implementation started, so the run is no longer non-converging."""
+    policy = fast_policy(convergence_seconds=900.0)
+    made = Harness(tmp_path, policy, progress_path=tmp_path / "p3.jsonl")
+    try:
+        ws = _stalled_workspace(tmp_path)
+        _busy(made, "inv-A", 2000)
+
+        # First source write, well inside the window: implementation begins, and
+        # the starter is genuinely no longer in place from then on.
+        _schedule(
+            made,
+            [
+                (200.0, lambda: (ws / "src" / "App.tsx").write_text(
+                    "export default function App() { return <main>x</main> }\n",
+                    encoding="utf-8",
+                )),
+            ],
+        )
+
+        run = made.run(
+            "inv-A",
+            exit_at=1900,
+            workspace=ws,
+            starter_probe=wd.STARTER_CHANGED,
+        )
+
+        assert run.outcome is None
+        assert made.killed == []
+        assert run.diagnostics["forensics"]["workspace"][
+            "first_src_mutation_offset_seconds"
+        ] is not None
+    finally:
+        made.script.close()
+
+
+def test_a_dna_change_before_the_window_resets_the_stall(harness, tmp_path):
+    """Refining the design is deliverable progress and restarts the window."""
+    policy = fast_policy(convergence_seconds=900.0)
+    made = Harness(tmp_path, policy, progress_path=tmp_path / "p4.jsonl")
+    try:
+        ws = _stalled_workspace(tmp_path, dna=False)
+        _busy(made, "inv-A", 2000)
+
+        # DNA is written, then refined, long after the window would have expired
+        # measured from launch. Each write is a deliverable mutation. The sizes
+        # differ deliberately: a same-size rewrite can fall inside one
+        # filesystem mtime tick, which the fingerprint cannot see.
+        _schedule(
+            made,
+            [
+                (400.0, lambda: (ws / "design-dna.json").write_text('{"v": 1}', encoding="utf-8")),
+                (1000.0, lambda: (ws / "design-dna.json").write_text(
+                    '{"v": 2, "palette": "warm"}', encoding="utf-8"
+                )),
+                (1600.0, lambda: (ws / "design-dna.json").write_text(
+                    '{"v": 3, "palette": "warm", "type": "serif"}', encoding="utf-8"
+                )),
+            ],
+        )
+
+        run = made.run(
+            "inv-A", exit_at=1950, workspace=ws, starter_probe=_unchanged
+        )
+
+        # Elapsed well past the 900s window, yet never terminated: the DNA
+        # changes kept resetting it.
+        assert run.outcome is None
+        assert made.killed == []
+        assert run.diagnostics["elapsed_seconds"] > 900.0
+        workspace = run.diagnostics["forensics"]["workspace"]
+        assert workspace["design_dna_first_seen_offset_seconds"] is not None
+        assert workspace["last_deliverable_mutation_offset_seconds"] is not None
+    finally:
+        made.script.close()
+
+
+def test_slow_but_continuous_source_progress_never_terminates(harness, tmp_path):
+    """A slow iterative implementer is the healthy case the guard must not kill.
+
+    Source keeps moving, so the window keeps resetting — across many samples and
+    well past several multiples of ``convergence_seconds`` in total.
+    """
+    policy = fast_policy(convergence_seconds=300.0)
+    made = Harness(tmp_path, policy, progress_path=tmp_path / "p5.jsonl")
+    try:
+        ws = _stalled_workspace(tmp_path)
+        _busy(made, "inv-A", 2000, every=10.0)
+
+        # A source edit every 100s: three times inside the 300s window, so the
+        # anchor never accumulates a full window of silence.
+        _schedule(
+            made,
+            [
+                (100.0 + index * 100.0,
+                 (lambda n: lambda: (
+                     ws / "src" / "App.tsx"
+                 ).write_text("x" * (n + 1), encoding="utf-8"))(index))
+                for index in range(18)
+            ],
+        )
+
+        run = made.run(
+            "inv-A", exit_at=1900, workspace=ws, starter_probe=wd.STARTER_CHANGED
+        )
+
+        assert run.outcome is None
+        assert made.killed == []
+        assert run.diagnostics["elapsed_seconds"] > 1800.0
+        assert run.diagnostics["forensics"]["workspace"][
+            "first_src_mutation_offset_seconds"
+        ] is not None
+    finally:
+        made.script.close()
+
+
+def test_genuine_activity_does_not_reset_the_convergence_timer(harness, tmp_path):
+    """The core separation: MODEL/STREAM/TOOL activity is NOT convergence evidence.
+
+    p21's shape exactly — hundreds of tool calls, zero deliverable change. The
+    control arm proves the activity is real (it would otherwise trip the idle
+    bound), so a termination here can only have come from deliverable state.
+    """
+    policy = fast_policy(convergence_seconds=900.0)
+    made = Harness(tmp_path, policy, progress_path=tmp_path / "p6.jsonl")
+    try:
+        ws = _stalled_workspace(tmp_path)
+        # Every 10s: a tool start+complete AND a model call, all advance=True.
+        made.script.ready(0, "inv-A")
+        for t in range(10, 2000, 10):
+            made.script.at(t, "inv-A", "TOOL", "started", desc="executing tool: read_file")
+            made.script.at(
+                t, "inv-A", "TOOL", "completed", desc="tool completed: read_file (1.0s)"
+            )
+            made.script.at(t, "inv-A", "MODEL", "completed", desc=f"API call #{t} completed")
+
+        run = made.run(
+            "inv-A", exit_at=None, workspace=ws, starter_probe=_unchanged
+        )
+
+        assert run.outcome == wd.OUTCOME_NO_CONVERGENCE
+        # The control arm: with a much shorter window removed entirely, the
+        # identical activity would have kept the run alive indefinitely.
+        counters = run.diagnostics["forensics"]["counters"]
+        # Heavy real activity: 10s cadence over >900s of a converged stall.
+        assert counters["tool_completed"] > 60
+        assert counters["model_completed"] > 60
+        assert counters["tool_error_count"] == 0
+        # And the activity was genuinely inside every liveness bound: the run was
+        # never close to idle, let alone the hard fuse.
+        assert run.diagnostics["idle_for_seconds"] < policy.idle_timeout_seconds
+        assert run.diagnostics["elapsed_seconds"] < policy.hard_max_runtime_seconds
+        # It ended at the convergence window, not before: every one of those
+        # seconds carried real activity, and none of it reset the timer.
+        assert run.diagnostics["elapsed_seconds"] == policy.convergence_seconds
+    finally:
+        made.script.close()
+
+
+def test_cancellation_still_wins_over_a_converging_guard(harness, tmp_path):
+    """Precedence: an operator shutdown is never reported as non-convergence.
+
+    Cancellation lands on the SAME poll that the convergence window completes,
+    so both conditions hold at once and only the ordering separates them. If the
+    guard were evaluated above the cancellation check, this test would report
+    FRONTEND_NO_CONVERGENCE for a run an operator had explicitly stopped.
+    """
+    policy = fast_policy(convergence_seconds=300.0)
+    made = Harness(tmp_path, policy, progress_path=tmp_path / "p7.jsonl")
+    canceller = _canceller()
+    try:
+        ws = _stalled_workspace(tmp_path)
+        _busy(made, "inv-A", 2000)
+
+        # The window completes at the t=300 sample. Request cancellation on the
+        # sleep that precedes it, so both are true when the poll evaluates.
+        def _hook():
+            if made.clock.now >= 240.0:
+                canceller.cancel("inv-A", reason="signal 15")
+
+        made.sleep_hook = _hook
+
+        run = made.run(
+            "inv-A",
+            exit_at=None,
+            workspace=ws,
+            starter_probe=_unchanged,
+            run_canceller=canceller,
+        )
+
+        assert run.outcome == wd.OUTCOME_CANCELLED
+        assert run.outcome != wd.OUTCOME_NO_CONVERGENCE
+        assert run.diagnostics["forensics"]["cancelled"] is True
+        # Non-vacuous in the way that matters: had the guard been evaluated
+        # first, it WOULD have fired on this very workspace. ``design_dna_present``
+        # and the untouched starter are both true, and a further 60s of stall
+        # would have satisfied the window. Only the ordering prevents the kill.
+        receipt = run.diagnostics["forensics"]
+        assert receipt["workspace"]["design_dna_present"] is True
+        assert receipt["workspace"]["last_deliverable_mutation_offset_seconds"] is None
+        assert policy.convergence_seconds == 300.0
+        assert (
+            receipt["elapsed_seconds"] + 60.0 >= policy.convergence_seconds
+        )
+    finally:
+        made.script.close()
+
+
+def test_idle_semantics_are_unchanged_by_the_guard(harness, tmp_path):
+    """A silent run is still an IDLE timeout, never a convergence failure.
+
+    The guard needs 900s of stall; idle needs 180s of silence. Idle therefore
+    always wins, and the outcome code a reader sees is unchanged.
+    """
+    ws = _stalled_workspace(tmp_path)
+    harness.script.ready(0, "inv-A").at(0, "inv-A", "MODEL", "started")
+
+    run = harness.run(
+        "inv-A", exit_at=None, workspace=ws, starter_probe=_unchanged
+    )
+
+    assert run.outcome == wd.OUTCOME_IDLE_TIMEOUT
+    assert run.outcome != wd.OUTCOME_NO_CONVERGENCE
+
+
+def test_hard_timeout_semantics_are_unchanged_by_the_guard(harness, tmp_path):
+    """A continuously-active run still ends only at the hard fuse.
+
+    Same activity as the convergence case, but with the convergence window set
+    beyond the hard bound: the run must end as a hard timeout, proving the guard
+    is a bound that is checked, not one that pre-empts the fuse.
+    """
+    policy = fast_policy(convergence_seconds=5000.0, hard_max_runtime_seconds=400.0)
+    made = Harness(tmp_path, policy, progress_path=tmp_path / "p8.jsonl")
+    try:
+        ws = _stalled_workspace(tmp_path)
+        _busy(made, "inv-A", 2000)
+
+        run = made.run(
+            "inv-A", exit_at=None, workspace=ws, starter_probe=_unchanged
+        )
+
+        assert run.outcome == wd.OUTCOME_HARD_TIMEOUT
+        assert run.outcome != wd.OUTCOME_NO_CONVERGENCE
+    finally:
+        made.script.close()
+
+
+def test_the_guard_is_unreachable_without_an_explicit_probe(harness, tmp_path):
+    """With no starter probe the new outcome cannot occur at any duration.
+
+    This is what makes the change safe to ship: every existing caller passes no
+    probe, so the guard is not merely unlikely to fire, it is unreachable.
+    """
+    policy = fast_policy(convergence_seconds=60.0, hard_max_runtime_seconds=2700.0)
+    made = Harness(tmp_path, policy, progress_path=tmp_path / "p9.jsonl")
+    try:
+        ws = _stalled_workspace(tmp_path)
+        _busy(made, "inv-A", 800)
+
+        run = made.run("inv-A", exit_at=790, workspace=ws)
+
+        assert run.outcome is None
+        assert made.killed == []
+    finally:
+        made.script.close()
+
+
+def test_the_guard_fires_only_on_a_real_sample_not_every_poll(harness, tmp_path):
+    """The cadence gate: one evaluation per workspace sample, not per poll.
+
+    Proven by count rather than by timing — the predicate must be asked a
+    number of times equal to the sampler's own sample count, which is what makes
+    it structurally impossible for a per-poll progress event to refresh it.
+    """
+    policy = fast_policy(convergence_seconds=900.0)
+    made = Harness(tmp_path, policy, progress_path=tmp_path / "p10.jsonl")
+    calls = {"n": 0}
+
+    def _probe():
+        calls["n"] += 1
+        return wd.STARTER_UNCHANGED
+
+    try:
+        ws = _stalled_workspace(tmp_path)
+        _busy(made, "inv-A", 1200)
+
+        run = made.run("inv-A", exit_at=None, workspace=ws, starter_probe=_probe)
+
+        assert run.outcome == wd.OUTCOME_NO_CONVERGENCE
+        samples = run.diagnostics["forensics"]["workspace"]["samples"]
+        # Far more polls than samples, and at most one probe call per sample.
+        assert run.diagnostics["forensics"]["counters"]["total_progress_events"] > samples
+        assert 0 < calls["n"] <= samples
+    finally:
+        made.script.close()
+
+
+def test_no_convergence_is_distinct_from_every_other_code():
+    """A new failure class deserves its own code, provably unequal to all of them."""
+    assert wd.OUTCOME_NO_CONVERGENCE not in {
+        wd.OUTCOME_IDLE_TIMEOUT,
+        wd.OUTCOME_HARD_TIMEOUT,
+        wd.OUTCOME_CANCELLED,
+        "FRONTEND_IMPLEMENTATION_MISSING",
+    }
+    # It IS a supervision termination, so it belongs with the other bounds.
+    assert wd.OUTCOME_NO_CONVERGENCE in wd.TIMED_OUT_OUTCOMES
+    # ...and unlike cancellation, it says something about the run's health.
+    assert wd.OUTCOME_NO_CONVERGENCE not in {
+        wd.OUTCOME_IDLE_TIMEOUT,
+        wd.OUTCOME_HARD_TIMEOUT,
+        wd.OUTCOME_LEGACY_TIMEOUT,
+    }
+
+
+# --- the starter probe is tri-state, and only proof may arm the guard --------
+
+
+def test_a_missing_app_tsx_does_not_arm_the_guard(harness, tmp_path):
+    """A missing App.tsx is UNKNOWN, not "still the starter".
+
+    The dangerous collapse would be a bool probe forced to answer False for every
+    failure. That would let a deleted or not-yet-created App.tsx read as "no
+    implementation progress" and end a healthy run.
+    """
+    ws = _stalled_workspace(tmp_path)
+    (ws / "src" / "App.tsx").unlink()
+    _busy(harness, "inv-A", 1200)
+
+    run = harness.run(
+        "inv-A",
+        exit_at=1150,
+        workspace=ws,
+        starter_probe=lambda: wd.STARTER_UNKNOWN,
+    )
+
+    assert run.outcome is None
+    assert harness.killed == []
+
+
+def test_an_unreadable_app_tsx_does_not_arm_the_guard(harness, tmp_path):
+    """A read failure is UNKNOWN too, and it cannot be laundered into a kill."""
+    ws = _stalled_workspace(tmp_path)
+    _busy(harness, "inv-A", 1200)
+
+    def _probe():
+        # Simulate the I/O error an unreadable file would produce.
+        raise OSError("permission denied")
+
+    run = harness.run(
+        "inv-A", exit_at=1150, workspace=ws, starter_probe=_probe
+    )
+
+    assert run.outcome is None
+    assert harness.killed == []
+
+
+def test_the_guard_will_not_arm_on_a_probe_that_raises(harness, tmp_path):
+    """Even a hostile probe fails closed: an exception disarms, never kills."""
+    ws = _stalled_workspace(tmp_path)
+    _busy(harness, "inv-A", 1200)
+
+    def _probe():
+        raise RuntimeError("probe exploded")
+
+    run = harness.run(
+        "inv-A", exit_at=1150, workspace=ws, starter_probe=_probe
+    )
+
+    assert run.outcome is None
+    assert harness.killed == []
+
+
+def test_an_implemented_app_tsx_never_gets_a_convergence_termination(harness, tmp_path):
+    """The compile-repair / QA-repair shape, proven through the real closure.
+
+    Both repair paths invoke ``frontend_build`` on a workspace whose App.tsx
+    already differs from the starter — that is why they were invoked. This drives
+    the ADAPTER's own probe against such a workspace, so the property is not
+    asserted about a hand-written stand-in.
+    """
+    from app.core.state import ProjectStateStore
+    from app.hermes.adapter import HermesAdapter
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        repo_root = Path(tmp) / "repo"
+        starter = repo_root / "templates" / "frontend-starter" / "src"
+        starter.mkdir(parents=True)
+        (starter / "App.tsx").write_text("// starter placeholder\n", encoding="utf-8")
+        adapter = HermesAdapter(
+            ProjectStateStore(Path(tmp) / "state"),
+            hermes_home=Path(tmp) / ".hermes-website",
+            repo_root=repo_root,
+        )
+        ws = _stalled_workspace(Path(tmp))
+        (ws / "src" / "App.tsx").write_text(
+            "export default function App() { return <main>x</main> }\n", encoding="utf-8"
+        )
+
+        # The real closure, bound exactly as the adapter binds it.
+        def _starter_probe():
+            from app.hermes import watchdog as wd_mod
+
+            try:
+                current = (ws / "src" / "App.tsx").read_bytes()
+                base = adapter.repo_root / "templates" / "frontend-starter" / "src" / "App.tsx"
+                starter_bytes = base.read_bytes()
+            except OSError:
+                return wd_mod.STARTER_UNKNOWN
+            return (
+                wd_mod.STARTER_UNCHANGED
+                if current == starter_bytes
+                else wd_mod.STARTER_CHANGED
+            )
+
+        assert _starter_probe() == wd.STARTER_CHANGED
+
+        _busy(harness, "inv-A", 1500)
+        run = harness.run(
+            "inv-A", exit_at=1450, workspace=ws, starter_probe=_starter_probe
+        )
+
+        assert run.outcome is None
+        assert harness.killed == []
+
+
+def test_a_genuine_revert_to_the_starter_restarts_the_window(harness, tmp_path):
+    """No sticky latch: a real revert is just another deliverable mutation.
+
+    The plan makes no "permanently disarms" claim, and this is the test that
+    holds it honest. Implementation happens at t=200, then the source genuinely
+    reverts to the starter placeholder at t=700 — more than a full 600s window
+    after launch, so a latched "already implemented" flag would end the run. The
+    revert restarts the window instead, and the run then keeps going.
+    """
+    policy = fast_policy(convergence_seconds=600.0)
+    made = Harness(tmp_path, policy, progress_path=tmp_path / "p11.jsonl")
+    try:
+        ws = _stalled_workspace(tmp_path)
+        _busy(made, "inv-A", 2400)
+
+        _schedule(
+            made,
+            [
+                (200.0, lambda: (ws / "src" / "App.tsx").write_text(
+                    "export default function App() { return <main>x</main> }\n",
+                    encoding="utf-8",
+                )),
+                # ...and then genuinely reverts to the placeholder, past a full
+                # window measured from launch.
+                (700.0, lambda: (ws / "src" / "App.tsx").write_text(
+                    "// starter placeholder\n", encoding="utf-8"
+                )),
+            ],
+        )
+
+        run = made.run(
+            "inv-A", exit_at=1250, workspace=ws, starter_probe=wd.STARTER_UNCHANGED
+        )
+
+        # A latched "implemented" flag would have terminated at t=800. It did not:
+        # the run survived past the revert AND past the pre-revert stall time.
+        assert run.outcome is None
+        assert made.killed == []
+        assert run.diagnostics["elapsed_seconds"] > 900.0
+        workspace = run.diagnostics["forensics"]["workspace"]
+        assert workspace["first_src_mutation_offset_seconds"] is not None
+    finally:
+        made.script.close()
+
+
+def test_a_revert_then_a_full_stall_does_terminate_again(harness, tmp_path):
+    """...and if it then truly stalls, the guard arms again from the revert.
+
+    The counterpart to the test above: not latching means the guard can still do
+    its job later. The probe answers from the REAL current bytes exactly as the
+    adapter's does, so once the source has reverted and then goes quiet, the
+    window runs out again and the run ends with its own code.
+    """
+    policy = fast_policy(convergence_seconds=600.0)
+    made = Harness(tmp_path, policy, progress_path=tmp_path / "p12.jsonl")
+    try:
+        ws = _stalled_workspace(tmp_path)
+        _busy(made, "inv-A", 2400)
+
+        _schedule(
+            made,
+            [
+                (200.0, lambda: (ws / "src" / "App.tsx").write_text(
+                    "export default function App() { return <main>x</main> }\n",
+                    encoding="utf-8",
+                )),
+                (700.0, lambda: (ws / "src" / "App.tsx").write_text(
+                    "// starter placeholder\n", encoding="utf-8"
+                )),
+            ],
+        )
+
+        starter_bytes = (ws / "src" / "App.tsx").read_bytes()
+
+        def _real_probe():
+            try:
+                current = (ws / "src" / "App.tsx").read_bytes()
+            except OSError:
+                return wd.STARTER_UNKNOWN
+            return (
+                wd.STARTER_UNCHANGED if current == starter_bytes else wd.STARTER_CHANGED
+            )
+
+        run = made.run(
+            "inv-A", exit_at=None, workspace=ws, starter_probe=_real_probe
+        )
+
+        assert run.outcome == wd.OUTCOME_NO_CONVERGENCE
+        assert made.killed == [(made.child.pid, signal.SIGTERM)]
+        # It survived past a full window while implemented, then ended once the
+        # revert went unanswered — anchored on the revert, not on launch.
+        assert run.diagnostics["elapsed_seconds"] > 1200.0
+    finally:
+        made.script.close()
+
+
+def test_the_predicate_is_a_pure_function_of_sampler_state(tmp_path):
+    """Unit-level: the predicate reads no clock the liveness bounds read.
+
+    Called directly with an explicit *now*, so this is the cleanest statement
+    that convergence is decided from deliverable offsets alone.
+    """
+    ws = _stalled_workspace(tmp_path, dna=False)
+    sampler = wd.WorkspaceSampler(ws, None, started_at=0.0)
+    sampler.sample(0.0)
+
+    # No DNA seen yet -> no anchor -> cannot arm, no matter how long.
+    assert sampler.deliverable_silent_for(5000.0) is None
+    assert not wd.convergence_stalled(
+        sampler, 5000.0, convergence_seconds=900.0, starter_probe=_unchanged
+    )
+
+    (ws / "design-dna.json").write_text('{"v": 1}', encoding="utf-8")
+    sampler.sample(30.0)
+
+    # DNA present, 900s elapsed since first-seen: exactly at the bound.
+    assert wd.convergence_stalled(
+        sampler, 930.0, convergence_seconds=900.0, starter_probe=_unchanged
+    )
+    assert not wd.convergence_stalled(
+        sampler, 929.0, convergence_seconds=900.0, starter_probe=_unchanged
+    )
+    # Only positive proof arms it.
+    for state in (wd.STARTER_CHANGED, wd.STARTER_UNKNOWN):
+        assert not wd.convergence_stalled(
+            sampler, 930.0, convergence_seconds=900.0, starter_probe=lambda s=state: s
+        )
+    # No probe at all also fails closed.
+    assert not wd.convergence_stalled(
+        sampler, 930.0, convergence_seconds=900.0, starter_probe=None
+    )
+
+    # The DNA requirement is independent of the window. Note that removing the
+    # file does NOT advance the deliverable anchor: ``changed`` is built from the
+    # NEW scan's entries, so a deleted path simply vanishes from it. The
+    # fingerprint still moves (hence distinct_fingerprints), but no removed path
+    # is ever attributed. So the window stays fully satisfied here and the DNA
+    # check is unambiguously the only thing holding the guard shut.
+    before = sampler.distinct_fingerprints
+    (ws / "design-dna.json").unlink()
+    sampler.sample(930.0)
+    assert not sampler.design_dna_present
+    assert sampler.distinct_fingerprints == before + 1
+    # Anchor is first-seen at 30.0 (the DNA was written after the baseline), and
+    # the removal did not move it. 900s of stall, fully elapsed.
+    assert sampler.deliverable_silent_for(930.0) == 900.0
+    assert not wd.convergence_stalled(
+        sampler, 930.0, convergence_seconds=900.0, starter_probe=_unchanged
+    )
+
+    # Decisive: the window has fully elapsed on a workspace with no design at all.
+    assert not wd.convergence_stalled(
+        sampler, 1200.0, convergence_seconds=900.0, starter_probe=_unchanged
+    )
 
 
 # --- the predicate the corrected verdict rests on --------------------------

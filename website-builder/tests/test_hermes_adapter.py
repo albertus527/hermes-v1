@@ -1487,5 +1487,255 @@ class TestFrontendCancellationMapping(unittest.TestCase):
         self.assertFalse(theirs.is_set())
 
 
+class TestFrontendNoConvergenceMapping(unittest.TestCase):
+    """FRONTEND_NO_CONVERGENCE: a supervision termination with its own code.
+
+    Two properties carry weight here.
+
+    1. It is a TIMEOUT-class termination, so it keeps exit status 124 and
+       ``timed_out=True`` alongside its sibling bounds — a supervision bound
+       fired, which is exactly what that flag means.
+    2. Artifact recovery can never admit it. The guard requires ``src/App.tsx`` to
+       be byte-identical to the starter; recovery requires it to differ. The two
+       conditions are mutually exclusive, so the predicate itself guarantees a
+       non-convergence run is reported as a failure, never recovered into a
+       "success" on a placeholder site.
+    """
+
+    def setUp(self):
+        self.tmpdir_obj = tempfile.TemporaryDirectory()
+        tmpdir = Path(self.tmpdir_obj.name)
+        self.tmpdir = tmpdir
+        self.store = ProjectStateStore(tmpdir / "state")
+        self.adapter = HermesAdapter(
+            self.store,
+            hermes_home=tmpdir / ".hermes-website",
+            repo_root=tmpdir / "repo",
+        )
+        self.workspace = tmpdir / "workspaces" / "proj-noconv"
+        (self.workspace / "src").mkdir(parents=True)
+        starter = self.adapter.repo_root / "templates" / "frontend-starter" / "src"
+        starter.mkdir(parents=True)
+        (starter / "App.tsx").write_text("// starter placeholder\n", encoding="utf-8")
+        # The workspace starts on the untouched starter, which is the state the
+        # guard is designed to detect.
+        (self.workspace / "src" / "App.tsx").write_text(
+            "// starter placeholder\n", encoding="utf-8"
+        )
+
+    def tearDown(self):
+        self.tmpdir_obj.cleanup()
+
+    def _role_config(self):
+        return {
+            "model": {"default": "fallback", "provider": "fallback"},
+            "website_builder": {
+                "models": {"FRONTEND": {"model": "frontend-model", "provider": "router"}}
+            },
+        }
+
+    def _supervised(self, outcome):
+        from app.hermes import watchdog as wd
+
+        with patch.object(
+            wd,
+            "supervise_frontend_run",
+            return_value=wd.SupervisedRun(
+                returncode=-15,
+                stdout="",
+                stderr="",
+                outcome=outcome,
+                diagnostics={"elapsed_seconds": 950.0, "outcome": outcome},
+                terminated=True,
+                tree_kill_attempted=True,
+            ),
+        ):
+            return self.adapter._run_hermes_cli_supervised(
+                ["python", "-m", "hermes_cli.main", "-z", "p"],
+                cwd=self.workspace,
+                env={},
+                project_id="proj-noconv",
+                build_operation_id="op-1",
+            )
+
+    def test_no_convergence_keeps_the_timeout_contract(self):
+        from app.hermes import watchdog as wd
+
+        result = self._supervised(wd.OUTCOME_NO_CONVERGENCE)
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, wd.OUTCOME_NO_CONVERGENCE)
+        self.assertTrue(result.timed_out)
+        self.assertEqual(result.exit_code, 124)
+        self.assertEqual(result.invocation["outcome"], wd.OUTCOME_NO_CONVERGENCE)
+
+    def test_no_convergence_is_distinct_from_every_other_frontend_code(self):
+        from app.hermes import watchdog as wd
+        from app.hermes.adapter import FRONTEND_IMPLEMENTATION_MISSING
+
+        result = self._supervised(wd.OUTCOME_NO_CONVERGENCE)
+
+        codes = {
+            wd.OUTCOME_NO_CONVERGENCE,
+            wd.OUTCOME_IDLE_TIMEOUT,
+            wd.OUTCOME_HARD_TIMEOUT,
+            wd.OUTCOME_CANCELLED,
+            FRONTEND_IMPLEMENTATION_MISSING,
+        }
+        self.assertEqual(len(codes), 5, codes)
+        self.assertNotIn(result.error_code, codes - {wd.OUTCOME_NO_CONVERGENCE})
+
+    def test_no_convergence_is_not_admitted_by_artifact_recovery(self):
+        """The exclusion is structural, not a coincidence of two predicates.
+
+        The guard only fires when App.tsx is byte-identical to the starter, while
+        recovery only fires when it differs — so in production the two can never
+        both be true. This test drives the IMPOSSIBLE combination anyway (a
+        complete workspace plus a no-convergence outcome) and asserts recovery
+        still refuses. That pins the exclusion by name: it must not depend on the
+        completeness check keeping its current shape.
+        """
+        from app.hermes import watchdog as wd
+
+        # A genuinely complete workspace: DNA present, App.tsx implemented.
+        (self.workspace / "design-dna.json").write_text('{"v": 1}', encoding="utf-8")
+        (self.workspace / "src" / "App.tsx").write_text(
+            "export default function App() { return <main>x</main> }\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            self.adapter._has_complete_frontend_artifacts(self.workspace)
+        )
+
+        with patch.object(
+            wd,
+            "supervise_frontend_run",
+            return_value=wd.SupervisedRun(
+                returncode=-15,
+                stdout="",
+                stderr="",
+                outcome=wd.OUTCOME_NO_CONVERGENCE,
+                diagnostics={"elapsed_seconds": 950.0},
+                terminated=True,
+                tree_kill_attempted=True,
+            ),
+        ), patch.object(
+            adapter_module, "load_config", return_value=self._role_config()
+        ):
+            failure = self.adapter.frontend_build(
+                project_id="proj-noconv",
+                brief={"name": "Northcut", "what": "shop", "why": "visit"},
+                workspace=self.workspace,
+            )
+
+        self.assertFalse(failure["success"])
+        self.assertEqual(failure["error_code"], wd.OUTCOME_NO_CONVERGENCE)
+
+    def test_the_other_timeouts_are_still_recoverable(self):
+        """The exclusion must be narrow: only this one outcome is refused.
+
+        Artifact recovery exists because a genuine timeout can produce the
+        artifacts and miss its final response. Removing it wholesale would
+        regress that path, so the sibling timeouts must still be admitted.
+        """
+        from app.hermes import watchdog as wd
+
+        (self.workspace / "design-dna.json").write_text('{"v": 1}', encoding="utf-8")
+        (self.workspace / "src" / "App.tsx").write_text(
+            "export default function App() { return <main>x</main> }\n",
+            encoding="utf-8",
+        )
+
+        for outcome in (
+            wd.OUTCOME_IDLE_TIMEOUT,
+            wd.OUTCOME_HARD_TIMEOUT,
+            wd.OUTCOME_LEGACY_TIMEOUT,
+        ):
+            with self.subTest(outcome=outcome), patch.object(
+                wd,
+                "supervise_frontend_run",
+                return_value=wd.SupervisedRun(
+                    returncode=-15,
+                    stdout="",
+                    stderr="",
+                    outcome=outcome,
+                    diagnostics={"elapsed_seconds": 950.0},
+                    terminated=True,
+                    tree_kill_attempted=True,
+                ),
+            ), patch.object(
+                adapter_module, "load_config", return_value=self._role_config()
+            ):
+                recovered = self.adapter.frontend_build(
+                    project_id="proj-noconv",
+                    brief={"name": "Northcut", "what": "shop", "why": "visit"},
+                    workspace=self.workspace,
+                )
+            self.assertTrue(recovered["success"], outcome)
+
+    def test_the_starter_probe_is_tri_state(self):
+        """Missing, differing, and identical App.tsx must be three distinct answers.
+
+        A bool probe cannot express "cannot tell", and every failure case would be
+        forced to answer "unchanged" — which the guard would read as proof and act
+        on. Each is asserted separately so collapsing two of them fails here.
+        """
+        from app.hermes import watchdog as wd
+
+        captured = {}
+
+        def _fake(cmd, **kwargs):
+            captured.update(kwargs)
+            return wd.SupervisedRun(0, "", "")
+
+        with patch.object(wd, "supervise_frontend_run", _fake):
+            self.adapter._run_hermes_cli_supervised(
+                ["x"],
+                cwd=self.workspace,
+                env={},
+                project_id="proj-noconv",
+                build_operation_id="op-1",
+            )
+
+        probe = captured["starter_probe"]
+
+        # 1. Byte-identical to the starter.
+        self.assertEqual(probe(), wd.STARTER_UNCHANGED)
+        # 2. Genuinely different: the compile-repair / QA-repair shape.
+        (self.workspace / "src" / "App.tsx").write_text("implemented\n", encoding="utf-8")
+        self.assertEqual(probe(), wd.STARTER_CHANGED)
+        # 3. Missing App.tsx: UNKNOWN, never silently "unchanged".
+        (self.workspace / "src" / "App.tsx").unlink()
+        self.assertEqual(probe(), wd.STARTER_UNKNOWN)
+        # 4. Starter missing from the install: also UNKNOWN.
+        (self.workspace / "src" / "App.tsx").write_text("// starter placeholder\n", encoding="utf-8")
+        self.adapter.repo_root.joinpath("templates/frontend-starter/src/App.tsx").unlink()
+        self.assertEqual(probe(), wd.STARTER_UNKNOWN)
+
+    def test_the_completeness_check_shares_the_starter_definition(self):
+        """One definition of the starter, or the two seams could drift apart."""
+        from app.hermes.adapter import _starter_app_path
+
+        self.assertEqual(
+            _starter_app_path(self.adapter.repo_root),
+            self.adapter.repo_root / "templates" / "frontend-starter" / "src" / "App.tsx",
+        )
+        # The probe and the completeness check must resolve the SAME file.
+        (self.adapter.repo_root / "templates" / "frontend-starter" / "src" / "App.tsx").write_text(
+            "// starter placeholder\n", encoding="utf-8"
+        )
+        self.assertFalse(
+            self.adapter._has_complete_frontend_artifacts(self.workspace)
+        )
+        (self.workspace / "design-dna.json").write_text('{"v": 1}', encoding="utf-8")
+        self.assertFalse(
+            self.adapter._has_complete_frontend_artifacts(self.workspace)
+        )
+        (self.workspace / "src" / "App.tsx").write_text("implemented\n", encoding="utf-8")
+        self.assertTrue(
+            self.adapter._has_complete_frontend_artifacts(self.workspace)
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

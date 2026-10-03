@@ -93,3 +93,15 @@ website_builder:
     # (Hermes runtime import is slow). Purely observational: a late handshake
     # degrades to legacy_wallclock_seconds, it never fails the run.
     startup_grace_seconds: 60
+
+    # No deliverable change (design-dna.json or anything under src/) for this
+    # long, WITH design-dna.json present AND src/App.tsx positively still the
+    # untouched starter placeholder => FRONTEND_NO_CONVERGENCE.
+    #
+    # NOT a liveness bound. It reads no progress event, so model and tool
+    # activity cannot refresh it — that is the point: a run that stays busy
+    # while never writing its own output is exactly what this catches, and no
+    # other bound covers it. Deliberately generous and matched to
+    # max_single_operation_seconds; any src/ or design-dna.json change restarts
+    # the window, and an implemented src/App.tsx means it can never arm.
+    convergence_seconds: 900

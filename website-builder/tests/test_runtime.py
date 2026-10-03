@@ -178,6 +178,36 @@ def test_cancelled_code_has_specific_user_copy():
     assert rendered != _FALLBACK_ERROR_TEXT
 
 
+def test_no_convergence_code_has_specific_truthful_user_copy():
+    """A run the supervisor ended for lack of progress needs its own words.
+
+    The copy must say what happened and what the user has — and must NOT promise
+    anything the system does not do. No automatic retry, no rollback, no
+    background recovery: a stalled run is ended and reported, and asking again is
+    the user's decision.
+    """
+    from app.runtime import ERROR_MESSAGES, _FALLBACK_ERROR_TEXT, render_error_message
+
+    assert "FRONTEND_NO_CONVERGENCE" in ERROR_MESSAGES
+    rendered = render_error_message("FRONTEND_NO_CONVERGENCE")
+    assert rendered == ERROR_MESSAGES["FRONTEND_NO_CONVERGENCE"]
+    assert rendered != _FALLBACK_ERROR_TEXT
+
+    # It must not claim a recovery mechanism the runtime does not perform.
+    lowered = rendered.lower()
+    for promise in (
+        "otomatis",
+        "retry",
+        "mengulang",
+        "rollback",
+        "dipulihkan",
+        "background",
+        "will continue",
+        "akan lanjut",
+    ):
+        assert promise not in lowered, promise
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

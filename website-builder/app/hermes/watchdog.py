@@ -267,7 +267,12 @@ MAX_RECEIPTS_PER_PROJECT = 20
 #: model-call count for the same reason: the classifier's ``" completed"``
 #: suffix rule also matches non-model lifecycle text, so the phase-derived count
 #: over-counted by one per compaction episode.
-FORENSICS_SCHEMA = "frontend_forensics/4"
+#: v5 adds ``tool_errors_by_name`` (which tool failed, sharing ``tool_names``'
+#: admission decision and bound), the three ``workspace`` convergence facts
+#: (S6), ``policy.convergence``, and a fifth possible ``outcome`` value
+#: (``FRONTEND_NO_CONVERGENCE``). Purely additive: no /4 field changes meaning,
+#: and no reader has to special-case a v5 receipt.
+FORENSICS_SCHEMA = "frontend_forensics/5"
 
 #: Watchdog outcome codes.
 OUTCOME_IDLE_TIMEOUT = "FRONTEND_IDLE_TIMEOUT"
@@ -286,8 +291,45 @@ OUTCOME_CANCELLED = "FRONTEND_CANCELLED"
 #: itself, so this stays stable regardless of which signal triggered it.
 CANCELLED_EXIT_CODE = 130
 
+#: The run stayed alive — genuine model and tool activity throughout — but the
+#: task's own OUTPUT never moved: the design was written and the implementation
+#: never started. Deliberately NOT any of the codes above, because it is not a
+#: hang, not a pathological run, not degraded mode, and not a shutdown.
+#:
+#: It exists because liveness and convergence are different facts. Every other
+#: bound reads progress events, so a run looping on ``read_file``/``terminal``
+#: while writing nothing is healthy by all of them and would otherwise run to the
+#: hard fuse. See :func:`convergence_stalled` for the predicate.
+OUTCOME_NO_CONVERGENCE = "FRONTEND_NO_CONVERGENCE"
+
+#: No deliverable change for this long, with the design present and the starter
+#: placeholder positively still in place, ends the run as
+#: ``FRONTEND_NO_CONVERGENCE``.
+#:
+#: Deliberately conservative and deliberately NOT a liveness bound. It matches
+#: ``max_single_operation_seconds`` and the previously documented convergence
+#: design, because p20 and p21 both spent far longer than this on activity that
+#: produced only ``design-dna.json`` — and that headroom is what keeps a healthy
+#: run that is thinking between two source writes out of the blast radius.
+FRONTEND_CONVERGENCE_SECONDS = 900.0
+
+#: Tri-state answer to "is ``src/App.tsx`` still the untouched starter?".
+#: TRI-STATE is the point, not ceremony: a missing file, an unreadable file, or
+#: no probe at all is ``STARTER_UNKNOWN``, and ``STARTER_UNKNOWN`` must never be
+#: collapsed into ``STARTER_UNCHANGED``. Doing so would let a transient I/O error
+#: read as "no implementation progress" and kill a healthy run — a fail-open on
+#: the one input the guard trusts. Only positive proof may arm the guard.
+STARTER_UNCHANGED = "starter_unchanged"
+STARTER_CHANGED = "starter_changed"
+STARTER_UNKNOWN = "starter_unknown"
+
 TIMED_OUT_OUTCOMES = frozenset(
-    {OUTCOME_IDLE_TIMEOUT, OUTCOME_HARD_TIMEOUT, OUTCOME_LEGACY_TIMEOUT}
+    {
+        OUTCOME_IDLE_TIMEOUT,
+        OUTCOME_HARD_TIMEOUT,
+        OUTCOME_LEGACY_TIMEOUT,
+        OUTCOME_NO_CONVERGENCE,
+    }
 )
 
 # Wire constants mirrored from agent/progress_events.py. Duplicated as literals
@@ -333,6 +375,7 @@ _CONFIG_KEYS = {
     "max_single_operation_seconds": FRONTEND_MAX_SINGLE_OPERATION_SECONDS,
     "legacy_wallclock_seconds": FRONTEND_LEGACY_WALLCLOCK_SECONDS,
     "startup_grace_seconds": PROGRESS_CHANNEL_STARTUP_GRACE_SECONDS,
+    "convergence_seconds": FRONTEND_CONVERGENCE_SECONDS,
 }
 
 
@@ -515,6 +558,7 @@ class WatchdogPolicy:
     max_single_operation_seconds: float = FRONTEND_MAX_SINGLE_OPERATION_SECONDS
     legacy_wallclock_seconds: float = FRONTEND_LEGACY_WALLCLOCK_SECONDS
     startup_grace_seconds: float = PROGRESS_CHANNEL_STARTUP_GRACE_SECONDS
+    convergence_seconds: float = FRONTEND_CONVERGENCE_SECONDS
     poll_interval_seconds: float = PROGRESS_POLL_INTERVAL_SECONDS
     activity_log_min_interval_seconds: float = ACTIVITY_LOG_MIN_INTERVAL_SECONDS
 
@@ -578,6 +622,18 @@ class FrontendInvocation:
     )
     tool_name_counts: Dict[str, int] = field(default_factory=dict)
     tool_name_counts_truncated: bool = False
+    #: Per-tool error breakdown: which tool the emitter reported as failed, and
+    #: how often. Deliberately shares ``tool_names``' admission decision and its
+    #: bound, so the two histograms always truncate on the SAME key set and one
+    #: truncation flag describes both. That also keeps ``tool_error_count`` exact
+    #: while this breakdown is a lower bound — the total is counted from the
+    #: description, never from this dict.
+    #:
+    #: Names only. A name comes from :func:`forensic_tool_name`, which admits
+    #: nothing but a bare identifier after a known emitter prefix, so no
+    #: argument, command, path, URL, prompt, or error body can reach the receipt.
+    #: Observation only: no bound and no convergence decision reads it.
+    tool_error_name_counts: Dict[str, int] = field(default_factory=dict)
     # --- STREAM frame shapes. Additive forensics: which post-provider-close
     # --- frame shape was emitted as STREAM/active/advance=true. Counts are
     # --- LOWER BOUNDS — the transport coalesces active events inside a 5s
@@ -668,6 +724,7 @@ class FrontendInvocation:
         """
         self.last_progress_phase = phase
         tool_completed = kind == _KIND_TOOL and phase == _PHASE_COMPLETED
+        tool_failed = False
         if kind == _KIND_MODEL:
             if phase == _PHASE_STARTED:
                 self.model_started_count += 1
@@ -684,6 +741,7 @@ class FrontendInvocation:
                 self.tool_completed_count += 1
                 if forensic_tool_failed(desc):
                     self.tool_error_count += 1
+                    tool_failed = True
         elif kind == _KIND_STREAM and phase == _PHASE_ACTIVE:
             self.stream_active_count += 1
 
@@ -693,6 +751,11 @@ class FrontendInvocation:
         # because a name is not an argument; only the clamped, redacted form is
         # ever stored. Counted on the COMPLETION boundary only, so one
         # invocation contributes exactly one — a `started` event would double it.
+        #
+        # The name is parsed ONCE and admitted ONCE, then reused by the error
+        # histogram below. Sharing the decision is what makes the two histograms
+        # truncate on the same key set, so there is one bound and one truncation
+        # flag rather than two dicts that could disagree.
         if tool_completed:
             name = forensic_tool_name(desc)
             if name is not None:
@@ -701,6 +764,12 @@ class FrontendInvocation:
                     self.tool_name_counts[name] = self.tool_name_counts.get(name, 0) + 1
                 else:
                     self.tool_name_counts_truncated = True
+                # A key the histogram just rejected is rejected here too, so the
+                # error breakdown can never hold a name the totals do not.
+                if tool_failed and name in self.tool_name_counts:
+                    self.tool_error_name_counts[name] = (
+                        self.tool_error_name_counts.get(name, 0) + 1
+                    )
 
         self.recent_activity.append(
             {
@@ -903,10 +972,48 @@ class WorkspaceSampler:
         self.app_tsx_present = False
         self.truncated = False
         self.probe_failed = False
+        # --- Deliverable facts (observational). These are what "the task's own
+        # --- output moved" looks like, as opposed to "something happened".
+        # ---
+        # --- First observation at which design-dna.json existed. Sticky: the
+        # --- first True wins, so a later observation can never move it. It is
+        # --- also the anchor that makes a run which WROTE the DNA during setup
+        # --- (before the first sample) measurable at all.
+        self.design_dna_first_seen_offset_seconds: Optional[float] = None
+        # First observed mutation under src/**. Null means src/** never changed.
+        self.first_src_mutation_offset_seconds: Optional[float] = None
+        # Latest observed change to design-dna.json OR anything under src/**.
+        # Null until a deliverable mutation is seen. This is the single clock the
+        # convergence guard reads — one anchor for the whole deliverable set, so a
+        # DNA edit and a source edit are equally good proof of forward progress.
+        self.last_deliverable_mutation_offset_seconds: Optional[float] = None
 
     @property
     def probe_available(self) -> bool:
         return self._probe is not None
+
+    def deliverable_silent_for(self, now: float) -> Optional[float]:
+        """Seconds since the last DELIVERABLE change, or ``None`` if unmeasurable.
+
+        The deliverable set is ``design-dna.json`` plus ``src/**``. Returns
+        ``None`` — meaning "no anchor exists yet, so no window has started" —
+        when neither deliverable has been seen at all, which is the honest
+        answer for a run that has not written its design yet.
+
+        When the DNA was already present at the launch baseline there is no
+        observed mutation to anchor to, so first-seen is used instead; that is
+        what makes "DNA written during setup, then nothing" measurable rather
+        than permanently unarmed.
+
+        Deliberately reads NO progress event and NO liveness clock, so genuine
+        MODEL/STREAM/TOOL activity can never refresh it.
+        """
+        anchor = self.last_deliverable_mutation_offset_seconds
+        if anchor is None:
+            anchor = self.design_dna_first_seen_offset_seconds
+        if anchor is None:
+            return None
+        return max(0.0, (now - self._started_at) - anchor)
 
     @property
     def metadata_fingerprint(self) -> Optional[str]:
@@ -941,6 +1048,10 @@ class WorkspaceSampler:
         self.truncated = self.truncated or truncated
         self.design_dna_present = "design-dna.json" in entries
         self.app_tsx_present = "src/App.tsx" in entries
+        if self.design_dna_present and self.design_dna_first_seen_offset_seconds is None:
+            # First observation wins and is never rewritten: "when the design
+            # first appeared" must not drift because the file kept existing.
+            self.design_dna_first_seen_offset_seconds = self._offset(now)
 
         fingerprint = self._fingerprint(entries)
         previous = self._last_fingerprint
@@ -1015,13 +1126,33 @@ class WorkspaceSampler:
             digest.update(f"{rel}\0{size}\0{mtime_ns}\n".encode("utf-8"))
         return digest.hexdigest()
 
+    def _offset(self, now: float) -> float:
+        """Seconds since the launch baseline, rounded to the receipt's precision."""
+        return round(max(0.0, now - self._started_at), 1)
+
     def _record_mutation(self, now: float, changed: Sequence[str]) -> None:
         self.source_mutation_count += 1
-        offset = round(max(0.0, now - self._started_at), 1)
+        offset = self._offset(now)
         if self.first_mutation_offset_seconds is None:
             self.first_mutation_offset_seconds = offset
         self.last_mutation_offset_seconds = offset
+        # Deliverable facts come from the SAME ``changed`` list the retained-path
+        # accounting already walks, so there is no second scan of the workspace
+        # and no new definition of what counts as a change. A truncated scan
+        # yields an empty ``changed`` while ``source_mutation_count`` still
+        # increments — that asymmetry is preserved exactly, and the deliverable
+        # offsets simply do not advance on a sample we cannot attribute.
         for rel in changed:
+            is_src = rel.startswith("src/")
+            if is_src and self.first_src_mutation_offset_seconds is None:
+                # Sticky: the FIRST src mutation anchors the whole "implementation
+                # began" fact, and later ones never move it.
+                self.first_src_mutation_offset_seconds = offset
+            if is_src or rel == "design-dna.json":
+                # Every deliverable mutation moves the single convergence anchor,
+                # so a DNA edit and a source edit are equally good proof that the
+                # task is still moving forward.
+                self.last_deliverable_mutation_offset_seconds = offset
             if rel in self._unique_mutated:
                 continue
             self._unique_mutated.add(rel)
@@ -1059,6 +1190,17 @@ class WorkspaceSampler:
             "unique_source_files_mutated": self.unique_source_files_mutated(),
             "first_mutation_offset_seconds": self.first_mutation_offset_seconds,
             "last_mutation_offset_seconds": self.last_mutation_offset_seconds,
+            # Deliverable facts: when the design first appeared, when
+            # implementation first began, and when the deliverable set last moved.
+            # These are what separate "the run was busy" from "the run produced
+            # its output", which no count of progress events can show.
+            "design_dna_first_seen_offset_seconds": (
+                self.design_dna_first_seen_offset_seconds
+            ),
+            "first_src_mutation_offset_seconds": self.first_src_mutation_offset_seconds,
+            "last_deliverable_mutation_offset_seconds": (
+                self.last_deliverable_mutation_offset_seconds
+            ),
             "mutated_paths": self.mutated_paths(),
             "design_dna_present": self.design_dna_present,
             "app_tsx_present": self.app_tsx_present,
@@ -1112,7 +1254,60 @@ def resolve_watchdog_policy(
         max_single_operation_seconds=values["max_single_operation_seconds"],
         legacy_wallclock_seconds=values["legacy_wallclock_seconds"],
         startup_grace_seconds=values["startup_grace_seconds"],
+        convergence_seconds=values["convergence_seconds"],
     )
+
+
+def convergence_stalled(
+    sampler: WorkspaceSampler,
+    now: float,
+    *,
+    convergence_seconds: float,
+    starter_probe: Optional[Callable[[], str]] = None,
+) -> bool:
+    """Whether this run has produced its output at all, and should now be ended.
+
+    Three conditions, all required:
+
+    1. Neither ``design-dna.json`` nor anything under ``src/**`` has changed for
+       ``convergence_seconds`` — :meth:`WorkspaceSampler.deliverable_silent_for`.
+    2. ``design-dna.json`` exists, so the design phase genuinely finished and this
+       is a stalled *implementation*, not a run still legitimately designing.
+    3. ``src/App.tsx`` is POSITIVELY PROVEN to still be the untouched shipped
+       starter.
+
+    Every input is filesystem state. There is deliberately no progress event, no
+    ``last_activity_at``, and no ``last_progress_at`` anywhere in this function, so
+    genuine MODEL/STREAM/TOOL activity cannot refresh it and it cannot be confused
+    with a hang. That separation is the entire reason the code exists.
+
+    Ordering matters: the two cheap sampler facts are checked before the probe runs,
+    so a healthy progressing run never pays for a file read.
+
+    Fails closed. ``starter_probe`` being ``None`` (the default, so every existing
+    caller is byte-for-byte unchanged), a probe that raises, and a probe answering
+    ``STARTER_UNKNOWN`` all return ``False``. Only ``STARTER_UNCHANGED`` arms the
+    guard, so an unreadable file can only ever PREVENT a termination, never cause
+    one — the error direction is always toward the pre-existing behaviour.
+
+    No sticky state. Starter identity is re-read on every eligible sample, so an
+    implemented tree is disarmed for as long as it stays implemented, and a genuine
+    revert to the starter is simply another deliverable mutation that restarts the
+    window from its own offset.
+    """
+    silent_for = sampler.deliverable_silent_for(now)
+    if silent_for is None or silent_for < convergence_seconds:
+        return False
+    if not sampler.design_dna_present:
+        return False
+    if starter_probe is None:
+        return False
+    try:
+        state = starter_probe()
+    except Exception:
+        logger.debug("FRONTEND starter probe failed", exc_info=True)
+        state = STARTER_UNKNOWN
+    return state == STARTER_UNCHANGED
 
 
 def load_watchdog_config() -> Dict[str, Any]:
@@ -1421,6 +1616,10 @@ def _build_receipt(
             "idle": policy.idle_timeout_seconds,
             "hard": policy.hard_max_runtime_seconds,
             "max_single_operation": policy.max_single_operation_seconds,
+            # Recorded so a reader can tell a run that was ended by the 900s
+            # convergence guard from one that merely happened to be cut at the
+            # hard fuse after a long non-deliverable stretch.
+            "convergence": policy.convergence_seconds,
         },
         "counters": {
             # ``*_started`` are PHASE-EVENT counts and can exceed the number of
@@ -1494,6 +1693,17 @@ def _build_receipt(
         # twice it. Names only — never arguments, by construction.
         "tool_names": dict(invocation.tool_name_counts),
         "tool_names_truncated": invocation.tool_name_counts_truncated,
+        # Which of those invocations FAILED, broken down by the same names. This
+        # is the number p21 needed and did not have: a flat ``tool_error_count``
+        # of 17 cannot say whether the refusals were ``read_file`` (a retry loop)
+        # or ``write_file`` (the implementation itself failing). Observation only —
+        # no bound and no convergence decision reads it.
+        #
+        # Truncates on exactly the key set ``tool_names`` kept, so the two always
+        # agree; ``tool_errors_by_name_truncated`` therefore carries the same
+        # meaning as ``tool_names_truncated`` and is emitted for that reason.
+        "tool_errors_by_name": dict(invocation.tool_error_name_counts),
+        "tool_errors_by_name_truncated": invocation.tool_name_counts_truncated,
         "recent_activity": [dict(entry) for entry in invocation.recent_activity],
         # Bare filename within the per-project diagnostics directory. The
         # receipt outlives runs/, so an absolute path would be both a leak and a
@@ -1569,6 +1779,7 @@ def supervise_frontend_run(
     artifacts_probe: Optional[Callable[[], bool]] = None,
     write_receipt: Optional[Callable[[Path, str, Mapping[str, Any]], str]] = None,
     run_canceller: Optional["FrontendRunCanceller"] = None,
+    starter_probe: Optional[Callable[[], str]] = None,
 ) -> SupervisedRun:
     """Run *cmd* as one supervised, activity-aware invocation.
 
@@ -1591,6 +1802,13 @@ def supervise_frontend_run(
     the sole owner of ``proc`` — performs the teardown through the existing
     ``_terminate_tree`` escalation. The registry is also the single source of
     truth for *why* the run was stopped, which the receipt then records.
+
+    *starter_probe* answers the tri-state question "is ``src/App.tsx`` still the
+    untouched shipped starter?". It defaults to ``None``, which
+    :func:`convergence_stalled` treats as ``STARTER_UNKNOWN`` and therefore can
+    never arm ``FRONTEND_NO_CONVERGENCE``. So with no probe supplied — which is
+    every existing caller and every existing test — this function behaves exactly
+    as before, and the new outcome is unreachable rather than merely unlikely.
     """
     if kill_process_tree is None and kill_tree is None:
         raise WatchdogUnavailable(
@@ -1661,7 +1879,14 @@ def supervise_frontend_run(
             # Observation only. Sampled here so a run that dies between two
             # polls still leaves a sample, and strictly after the progress read
             # so the workspace can never gate the liveness decision below.
+            samples_before = sampler.samples
             sampler.sample(now)
+            # The convergence guard is evaluated ONLY on a poll that actually took
+            # a new workspace sample. That makes it run at most once per
+            # ``WORKSPACE_SAMPLE_INTERVAL_SECONDS`` and, more importantly, gives
+            # it no per-poll path by which a progress event could refresh it:
+            # between two samples nothing about the workspace is re-read at all.
+            sampled_now = sampler.samples > samples_before
             if invocation.progress_event_count and not outcome:
                 _log_activity(invocation, now, policy)
 
@@ -1718,6 +1943,22 @@ def supervise_frontend_run(
                         # once its progress has been silent for that long.
                         if no_progress >= policy.idle_timeout_seconds and not in_flight:
                             outcome = OUTCOME_IDLE_TIMEOUT
+                        # Convergence is checked LAST, and only on a poll that took
+                        # a real workspace sample. Every earlier bound is
+                        # therefore unchanged: a silent run still dies to the idle
+                        # bound at 180s, and a continuously-active run still only
+                        # ends at the hard fuse. The guard can only produce a NEW
+                        # outcome in the one case no liveness bound covers — alive,
+                        # but not converging. Deliberately NOT elif-chained onto
+                        # the idle result: this must be evaluated whenever idle did
+                        # not fire, since it is the interesting case.
+                        elif sampled_now and convergence_stalled(
+                            sampler,
+                            now,
+                            convergence_seconds=policy.convergence_seconds,
+                            starter_probe=starter_probe,
+                        ):
+                            outcome = OUTCOME_NO_CONVERGENCE
 
             if outcome is not None or exited:
                 break
@@ -1814,6 +2055,17 @@ def supervise_frontend_run(
             "FRONTEND cancelled project=%s invocation=%s pid=%s reason=%s",
             project_id, invocation_id, invocation.child_pid,
             cancel_reason or "unspecified",
+        )
+    elif outcome == OUTCOME_NO_CONVERGENCE:
+        # Not a hang: the child was demonstrably alive and making calls. It just
+        # never moved its own output, which is a different failure and gets its
+        # own line so it is never read as an idle timeout after the fact.
+        logger.warning(
+            "FRONTEND no-convergence project=%s invocation=%s pid=%s "
+            "(design present, starter placeholder untouched, no deliverable "
+            "change for %.0fs)",
+            project_id, invocation_id, invocation.child_pid,
+            policy.convergence_seconds,
         )
     else:
         logger.info(

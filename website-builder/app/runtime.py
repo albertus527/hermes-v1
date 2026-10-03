@@ -1158,6 +1158,15 @@ ERROR_MESSAGES: Dict[str, str] = {
         "The build finished without producing the website — only the design was "
         "written. Nothing was published. Please start the build again."
     ),
+    # Truthful about exactly what happened: the run was stopped, why, and what
+    # the user has. It deliberately promises NO automatic retry, NO rollback and
+    # NO background recovery, because none of those happen — a stalled run is
+    # ended and reported, and a new request is the user's to make.
+    "FRONTEND_NO_CONVERGENCE": (
+        "Proses pembuatan website berhenti karena belum ada kemajuan pada "
+        "implementasi setelah desain selesai disiapkan. Tidak ada versi website "
+        "yang dianggap selesai dari proses ini."
+    ),
     "BUILD_NOT_ALLOWED_IN_LIFECYCLE": "The project is not ready to build yet.",
     "DIRECTION_CHOICE_PENDING": "Please choose a design direction first.",
     "EVENT_RECONCILIATION_REQUIRED": "A previous operation needs reconciliation. Please try again.",
