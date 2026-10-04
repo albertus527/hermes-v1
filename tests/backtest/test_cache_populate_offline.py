@@ -797,3 +797,134 @@ def test_published_at_relocation_fails_closed(tmp_path):
 
 
 import argparse  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Multi-ticker canonical identity (R2.8.1 Phase-2 unblock)
+#
+# The canonical inventory map must be keyed on the FULL row identity
+# (headline_hash, source, ticker). One AV-associated story naming TWO
+# canonical tickers is genuinely TWO cache identities; a map keyed one
+# column short collapses them and rejects the loser as ticker_mismatch,
+# which cascades into missing_requested_identity.
+# ---------------------------------------------------------------------------
+
+_MT_TEXT = "Apple and Microsoft announce joint cloud partnership"
+
+
+def _multi_ticker_store(tmp_path, name="mt.sqlite3", *, sources=("finnhub",)):
+    """One story, one source, TWO canonical tickers."""
+    hl = [(t, s, _MT_TEXT, T0) for t in ("AAPL", "MSFT") for s in sources]
+    spans = [(t, dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
+              dt.datetime(2024, 2, 1, tzinfo=dt.timezone.utc))
+             for t in ("AAPL", "MSFT")]
+    return _make_store(tmp_path / name, hl, spans)
+
+
+def _mt_result(ticker, source, severity="MEDIUM"):
+    row = _classification(ticker, source, _MT_TEXT, T0)
+    row["classification"]["severity"] = severity
+    return row
+
+
+# 1+2+3+4. same (headline_hash, source) + different ticker => TWO distinct
+# canonical identities; both populate; no ticker_mismatch, no
+# missing_requested_identity.
+def test_multi_ticker_same_hash_source_are_distinct_identities(tmp_path):
+    cache = _multi_ticker_store(tmp_path)
+    doc = _artifact([_mt_result("AAPL", "finnhub"),
+                     _mt_result("MSFT", "finnhub")])
+    report = _populate(cache, _write(tmp_path, doc), tmp_path,
+                       tickers=("AAPL", "MSFT"))
+    assert report.complete
+    assert report.errors == []
+    assert report.expected_identity_count == 2
+    assert report.artifact_identity_count == 2
+    assert report.missing_identity_count == 0
+    assert report.extra_identity_count == 0
+    assert report.validated_identity_count == 2
+    assert report.inserted_row_count == 2
+    classes = {e["error_class"] for e in report.errors}
+    assert "ticker_mismatch" not in classes
+    assert "missing_requested_identity" not in classes
+    assert cache.headline_count() == 2
+
+
+# 5. identical replay of the multi-ticker artifact stays idempotent
+def test_multi_ticker_identical_replay_idempotent(tmp_path):
+    cache = _multi_ticker_store(tmp_path)
+    doc = _artifact([_mt_result("AAPL", "finnhub"),
+                     _mt_result("MSFT", "finnhub")])
+    path = _write(tmp_path, doc)
+    r1 = _populate(cache, path, tmp_path, tickers=("AAPL", "MSFT"))
+    r2 = _populate(cache, path, tmp_path, tickers=("AAPL", "MSFT"))
+    assert r1.inserted_row_count == 2 and r1.idempotent_existing_row_count == 0
+    assert r2.inserted_row_count == 0
+    assert r2.idempotent_existing_row_count == 2
+    assert r2.input_digest == r1.input_digest
+    assert cache.headline_count() == 2
+
+
+# 6. a differing payload for the SAME exact (headline_hash, source,
+# ticker) still raises CacheKeyConflictError — the wider key must not
+# weaken the immutable-cache rule.
+def test_multi_ticker_same_identity_conflict_fails_closed(tmp_path):
+    from backtest.news.cache import CacheKeyConflictError
+    cache = _multi_ticker_store(tmp_path)
+    seed = _artifact([_mt_result("AAPL", "finnhub"),
+                      _mt_result("MSFT", "finnhub")])
+    _populate(cache, _write(tmp_path, seed, "seed.json"), tmp_path,
+              tickers=("AAPL", "MSFT"))
+    assert cache.headline_count() == 2
+    conflict = _artifact([_mt_result("AAPL", "finnhub", severity="HIGH"),
+                          _mt_result("MSFT", "finnhub")])
+    with pytest.raises(CacheKeyConflictError):
+        _populate(cache, _write(tmp_path, conflict, "conflict.json"),
+                  tmp_path, tickers=("AAPL", "MSFT"))
+    assert cache.headline_count() == 2  # nothing partially published
+
+
+# 7. existing wrong-ticker fail-closed behavior is preserved EXPLICITLY:
+# a ticker absent from the canonical inventory for this (hash, source)
+# pair is still ticker_mismatch, never published.
+def test_multi_ticker_wrong_ticker_still_fails_closed(tmp_path):
+    cache = _multi_ticker_store(tmp_path)
+    report = _populate(cache, _write(tmp_path, _artifact([
+        _mt_result("AAPL", "finnhub"),
+        _mt_result("MSFT", "finnhub"),
+        _mt_result("GOOG", "finnhub")])), tmp_path,
+        tickers=("AAPL", "MSFT", "GOOG"))
+    assert not report.complete
+    mismatch = [e for e in report.errors
+                if e["error_class"] == "ticker_mismatch"]
+    assert len(mismatch) == 1
+    assert mismatch[0]["got_ticker"] == "GOOG"
+    assert mismatch[0]["expected_ticker"] == "AAPL,MSFT"
+    assert cache.headline_count() == 0
+
+
+# multi-source + multi-ticker together: (hash, source, ticker) is the
+# identity, so 2 tickers x 2 sources is FOUR identities, all populated.
+def test_multi_ticker_and_multi_source_four_identities(tmp_path):
+    sources = ("finnhub", "bloomberg")
+    cache = _multi_ticker_store(tmp_path, sources=sources)
+    doc = _artifact([_mt_result(t, s)
+                     for t in ("AAPL", "MSFT") for s in sources])
+    report = _populate(cache, _write(tmp_path, doc), tmp_path,
+                       tickers=("AAPL", "MSFT"))
+    assert report.complete and report.errors == []
+    assert report.expected_identity_count == 4
+    assert report.inserted_row_count == 4
+    assert cache.headline_count() == 4
+
+
+# the canonical map must never be smaller than its input row count — the
+# cheap invariant that catches the one-column-short key class.
+def test_canonical_map_is_not_smaller_than_inventory(tmp_path):
+    from backtest.news.cache import HeadlineInventory
+    cache = _multi_ticker_store(tmp_path)
+    rows = HeadlineInventory(cache._conn).timed_headlines_all()
+    identity_key = lambda r: (r[0], r[1], r[2])  # noqa: E731
+    legacy_key = lambda r: (r[0], r[1])           # noqa: E731
+    assert len({identity_key(r) for r in rows}) == len(rows)
+    assert len({legacy_key(r) for r in rows}) < len(rows)

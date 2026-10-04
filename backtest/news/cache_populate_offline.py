@@ -471,25 +471,39 @@ def populate_cache_from_offline_artifact(
 
     # --- canonical inventory validation of artifact rows (fail closed,
     # nothing skipped) ------------------------------------------------------
-    canonical: dict[tuple[str, str], tuple] = {}
+    # Canonical identity is the FULL cache identity row identity
+    # (headline_hash, source, ticker): ``news_classifications.ticker`` is
+    # a real column of the cache key, so one AV-associated story naming
+    # TWO canonical tickers is genuinely TWO identities. A map keyed one
+    # column short collapses those rows and rejects the loser as
+    # ``ticker_mismatch``, which cascades into
+    # ``missing_requested_identity`` and can never satisfy the exact
+    # set-equality guard below. ``by_pair`` is retained ONLY to keep the
+    # fail-closed distinction between a genuinely unknown
+    # (headline_hash, source) and a known pair carrying the wrong ticker.
+    canonical: dict[tuple[str, str, str], tuple] = {}
+    by_pair: dict[tuple[str, str], set[str]] = {}
     for r in inventory.timed_headlines_all():
-        canonical[(r[0], r[1])] = r  # (headline_hash, source) -> row
+        canonical[(r[0], r[1], r[2])] = r  # (hash, source, ticker) -> row
+        by_pair.setdefault((r[0], r[1]), set()).add(r[2])
     validated = []
     seen = set()
     for row in rows:
-        key = (row.headline_hash, row.source)
+        key = (row.headline_hash, row.source, row.ticker)
         if key not in canonical:
-            report.errors.append({
-                "error_class": "unknown_headline_identity",
-                "headline_hash": row.headline_hash, "source": row.source})
+            pair_tickers = by_pair.get((row.headline_hash, row.source))
+            if pair_tickers:
+                report.errors.append({
+                    "error_class": "ticker_mismatch",
+                    "headline_hash": row.headline_hash,
+                    "expected_ticker": ",".join(sorted(pair_tickers)),
+                    "got_ticker": row.ticker})
+            else:
+                report.errors.append({
+                    "error_class": "unknown_headline_identity",
+                    "headline_hash": row.headline_hash, "source": row.source})
             continue
         chash, csource, cticker, cpublished, ctext = canonical[key]
-        if cticker != row.ticker:
-            report.errors.append({
-                "error_class": "ticker_mismatch",
-                "headline_hash": row.headline_hash,
-                "expected_ticker": cticker, "got_ticker": row.ticker})
-            continue
         if row.ticker not in requested_tickers:
             report.errors.append({
                 "error_class": "identity_outside_declared_scope",
@@ -549,7 +563,7 @@ def populate_cache_from_offline_artifact(
 
     # FP-4 recomputation guard: text -> hash must equal the inventory hash.
     for row in validated:
-        ctext = canonical[(row.headline_hash, row.source)][4]
+        ctext = canonical[(row.headline_hash, row.source, row.ticker)][4]
         if compute_headline_hash(normalize_headline_text(ctext)) != \
                 row.headline_hash:
             raise ArtifactFormatError(
