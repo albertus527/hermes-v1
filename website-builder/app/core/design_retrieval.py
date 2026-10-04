@@ -497,25 +497,58 @@ _TOKEN_SPLIT_RE = re.compile(r"[^0-9A-Za-z]+")
 
 
 def normalize_query_tokens(query: Optional[str]) -> Tuple[str, ...]:
-    """Split ``query`` into normalized, case-insensitive tokens.
+    """Split ``query`` into normalized, case-insensitive lexical tokens.
 
     Returns an empty tuple for an empty or whitespace-only query, which the
     adapters read as "stable source order, first N rows" -- the documented
     resting behaviour, not a silent no-op.
+
+    This is :func:`lexical_tokens` with the query-specific character bound
+    applied first, so a query and a cell are tokenized by ONE function.
     """
     if not query:
         return ()
-    bounded = query[:MAX_QUERY_CHARS]
+    return lexical_tokens(query[:MAX_QUERY_CHARS])
+
+
+def lexical_tokens(text: Optional[str]) -> Tuple[str, ...]:
+    """Split arbitrary text into normalized, case-insensitive lexical tokens.
+
+    **The one tokenizer.** Both the query side and the cell side call it, so a
+    token compared on the way in is produced exactly the way it is compared on
+    the way out. Two tokenizers would make a match depend on which side
+    normalized, and the mismatch would look like a recall bug rather than a
+    symmetric-tokenizer bug.
+
+    Tokens are runs of ``[0-9A-Za-z]``; every other character is a separator.
+    That single rule is what makes matching *lexical*:
+
+    * ``"no"`` does **not** match ``"Ignore"`` -- the substring test that made
+      it match (``"no" in "ig" + "no" + "re"``) was a silent recall explosion
+      that surfaced every row containing the letters n-o anywhere, including
+      ``Ignore``, ``Known``, and ``Font``. Recall is a quality problem; a query
+      that matches a third of the corpus for no reason is a correctness one.
+    * ``"3d"``, ``"ui"``, and ``"hero"`` stay intact: digits and short
+      alphanumeric runs are ordinary lexical tokens, not special cases.
+
+    Over-long tokens are dropped rather than truncated, so a single pathological
+    run cannot force a match against a partial word. Splitting is bounded work
+    on a bounded string; nothing here is compiled into a regular expression.
+    """
+    if not text:
+        return ()
     tokens = []
-    for raw in _TOKEN_SPLIT_RE.split(bounded):
-        token = raw.strip().lower()
-        if token and len(token) <= MAX_QUERY_TOKEN_CHARS:
+    for raw in _TOKEN_SPLIT_RE.split(text):
+        if not raw:
+            continue
+        token = raw.lower()
+        if len(token) <= MAX_QUERY_TOKEN_CHARS:
             tokens.append(token)
     return tuple(tokens)
 
 
 def row_matches_tokens(row: Mapping[str, str], tokens: Sequence[str]) -> bool:
-    """True when ``row`` contains any of ``tokens`` in any scalar textual field.
+    """True when ``row`` contains any of ``tokens`` as a **whole lexical token**.
 
     **Every parsed field is searched; no column is excluded by name.** An
     earlier draft proposed excluding columns "named to imply instruction"
@@ -529,20 +562,25 @@ def row_matches_tokens(row: Mapping[str, str], tokens: Sequence[str]) -> bool:
     * A name-based list breaks the moment the real schema differs from the
       guess, protecting nothing real while silently narrowing recall.
 
+    Each cell is tokenized by :func:`lexical_tokens` -- the same function the
+    query side uses -- and compared by **token equality**, never by substring.
     Matching is case-insensitive, unordered, and unscored. A row matching more
-    tokens does **not** outrank one matching fewer -- ranking would make output
+    tokens does **not** outrank one matching fewer: ranking would make output
     order depend on a scoring function, and "same input, same bytes" is the
     property this batch is selling.
+
+    The comparison is a set intersection bounded by the cell, with no fuzzy
+    matching, no edit distance, no stemming, no regular expression built from
+    caller text, and no rerank of any kind.
     """
     if not tokens:
         return True
+    wanted = set(tokens)
     for value in row.values():
         if not isinstance(value, str):
             continue
-        lowered = value.lower()
-        for token in tokens:
-            if token in lowered:
-                return True
+        if wanted.intersection(lexical_tokens(value)):
+            return True
     return False
 
 
@@ -561,7 +599,115 @@ def filter_rows(
 
 
 # ---------------------------------------------------------------------------
-# Adapters
+# Per-resource identity projection
+# ---------------------------------------------------------------------------
+
+#: The UI UX Pro Max dataset's verified identity columns.
+#:
+#: These two -- and ONLY these two -- are promoted into an entry's ``title`` and
+#: ``entry_id``. Every other column stays an ordinary bounded ``fields`` entry.
+#:
+#: The generic reader took ``header[0]`` as the title. On the real VPS dataset
+#: that column is ``No`` -- a row ordinal -- so entries shipped as
+#: ``title = "4"``. The identity a consumer can cite and a human can read are
+#: ``Style Category`` and ``Style ID``, and both are verified-present.
+#:
+#: Deliberately a **projection of two names, not a parsed schema**. Hardcoding
+#: all eighteen verified columns would freeze a snapshot of a third-party CSV
+#: into this module and make a schema change look like a code change. Projecting
+#: only identity fixes the defect that was actually observed and leaves every
+#: other column free to arrive, be added to, or disappear.
+UI_UX_PRO_MAX_TITLE_COLUMN = "Style Category"
+UI_UX_PRO_MAX_ID_COLUMN = "Style ID"
+
+
+@dataclass(frozen=True)
+class ResourceIdentityProjection:
+    """How one resource's rows derive an entry's title and id.
+
+    ``title_column``/``id_column`` are header names to look up. When a column is
+    absent, empty, or whitespace on a given row, the caller falls back -- per
+    field, per row -- so one row missing ``Style ID`` degrades that row's id
+    rather than the whole dataset's.
+    """
+
+    title_column: Optional[str] = None
+    id_column: Optional[str] = None
+
+
+#: Projections keyed by resource id. A resource absent from this table keeps the
+#: generic behaviour (first column as title, positional id).
+RESOURCE_IDENTITY_PROJECTIONS: Dict[str, ResourceIdentityProjection] = {
+    "ui_ux_pro_max": ResourceIdentityProjection(
+        title_column=UI_UX_PRO_MAX_TITLE_COLUMN,
+        id_column=UI_UX_PRO_MAX_ID_COLUMN,
+    ),
+}
+
+
+def identity_projection_for(resource_id: str) -> ResourceIdentityProjection:
+    """The identity projection for ``resource_id`` (generic when undeclared)."""
+    return RESOURCE_IDENTITY_PROJECTIONS.get(
+        resource_id, ResourceIdentityProjection()
+    )
+
+
+def _cell_text(row: Mapping[str, str], column: Optional[str]) -> str:
+    """A row cell as trimmed text, or ``""`` when absent/blank.
+
+    Missing and blank are treated identically on purpose: a CSV cell holding
+    whitespace is not an identity, and falling through on both keeps the
+    fallback path to one rule instead of two.
+    """
+    if not column:
+        return ""
+    value = row.get(column)
+    if not isinstance(value, str):
+        return ""
+    return value.strip()
+
+
+def project_entry_identity(
+    row: Mapping[str, str],
+    header: Sequence[str],
+    projection: ResourceIdentityProjection,
+    fallback_title: str,
+    row_number: int,
+) -> Tuple[str, str]:
+    """Return ``(title, identity)`` for one row under ``projection``.
+
+    Each field falls back independently and deterministically:
+
+    * **title** -- the projected title column, else the declared fallback column,
+      else the row's first non-empty header value, else a positional
+      ``"<resource>: row <n>"``.
+    * **identity** -- the projected id column, else a positional
+      ``"<resource>:<n>"``.
+
+    The positional id is derived from the row's index in the *whole* dataset, so
+    it is stable for a given file regardless of how many rows matched a query.
+    Two rows can therefore never collide on the fallback id, and a fallback id
+    never masquerades as a real ``Style ID``.
+    """
+    title = _cell_text(row, projection.title_column)
+    if not title:
+        title = _cell_text(row, header[0] if header else None)
+    if not title:
+        for column in header:
+            candidate = _cell_text(row, column)
+            if candidate:
+                title = candidate
+                break
+    if not title:
+        title = fallback_title
+
+    identity = _cell_text(row, projection.id_column)
+    if not identity:
+        identity = f"{fallback_title}:{row_number}"
+    return title, identity
+
+
+# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 
 
@@ -572,6 +718,11 @@ class _RawEntry:
     ``locator`` travels WITH the entry rather than being reconstructed later,
     so provenance always names the file the entry actually came from -- a
     multi-locator adapter cannot misattribute one file's rows to another.
+
+    ``entry_id`` is the adapter's own identity for the row, which may be a real
+    dataset key (``Style ID``) or a positional fallback. It is empty when the
+    adapter has no better idea, and the caller supplies the generic
+    ``<resource>:<index>`` form.
     """
 
     title: str
@@ -579,6 +730,7 @@ class _RawEntry:
     fields: Dict[str, str]
     index: int
     locator: str
+    entry_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -588,6 +740,11 @@ class AdapterResult:
     entries: Tuple[_RawEntry, ...]
     warnings: Tuple[str, ...] = ()
     ok: bool = True
+    #: The row number of the first row this result's ``_RawEntry.index`` values
+    #: are relative to. An adapter that filters must report the source position,
+    #: not the filtered position, so a fallback identity stays stable for a
+    #: given file across different queries.
+    index_base: int = 0
 
 
 @dataclass(frozen=True)
@@ -642,6 +799,13 @@ class DesignAdapterContext:
     locator: str
     query: str
     tokens: Tuple[str, ...]
+    #: How this resource's rows derive title and id. Always present; the
+    #: generic (all-None) projection reproduces the pre-projection behaviour, so
+    #: an adapter written against the old context still works.
+    projection: ResourceIdentityProjection = ResourceIdentityProjection()
+    #: Prefix used to build a positional fallback identity, so a fallback can
+    #: never be mistaken for a real dataset key.
+    fallback_id_prefix: str = ""
 
 
 def _csv_text(cell: str) -> str:
@@ -655,10 +819,9 @@ def _guidance_csv(context: DesignAdapterContext) -> AdapterResult:
     """Read a pinned CSV dataset into one entry per data row.
 
     Generic by design: the first row is the header, every column becomes a
-    field, and no column NAME is special-cased. That is deliberate -- the real
-    ``styles.csv`` schema has not been inspected on this host, and hardcoding
-    guessed column names would turn a guess into a hidden dependency that
-    breaks the moment the real schema differs.
+    field, and no column is promoted into authority. The ONLY per-column
+    knowledge is the identity projection (:class:`ResourceIdentityProjection`),
+    which supplies this resource's ``title``/``entry_id`` and nothing else.
 
     **No subprocess.** ``scripts/search.py`` is never executed; the dataset is
     read in-process with the stdlib CSV reader. Running a skill's own script is
@@ -667,50 +830,67 @@ def _guidance_csv(context: DesignAdapterContext) -> AdapterResult:
     path = context.skill_root / context.locator
 
     try:
-        raw = path.read_text(encoding="utf-8", errors="replace")
+            raw = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return AdapterResult(entries=(), warnings=(WARNING_MALFORMED,), ok=False)
+            return AdapterResult(entries=(), warnings=(WARNING_MALFORMED,), ok=False)
 
     if not raw.strip():
-        return AdapterResult(entries=(), warnings=(WARNING_MALFORMED,), ok=False)
+            return AdapterResult(entries=(), warnings=(WARNING_MALFORMED,), ok=False)
 
     try:
-        reader = csv.reader(io.StringIO(raw))
-        rows = [row for row in reader]
+            reader = csv.reader(io.StringIO(raw))
+            rows = [row for row in reader]
     except csv.Error:
-        return AdapterResult(entries=(), warnings=(WARNING_MALFORMED,), ok=False)
+            return AdapterResult(entries=(), warnings=(WARNING_MALFORMED,), ok=False)
 
     if not rows:
-        return AdapterResult(entries=(), warnings=(WARNING_MALFORMED,), ok=False)
+            return AdapterResult(entries=(), warnings=(WARNING_MALFORMED,), ok=False)
 
     header = [cell.strip() for cell in rows[0]]
     # A header row of nothing usable is a malformed dataset, not an empty one.
     if not header or not any(header):
-        return AdapterResult(entries=(), warnings=(WARNING_MALFORMED,), ok=False)
+            return AdapterResult(entries=(), warnings=(WARNING_MALFORMED,), ok=False)
 
     # Normalize every row to the header width so a ragged row cannot silently
     # shift values into the wrong column.
     normalized: List[Dict[str, str]] = []
     for row in rows[1:]:
-        if not any(cell.strip() for cell in row):
-            continue
-        padded = list(row) + [""] * (len(header) - len(row))
-        normalized.append(
-            {header[i]: _csv_text(padded[i]) for i in range(len(header))}
-        )
+            if not any(cell.strip() for cell in row):
+                continue
+            padded = list(row) + [""] * (len(header) - len(row))
+            normalized.append(
+                {header[i]: _csv_text(padded[i]) for i in range(len(header))}
+            )
 
     # Filter over the WHOLE dataset before any cap. See filter_rows.
-    selected = filter_rows(normalized, context.tokens)
+    #
+    # ``enumerate(normalized, 1)`` numbers the SOURCE rows, so a matching row
+    # keeps its real position whatever else matched: a late match is both
+    # reachable and still identified by where it actually lives.
+    numbered = list(enumerate(normalized, 1))
+    selected = [
+        (number, row)
+        for number, row in numbered
+        if row_matches_tokens(row, context.tokens)
+    ]
 
     entries: List[_RawEntry] = []
-    for index, row in enumerate(selected):
-        entries.append(
-            _RawEntry(
-                title=row.get(header[0], "") or "",
-                body=_row_body(row, header),
-                fields=dict(row),
-                index=index,
+    for index, (number, row) in enumerate(selected):
+            title, identity = project_entry_identity(
+                row,
+                header,
+                context.projection,
+                context.fallback_id_prefix,
+                number,
+            )
+            entries.append(
+                _RawEntry(
+                    title=title,
+                    body=_row_body(row, header),
+                    fields=dict(row),
+                    index=number,
                     locator=context.locator,
+                    entry_id=identity,
                 )
             )
 
@@ -1253,7 +1433,9 @@ def _retrieve_one(
             locator=locator,
             query=query,
             tokens=tokens,
-        )
+                        projection=identity_projection_for(resource.resource_id),
+                        fallback_id_prefix=resource.resource_id,
+                    )
         adapter_result = adapter.read(context)
         raw_entries.extend(adapter_result.entries)
         warnings.extend(adapter_result.warnings)
@@ -1278,11 +1460,11 @@ def _retrieve_one(
             resource_id=resource.resource_id,
             resource_kind=resource.kind,
             adapter=adapter.name,
-                    locator=raw.locator,
+                        locator=raw.locator,
             entry_index=raw.index,
         )
         entry = DesignEntry(
-            entry_id=f"{resource.resource_id}:{raw.index}",
+                        entry_id=raw.entry_id or f"{resource.resource_id}:{raw.index}",
             kind=adapter.entry_kind,
             title=raw.title,
             body=raw.body,
@@ -1346,9 +1528,15 @@ __all__ = [
     "DesignResourceResult",
     "DesignRetrievalReport",
     "EntryProvenance",
-    "filter_rows",
-    "normalize_query_tokens",
-    "payload_chars",
-    "retrieve_design_guidance",
-    "row_matches_tokens",
-]
+        "UI_UX_PRO_MAX_ID_COLUMN",
+        "UI_UX_PRO_MAX_TITLE_COLUMN",
+        "RESOURCE_IDENTITY_PROJECTIONS",
+        "ResourceIdentityProjection",
+        "filter_rows",
+        "identity_projection_for",
+        "lexical_tokens",
+        "normalize_query_tokens",
+        "payload_chars",
+        "retrieve_design_guidance",
+        "row_matches_tokens",
+    ]

@@ -110,34 +110,41 @@ MUTATIONS = [
     (
         "query filter applied",
         RETRIEVAL,
-        """    selected = filter_rows(normalized, context.tokens)""",
-        """    selected = list(normalized)""",
+        """    selected = [
+        (number, row)
+        for number, row in numbered
+        if row_matches_tokens(row, context.tokens)
+    ]""",
+        """    selected = list(numbered)""",
     ),
     # --- 9. Query filter must run BEFORE the count cap --------------------
     # Reverting this makes a late-matching row unreachable, because capping
-    # first truncates the head of the file before relevance is ever considered.
+    # first truncates the head of the file before relevance is considered.
     (
         "query filter runs before the count cap",
         RETRIEVAL,
-        """    # Filter over the WHOLE dataset before any cap. See filter_rows.
-    selected = filter_rows(normalized, context.tokens)""",
+        """    numbered = list(enumerate(normalized, 1))""",
         """    # Filter over the head of the file only.
-    selected = filter_rows(normalized[:1], context.tokens)""",
+    numbered = list(enumerate(normalized[:1], 1))""",
     ),
     # --- 10. Matched rows must not be re-sorted by match count -------------
     (
         "matched rows keep source order, never re-ranked",
         RETRIEVAL,
-        """def filter_rows(
-    rows: Sequence[Mapping[str, str]], tokens: Sequence[str]
-) -> List[Mapping[str, str]]:""",
-        """def _rank(row, tokens):
-    return sum(1 for t in tokens for v in row.values() if isinstance(v, str) and t in v.lower())
-
-
-def filter_rows(
-    rows: Sequence[Mapping[str, str]], tokens: Sequence[str]
-) -> List[Mapping[str, str]]:""",
+        """    if not tokens:
+        return list(rows)
+    return [row for row in rows if row_matches_tokens(row, tokens)]""",
+        """    if not tokens:
+        return sorted(rows)
+    return sorted(
+        (row for row in rows if row_matches_tokens(row, tokens)),
+        key=lambda row: -sum(
+            1
+            for t in tokens
+            for v in row.values()
+            if isinstance(v, str) and t in lexical_tokens(v)
+        ),
+    )""",
     ),
     # --- 11. No column-name heuristic --------------------------------------
     (
@@ -146,20 +153,16 @@ def filter_rows(
         """    for value in row.values():
         if not isinstance(value, str):
             continue
-        lowered = value.lower()
-        for token in tokens:
-            if token in lowered:
-                return True
+        if wanted.intersection(lexical_tokens(value)):
+            return True
     return False""",
         """    for key, value in row.items():
         if key.lower() in ("instruction", "prompt", "recommendation"):
             continue
         if not isinstance(value, str):
             continue
-        lowered = value.lower()
-        for token in tokens:
-            if token in lowered:
-                return True
+        if wanted.intersection(lexical_tokens(value)):
+            return True
     return False""",
     ),
     # --- 12. Containment re-checked on every read -------------------------
@@ -350,6 +353,85 @@ def filter_rows(
         RETRIEVAL,
         """        if len(key) > remaining:""",
         """        if len(key) > remaining and False:""",
+    ),
+    # --- 28. Matching is whole-token, never substring ----------------------
+    # Reverting to substring matching makes "no" match "Ignore" again: the
+    # recall explosion A2 removed.
+    (
+        "matching is whole-token equality, never substring",
+        RETRIEVAL,
+        """        if wanted.intersection(lexical_tokens(value)):
+            return True""",
+        """        lowered = value.lower()
+        for token in tokens:
+            if token in lowered:
+                return True""",
+    ),
+    # --- 29. One shared tokenizer on both sides ----------------------------
+    # Tokenizing cells differently from the query side makes a match depend on
+    # which side normalized, which reads as a recall bug rather than an
+    # asymmetric-tokenizer bug.
+    (
+        "query and cells share one tokenizer",
+        RETRIEVAL,
+        """def normalize_query_tokens(query: Optional[str]) -> Tuple[str, ...]:""",
+        """def normalize_query_tokens(query: Optional[str]) -> Tuple[str, ...]:
+    if not query:
+        return ()
+    out = []
+    for raw in _TOKEN_SPLIT_RE.split(query[:MAX_QUERY_CHARS]):
+        token = raw.strip().lower()
+        if token and len(token) <= MAX_QUERY_TOKEN_CHARS:
+            out.append(token)
+    return tuple(out)
+
+
+def _unused_normalize_query_tokens(query: Optional[str]) -> Tuple[str, ...]:""",
+    ),
+    # --- 30. Style Category is the title -----------------------------------
+    # Reverting to header[0] restores title="4" on the real dataset.
+    (
+        "Style Category becomes the title, not the row ordinal",
+        RETRIEVAL,
+        """    title = _cell_text(row, projection.title_column)
+    if not title:""",
+        """    title = ""
+    if not title:""",
+    ),
+    # --- 31. Style ID is the entry id --------------------------------------
+    # Reverting to the positional form makes every id change with the query.
+    (
+        "Style ID becomes the entry_id, not a positional index",
+        RETRIEVAL,
+        """    identity = _cell_text(row, projection.id_column)
+    if not identity:""",
+        """    identity = ""
+    if not identity:""",
+    ),
+    # --- 32. Identity fallback keys off the SOURCE row ---------------------
+    # The FILTERED position renumbers an entry every time the query changes, so
+    # provenance stops being a stable citation.
+    (
+        "identity fallback keys off the SOURCE row, not the filtered position",
+        RETRIEVAL,
+        """    numbered = list(enumerate(normalized, 1))""",
+        """    numbered = list(enumerate(filter_rows(normalized, context.tokens), 1))""",
+    ),
+    # --- 33. Projection stays scoped to ui_ux_pro_max ----------------------
+    # Applying it to every resource would silently change datasets that have no
+    # Style Category / Style ID columns.
+    (
+        "identity projection is scoped to ui_ux_pro_max only",
+        RETRIEVAL,
+        """    "ui_ux_pro_max": ResourceIdentityProjection(
+        title_column=UI_UX_PRO_MAX_TITLE_COLUMN,
+        id_column=UI_UX_PRO_MAX_ID_COLUMN,
+    ),""",
+        """    "ui_ux_pro_max": ResourceIdentityProjection(
+        title_column=UI_UX_PRO_MAX_TITLE_COLUMN,
+        id_column=UI_UX_PRO_MAX_ID_COLUMN,
+    ),
+    ResourceIdentityProjection(title_column=UI_UX_PRO_MAX_TITLE_COLUMN),""",
     ),
 ]
 
