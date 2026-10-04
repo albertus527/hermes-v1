@@ -39,6 +39,7 @@ from typing import Any, Dict, List, Optional
 
 from app.core import credentials
 from app.core.design_dna import load_persisted_design_dna
+from app.core.design_context_render import render_design_context_block
 from app.core.design_resources import design_profile_skills_dir
 from app.core.state import ProjectStateStore
 # Stdlib-only by design (see that module's docstring): importing it at module
@@ -1497,6 +1498,7 @@ Respond in this exact JSON format:
         workspace: Path,
         design_dna_instructions: Optional[str] = None,
         build_operation_id: Optional[str] = None,
+        design_context=None,
     ) -> Dict[str, Any]:
         """Use Hermes FRONTEND role to derive design direction and build the site.
 
@@ -1511,7 +1513,12 @@ Respond in this exact JSON format:
         neither can refresh the other's watchdog.
         """
         # Build the FRONTEND prompt
-        prompt = self._build_frontend_prompt(brief, workspace, design_dna_instructions)
+        prompt = self._build_frontend_prompt(
+            brief,
+            workspace,
+            design_dna_instructions,
+            design_context=design_context,
+        )
 
         # FRONTEND uses explicit toolsets: file, terminal, skills
         # It does NOT silently inherit the broader default hermes-cli toolset.
@@ -1644,10 +1651,15 @@ Respond in this exact JSON format:
         brief: Dict[str, Any],
         workspace: Path,
         extra_instructions: Optional[str] = None,
+        design_context=None,
     ) -> str:
         """Build the FRONTEND build prompt.
 
         FRONTEND does NOT run npm cheap checks. Application code does.
+
+        ``design_context`` is the D2/D3a :class:`DesignContextPack`. It is
+        rendered as ONE bounded DATA block. FRONTEND never selects, installs, or
+        re-derives anything: it consumes the decisions this pack already carries.
         """
         name = brief.get("name", "Website")
         what = brief.get("what", "")
@@ -1661,6 +1673,7 @@ Respond in this exact JSON format:
             cta_note = f"\nCTA intent: {why} (destination UNRESOLVED — do not fabricate a URL)"
 
         instructions = extra_instructions or ""
+        design_context_block = render_design_context_block(design_context)
 
         return f"""You are FRONTEND, the website designer and builder for Website Builder R1.
 
@@ -1694,7 +1707,7 @@ Rules:
   exclusivity rules (e.g. "exactly one CTA"), and no per-element QA or
   acceptance contracts. Design DNA describes intent (palette, typography,
   personality, layout character); it is not a test specification.
-- Keep the build sequential.
+{design_context_block}- Keep the build sequential.
 - Keep design discovery bounded. Choose a coherent direction quickly rather
   than exhaustively exploring alternatives. Once Design DNA is written,
   immediately implement the website. Creating design-dna.json alone does

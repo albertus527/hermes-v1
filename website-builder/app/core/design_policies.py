@@ -74,6 +74,15 @@ DEPENDENCY_STATES: Tuple[str, ...] = (
 #: project-scoped dependency starts and where all of them remain in D1.
 STATE_AVAILABLE_ON_DEMAND = "available_for_project_on_demand"
 
+#: A design decision has chosen this dependency for a specific project, against a
+#: written justification. Selection is a decision, not a heuristic.
+#:
+#: D2 is the first batch that may produce this state, and it can produce ONLY
+#: this one. Reaching ``installed`` requires a VERIFIED project-local install,
+#: which is D3a's responsibility; naming the state here keeps the ladder's
+#: vocabulary explicit rather than leaving each consumer to spell the string.
+STATE_SELECTED = "selected"
+
 
 # ---------------------------------------------------------------------------
 # Justification gates
@@ -316,6 +325,7 @@ __all__ = [
     "DESIGN_AUTHORITY_PRECEDENCE",
     "DESIGN_DEPENDENCY_POLICIES",
     "STATE_AVAILABLE_ON_DEMAND",
+    "STATE_SELECTED",
     "DependencyPolicy",
     "authority_rank",
     "dependency_state",
