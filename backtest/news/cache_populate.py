@@ -61,7 +61,27 @@ class PopulationReport:
     cache_misses: list[dict] = field(default_factory=list)
     p4_conflicts: list[dict] = field(default_factory=list)
     malformed: list[dict] = field(default_factory=list)
+    #: §11.1 deterministic ma_role normalizations applied during this run
+    #: (one row per normalized headline, with the raw model ma_role). The
+    #: normalization is NOT invisible: it is counted here and the raw
+    #: output is preserved in ``normalized_ma_role``.
+    normalized_ma_role: list[dict] = field(default_factory=list)
     classified_at_wallclock: str = ""
+
+    @property
+    def normalized_ma_role_count(self) -> int:
+        """Number of headlines whose raw ``ma_role`` was forced to NEITHER
+        because the model's ``category`` was a valid non-M&A category."""
+        return len(self.normalized_ma_role)
+
+    @property
+    def normalization_rate(self) -> float | None:
+        """Normalized rows / classified rows, or ``None`` when nothing was
+        classified (a rate over zero rows is undefined, never 0.0/1.0)."""
+        denominator = self.headlines_classified
+        if denominator <= 0:
+            return None
+        return self.normalized_ma_role_count / denominator
 
     @property
     def complete(self) -> bool:
@@ -123,15 +143,32 @@ def populate_news_cache_entries(
                 classifier.model_version, ticker) in cached:
             report.headlines_skipped_existing += 1
             continue
+        # Prefer the 3-tuple entry point so the §11.1 normalization audit
+        # record is available; a narrow injected stub exposing only
+        # ``classify`` is still supported and is used verbatim (the
+        # normalization lives in the canonical client, never here).
+        classify_audited = getattr(
+            classifier, "classify_with_normalization", None)
         try:
-            classification, payload = classifier.classify(
-                ticker=ticker, headline_text=headline_text,
-                source=source, published_at=published_at)
+            if classify_audited is not None:
+                classification, payload, normalization = classify_audited(
+                    ticker=ticker, headline_text=headline_text,
+                    source=source, published_at=published_at)
+            else:
+                classification, payload = classifier.classify(
+                    ticker=ticker, headline_text=headline_text,
+                    source=source, published_at=published_at)
+                normalization = None
         except Exception as exc:  # malformed model output — fail-closed row
             report.malformed.append({
                 "ticker": ticker, "source": source,
                 "headline_hash": h_hash, "error": repr(exc)})
             continue
+        if normalization is not None and normalization.normalization_applied:
+            report.normalized_ma_role.append({
+                "ticker": ticker, "source": source,
+                "headline_hash": h_hash,
+                **normalization.audit_record()})
         cache.insert(
             classification, payload=payload,
             classified_at_wallclock=classified_at_wallclock,

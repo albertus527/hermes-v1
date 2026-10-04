@@ -49,6 +49,10 @@ from trading_core.news_effects import headline_hash as compute_headline_hash
 
 from backtest.news.calibration import LABEL_FIELDS, MIN_LABELED_HEADLINES
 from backtest.news.cache import MalformedClassificationError
+from backtest.news.normalize import (
+    NORMALIZATION_REASON_NON_MA_MA_ROLE,
+    normalize_classification_payload,
+)
 
 BENCHMARK_FORMAT_VERSION = "r281-classifier-benchmark-1"
 
@@ -84,6 +88,9 @@ def _parse_human_label(raw, where: str) -> dict:
             f"{where}: human_label must have exactly {list(LABEL_FIELDS)} "
             "fields")
     # Strict §11.1 enum + conditional-validity check (fail-closed).
+    # A HUMAN label is ground truth, NOT model output, so it is NEVER
+    # normalized: `ma_role != NEITHER` on a non-M&A human label is a real
+    # adjudication finding and must keep failing the whole worksheet.
     # confidence is not a label dimension; a placeholder passes the
     # shared validator which we only use for enum/shape enforcement.
     from backtest.news.cache import validate_classification_payload
@@ -176,7 +183,10 @@ class CandidatePrediction:
     sample_id: str
     headline_hash: str
     ticker: str
-    label: dict
+    label: dict            # CANONICAL label (post-normalization)
+    #: Flat §11.1 normalization audit record for this row (raw_* /
+    #: canonical_* / normalization_applied / normalization_reason).
+    normalization: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -186,19 +196,41 @@ class CandidateFile:
     predictions: dict[str, CandidatePrediction]   # keyed by sample_id
 
 
-def _parse_candidate_label(raw, where: str) -> dict:
+def _parse_candidate_label(raw, where: str) -> tuple[dict, dict]:
+    """Parse + normalize + strictly validate ONE candidate (MODEL) label.
+
+    A candidate prediction is model-authored output, so it goes through the
+    SAME deterministic §11.1 ``ma_role`` normalization as the live client
+    before strict validation: a non-M&A row carrying TARGET/ACQUIRER is
+    canonicalized to NEITHER instead of failing the whole candidate file.
+
+    Returns ``(canonical_label, audit)`` where ``audit`` is the flat
+    normalization record (``normalization_applied``,
+    ``normalization_reason``, raw_* and canonical_*). HUMAN labels are NOT
+    normalized — they are ground truth, not model output — see
+    :func:`_parse_human_label`.
+
+    Every other contract violation still fails closed: an unknown enum in
+    category/direction/severity/ma_role, a wrong field set, or a
+    non-object label all raise exactly as before.
+    """
     if not isinstance(raw, dict) or set(raw) != set(LABEL_FIELDS):
         raise BenchmarkInputError(
             f"{where}: prediction must have exactly {list(LABEL_FIELDS)} "
-            "fields")
+            f"fields")
     from backtest.news.cache import validate_classification_payload
+    # Deterministic §11.1 normalization, applied EXACTLY ONCE, before
+    # validation. Only a valid non-M&A category with a valid non-NEITHER
+    # ma_role is repaired; anything else passes through untouched.
+    normalization = normalize_classification_payload(dict(raw))
+    canonical = normalization.canonical
     try:
         validate_classification_payload({
             "ticker": "BENCH",
-            "category": raw["category"],
-            "direction": raw["direction"],
-            "severity": raw["severity"],
-            "ma_role": raw["ma_role"],
+            "category": canonical["category"],
+            "direction": canonical["direction"],
+            "severity": canonical["severity"],
+            "ma_role": canonical["ma_role"],
             "confidence": 1.0,
             "published_at": "2024-01-01T00:00:00+00:00",
             "headline_hash": "x" * 64,
@@ -210,7 +242,8 @@ def _parse_candidate_label(raw, where: str) -> dict:
     except MalformedClassificationError as exc:
         raise BenchmarkInputError(
             f"{where}: prediction invalid: {exc}") from exc
-    return {f: raw[f] for f in LABEL_FIELDS}
+    return ({f: canonical[f] for f in LABEL_FIELDS},
+            normalization.audit_record())
 
 
 def load_candidate_file(path) -> CandidateFile:
@@ -254,13 +287,15 @@ def load_candidate_file(path) -> CandidateFile:
                 if not isinstance(val, str) or not val.strip():
                     raise BenchmarkInputError(
                         f"{where}: {name} must be a non-empty string")
-            label = _parse_candidate_label(obj.get("label"), where)
+            label, normalization = _parse_candidate_label(
+                obj.get("label"), where)
             if sid in predictions:
                 raise BenchmarkInputError(
                     f"{where}: duplicate candidate prediction identity "
                     f"({cid}, {sid})")
             predictions[sid] = CandidatePrediction(
-                sample_id=sid, headline_hash=hh, ticker=ticker, label=label)
+                sample_id=sid, headline_hash=hh, ticker=ticker, label=label,
+                normalization=normalization)
     if not predictions:
         raise BenchmarkInputError(f"{path.name}: no predictions")
     if len(candidate_ids) != 1:
@@ -343,6 +378,18 @@ class CandidateResult:
     per_field_accuracy: dict = field(default_factory=dict)
     exact_match_rate: float | None = None
     meets_minimum: bool = False
+    #: §11.1 ma_role-normalization reliability evidence. These are AUDIT
+    #: counters describing how often the candidate emitted a
+    #: contract-invalid ``ma_role`` and how often the deterministic
+    #: normalization had to canonicalize it — never a quality score.
+    #: ``normalization_rate`` is None when no prediction was normalized
+    #: (undefined, not 0.0). Idempotence: a row is counted at most once,
+    #: because normalization is applied once at load time.
+    raw_invalid_ma_role_count: int = 0
+    normalized_ma_role_count: int = 0
+    normalization_rate: float | None = None
+    normalization_reason: str = NORMALIZATION_REASON_NON_MA_MA_ROLE
+    normalized_sample_ids: list = field(default_factory=list)
 
 
 @dataclass
@@ -390,6 +437,13 @@ def _evaluate_candidate(labeled: list[LabeledRow],
         if all_match:
             exact += 1
     n = len(labeled)
+    # §11.1 normalization audit counters (reliability evidence, NOT a
+    # score). Counted from the per-row audit records recorded at load time;
+    # canonical labels are what the agreement loop above compares.
+    normalized_sids = sorted(
+        sid for sid, pred in preds.items()
+        if (pred.normalization or {}).get("normalization_applied"))
+    normalized_count = len(normalized_sids)
     return CandidateResult(
         candidate_id=candidate.candidate_id,
         prompt_version=candidate.prompt_version,
@@ -399,6 +453,10 @@ def _evaluate_candidate(labeled: list[LabeledRow],
         per_field_accuracy={f: per_field_correct[f] / n for f in LABEL_FIELDS},
         exact_match_rate=exact / n,
         meets_minimum=n >= MIN_LABELED_HEADLINES,
+        raw_invalid_ma_role_count=normalized_count,
+        normalized_ma_role_count=normalized_count,
+        normalization_rate=(normalized_count / n) if normalized_count else None,
+        normalized_sample_ids=normalized_sids,
     )
 
 

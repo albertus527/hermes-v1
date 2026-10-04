@@ -325,13 +325,48 @@ def test_fp4_hash_mismatch_in_worksheet_fails_closed(tmp_path):
         load_labeled_worksheet(path)
 
 
-def test_ma_role_conditional_validity_enforced(ws, tmp_path):
+def test_candidate_ma_role_condition_normalized_not_rejected(ws, tmp_path):
+    """§11.1 conditional validity on CANDIDATE (model) output.
+
+    CHANGED 2026-10-04 (R2.8.1 ma_role normalization): a candidate
+    prediction is model output, so a non-M&A row carrying TARGET/ACQUIRER
+    is deterministically canonicalized to NEITHER instead of failing the
+    whole candidate file. The 99-row safety-challenge benchmark showed
+    that failure class was the ONLY failure class across all three
+    candidates (17/17), and retrying cannot fix a strict-schema
+    cross-field rule.
+
+    The row is still scored against the canonical label and the
+    normalization is reported — the invalidity is not erased, only
+    repaired deterministically. Category/direction/severity are untouched.
+    See tests/backtest/test_news_classifier_ma_role_normalization.py for the
+    full contract (fail-closed surface, idempotence, M&A untouched).
+    """
     rows = [(sid, _hash(text), ticker) for sid, _hh, ticker, _src, text, _lbl in ROWS]
     bad = {"category": "EARNINGS", "direction": "BULLISH",
            "severity": "MEDIUM", "ma_role": "TARGET"}
     c = _write_candidate(tmp_path / "c.jsonl", rows=rows,
                          predictions={0: bad})
-    with pytest.raises(BenchmarkInputError, match="ma_role must be NEITHER"):
+    cf = load_candidate_files([c])[0]
+    sid = rows[0][0]
+    assert cf.predictions[sid].label == {
+        "category": "EARNINGS", "direction": "BULLISH",
+        "severity": "MEDIUM", "ma_role": "NEITHER"}
+    audit = cf.predictions[sid].normalization
+    assert audit["raw_ma_role"] == "TARGET"
+    assert audit["canonical_ma_role"] == "NEITHER"
+    assert audit["normalization_applied"] is True
+
+
+def test_candidate_unknown_ma_role_enum_still_fails_closed(ws, tmp_path):
+    """The normalization is NOT an enum coercer: an unknown ma_role value is
+    still rejected outright."""
+    rows = [(sid, _hash(text), ticker) for sid, _hh, ticker, _src, text, _lbl in ROWS]
+    bad = {"category": "EARNINGS", "direction": "BULLISH",
+           "severity": "MEDIUM", "ma_role": "SELLER"}
+    c = _write_candidate(tmp_path / "c.jsonl", rows=rows,
+                         predictions={0: bad})
+    with pytest.raises(BenchmarkInputError, match="unknown ma_role"):
         load_candidate_files([c])
 
 

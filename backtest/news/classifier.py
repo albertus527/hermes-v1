@@ -39,6 +39,10 @@ from backtest.news.cache import (
     MalformedClassificationError,
     validate_classification_payload,
 )
+from backtest.news.normalize import (
+    ClassificationNormalization,
+    normalize_classification_payload,
+)
 
 # §11.5: temperature is pinned at 0 for reproducibility.
 CLASSIFICATION_TEMPERATURE = 0.0
@@ -233,7 +237,8 @@ class NewsClassifierClient:
         return response
 
     def classify(self, *, ticker: str, headline_text: str,
-                 source: str, published_at: _dt.datetime) -> tuple[Classification, dict]:
+                 source: str,
+                 published_at: _dt.datetime) -> tuple[Classification, dict]:
         """Classify one timed headline.
 
         Returns ``(classification, payload)`` where ``payload`` is the
@@ -241,14 +246,45 @@ class NewsClassifierClient:
         and ``model_version`` for reproducibility) ready for
         :meth:`NewsClassificationCache.insert`.
 
-        Deterministic post-processing:
-        - the model's JSON is validated strictly (fail-closed
-          :class:`MalformedClassificationError` on any deviation);
+        Deterministic post-processing, in order:
+        - the model's JSON is parsed (malformed JSON fails closed);
+        - the §11.1 cross-field ``ma_role`` rule is applied ONCE by
+          :func:`~backtest.news.normalize.normalize_classification_payload`
+          — ``ma_role`` is forced to NEITHER only when ``category`` is a
+          valid non-M&A category. NOTHING else is rewritten (never
+          ``category``/``direction``/``severity``/``confidence``), M&A rows
+          are never touched, and the pass is idempotent;
+        - the NORMALIZED payload is then validated strictly (fail-closed
+          :class:`MalformedClassificationError` on any other deviation),
+          so every contract violation other than this single cross-field
+          inconsistency still fails closed exactly as before;
         - §11.3 keyword fallback is applied (BEFORE the §11.2 mapping,
           persisted as ``keyword_override``) so cache-only replay
           reproduces it without headline-time LLM calls;
         - the FP-4 ``headline_hash`` is recomputed from the headline text —
           the model never supplies identity fields.
+
+        ``payload`` stays the canonical news_schema_v3 object — the
+        normalization audit metadata is NOT injected into it (the §16
+        cache payload is a strict, frozen field set). It is returned by
+        :meth:`classify_with_normalization` for callers that must record
+        it (population report, benchmark audit).
+        """
+        classification, payload, _normalization = self.classify_with_normalization(
+            ticker=ticker, headline_text=headline_text, source=source,
+            published_at=published_at)
+        return classification, payload
+
+    def classify_with_normalization(
+        self, *, ticker: str, headline_text: str, source: str,
+        published_at: _dt.datetime,
+    ) -> tuple[Classification, dict, ClassificationNormalization]:
+        """:meth:`classify` plus the §11.1 normalization audit record.
+
+        The single place the deterministic ``ma_role`` normalization is
+        applied; :meth:`classify` delegates here so the rule is never
+        duplicated across callers. The third element carries the raw model
+        fields, the canonical fields, and whether a normalization occurred.
         """
         response = self._call(build_messages(ticker, headline_text))
         import json
@@ -257,6 +293,9 @@ class NewsClassifierClient:
         except (ValueError, TypeError) as exc:
             raise MalformedClassificationError(
                 f"model output is not valid JSON: {exc}") from exc
+        if not isinstance(raw, dict):
+            raise MalformedClassificationError(
+                "model output is not a JSON object")
         # The model supplies effect fields only; identity, clock, source,
         # schema/model provenance are stamped deterministically here.
         payload = {
@@ -273,8 +312,13 @@ class NewsClassifierClient:
             "schema_version": self.schema_version,
             "model_version": self.model_version,
         }
-        # Validate the LLM-shaped payload BEFORE the keyword override so a
-        # malformed model answer fails closed here.
+        # §11.1 cross-field ma_role normalization — applied EXACTLY ONCE,
+        # here, before validation. Deterministic + idempotent; it can only
+        # rewrite ma_role on a valid non-M&A row.
+        normalization = normalize_classification_payload(payload)
+        payload = normalization.canonical
+        # Validate the LLM-shaped NORMALIZED payload BEFORE the keyword
+        # override so a malformed model answer still fails closed here.
         validated = validate_classification_payload(payload)
         # §11.3 deterministic keyword fallback at classification time.
         final = classify_with_keyword_fallback(
@@ -291,4 +335,4 @@ class NewsClassifierClient:
         payload["keyword_override"] = final.keyword_override
         payload["direction"] = final.direction
         payload["severity"] = final.severity
-        return final, payload
+        return final, payload, normalization
