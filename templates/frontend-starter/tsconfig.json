@@ -1,4 +1,16 @@
 {
+  // The solution file below references the two real projects, but the pinned
+  // shadcn CLI (>=4) reads THIS file to resolve `aliases.ui` and joins the
+  // result against the alias literally. It does not follow `references` into
+  // tsconfig.app.json, so without `paths` here `shadcn add` writes a literal
+  // `@/components/ui/` directory at the project root -- outside `src/`, so
+  // `tsc -b` never checks it, `vite build` never bundles it, and the install
+  // silently "succeeds" while producing a component nothing imports.
+  //
+  // This mapping is therefore load-bearing for the component destination and
+  // must stay identical to the `paths` in tsconfig.app.json and the
+  // `resolve.alias` in vite.config.ts.
+  "compilerOptions": { "paths": { "@/*": ["./src/*"] } },
   "files": [],
   "references": [{ "path": "./tsconfig.app.json" }, { "path": "./tsconfig.node.json" }]
 }

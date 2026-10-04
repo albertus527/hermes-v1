@@ -73,10 +73,26 @@ templates/frontend-starter/
 
 ## Path alias
 
-`@/*` resolves to `src/*`, declared in **both** `tsconfig.app.json` (`paths`) and
-`vite.config.ts` (`resolve.alias`) so TypeScript and Vite agree. There is no
-`baseUrl`: it is deprecated-and-failing in TypeScript 6.0, and `paths` resolves
-relative to the containing tsconfig without it.
+`@/*` resolves to `src/*`, declared in **three** places so every tool that reads
+the mapping agrees:
+
+| File                    | Key           | Read by                      |
+| ----------------------- | ------------- | ---------------------------- |
+| `tsconfig.json`         | `paths`       | the pinned shadcn CLI (>=4)   |
+| `tsconfig.app.json`     | `paths`       | `tsc -b`                     |
+| `vite.config.ts`        | `resolve.alias` | the Vite bundler           |
+
+The **root** `tsconfig.json` entry is load-bearing for the component destination
+and must not be removed as "redundant" with the other two. shadcn >=4 reads
+*that* file to resolve `aliases.ui`, and it does not follow `references` into
+`tsconfig.app.json`. With the root mapping absent, `shadcn add button` joins the
+alias literally and writes a real directory named `@/components/ui/` at the
+project root — outside `src/`, so `tsc -b` never checks it, `vite build` never
+bundles it, and the command still exits 0. The install reports success while
+producing a component nothing imports.
+
+There is no `baseUrl`: it is deprecated-and-failing in TypeScript 6.0, and
+`paths` resolves relative to the containing tsconfig without it.
 
 ## shadcn configuration
 
@@ -90,6 +106,15 @@ It is committed rather than generated because the destination must be known
 this alias, and a project whose config is absent or unreviewed is refused rather
 than driven against a guessed path. `shadcn init` is deliberately **not** run —
 it can rewrite `package.json`, the CSS entry, and the config itself.
+
+### Dependency note (shadcn 4.x)
+
+`class-variance-authority` is a starter dependency. The v4 registry bases that
+shadcn 4.x resolves `new-york` to emit a component importing `cva`, but declare
+only `cn` as a dependency, so the CLI does not install it. Without the starter
+declaring it, every generated component fails `tsc -b` with TS2307 once it lands
+inside `src/` — the build gate for every project. `cn` and `radix-ui` are added
+by the CLI itself at `^` ranges; the starter's own deps stay exactly pinned.
 
 ## Baseline included
 

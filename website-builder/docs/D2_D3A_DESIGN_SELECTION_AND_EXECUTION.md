@@ -140,14 +140,17 @@ Commands are argv **lists** (no shell), built from allowlisted constants:
 
 ```
 npm install gsap --save-exact --no-audit --no-fund
-npm exec --yes --package=shadcn@2.1.6 -- shadcn add button card --yes --overwrite
+npm exec --yes --package=shadcn@4.21.0 -- shadcn add button card --yes --overwrite
 ```
 
 - The package manager is **detected** from the project's own lockfile, so a
   pnpm/yarn project is never driven with npm (which would rewrite the other
   manager's lockfile).
 - `--save-exact` — an unpinned dependency can float on a later build.
-- shadcn is **pinned** at `2.1.6`; production never resolves a floating `latest`.
+- shadcn is **pinned** at `4.21.0`; production never resolves a floating
+  `latest`. There is no official shadcn LTS channel, so the policy is *latest
+  stable + exact pin*: no prerelease, no canary, no `^`/`~` range. The pin is
+  bumped only after a regression run plus a VPS smoke.
 - Only **explicitly requested, allowlisted** components reach the CLI. No default
   bundle. `--yes` keeps the invocation non-interactive inside a supervised run.
 - Bounded timeouts (300 s), and every command carries a bounded `CommandReceipt`.
@@ -161,9 +164,9 @@ subcommand**; its one-off mechanism is `npm exec` (`npx` is its alias).
 
 | manager | invocation |
 |---|---|
-| npm | `npm exec --yes --package=shadcn@2.1.6 -- shadcn add …` |
-| pnpm | `pnpm dlx shadcn@2.1.6 add …` |
-| Yarn Berry | `yarn dlx shadcn@2.1.6 add …` |
+| npm | `npm exec --yes --package=shadcn@4.21.0 -- shadcn add …` |
+| pnpm | `pnpm dlx shadcn@4.21.0 add …` |
+| Yarn Berry | `yarn dlx shadcn@4.21.0 add …` |
 | Yarn Classic | **unsupported — fails closed** |
 
 - The trailing **`--`** is required. Without it npm re-parses later switches as
@@ -186,9 +189,21 @@ A pinned, reviewed `components.json` ships in the frontend starter
 (`templates/frontend-starter/`), matching that starter's actual toolchain —
 Vite 8 + React 19 + TypeScript 6 + **Tailwind 4** (so `tailwind.config` is `""`
 and the CSS entry is `src/index.css`), `tsx: true`, `style: new-york`. Its
-`@/…` aliases are backed by an `@/* → ./src/*` mapping in both
-`tsconfig.app.json` (`paths`) and `vite.config.ts` (`resolve.alias`), without
-which no generated component would resolve or typecheck.
+`@/…` aliases are backed by an `@/* → ./src/*` mapping declared in **three**
+places — the root `tsconfig.json` (`paths`), `tsconfig.app.json` (`paths`) and
+`vite.config.ts` (`resolve.alias`).
+
+**The root `tsconfig.json` entry is load-bearing for shadcn >=4.** The 4.x CLI
+resolves `aliases.ui` by reading `paths` from the *root* tsconfig and joining it
+against the alias; it does not follow `references` into `tsconfig.app.json`.
+With the root mapping absent it writes a real directory named `@/components/ui/`
+at the project root instead — outside `src/`, so `tsc -b` never checks it,
+`vite build` never bundles it, and the command **still exits 0**. The failure is
+silent: D3a would report `installed` while the component existed nowhere the
+project could import it. (`approved_component_dir()` binds the destination to
+`src`, so had the stray `@/` tree been produced under the old starter it would
+have been refused rather than verified — the containment check is what makes the
+misplacement loud instead of silent.)
 
 `approved_component_dir()` accepts a config only when it parses, uses an
 approved style, carries a Tailwind CSS entry, declares both `ui` and `utils`

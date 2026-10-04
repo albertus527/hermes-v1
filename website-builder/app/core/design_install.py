@@ -156,7 +156,19 @@ ALLOWED_SHADCN_COMPONENTS: Tuple[str, ...] = (
 #: Pinned shadcn CLI version. Production execution never resolves a floating
 #: ``latest``: an unpinned registry CLI is a silent supply-chain upgrade inside a
 #: build, which is the exact failure a pinned toolchain file exists to prevent.
-SHADCN_CLI_VERSION = "2.1.6"
+#:
+#: There is no official shadcn LTS channel, so the policy is latest STABLE plus
+#: an exact pin: no prerelease, no canary, no range operator (``^``/``~``). The
+#: pin is bumped only after a regression run plus a VPS smoke.
+#:
+#: 4.x resolves the component destination by reading ``paths`` from the ROOT
+#: ``tsconfig.json`` and joining it against the alias. It does not follow
+#: ``references`` into ``tsconfig.app.json``. The starter therefore declares the
+#: same ``@/* -> ./src/*`` mapping in all three places that matter -- the root
+#: tsconfig (what the CLI reads), ``tsconfig.app.json`` (what ``tsc -b``
+#: typechecks against) and ``vite.config.ts`` (what the bundler resolves). See
+#: ``templates/frontend-starter/tsconfig.json`` for the standing requirement.
+SHADCN_CLI_VERSION = "4.21.0"
 
 #: File suffixes a shadcn component may materialize as. shadcn emits TSX for a
 #: TypeScript project (components.json ``tsx: true``); ``.ts`` is accepted so a
@@ -392,15 +404,26 @@ SHADCN_CONFIG_FILENAME = "components.json"
 _APPROVED_SHADCN_STYLES = frozenset({"new-york"})
 
 #: The root an approved alias is resolved AGAINST. The starter maps `@/*` to
-#: `./src/*` (tsconfig.app.json `paths`, vite.config.ts `resolve.alias`), so an
-#: alias is relative to the source root, not to the project root: `@/components/ui`
-#: names `src/components/ui`. Binding here means a config can only ever direct the
-#: CLI into the project source tree that `tsconfig.app.json` actually typechecks.
+#: `./src/*`, so an alias is relative to the source root, not to the project
+#: root: `@/components/ui` names `src/components/ui`. Binding here means a
+#: config can only ever direct the CLI into the project source tree that
+#: `tsc -b` actually typechecks.
+#:
+#: shadcn >=4 resolves the alias by reading ``paths`` from the ROOT
+#: ``tsconfig.json``; it does not follow ``references``. So this assumption is
+#: only sound while the starter declares the mapping in all three places that
+#: read it: the root tsconfig (the CLI), ``tsconfig.app.json`` (``tsc -b``) and
+#: ``vite.config.ts`` (the bundler). If the root mapping is ever dropped, shadcn
+#: writes a literal ``@/components/ui`` directory at the project root instead --
+#: which this module then correctly REFUSES to verify, because that path is not
+#: under ``src``. The failure is loud, not silent.
 _APPROVED_COMPONENT_ROOT = "src"
 
 #: The approved alias must use the starter's `@/*` mapping. The starter declares
-#: it in tsconfig.app.json (`paths`) and vite.config.ts (`resolve.alias`), so
-#: this is a check that the config agrees with the toolchain, not a preference.
+#: it in the root ``tsconfig.json`` (``paths``, which is what shadcn >=4 reads),
+#: in ``tsconfig.app.json`` (``paths``) and in ``vite.config.ts``
+#: (``resolve.alias``), so this is a check that the config agrees with the
+#: toolchain, not a preference.
 _APPROVED_ALIAS_PREFIX = "@/"
 
 #: Longest alias string accepted. A config that names a 4 KB directory is not a

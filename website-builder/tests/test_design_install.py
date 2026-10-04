@@ -693,8 +693,11 @@ def test_yarn_classic_fails_closed_instead_of_falling_back(project):
 
 
 def test_unknown_package_manager_has_no_invocation():
-    assert registry_invocation_prefix((), project_root=Path("."), version="2.1.6") is None
-    assert registry_invocation_prefix(("bun",), project_root=Path("."), version="2.1.6") is None
+    # The version is a passthrough the function never reads on these paths --
+    # the refusal is decided by the manager name alone. Passing the real pin
+    # keeps the test honest about which version production uses.
+    assert registry_invocation_prefix((), project_root=Path("."), version=SHADCN_CLI_VERSION) is None
+    assert registry_invocation_prefix(("bun",), project_root=Path("."), version=SHADCN_CLI_VERSION) is None
 
 
 def test_no_manager_argv_uses_a_floating_latest_or_a_global_flag(project):
