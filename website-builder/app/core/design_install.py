@@ -22,7 +22,9 @@ convention.
 **Selection alone never means installed.** The state machine is
 ``available_for_project_on_demand -> selected -> install attempted -> installed``
 and ``installed`` is reachable ONLY after verification observes the package in
-the project's own ``package.json``. A selection flag, a successful-looking
+the project's own ``package.json`` — or, for shadcn, observes every requested
+component as a contained regular file under the destination the project's own
+reviewed ``components.json`` declares. A selection flag, a successful-looking
 command, or a returned exit code are each individually insufficient.
 
 **Failure is explicit and never silently degrades requirements.** A failed
@@ -32,8 +34,11 @@ a silent substitution is a user requirement quietly changed by the application.
 
 **shadcn is component-scoped and pinned.** Only the components D2 selected are
 requested, never a default bundle, and the CLI is invoked by pinned version
-through the project's own package manager. An unselected shadcn produces zero
-invocations.
+through the project's own package manager, using that manager's real one-off
+runner (``npm exec`` / ``pnpm dlx`` / ``yarn dlx``). An unselected shadcn
+produces zero invocations, and a project with no approved shadcn configuration
+produces zero invocations too — a destination is never guessed and
+``shadcn init`` is never run.
 """
 
 from __future__ import annotations
@@ -44,7 +49,7 @@ import subprocess
 import re
 import shutil
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from app.core.design_policies import (
@@ -153,6 +158,13 @@ ALLOWED_SHADCN_COMPONENTS: Tuple[str, ...] = (
 #: build, which is the exact failure a pinned toolchain file exists to prevent.
 SHADCN_CLI_VERSION = "2.1.6"
 
+#: File suffixes a shadcn component may materialize as. shadcn emits TSX for a
+#: TypeScript project (components.json ``tsx: true``); ``.ts`` is accepted so a
+#: component that is genuinely a single non-JSX module still verifies. Both are
+#: exact, application-owned extensions -- never a prefix scan, never "any file
+#: whose name contains the component name".
+COMPONENT_SUFFIXES: Tuple[str, ...] = (".tsx", ".ts")
+
 
 def allowed_shadcn_components() -> Tuple[str, ...]:
     return tuple(sorted(ALLOWED_SHADCN_COMPONENTS))
@@ -175,6 +187,17 @@ REASON_NOT_VERIFIED = (
 REASON_PACKAGE_NOT_ALLOWLISTED = "no allowlisted package is declared for this dependency"
 REASON_COMPONENT_NOT_ALLOWED = "requested component is not in the allowlist"
 REASON_COMPONENT_NONE_REQUESTED = "no component was selected, so no CLI was invoked"
+REASON_COMPONENTS_NOT_VERIFIED = (
+    "the registry command succeeded but the requested components are absent from "
+    "the approved component directory; the state is not upgraded to installed"
+)
+REASON_SHADCN_CONFIG_INVALID = (
+    "the project has no valid application-owned shadcn configuration, so the "
+    "component destination is unknown; no command was attempted"
+)
+REASON_MANAGER_UNSUPPORTED = (
+    "the project's package manager has no supported pinned one-off mechanism"
+)
 REASON_OUTSIDE_PROJECT = "resolved path is outside the project workspace"
 REASON_TIMEOUT = "the project-local command exceeded its bounded timeout"
 REASON_NO_PACKAGE_MANAGER = "no project-local package manager is available"
@@ -245,6 +268,10 @@ class InstallOutcome:
     reason: str
     receipt: Optional[CommandReceipt] = None
     verified_in_manifest: bool = False
+    #: Component NAMES observed under the approved component directory. Names
+    #: only, drawn from the closed allowlist -- never an absolute path -- so the
+    #: receipt stays bounded and leaks no filesystem layout.
+    verified_components: Tuple[str, ...] = ()
 
     @property
     def installed(self) -> bool:
@@ -262,6 +289,7 @@ class InstallOutcome:
             "package": self.package,
             "reason": self.reason,
             "verified_in_manifest": self.verified_in_manifest,
+            "verified_components": list(self.verified_components),
             "receipt": self.receipt.to_dict() if self.receipt else None,
         }
 
@@ -335,6 +363,214 @@ def is_contained(root: Path, candidate: Path) -> bool:
             return False
 
 
+# ---------------------------------------------------------------------------
+# The approved component destination -- APPLICATION-OWNED
+# ---------------------------------------------------------------------------
+#
+# `shadcn add` does not choose where a component lands; it reads the project's
+# `components.json` and writes under `aliases.ui`. So the destination is a
+# property of the PROJECT'S CONFIG, and this module's job is to decide whether
+# that config is one we are willing to act on.
+#
+# Two failure modes this deliberately refuses:
+#
+#   * Guessing. Hardcoding `src/components/ui` would verify a path the CLI was
+#     never told to write, which can both false-pass (a file that happens to sit
+#     there) and false-fail (a perfectly valid custom alias).
+#   * `shadcn init`. Bootstrapping by running init would let the CLI mutate
+#     package.json, the CSS entry and the config itself -- changes well beyond
+#     the component the caller asked for. D3a only ever runs `add`.
+#
+# Absent or unapprovable config therefore FAILS CLOSED: no destination is
+# invented and no command is attempted.
+
+#: The config file shadcn reads. Named here so no code path spells it.
+SHADCN_CONFIG_FILENAME = "components.json"
+
+#: shadcn CLI styles accepted by this application. Anything else is a config we
+#: have not reviewed, so it is not acted on.
+_APPROVED_SHADCN_STYLES = frozenset({"new-york"})
+
+#: The root an approved alias is resolved AGAINST. The starter maps `@/*` to
+#: `./src/*` (tsconfig.app.json `paths`, vite.config.ts `resolve.alias`), so an
+#: alias is relative to the source root, not to the project root: `@/components/ui`
+#: names `src/components/ui`. Binding here means a config can only ever direct the
+#: CLI into the project source tree that `tsconfig.app.json` actually typechecks.
+_APPROVED_COMPONENT_ROOT = "src"
+
+#: The approved alias must use the starter's `@/*` mapping. The starter declares
+#: it in tsconfig.app.json (`paths`) and vite.config.ts (`resolve.alias`), so
+#: this is a check that the config agrees with the toolchain, not a preference.
+_APPROVED_ALIAS_PREFIX = "@/"
+
+#: Longest alias string accepted. A config that names a 4 KB directory is not a
+#: config this application is going to treat as reviewed.
+_MAX_ALIAS_LEN = 200
+
+
+def _read_shadcn_config(project_root: Path) -> Optional[Dict[str, Any]]:
+    """The project's ``components.json``, or ``None`` if absent/unreadable."""
+    path = Path(project_root) / SHADCN_CONFIG_FILENAME
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        document = json.loads(raw)
+    except ValueError:
+        return None
+    return document if isinstance(document, dict) else None
+
+
+def _alias_is_approved(alias: object) -> bool:
+    """Whether a shadcn alias names a reviewed directory inside the source root.
+
+    The alias is validated as a SHAPE only. It must use the starter's `@/*`
+    mapping and must be a plain relative path with no traversal, drive letter or
+    leading separator. Resolving it against the source root (and requiring
+    containment) is :func:`approved_component_dir`'s job, so a single place
+    decides where the path actually lands.
+    """
+    if not isinstance(alias, str):
+        return False
+    if not alias or len(alias) > _MAX_ALIAS_LEN:
+        return False
+    if not alias.startswith(_APPROVED_ALIAS_PREFIX):
+        # Rejects an absolute path ("/tmp/x"), a Windows drive path ("C:/x"), a
+        # traversal ("@/../.."), and a bare relative path the toolchain has no
+        # mapping for -- all without ever joining it to anything.
+        return False
+    relative = alias[len(_APPROVED_ALIAS_PREFIX):]
+    if not relative:
+        return False
+    # PurePosixPath, deliberately: the alias is written in the shadcn config with
+    # forward slashes on every platform, and parsing it with the native flavour
+    # would treat "/" as a separator on POSIX but still yield host-dependent
+    # parts on Windows. The alias is not a host path until we join it below.
+    parts = PurePosixPath(relative).parts
+    if not parts:
+        return False
+    # `..` anywhere is a traversal; "." segments are noise but harmless.
+    if any(part == ".." for part in parts):
+        return False
+    if parts[0] in ("", "/"):
+        return False
+    return True
+
+
+def approved_component_dir(project_root: Path) -> Optional[Path]:
+    """The approved component directory declared by the project's shadcn config.
+
+    Returns the resolved absolute directory, or ``None`` when the project has no
+    config this application is willing to act on -- which callers MUST treat as
+    "do not invoke the CLI", because without a destination there is nothing to
+    verify against afterwards.
+
+    The returned directory is validated twice: once as a *shape* (an alias we
+    approve) and once as a *location* (resolves inside the project, with no
+    symlinked segment escaping it). Only then is it usable.
+    """
+    document = _read_shadcn_config(project_root)
+    if document is None:
+        return None
+
+    style = document.get("style")
+    if style not in _APPROVED_SHADCN_STYLES:
+        return None
+
+    tailwind = document.get("tailwind")
+    if not isinstance(tailwind, Mapping) or not isinstance(
+        tailwind.get("css"), str
+    ):
+        # shadcn's own schema requires tailwind.{config,css,baseColor,
+        # cssVariables}; a config missing the CSS entry is not one we reviewed.
+        return None
+
+    aliases = document.get("aliases")
+    if not isinstance(aliases, Mapping):
+        return None
+    # `utils` is required by the shadcn schema and is the import every emitted
+    # component depends on, so its absence means the config cannot produce a
+    # compiling project.
+    if not _alias_is_approved(aliases.get("ui")) or not _alias_is_approved(
+        aliases.get("utils")
+    ):
+        return None
+
+    ui_alias = str(aliases["ui"])
+    relative = PurePosixPath(ui_alias[len(_APPROVED_ALIAS_PREFIX):])
+    root = Path(project_root)
+    # The alias is bound against the SOURCE root, because that is what the
+    # starter's `@/*` mapping points at. Joining against the project root would
+    # resolve `@/components/ui` to `<project>/components/ui`, a directory the
+    # CLI would never write to and `tsc -b` would never check.
+    candidate = root / _APPROVED_COMPONENT_ROOT / relative
+
+    # Require containment in BOTH the project and the source root. `is_contained`
+    # resolves, so a component root that is a symlink pointing outside the
+    # workspace is rejected here rather than after files are written through it.
+    if not is_contained(root, candidate) or not is_contained(
+        root / _APPROVED_COMPONENT_ROOT, candidate
+    ):
+        logger.warning(
+            "Refused a shadcn component directory that resolved outside the project."
+        )
+        return None
+    return candidate
+
+
+def verify_components_materialized(
+    project_root: Path, components: Sequence[str], component_dir: Optional[Path]
+) -> Tuple[str, ...]:
+    """Which of ``components`` are materialized under the approved directory.
+
+    Returns the components that are present, or ``()`` if ANY is missing: a
+    partial install is not a success, because the caller will run
+    ``npm run build`` immediately afterwards and a missing component fails it.
+
+    ``component_dir`` is the ONLY directory consulted. It comes from
+    :func:`approved_component_dir`, i.e. the project's own reviewed config, and
+    is never derived from model text, resource text, or the command's stdout.
+
+    Each candidate must satisfy ALL of:
+      * a regular file (``is_file()`` -- a directory or dangling symlink fails),
+      * named exactly ``<component><suffix>`` for an approved suffix,
+      * contained in ``project_root`` after resolution (no symlink escape).
+    """
+    if component_dir is None or not components:
+        return ()
+
+    verified: List[str] = []
+    for component in components:
+        if not any(
+            _component_is_materialized(project_root, component_dir, component, suffix)
+            for suffix in COMPONENT_SUFFIXES
+        ):
+            # All-or-nothing: report nothing rather than the subset that
+            # happened to land, so a partial install cannot be read as success.
+            return ()
+        verified.append(component)
+    return tuple(sorted(verified))
+
+
+def _component_is_materialized(
+    project_root: Path, component_dir: Path, component: str, suffix: str
+) -> bool:
+    """Whether one component exists as a contained regular file."""
+    if not component or component not in ALLOWED_SHADCN_COMPONENTS:
+        # Defence in depth. Callers already pass an allowlisted tuple; this makes
+        # it impossible for a rejected component to be verified even if a future
+        # caller forgets to filter first.
+        return False
+    candidate = Path(component_dir) / f"{component}{suffix}"
+    try:
+        if not candidate.is_file():
+            return False
+    except OSError:
+        return False
+    return is_contained(project_root, candidate)
+
+
 
 # ---------------------------------------------------------------------------
 # Command construction
@@ -360,6 +596,12 @@ LOCKFILES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("package-lock.json", ("npm",)),
 )
 
+#: Yarn Berry's marker file. Berry is the only yarn that ships ``yarn dlx``;
+#: Yarn Classic (which writes ``.yarnrc``) has no such subcommand. Presence of
+#: this file is therefore the whole "is dlx supported by this toolchain" test,
+#: decided from the project rather than by running ``yarn --version``.
+YARN_BERRY_CONFIG = ".yarnrc.yml"
+
 
 def detect_package_manager(project_root: Path) -> Optional[Tuple[str, ...]]:
     """The project's own package manager argv prefix, or ``None``.
@@ -371,6 +613,46 @@ def detect_package_manager(project_root: Path) -> Optional[Tuple[str, ...]]:
     for filename, argv in LOCKFILES:
         if (project_root / filename).exists():
             return argv
+    return None
+
+
+def registry_invocation_prefix(
+    manager: Sequence[str], *, project_root: Path, version: str
+) -> Optional[Tuple[str, ...]]:
+    """The manager-specific one-off runner argv for the pinned registry CLI.
+
+    Each package manager has a DIFFERENT one-off mechanism, and the old code
+    assumed they all shared one by appending a bare ``dlx``. That produced
+    ``npm dlx ...``, and ``npm`` has no ``dlx`` subcommand -- npm's one-off
+    mechanism is ``npm exec`` (``npx`` is its alias).
+
+    Returning ``None`` means "this toolchain has no mechanism I will drive", and
+    the caller runs NO command at all. That is deliberate for Yarn Classic:
+    rather than silently falling back to ``npx``/``npm``, which would run a CLI
+    the project never opted into, an unsupported toolchain fails closed.
+    """
+    argv = tuple(manager)
+    if not argv:
+        return None
+    name = argv[0]
+    spec = f"shadcn@{version}"
+
+    if name == "npm":
+        # `npm exec --package=<spec> -- shadcn`. The trailing `--` is REQUIRED:
+        # without it npm re-parses later switches as its own and would swallow
+        # shadcn's `--yes` / `--overwrite`. `--yes` suppresses npm's own
+        # install prompt so a supervised run cannot block on it.
+        return argv + ("exec", "--yes", f"--package={spec}", "--", "shadcn")
+    if name == "pnpm":
+        # `pnpm dlx` is a real subcommand that takes the pinned spec positionally.
+        return argv + ("dlx", spec)
+    if name == "yarn":
+        # Only Yarn Berry (v2+) has `dlx`. Classic does not, and falling back to
+        # npx/npm would execute a CLI outside this project's toolchain contract.
+        if (Path(project_root) / YARN_BERRY_CONFIG).exists():
+            return argv + ("dlx", spec)
+        logger.warning("Yarn Classic has no pinned one-off runner; refusing to invoke.")
+        return None
     return None
 
 
@@ -392,22 +674,21 @@ def build_install_argv(manager: Sequence[str], package: str) -> Tuple[str, ...]:
 
 
 def build_registry_argv(
-    manager: Sequence[str], *, components: Sequence[str], version: str
+    prefix: Sequence[str], *, components: Sequence[str]
 ) -> Tuple[str, ...]:
-    """The shadcn registry argv for an explicit, allowlisted component list.
+    """The shadcn ``add`` argv for an explicit, allowlisted component list.
 
-    Invoked through the PROJECT's own package manager at a PINNED version, so no
-    global shadcn CLI is required and no floating ``latest`` is resolved inside a
-    production build. ``--yes`` keeps the invocation non-interactive; without it
-    the CLI can block on a prompt inside a supervised run.
+    ``prefix`` is the manager-specific one-off runner from
+    :func:`registry_invocation_prefix` (already carrying the pinned version), so
+    the version is pinned in exactly one place and this function cannot
+    reintroduce a floating ``latest``.
+
+    ``--yes`` keeps the invocation non-interactive; without it the CLI can block
+    on a prompt inside a supervised run. ``--overwrite`` makes a re-run
+    deterministic instead of failing on an existing file.
     """
     ordered = sorted(set(components))
-    return (
-        tuple(manager)
-        + ("dlx", f"shadcn@{version}", "add")
-        + tuple(ordered)
-        + ("--yes", "--overwrite")
-    )
+    return tuple(prefix) + ("add",) + tuple(ordered) + ("--yes", "--overwrite")
 
 
 def filter_allowed_components(requested: Sequence[str]) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
@@ -629,6 +910,15 @@ class DesignDependencyInstaller:
         With no components requested this performs ZERO commands -- the
         "unselected => no CLI invocation" property is implemented by the absence
         of any argv, not by a guard that could be skipped.
+
+        Three independent ways to run nothing at all, all checked BEFORE any
+        command is built: no components, a config this application will not act
+        on, or a toolchain with no supported one-off runner.
+
+        ``installed`` is assigned ONLY after every requested component is observed
+        as a contained regular file under the destination the project's own
+        reviewed ``components.json`` declares. A zero exit code, however
+        confident, is not sufficient.
         """
         if not components:
             return (
@@ -655,6 +945,22 @@ class DesignDependencyInstaller:
                 rejected,
             )
 
+        # Fail closed BEFORE any command: without an approved destination there
+        # is nothing to verify against afterwards, so invoking the CLI would buy
+        # an uncheckable "success".
+        component_dir = approved_component_dir(self.project_root)
+        if component_dir is None:
+            return (
+                InstallOutcome(
+                    dependency_id=REGISTRY_DEPENDENCY,
+                    state=INSTALL_FAILED,
+                    package=None,
+                    reason=REASON_SHADCN_CONFIG_INVALID,
+                ),
+                allowed,
+                rejected,
+            )
+
         manager = detect_package_manager(self.project_root)
         if manager is None:
             return (
@@ -668,9 +974,22 @@ class DesignDependencyInstaller:
                 rejected,
             )
 
-        argv = build_registry_argv(
-            manager, components=allowed, version=SHADCN_CLI_VERSION
+        prefix = registry_invocation_prefix(
+            manager, project_root=self.project_root, version=SHADCN_CLI_VERSION
         )
+        if prefix is None:
+            return (
+                InstallOutcome(
+                    dependency_id=REGISTRY_DEPENDENCY,
+                    state=INSTALL_FAILED,
+                    package=None,
+                    reason=REASON_MANAGER_UNSUPPORTED,
+                ),
+                allowed,
+                rejected,
+            )
+
+        argv = build_registry_argv(prefix, components=allowed)
         process, timed_out = self._run(argv, REGISTRY_TIMEOUT_SECONDS)
         if timed_out:
             return (
@@ -701,13 +1020,33 @@ class DesignDependencyInstaller:
                 rejected,
             )
 
+        # The command succeeded. That is NOT yet an installed claim.
+        receipt = CommandReceipt.from_process(process, cwd_label="<project>")
+        verified = verify_components_materialized(
+            self.project_root, allowed, component_dir
+        )
+        if not verified:
+            return (
+                InstallOutcome(
+                    dependency_id=REGISTRY_DEPENDENCY,
+                    state=INSTALL_FAILED,
+                    package=None,
+                    reason=REASON_COMPONENTS_NOT_VERIFIED,
+                    receipt=receipt,
+                    verified_components=(),
+                ),
+                allowed,
+                rejected,
+            )
+
         return (
             InstallOutcome(
                 dependency_id=REGISTRY_DEPENDENCY,
                 state="installed",
                 package=None,
                 reason=REASON_ALREADY_INSTALLED,
-                receipt=CommandReceipt.from_process(process, cwd_label="<project>"),
+                receipt=receipt,
+                verified_components=verified,
             ),
             allowed,
             rejected,
@@ -781,38 +1120,47 @@ class DesignDependencyInstaller:
 
 __all__ = [
     "ALLOWED_SHADCN_COMPONENTS",
+    "COMPONENT_SUFFIXES",
     "DEPENDENCY_PACKAGES",
     "INSTALL_FAILED",
     "INSTALL_STATES",
     "REASON_ALREADY_INSTALLED",
     "REASON_COMPONENT_NOT_ALLOWED",
     "REASON_COMPONENT_NONE_REQUESTED",
+    "REASON_COMPONENTS_NOT_VERIFIED",
     "REASON_INSTALL_FAILED",
+    "REASON_MANAGER_UNSUPPORTED",
     "REASON_NOT_SELECTED",
     "REASON_NOT_VERIFIED",
     "REASON_NO_PACKAGE_MANAGER",
     "REASON_OUTSIDE_PROJECT",
     "REASON_PACKAGE_NOT_ALLOWLISTED",
     "REASON_PROJECT_INVALID",
+    "REASON_SHADCN_CONFIG_INVALID",
     "REASON_TIMEOUT",
     "REGISTRY_DEPENDENCY",
     "SHADCN_CLI_VERSION",
+    "SHADCN_CONFIG_FILENAME",
     "TERMINAL_INSTALL_STATES",
     "CommandReceipt",
     "InstallOutcome",
     "allowlisted_dependencies",
     "allowed_shadcn_components",
+    "approved_component_dir",
     "is_contained",
     "package_name_is_well_formed",
     "project_declares_dependency",
     "InstallReport",
     "DesignDependencyInstaller",
     "LOCKFILES",
+    "YARN_BERRY_CONFIG",
     "INSTALL_TIMEOUT_SECONDS",
     "REGISTRY_TIMEOUT_SECONDS",
     "build_install_argv",
     "build_registry_argv",
     "detect_package_manager",
     "filter_allowed_components",
+    "registry_invocation_prefix",
     "resolve_package",
+    "verify_components_materialized",
 ]

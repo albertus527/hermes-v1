@@ -50,6 +50,7 @@ from app.sandbox.runner import ProjectRunner, WorkspaceError
 PROTECTED_TOOLCHAIN_FILES = (
     ".nvmrc",
     ".npmrc",
+    "components.json",
     "package.json",
     "package-lock.json",
     "tsconfig.json",
@@ -494,8 +495,8 @@ Repair rules (HARD constraints):
   the reported parser error, inspect sibling icon components in src/components
   for the same unused public-prop pattern and fix only identical defects.
 - Do NOT modify or delete protected toolchain files: .nvmrc, .npmrc,
-  package.json, package-lock.json, tsconfig.json, tsconfig.app.json,
-  tsconfig.node.json, vite.config.ts.
+  components.json, package.json, package-lock.json, tsconfig.json,
+  tsconfig.app.json, tsconfig.node.json, vite.config.ts.
 - Do NOT run npm ci, npm run build, or npm run typecheck yourself — the
   application reruns the entire fixed cheap-check sequence after you finish.
 - Do NOT invent business facts.

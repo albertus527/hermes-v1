@@ -54,13 +54,14 @@ when deliberately changing dependencies of the starter itself.
 templates/frontend-starter/
 ├── .npmrc               # engine-strict: enforce Node >=26 <27
 ├── .nvmrc               # 26.5.0
+├── components.json      # pinned shadcn config (aliases + Tailwind v4 CSS entry)
 ├── index.html           # single HTML entry point
 ├── package.json         # fixed dependencies + fixed scripts
 ├── package-lock.json    # committed; required by `npm ci`
 ├── tsconfig.json        # solution file
-├── tsconfig.app.json    # src/ (DOM, react-jsx, strict)
+├── tsconfig.app.json    # src/ (DOM, react-jsx, strict, @/* -> ./src/*)
 ├── tsconfig.node.json   # vite.config.ts
-├── vite.config.ts       # react + tailwind plugins
+├── vite.config.ts       # react + tailwind plugins, @ -> ./src
 ├── public/
 │   └── favicon.svg      # neutral placeholder icon
 └── src/
@@ -69,6 +70,26 @@ templates/frontend-starter/
     ├── main.tsx         # React root
     └── vite-env.d.ts
 ```
+
+## Path alias
+
+`@/*` resolves to `src/*`, declared in **both** `tsconfig.app.json` (`paths`) and
+`vite.config.ts` (`resolve.alias`) so TypeScript and Vite agree. There is no
+`baseUrl`: it is deprecated-and-failing in TypeScript 6.0, and `paths` resolves
+relative to the containing tsconfig without it.
+
+## shadcn configuration
+
+`components.json` is **platform-owned and pinned** — it declares the shadcn
+component destination (`aliases.ui` → `@/components/ui`), the `utils` module, and
+the Tailwind v4 CSS entry (`tailwind.config` is `""` because Tailwind 4 is wired
+through `@tailwindcss/vite` with the `@import 'tailwindcss'` in `src/index.css`).
+
+It is committed rather than generated because the destination must be known
+*before* any component is fetched: the installer verifies each component against
+this alias, and a project whose config is absent or unreviewed is refused rather
+than driven against a guessed path. `shadcn init` is deliberately **not** run —
+it can rewrite `package.json`, the CSS entry, and the config itself.
 
 ## Baseline included
 

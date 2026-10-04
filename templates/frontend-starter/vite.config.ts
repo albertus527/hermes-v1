@@ -1,3 +1,5 @@
+import { fileURLToPath, URL } from 'node:url'
+
 import tailwindcss from '@tailwindcss/vite'
 import react from '@vitejs/plugin-react'
 import { defineConfig } from 'vite'
@@ -7,6 +9,15 @@ import { defineConfig } from 'vite'
 // templates/frontend-starter/ is never modified by a build.
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  resolve: {
+    // `@/*` -> `src/*`. Required by the `@/components/ui` alias in
+    // components.json: shadcn emits `@/lib/utils` imports, so without this
+    // mapping every generated component fails to resolve (and `tsc -b`, which
+    // gates `npm run build`, fails with it).
+    alias: {
+      '@': fileURLToPath(new URL('./src', import.meta.url)),
+    },
+  },
   server: {
     // `host: true` so a sandbox/browser QA pass can reach the dev server from
     // outside the project's own network namespace. The project runner is

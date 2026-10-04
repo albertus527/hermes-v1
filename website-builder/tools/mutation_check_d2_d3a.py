@@ -15,6 +15,10 @@ class rather than a style rule:
   * global-install-flag               -> a project install escapes its workspace
   * 3d-veto-overridable               -> decorative depth selects Three.js
   * shadcn-unpinned                   -> production resolves a floating latest
+  * npm-dlx                           -> npm is handed a subcommand it lacks
+  * yarn-classic-fallback             -> a CLI outside the toolchain is executed
+  * registry-unverified               -> exit 0 is taken as a component install
+  * config-not-enforced               -> a component destination is guessed
   * selection-can-reach-installed     -> D2 claims an install it never performed
 
 Run:  python tools/mutation_check_d2_d3a.py
@@ -126,12 +130,32 @@ MUTATIONS = [
     ),
     # --- 7. shadcn is pinned ---------------------------------------------
     # A floating `latest` inside a production build is a silent supply-chain
-    # upgrade.
+    # upgrade. The pin lives in the manager-specific prefix, where the version
+    # is interpolated exactly once.
     (
         "the registry CLI is pinned, never a floating latest",
         INSTALL,
-        """        + ("dlx", f"shadcn@{version}", "add")""",
-        """        + ("dlx", "shadcn@latest", "add")""",
+        """    spec = f"shadcn@{version}\"""",
+        """    spec = "shadcn@latest\"""",
+    ),
+    # --- 7b. npm gets a real one-off runner, not a fictional `dlx` --------
+    # `npm dlx` is not an npm subcommand; npm's one-off mechanism is `npm exec`.
+    # Reverting to a shared `dlx` reintroduces exactly the reported bug.
+    (
+        "npm is invoked through `npm exec`, never a bare `dlx`",
+        INSTALL,
+        """        return argv + ("exec", "--yes", f"--package={spec}", "--", "shadcn")""",
+        """        return argv + ("dlx", spec)""",
+    ),
+    # --- 7c. Yarn Classic fails closed instead of falling back -----------
+    # Falling back to npx/npm would run a CLI outside the project's toolchain.
+    (
+        "Yarn Classic has no supported runner and refuses to invoke",
+        INSTALL,
+        """        if (Path(project_root) / YARN_BERRY_CONFIG).exists():
+            return argv + ("dlx", spec)""",
+        """        if True:
+            return argv + ("dlx", spec)""",
     ),
     # --- 8. Only allowlisted components reach the CLI -------------------
     (
@@ -141,6 +165,32 @@ MUTATIONS = [
             allowed.append(component)""",
         """        if True:
             allowed.append(component)""",
+    ),
+    # --- 8b. Registry installs are verified on disk, not on exit code -----
+    # The postcondition's whole point: a CLI that exits 0 having written nothing
+    # must NOT report installed.
+    (
+        "a registry command that wrote nothing is not installed",
+        INSTALL,
+        """        verified = verify_components_materialized(
+            self.project_root, allowed, component_dir
+        )
+        if not verified:""",
+        """        verified = allowed
+        if False:""",
+    ),
+    # --- 8c. The component destination is enforced, never assumed ---------
+    # Without this guard a project with no components.json would be driven
+    # against a guessed path with nothing to verify against afterwards.
+    (
+        "an absent or unapproved shadcn config runs no command at all",
+        INSTALL,
+        """        component_dir = approved_component_dir(self.project_root)
+        if component_dir is None:""",
+        """        component_dir = approved_component_dir(self.project_root) or (
+            self.project_root / "src" / "components" / "ui"
+        )
+        if False:""",
     ),
     # --- 9. No components => no invocation ------------------------------
     (
