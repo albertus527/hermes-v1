@@ -142,8 +142,12 @@ MUTATIONS = [
     (
         "the registry CLI is pinned, never a floating latest",
         INSTALL,
-        """    spec = f"shadcn@{version}\"""",
-        """    spec = "shadcn@latest\"""",
+        """    pinned = PINNED_CLIS.get(cli_id) if isinstance(cli_id, str) else None
+    if pinned is None:
+        return None""",
+        """    pinned = PINNED_CLIS.get(cli_id) if isinstance(cli_id, str) else None
+    if pinned is not None:
+        pinned = PinnedCli(pinned.package, "latest", pinned.binary)""",
     ),
     # --- 7b. npm gets a real one-off runner, not a fictional `dlx` --------
     # `npm dlx` is not an npm subcommand; npm's one-off mechanism is `npm exec`.
@@ -151,7 +155,7 @@ MUTATIONS = [
     (
         "npm is invoked through `npm exec`, never a bare `dlx`",
         INSTALL,
-        """        return argv + ("exec", "--yes", f"--package={spec}", "--", "shadcn")""",
+        """        return argv + ("exec", "--yes", f"--package={spec}", "--", binary)""",
         """        return argv + ("dlx", spec)""",
     ),
     # --- 7c. Yarn Classic fails closed instead of falling back -----------
@@ -279,7 +283,7 @@ MUTATIONS = [
     (
         "an absent reference is rejected with an honest reason",
         SELECTION,
-        """    if not _is_reachable(capability_report, resource_id):
+        """    if not _is_reachable(capability_report, resource_id, activation_report):
         return _RuleOutcome(
             False,
             reason,

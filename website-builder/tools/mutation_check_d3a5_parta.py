@@ -24,11 +24,13 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Tuple
 
 ROOT = Path(__file__).resolve().parents[1]
 IGNORED = shutil.ignore_patterns("__pycache__", "*.pyc", ".git", ".venv", "venv")
 
 PIN_TESTS = "tests/test_design_dependency_pins.py"
+CLI_TESTS = "tests/test_design_pinned_cli.py"
 
 INSTALL = "app/core/design_install.py"
 
@@ -230,16 +232,97 @@ MUTATIONS = [
             "--no-fund",
         )''',
     ),
+    # ------------------------------------------------------------------
+    # Part B: the generic pinned-CLI primitive
+    # ------------------------------------------------------------------
+    # --- 11. the closed table is the only source of a CLI spec -----------
+    (
+        "a pinned CLI spec comes only from the closed table",
+        INSTALL,
+        '''    pinned = PINNED_CLIS.get(cli_id) if isinstance(cli_id, str) else None
+    if pinned is None:
+        return None''',
+        '''    pinned = PINNED_CLIS.get(cli_id) if isinstance(cli_id, str) else None
+    if pinned is None:
+        return (
+            ("npm", "exec", "--yes", f"--package={cli_id}@latest", "--", cli_id)
+            if isinstance(cli_id, str)
+            else None
+        )''',
+    ),
+    # --- 12. an unknown cli_id never echoes its input --------------------
+    (
+        "an unknown cli id resolves to no pinned CLI",
+        INSTALL,
+        """    if not isinstance(cli_id, str):
+        return None
+    return PINNED_CLIS.get(cli_id)""",
+        """    if not isinstance(cli_id, str):
+        return None
+    return PINNED_CLIS.get(cli_id, PinnedCli(cli_id, "0.0.0", cli_id))""",
+    ),
+    # --- 13. npm gets `exec`, never the fictional `dlx` -----------------
+    (
+        "npm is invoked through `exec`, never a bare `dlx`",
+        INSTALL,
+        '''        return argv + ("exec", "--yes", f"--package={spec}", "--", binary)''',
+        '''        return argv + ("dlx", spec)''',
+    ),
+    # --- 14. yarn Classic fails closed instead of falling back ----------
+    (
+        "Yarn Classic has no supported runner and refuses to invoke",
+        INSTALL,
+        '''        if (Path(project_root) / YARN_BERRY_CONFIG).exists():
+            return argv + ("dlx", spec)''',
+        '''        if True:
+            return argv + ("dlx", spec)''',
+    ),
+    # --- 15. the registry seam cannot take a caller-supplied version ---
+    (
+        "the registry seam refuses a non-pinned shadcn version",
+        INSTALL,
+        """    if version != SHADCN_CLI_VERSION:
+        logger.error("Refusing a registry invocation with a non-pinned shadcn version.")
+        return None""",
+        """    if False:
+        return None""",
+    ),
+    # --- 16. impeccable stays out of the pinned-CLI table ---------------
+    (
+        "impeccable is not a pinned CLI (binary-download shim)",
+        INSTALL,
+        '''    "transitions_dev": PinnedCli(
+        package="transitions-dev", version="0.3.0", binary="transitions-dev"
+    ),
+}''',
+        '''    "transitions_dev": PinnedCli(
+        package="transitions-dev", version="0.3.0", binary="transitions-dev"
+    ),
+    "impeccable": PinnedCli(
+        package="impeccable", version="4.1.0", binary="impeccable"
+    ),
+}''',
+    ),
 ]
 
 
-def run_tests(cwd, test_file):
+def run_tests(cwd, test_files):
+    """Run the given focused test file(s) and return (exit_code, summary_line).
+
+    ``test_files`` may be a single path or several; each is passed as its own
+    argv element. Passing several paths as ONE space-joined string makes pytest
+    treat the whole string as a single path, collect nothing, and exit non-zero
+    -- which looks exactly like a successful kill. The caller therefore also
+    checks for "no tests ran" and reports INVALID rather than KILLED.
+    """
+    if isinstance(test_files, str):
+        test_files = (test_files,)
     result = subprocess.run(
         [
             sys.executable,
             "-m",
             "pytest",
-            test_file,
+            *test_files,
             "-q",
             "--no-header",
             "-p",
@@ -253,10 +336,27 @@ def run_tests(cwd, test_file):
     return result.returncode, lines[-1] if lines else result.stderr.strip()[-140:]
 
 
+def tests_for(relative: str) -> Tuple[str, ...]:
+    """Which focused test file(s) prove the guards in ``relative``.
+
+    Part A's guards live in the pin tests; Part B's live in the CLI tests. Both
+    run for a mutation in ``design_install.py`` because that module now owns
+    both concerns, so running only one file would let a Part B mutation appear
+    to survive merely because the wrong suite was executed.
+    """
+    if relative == INSTALL:
+        return (PIN_TESTS, CLI_TESTS)
+    return (PIN_TESTS,)
+
+
 def main():
     baseline_code, tail = run_tests(ROOT, PIN_TESTS)
     print(f"Part A baseline: exit={baseline_code} {tail}")
     if baseline_code != 0:
+        return 1
+    cli_baseline, cli_tail = run_tests(ROOT, CLI_TESTS)
+    print(f"Part B baseline: exit={cli_baseline} {cli_tail}")
+    if cli_baseline != 0:
         return 1
 
     print()
@@ -281,10 +381,16 @@ def main():
             shutil.copytree(ROOT, work, ignore=IGNORED)
             (work / relative).write_text(mutated, encoding="utf-8")
 
-            code, tail = run_tests(work, PIN_TESTS)
+            code, tail = run_tests(work, tests_for(relative))
             if code == 0:
                 print(f"[SURVIVED]   {label} -- tests still pass without this guard")
                 unproven.append(f"{label}: tests still pass without this guard")
+            elif "no tests ran" in tail:
+                # A collection failure must never count as a kill: it proves the
+                # tests did not execute at all, which is an invalidation of the
+                # mutation, not a demonstration that the guard is load-bearing.
+                print(f"[INVALID]    {label} -- {tail}")
+                unproven.append(f"{label}: mutation invalidated collection ({tail})")
             else:
                 print(f"[KILLED]     {label} -- {tail}")
 

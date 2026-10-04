@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from app.core.design_capabilities import (
     STATUS_AVAILABLE,
@@ -56,6 +56,13 @@ from app.core.design_capabilities import (
     STATUS_UNAVAILABLE_REQUIRED,
     DesignCapabilityReport,
 )
+
+if TYPE_CHECKING:
+    # Imported for typing only. design_activation deliberately imports nothing
+    # from this module, so a real import here would be a needless cycle; the
+    # runtime never needs the name because the parameter is optional and
+    # duck-typed at the call site.
+    from app.core.design_activation import DesignActivationReport
 from app.core.design_policies import (
     COMPONENT_SOURCE_PREFERENCE,
     DEPENDENCY_STATES,
@@ -672,13 +679,29 @@ def _capability_status(
 
 
 def _is_reachable(
-    capability_report: Optional[DesignCapabilityReport], resource_id: str
+    capability_report: Optional[DesignCapabilityReport],
+    resource_id: str,
+    activation_report: Optional["DesignActivationReport"] = None,
 ) -> bool:
     """Whether a resource can actually be READ on this host right now.
 
-    ``available`` is the honest signal. A deferred reference (no local, verified
-    content) is NOT reachable, so it degrades honestly instead of pretending.
+    When an activation report is supplied it is the AUTHORITATIVE signal,
+    because it carries the per-axis record that D0's single ``available``
+    boolean cannot. A resource is readable when ANY capability axis it genuinely
+    holds is usable -- retrieval, discovery, or the local skill read -- rather
+    than when one boolean happened to be set.
+
+    The D0 boolean remains the fallback for callers that pass no activation
+    report, so the pre-D3a.5 contract is unchanged for them.
     """
+    if activation_report is not None:
+        capability = activation_report.resources.get(resource_id)
+        if capability is None:
+            # Present in the D0 report but absent from activation: we cannot
+            # prove it, so it is NOT reachable. Never invent.
+            return False
+        return bool(capability.usable)
+
     if capability_report is None:
         # With no capability report we cannot prove reachability. Assume NOT
         # reachable for references (never invent), but allow on-demand
@@ -735,6 +758,7 @@ def _select_reference(
     requirements: DesignRequirementSet,
     capability_report: Optional[DesignCapabilityReport],
     forbidden: bool,
+    activation_report: Optional["DesignActivationReport"] = None,
 ) -> _RuleOutcome:
     """Evaluate one reference corpus.
 
@@ -756,7 +780,7 @@ def _select_reference(
     if not getattr(requirements, attribute):
         return _RuleOutcome(False, SelectionReason.DNA_SIMPLE_MINIMAL)
 
-    if not _is_reachable(capability_report, resource_id):
+    if not _is_reachable(capability_report, resource_id, activation_report):
         return _RuleOutcome(
             False,
             reason,
@@ -789,6 +813,7 @@ def select_design_resources(
     capability_report: Optional[DesignCapabilityReport] = None,
     user_requirements: Optional[Mapping[str, Any]] = None,
     include_guidance: bool = False,
+    activation_report: Optional["DesignActivationReport"] = None,
 ) -> DesignResourceSelectionPlan:
     """Select design resources and dependencies justified by the accepted DNA.
 
@@ -796,6 +821,13 @@ def select_design_resources(
     order and rejections are sorted for determinism. ``include_guidance``
     optionally selects ``ui_ux_pro_max`` (bounded design guidance) when it is
     actually available.
+
+    ``activation_report`` is the D3a.5 multi-dimensional capability record. When
+    supplied it is AUTHORITATIVE for reachability, because the D0 report's
+    single ``available`` boolean cannot express the states that are
+    simultaneously true -- a resource may be usable for discovery while its
+    authenticated retrieval is unavailable. Callers that omit it keep the
+    pre-D3a.5 behaviour exactly.
 
     **This batch never installs anything.** Every dependency decision is at most
     ``selected``; ``installed`` is unreachable here by construction.
@@ -852,11 +884,17 @@ def select_design_resources(
             outcome = _select_dependency(resource_id, requirements, user, forbidden)
         elif kind == "reference":
             outcome = _select_reference(
-                resource_id, requirements, capability_report, forbidden
+                resource_id,
+                requirements,
+                capability_report,
+                forbidden,
+                activation_report,
             )
         elif kind == "skill":
             if resource_id == GUIDANCE_RESOURCE:
-                if _is_reachable(capability_report, resource_id):
+                if _is_reachable(
+                    capability_report, resource_id, activation_report
+                ):
                     outcome = _RuleOutcome(True, SelectionReason.DNA_SIMPLE_MINIMAL)
                 else:
                     outcome = _RuleOutcome(
@@ -898,7 +936,9 @@ def select_design_resources(
             kind == "reference"
             and not outcome.selected
             and outcome.detail is None
-            and not _is_reachable(capability_report, resource_id)
+            and not _is_reachable(
+                capability_report, resource_id, activation_report
+            )
         ):
             outcome = _RuleOutcome(
                 False, outcome.reason, detail=WARNING_REFERENCE_NO_INTEGRATION

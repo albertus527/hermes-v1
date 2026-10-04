@@ -144,8 +144,11 @@ def test_shipped_manifest_loads():
     [
         ("ui_ux_pro_max", "skill", True),
         ("impeccable", "skill", False),
-        ("refero", "reference", False),
-        ("shadcn", "registry", False),
+                # Refero became a `skill` in D3a.5: its baseline capability is the
+                # official bundled craft references, provisioned into the profile. It was
+                # a `reference` only while it was a placeholder with no real mechanism.
+                ("refero", "skill", False),
+                ("shadcn", "registry", False),
         ("twenty_first", "reference", False),
         ("react_bits", "reference", False),
         ("transitions_dev", "reference", False),

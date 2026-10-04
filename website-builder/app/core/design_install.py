@@ -841,6 +841,72 @@ LOCKFILES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
 YARN_BERRY_CONFIG = ".yarnrc.yml"
 
 
+# ---------------------------------------------------------------------------
+# Pinned CLIs -- application-owned, closed
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PinnedCli:
+    """One allowlisted, exactly-pinned command-line tool.
+
+    ``package`` and ``binary`` are separate because they are NOT always the
+    same string: npm runs the spec but the binary name may differ from the
+    package name. Keeping both explicit stops a future entry from accidentally
+    assuming they match.
+    """
+
+    package: str
+    version: str
+    binary: str
+
+    @property
+    def spec(self) -> str:
+        """The exact ``package@version`` spec handed to the package manager."""
+        return f"{self.package}@{self.version}"
+
+    def is_exact(self) -> bool:
+        return bool(_EXACT_VERSION_RE.match(self.version))
+
+
+#: The ONLY command-line tools this application will ever execute in a build.
+#:
+#: Closed by construction, for the same reason
+#: :data:`DEPENDENCY_COMPANION_PACKAGES` is closed: the map is the allowlist.
+#: A caller supplies a ``cli_id`` and gets whatever this table says, or nothing.
+#: No caller, model, prompt, or resource text can add a row or override a
+#: version, because nothing in the codebase writes to this mapping after
+#: import.
+#:
+#: ``impeccable`` is deliberately ABSENT. Its npm package is a binary shim that
+#: resolves or DOWNLOADS an opaque platform executable into ``~/.impeccable``,
+#: which would put a downloaded binary inside the containment model of a project
+#: build. Impeccable is invoked from its explicitly provisioned profile skill's
+#: bundled engine instead (see ``app.core.design_activation``).
+#:
+#: Versions were verified against the live npm registry as current stable.
+PINNED_CLIS: Dict[str, PinnedCli] = {
+    "shadcn": PinnedCli(
+        package="shadcn", version=SHADCN_CLI_VERSION, binary="shadcn"
+    ),
+    "transitions_dev": PinnedCli(
+        package="transitions-dev", version="0.3.0", binary="transitions-dev"
+    ),
+}
+
+
+def pinned_cli(cli_id: str) -> Optional[PinnedCli]:
+    """The :class:`PinnedCli` for ``cli_id``, or ``None`` if not allowlisted.
+
+    The only function that turns a name into an executable package. Mirrors
+    :func:`resolve_package`'s contract: an unrecognised id yields ``None``
+    rather than something derived from the input.
+    """
+    if not isinstance(cli_id, str):
+        return None
+    return PINNED_CLIS.get(cli_id)
+
+
 def detect_package_manager(project_root: Path) -> Optional[Tuple[str, ...]]:
     """The project's own package manager argv prefix, or ``None``.
 
@@ -854,33 +920,47 @@ def detect_package_manager(project_root: Path) -> Optional[Tuple[str, ...]]:
     return None
 
 
-def registry_invocation_prefix(
-    manager: Sequence[str], *, project_root: Path, version: str
+def build_pinned_cli_prefix(
+    manager: Sequence[str], cli_id: str, project_root: Path
 ) -> Optional[Tuple[str, ...]]:
-    """The manager-specific one-off runner argv for the pinned registry CLI.
+    """The manager-specific one-off runner argv for one allowlisted pinned CLI.
 
-    Each package manager has a DIFFERENT one-off mechanism, and the old code
+    Each package manager has a DIFFERENT one-off mechanism, and the pre-B code
     assumed they all shared one by appending a bare ``dlx``. That produced
     ``npm dlx ...``, and ``npm`` has no ``dlx`` subcommand -- npm's one-off
     mechanism is ``npm exec`` (``npx`` is its alias).
+
+    **This is a pinned-CLI primitive, not an installer.** The package and
+    version come only from :data:`PINNED_CLIS`, keyed by a caller-supplied
+    ``cli_id`` that must already be in that closed map. There is deliberately
+    no ``install_anything(package_name, version)`` form: a caller that could
+    pass a package string would be able to execute arbitrary code inside a
+    build, which is the entire class this module exists to prevent. A missing
+    or unknown ``cli_id`` returns ``None`` and the caller runs nothing.
 
     Returning ``None`` means "this toolchain has no mechanism I will drive", and
     the caller runs NO command at all. That is deliberate for Yarn Classic:
     rather than silently falling back to ``npx``/``npm``, which would run a CLI
     the project never opted into, an unsupported toolchain fails closed.
     """
+    pinned = PINNED_CLIS.get(cli_id) if isinstance(cli_id, str) else None
+    if pinned is None:
+        return None
+
     argv = tuple(manager)
     if not argv:
         return None
     name = argv[0]
-    spec = f"shadcn@{version}"
+    spec = pinned.spec
+    binary = pinned.binary
 
     if name == "npm":
-        # `npm exec --package=<spec> -- shadcn`. The trailing `--` is REQUIRED:
-        # without it npm re-parses later switches as its own and would swallow
-        # shadcn's `--yes` / `--overwrite`. `--yes` suppresses npm's own
-        # install prompt so a supervised run cannot block on it.
-        return argv + ("exec", "--yes", f"--package={spec}", "--", "shadcn")
+        # `npm exec --package=<spec> -- <binary>`. The trailing `--` is
+        # REQUIRED: without it npm re-parses later switches as its own and
+        # would swallow the CLI's own flags (e.g. shadcn's `--yes`). `--yes`
+        # suppresses npm's own install prompt so a supervised run cannot block
+        # on it.
+        return argv + ("exec", "--yes", f"--package={spec}", "--", binary)
     if name == "pnpm":
         # `pnpm dlx` is a real subcommand that takes the pinned spec positionally.
         return argv + ("dlx", spec)
@@ -892,6 +972,27 @@ def registry_invocation_prefix(
         logger.warning("Yarn Classic has no pinned one-off runner; refusing to invoke.")
         return None
     return None
+
+
+def registry_invocation_prefix(
+    manager: Sequence[str], *, project_root: Path, version: str
+) -> Optional[Tuple[str, ...]]:
+    """The one-off runner argv for the pinned **shadcn** CLI.
+
+    Retained as a named seam because the component path calls it directly with
+    an explicit version, and because the D2/D3a mutation driver anchors on it.
+    The runner construction itself now lives in
+    :func:`build_pinned_cli_prefix`, so the per-manager argv shape is defined in
+    exactly one place.
+
+    ``version`` must equal :data:`SHADCN_CLI_VERSION`. A caller passing any
+    other value would reintroduce a floating pin, so a mismatch fails closed
+    rather than being interpolated into the argv.
+    """
+    if version != SHADCN_CLI_VERSION:
+        logger.error("Refusing a registry invocation with a non-pinned shadcn version.")
+        return None
+    return build_pinned_cli_prefix(manager, REGISTRY_DEPENDENCY, project_root)
 
 
 def build_install_argv(
@@ -1488,6 +1589,8 @@ __all__ = [
     "DEPENDENCY_PACKAGES",
     "DEPENDENCY_SECTIONS",
     "INSTALL_FAILED",
+    "PINNED_CLIS",
+    "PinnedCli",
     "INSTALL_STATES",
     "REASON_ALREADY_INSTALLED",
     "REASON_COMPANION_NOT_VERIFIED",
@@ -1531,9 +1634,11 @@ __all__ = [
     "REGISTRY_TIMEOUT_SECONDS",
     "build_companion_install_argv",
     "build_install_argv",
+    "build_pinned_cli_prefix",
     "build_registry_argv",
     "detect_package_manager",
     "filter_allowed_components",
+    "pinned_cli",
     "registry_invocation_prefix",
     "required_package_specs",
     "resolve_companion_packages",

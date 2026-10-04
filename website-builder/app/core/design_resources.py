@@ -53,10 +53,70 @@ MANIFEST_VERSION = 1
 #: some default resolution behaviour.
 RESOURCE_KINDS: Tuple[str, ...] = ("skill", "reference", "registry", "npm_optional")
 
-#: How a resource is located. ``profile_skill`` is verifiable locally today;
-#: ``deferred`` means the resource is declared but not yet wired, so capability
-#: verification deliberately does not attempt it.
-RESOLUTIONS: Tuple[str, ...] = ("profile_skill", "deferred")
+#: How a resource is located. This is a CLOSED set and it fails closed: an
+#: unrecognized resolution is a typo or an unsupported feature, never a silent
+#: fallback to some default behaviour.
+#:
+#: ``profile_skill`` is verifiable locally today -- the resource is a directory
+#: under ``$HERMES_HOME/skills/<skill_name>`` whose ``data_entries`` are checked
+#: for existence and containment.
+#:
+#: ``on_demand_registry`` is a resource that is fetched INTO AN INDIVIDUAL
+#: PROJECT when and if that project's design calls for it (the shadcn registry,
+#: the 21st.dev / React Bits catalogs). It is not a global dependency, so its
+#: absence is the correct resting state.
+#:
+#: ``deferred`` remains ONLY for a resource that is declared but genuinely not
+#: wired. It is a statement about the CODE, not about the host: a wired resource
+#: must never carry it, because ``deferred`` suppresses capability verification
+#: and a wired-but-deferred resource would report nothing while pretending to be
+#: honest about being unwired.
+RESOLUTIONS: Tuple[str, ...] = ("profile_skill", "on_demand_registry", "deferred")
+
+#: Resolutions that describe a resource the application actually operates.
+#: Everything else in :data:`RESOLUTIONS` is a declaration without an
+#: implementation behind it.
+IMPLEMENTED_RESOLUTIONS: Tuple[str, ...] = ("profile_skill", "on_demand_registry")
+
+#: The CLOSED set of adapters a resource may name, each mapped to the
+#: ``(module, attribute)`` that implements it.
+#:
+#: This spans BOTH surfaces a design resource can be reached through, which is
+#: why it is not simply the retrieval registry:
+#:
+#: * **retrieval** reads guidance into a prompt -- the csv/reference/markdown
+#:   adapters in :mod:`app.core.design_retrieval`;
+#: * **critic** runs a bounded scan -- :mod:`app.core.design_critic`;
+#: * **catalog** normalizes a remote component listing --
+#:   :mod:`app.core.design_catalog`;
+#: * **cli** materializes recipes -- :mod:`app.core.design_transitions`;
+#: * **registry** types a component install -- :mod:`app.core.design_registry`;
+#: * **package** installs an exact-pinned npm dependency --
+#:   :mod:`app.core.design_install`.
+#:
+#: The value is checked at load time by importing the module and reading the
+#: attribute, so a renamed or deleted implementation breaks the manifest load
+#: rather than silently leaving a resource claiming wiring it does not have.
+DESIGN_ADAPTERS: Dict[str, Tuple[str, str]] = {
+    # retrieval surfaces. These names are the `DesignAdapter.name` values in
+    # design_retrieval.DESIGN_ADAPTERS, and the table entry is what
+    # design_retrieval._adapter_by_name resolves against -- so a renamed adapter
+    # breaks the manifest load rather than silently detaching it.
+    "critic": ("app.core.design_retrieval", "_adapter_by_name"),
+    "guidance": ("app.core.design_retrieval", "_adapter_by_name"),
+    "reference_markdown": ("app.core.design_retrieval", "_adapter_by_name"),
+    # bounded critic scan
+    "critic_scan": ("app.core.design_critic", "run_critic_scan"),
+    # remote component catalogs
+    "twenty_first": ("app.core.design_catalog", "normalize_catalog"),
+    "react_bits": ("app.core.design_catalog", "normalize_catalog"),
+    # recipe materialization
+    "transitions_dev": ("app.core.design_transitions", "build_add_argv"),
+    # typed component installs
+    "shadcn": ("app.core.design_registry", "build_registry_request"),
+    # exact-pinned npm dependencies
+    "npm_package": ("app.core.design_install", "build_install_argv"),
+}
 
 #: The only install mode in this batch. Resources carrying it are provisioned
 #: per project on demand and are NOT global dependencies.
@@ -89,6 +149,8 @@ _RESOURCE_KEYS: Tuple[str, ...] = (
     "resolution",
     "skill_name",
     "install_mode",
+    "adapter",
+    "companion",
     "data_entries",
 )
 
@@ -197,7 +259,18 @@ class DesignResource:
     resolution: str
     skill_name: Optional[str] = None
     install_mode: Optional[str] = None
+    adapter: Optional[str] = None
+    companion: Optional[str] = None
     data_entries: Tuple[str, ...] = field(default_factory=tuple)
+
+    @property
+    def is_implemented(self) -> bool:
+            """True when this declaration describes something the code operates.
+
+            The counterpart to ``deferred``: a resource may be perfectly well
+            formed and still be a declaration with no implementation behind it.
+            """
+            return self.resolution in IMPLEMENTED_RESOLUTIONS
 
     @property
     def is_profile_skill(self) -> bool:
@@ -224,6 +297,8 @@ class DesignResource:
             "resolution": self.resolution,
             "skill_name": self.skill_name,
             "install_mode": self.install_mode,
+            "adapter": self.adapter,
+            "companion": self.companion,
             "data_entries": list(self.data_entries),
         }
 
@@ -254,6 +329,30 @@ class DesignResourceManifest:
     @property
     def required_ids(self) -> List[str]:
         return sorted(r.resource_id for r in self.resources.values() if r.required)
+
+    @property
+    def deferred_ids(self) -> List[str]:
+        """Declared-but-unwired resources.
+
+        A REVIEW LEDGER, not a health check. After D3a.5 this set is expected to
+        be empty: every resource below is reached through a named adapter.
+        Anything appearing here needs a wiring story.
+        """
+        return sorted(
+            r.resource_id for r in self.resources.values() if not r.is_implemented
+        )
+
+        @property
+        def deferred_ids(self) -> List[str]:
+            """Declared-but-unwired resources.
+
+            This is a REVIEW LEDGER, not a health check. After D3a.5 the set is
+            expected to be empty for the five activated resources; anything here
+            still needs a wiring story.
+            """
+            return sorted(
+                r.resource_id for r in self.resources.values() if not r.is_implemented
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +396,38 @@ def _parse_resource(resource_id: Any, raw: Any) -> DesignResource:
             f"expected one of {list(RESOLUTIONS)}"
         )
 
+    # `adapter` names the surface this resource is reached through. Its
+    # EXISTENCE is not required here: parse_design_resource_manifest() validates
+    # the schema, and the shipped file's truth claims are checked separately by
+    # validate_adapter_claims() -- called from load_design_resource_manifest().
+    #
+    # What IS refused here is the self-contradictory case. `deferred` asserts
+    # that nothing operates the resource; an adapter beside it is a claim the
+    # manifest contradicts itself about, and no amount of later validation makes
+    # that coherent.
+    adapter = raw.get("adapter")
+    if adapter is not None and not isinstance(adapter, str):
+        raise DesignResourceManifestError(
+            f"resource {resource_id!r} must declare 'adapter' as a string"
+        )
+    if adapter is not None and resolution == "deferred":
+        raise DesignResourceManifestError(
+            f"resource {resource_id!r} is resolution 'deferred' and must not "
+            f"declare 'adapter'"
+        )
+
+    # A companion package is a CLOSED, reviewed entry -- never derived from a
+    # generic naming rule at load time. The name is the key into
+    # design_install.DEPENDENCY_COMPANION_PACKAGES.
+    companion = raw.get("companion")
+    if companion is not None and (
+        not isinstance(companion, str) or not companion.strip()
+    ):
+        raise DesignResourceManifestError(
+            f"resource {resource_id!r} must declare 'companion' as a "
+            f"non-empty string"
+        )
+
     skill_name = raw.get("skill_name")
     if kind == "skill":
         if not isinstance(skill_name, str) or not skill_name.strip():
@@ -305,7 +436,8 @@ def _parse_resource(resource_id: Any, raw: Any) -> DesignResource:
             )
     elif skill_name is not None:
         raise DesignResourceManifestError(
-            f"resource {resource_id!r} of kind {kind!r} must not declare 'skill_name'"
+            f"resource {resource_id!r} of kind {kind!r} must not declare "
+            f"'skill_name'"
         )
 
     install_mode = raw.get("install_mode")
@@ -343,8 +475,10 @@ def _parse_resource(resource_id: Any, raw: Any) -> DesignResource:
         resolution=resolution,
         skill_name=skill_name,
         install_mode=install_mode,
-        data_entries=tuple(validate_data_entry(entry) for entry in raw_entries),
-    )
+            adapter=adapter,
+            companion=companion,
+            data_entries=tuple(validate_data_entry(entry) for entry in raw_entries),
+        )
 
 
 def parse_design_resource_manifest(
@@ -409,9 +543,66 @@ def parse_design_resource_manifest(
             )
         resources[resource.resource_id] = resource
 
+    # Schema only. Whether the shipped manifest's claims are TRUE is checked by
+    # load_design_resource_manifest() below, so a hand-built document exercising
+    # an unrelated rule does not have to restate which adapter operates it.
     return DesignResourceManifest(
         version=version, data_entries_max=max_entries, resources=resources
     )
+
+
+def validate_adapter_claims(manifest: DesignResourceManifest) -> None:
+    """Every claimed adapter must exist; every companion must be in the table.
+
+    This is the check that makes ``adapter:`` worth having. Without it the
+    manifest could name an adapter nobody registered -- reintroducing exactly
+    the placeholder D3a.5 removes, but now with a field that LOOKS like
+    evidence of wiring.
+
+    A missing adapter raises rather than warning. A manifest that claims a
+    capability nothing implements is a build-time error, not a degraded host:
+    the operator has to fix the file, and silently degrading would let the
+    mistake ship.
+
+    Imports are local and lazy so the manifest module stays importable without
+    dragging the retrieval/catalog/registry/install layers into a file that only
+    needs to be parseable.
+    """
+    import importlib
+
+    for resource_id, resource in sorted(manifest.resources.items()):
+        adapter = resource.adapter
+        if adapter is not None:
+            target = DESIGN_ADAPTERS.get(adapter)
+            if target is None:
+                raise DesignResourceManifestError(
+                    f"resource {resource_id!r} claims unknown adapter "
+                    f"{adapter!r}; known adapters: {sorted(DESIGN_ADAPTERS)}"
+                )
+            module_name, attribute = target
+            try:
+                module = importlib.import_module(module_name)
+            except ImportError:
+                raise DesignResourceManifestError(
+                    f"resource {resource_id!r} claims adapter {adapter!r}, whose "
+                    f"module {module_name!r} cannot be imported"
+                ) from None
+            if not hasattr(module, attribute):
+                raise DesignResourceManifestError(
+                    f"resource {resource_id!r} claims adapter {adapter!r}, but "
+                    f"{module_name!r} has no attribute {attribute!r}"
+                )
+
+        companion = resource.companion
+        if companion is not None:
+            from app.core.design_install import DEPENDENCY_COMPANION_PACKAGES
+
+            if companion not in DEPENDENCY_COMPANION_PACKAGES:
+                raise DesignResourceManifestError(
+                    f"resource {resource_id!r} claims companion package "
+                    f"{companion!r}, which is not in the closed companion table; "
+                    f"known: {sorted(DEPENDENCY_COMPANION_PACKAGES)}"
+                )
 
 
 def load_design_resource_manifest(
@@ -442,4 +633,21 @@ def load_design_resource_manifest(
                 f"design resource manifest at {path} could not be parsed: {type(exc).__name__}"
             ) from None
 
-    return parse_design_resource_manifest(raw)
+    manifest = parse_design_resource_manifest(raw)
+
+    # The SHIPPED manifest is held to a stricter standard than an ad-hoc one.
+    # Only when no path was supplied are we looking at the file whose claims
+    # this batch actually made; an explicit `path` is a caller asking to inspect
+    # some manifest, which is exactly how drift tests and custom manifests are
+    # exercised, and restating the shipped wiring contract there would make an
+    # otherwise-valid custom manifest unparseable.
+    if path is None:
+        for resource in manifest.resources.values():
+            if resource.is_implemented and not resource.adapter:
+                raise DesignResourceManifestError(
+                    f"shipped resource {resource.resource_id!r} is resolution "
+                    f"{resource.resolution!r} and must name the 'adapter' that "
+                    f"operates it"
+                )
+    validate_adapter_claims(manifest)
+    return manifest

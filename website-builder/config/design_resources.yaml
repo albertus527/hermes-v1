@@ -20,13 +20,25 @@
 #   resources        mapping of <resource_id> -> resource declaration
 #     kind           skill | reference | registry | npm_optional  (closed set)
 #     required       bool
-#     resolution     profile_skill | deferred                   (closed set)
+#     resolution     profile_skill | on_demand_registry | deferred
+#                    (closed set)
 #     skill_name     str, REQUIRED iff kind == skill
 #     install_mode   project_on_demand, permitted iff kind in
 #                    (registry, npm_optional)
+#     adapter        str, the retrieval adapter this resource is reached
+#                    through. An adapter named here MUST exist in
+#                    design_retrieval._RESOURCE_ADAPTER_IDS -- a resource
+#                    claiming an adapter nobody registered is exactly the
+#                    placeholder this batch removes.
 #     data_entries   list of skill-root-relative paths. Each must be relative,
 #                    free of ".." under either separator, and must resolve
 #                    INSIDE the skill directory (symlinks included).
+#
+# `deferred` is reserved for resources that are declared but NOT wired. Every
+# resource below that D3a.5 actually operates carries `profile_skill` or
+# `on_demand_registry` instead; tests/test_design_resources.py fails closed if
+# an adapter is claimed and not registered, or if an implemented resource is
+# still marked deferred.
 #
 # Two resources are deliberately required=false at this stage: making them
 # required would block startup on a host that has never been provisioned with
@@ -53,6 +65,7 @@ resources:
     required: true
     resolution: profile_skill
     skill_name: ui-ux-pro-max
+    adapter: guidance
     # The two canonical artifacts, verified against the real profile layout:
     # one search entrypoint and one core dataset. A skill whose only verified
     # artifact is SKILL.md is a placeholder directory -- precisely the case
@@ -64,39 +77,98 @@ resources:
       - scripts/search.py
       - data/styles.csv
 
+
   impeccable:
     kind: skill
     required: false
     resolution: profile_skill
     skill_name: impeccable
-    # Not provisioned at this stage. Absent => unavailable_optional, which is
-    # a degraded status and never a startup failure.
-    data_entries: []
-
-  # --- Reference corpora -----------------------------------------------------
-  #
-  # Read-only inspiration/reference sources. Never a build dependency; a
-  # missing reference degrades design quality, never correctness.
-
+    # Impeccable has TWO surfaces, and `adapter` names only the retrieval one:
+    #
+    #   * RETRIEVAL -- `critic`, the SKILL.md adapter that feeds Impeccable's
+    #     critique guidance into a prompt. That is what this field means.
+    #   * CRITIC SCAN -- `design_critic.run_critic_scan`, the bounded
+    #     `detect --json --quiet` invocation against the platform engine. This
+    #     is NOT a retrieval adapter: it produces CriticFinding records, not
+    #     prompt text, so forcing it through `adapter` would misdescribe the
+    #     field. It is verified by tests/test_design_critic.py and reported
+    #     through the activation report's `critic_available` axis.
+    #
+    # There is NO repair path in either surface -- see design_critic's module
+    # docstring.
+    adapter: critic
+    # The official Impeccable skill ships a Hermes layout at
+    # .hermes/skills/impeccable/ in pbakaus/impeccable (CLI 4.1.0): SKILL.md,
+    # reference/*.md and scripts/impeccable.
+    #
+    # Provisioned EXPLICITLY (setup / deploy / profile update). A build never
+    # clones or updates it, and an absent skill is `unavailable_optional` --
+    # a degraded status that is never a startup failure.
+    #
+    # CROSS-PLATFORM AND STABLE ONLY. No platform-specific literal appears here
+    # (no `scripts/bin/<os>-<arch>/...`): a manifest pinned to one OS would
+    # report the resource unavailable on every other OS, which is the exact
+    # "declares a capability it cannot deliver" failure this batch removes. The
+    # per-platform engine is resolved and verified SEPARATELY by
+    # app.core.design_activation through a CLOSED platform mapping.
+    data_entries:
+      - SKILL.md
+      - reference/critique.md
+      - reference/audit.md
+      - scripts/impeccable
   refero:
-    kind: reference
+    kind: skill
     required: false
-    resolution: deferred
-
+    resolution: profile_skill
+    skill_name: refero-design
+    adapter: reference_markdown
+    # Provisioned EXPLICITLY (setup / deploy / profile update), never cloned
+    # during a project build. The canonical upstream skill lives at
+    # skills/refero-design/ in referodesign/refero_skill (VERSION 1.0.2) and
+    # ships SKILL.md plus eleven references/*.md and agents/openai.yaml.
+    #
+    # The WHOLE directory is required, not SKILL.md alone: the reference files
+    # ARE the craft guidance, and a skill whose only verified artifact is
+    # SKILL.md is exactly the placeholder directory this manifest exists to
+    # distinguish from a usable capability.
+    #
+    # These entries are cross-platform and OS-agnostic. Nothing here names a
+    # platform, and no live-MCP host appears: the paid MCP tier is an optional
+    # enhancement that must never gate the free local baseline.
+    data_entries:
+      - SKILL.md
+      - references/typography.md
+      - references/color.md
+      - references/motion.md
+      - references/craft-details.md
+      - references/anti-ai-slop.md
   twenty_first:
     kind: reference
     required: false
-    resolution: deferred
+    # D3a.5: metadata SEARCH is real and works with no credential (the free
+    # tier), while component RETRIEVAL needs an account. The activation report
+    # carries both axes separately -- discovery_available vs retrieval_available
+    # -- so the resource is no longer a single boolean that must lie about one
+    # of them.
+    resolution: on_demand_registry
+    adapter: twenty_first
 
   react_bits:
     kind: reference
     required: false
-    resolution: deferred
+    # D3a.5: components install through the pinned shadcn CLI from
+    # reactbits.dev, using React Bits' published llms.txt as the catalog.
+    resolution: on_demand_registry
+    adapter: react_bits
 
   transitions_dev:
     kind: reference
     required: false
-    resolution: deferred
+    # D3a.5: recipes materialize through the pinned transitions-dev CLI, one
+    # catalog-listed slug at a time, into ./transitions/ inside the project.
+    # Only the free tier is reachable; `add --pro` opens a browser sign-in.
+    resolution: on_demand_registry
+    adapter: transitions_dev
 
   # --- Provisioned per project, on demand ------------------------------------
   #
@@ -112,23 +184,35 @@ resources:
   shadcn:
     kind: registry
     required: false
-    resolution: deferred
+    # D3a.5: components install through the shadcn CLI at an EXACT pinned
+    # version, through the typed registry boundary in design_registry.py.
+    resolution: on_demand_registry
     install_mode: project_on_demand
+    adapter: shadcn
 
   gsap:
     kind: npm_optional
     required: false
-    resolution: deferred
+    resolution: on_demand_registry
     install_mode: project_on_demand
+    adapter: npm_package
 
   three:
     kind: npm_optional
     required: false
-    resolution: deferred
+    resolution: on_demand_registry
     install_mode: project_on_demand
+    adapter: npm_package
+    # `three` pulls a COMPANION package -- @types/three -- which is what makes
+    # the TypeScript build actually compile (TS7016 without it). The companion
+    # is an CLOSED entry in design_install.DEPENDENCY_COMPANION_PACKAGES, not
+    # a generic `@types/<pkg>` derivation: a generic rule would invent a
+    # types-package for every dependency ever added.
+    companion: three
 
   lenis:
     kind: npm_optional
     required: false
-    resolution: deferred
+    resolution: on_demand_registry
     install_mode: project_on_demand
+    adapter: npm_package

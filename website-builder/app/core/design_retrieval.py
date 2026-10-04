@@ -912,6 +912,100 @@ def _row_body(row: Mapping[str, str], header: Sequence[str]) -> str:
     return _BODY_SEPARATOR.join(parts)
 
 
+#: Markdown section-heading characters stripped when deriving an entry title.
+_MD_HEADING_RE = re.compile(r"^#{1,6}\s*")
+
+#: Markdown structural characters stripped when a section is rendered as body
+#: text. Only presentation markup is removed; the PROSE is untouched, because
+#: these files ARE the guidance and paraphrasing them would be inventing it.
+_MD_MARKUP_RE = re.compile(r"(\*\*|__|`+|^[-*+]\s+|^\d+\.\s+)", re.MULTILINE)
+
+
+def _markdown_sections(text: str) -> List[Tuple[str, str]]:
+    """Split Markdown into ``(heading, body)`` pairs.
+
+    Splitting on ATX headings rather than rendering keeps the result
+    deterministic and dependency-free, and it makes each section a citable
+    unit: a consumer can reference "typography > Line length" rather than a
+    page offset that changes with any edit above it.
+
+    Content BEFORE the first heading is emitted under an empty heading so it is
+    still retrieved rather than silently dropped -- a reference file whose
+    opening paragraph matters would otherwise lose it.
+    """
+    sections: List[Tuple[str, List[str]]] = []
+    current_heading = ""
+    current_body: List[str] = []
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#") and stripped.lstrip("#").strip():
+            if current_body:
+                sections.append((current_heading, current_body))
+            current_heading = _MD_HEADING_RE.sub("", stripped).strip()
+            current_body = []
+        else:
+            current_body.append(line)
+
+    if current_body:
+        sections.append((current_heading, current_body))
+
+    return [
+        (heading, "\n".join(body).strip())
+        for heading, body in sections
+        if body or heading
+    ]
+
+
+def _markdown_reference(context: DesignAdapterContext) -> AdapterResult:
+    """Read one Markdown reference file into one entry per section.
+
+    Used by Refero's bundled craft references. The same discipline as the CSV
+    reader applies, with one difference forced by the format: a section has no
+    key column, so identity is derived from the heading plus its position.
+
+    **No summarization and no invention.** The body is the file's own prose with
+    presentation markup stripped. A plausible-sounding summary of a document
+    nobody read is the precise failure this module exists to prevent, so the
+    only transformation applied is removing characters that are markup rather
+    than content.
+    """
+    path = context.skill_root / context.locator
+
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return AdapterResult(entries=(), warnings=(WARNING_MALFORMED,), ok=False)
+
+    if not raw.strip():
+        return AdapterResult(entries=(), warnings=(WARNING_MALFORMED,), ok=False)
+
+    sections = _markdown_sections(raw)
+    if not sections:
+        return AdapterResult(entries=(), warnings=(WARNING_MALFORMED,), ok=False)
+
+    entries: List[_RawEntry] = []
+    for index, (heading, body) in enumerate(sections):
+        title = heading or f"{context.fallback_id_prefix}:preamble"
+        # Query filtering happens HERE, over the whole document, before any cap
+        # is applied -- so a match deep in a long reference is reachable rather
+        # than lost to an entry limit applied first.
+        if context.tokens and not row_matches_tokens({"text": f"{title} {body}"}, context.tokens):
+            continue
+        entries.append(
+            _RawEntry(
+                title=title,
+                body=_MD_MARKUP_RE.sub("", body).strip(),
+                fields={"section": heading},
+                index=index + 1,
+                locator=context.locator,
+                entry_id=f"{context.locator}#{heading or 'preamble'}",
+            )
+        )
+
+    return AdapterResult(entries=tuple(entries), ok=True)
+
+
 def _reference_adapter(context: DesignAdapterContext) -> AdapterResult:
     """Reference corpora: honest emptiness.
 
@@ -951,6 +1045,24 @@ DESIGN_ADAPTERS: Tuple[DesignAdapter, ...] = (
         entry_kind="guidance",
         locators=("data/styles.csv",),
         read=_guidance_csv,
+        supports_query=True,
+    ),
+    DesignAdapter(
+        name="reference_markdown",
+        resource_kinds=("skill",),
+        entry_kind="reference",
+        # One locator per verified Refero craft reference. Every name MUST also
+        # appear in that resource's manifest ``data_entries``; the cross-check in
+        # _adapter_locators_allowed renders the adapter inert otherwise, so a
+        # locator added here without being pinned cannot be read.
+        locators=(
+            "references/typography.md",
+            "references/color.md",
+            "references/motion.md",
+            "references/craft-details.md",
+            "references/anti-ai-slop.md",
+        ),
+        read=_markdown_reference,
         supports_query=True,
     ),
     DesignAdapter(
@@ -1021,6 +1133,10 @@ def _adapter_by_name(name: str) -> DesignAdapter:
 _RESOURCE_ADAPTER_IDS: Dict[str, DesignAdapter] = {
     "impeccable": _adapter_by_name("critic"),
     "ui_ux_pro_max": _adapter_by_name("guidance"),
+    # Refero's baseline is its bundled, credential-free craft references, read
+    # from the provisioned skill. Pinned explicitly so it can never inherit the
+    # CSV guidance adapter, whose locators are ui_ux_pro_max's dataset.
+    "refero": _adapter_by_name("reference_markdown"),
 }
 
 
