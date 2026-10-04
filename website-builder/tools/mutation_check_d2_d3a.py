@@ -49,17 +49,20 @@ RETRIEVAL = "app/core/design_retrieval.py"
 # reports ANCHOR-MISS loudly rather than silently proving nothing.
 MUTATIONS = [
     # --- 1. installed requires manifest verification -----------------------
-    (
-        "installed requires an observed manifest change",
-        INSTALL,
-        """        verified = project_declares_dependency(self.project_root, package)
-        receipt = CommandReceipt.from_process(process, cwd_label="<project>")
-        if not verified:""",
-        """        verified = True
-        receipt = CommandReceipt.from_process(process, cwd_label="<project>")
-        if False:""",
-    ),
-    # --- 2. A failed command never reports installed ----------------------
+        # The conjunctive postcondition is now split between two functions: this
+        # mutation reverts the CALL SITE that must run verification after the
+        # commands succeed, and mutation_check_d3a5_parta.py mutation 1 reverts the
+        # predicate itself (runtime-only must not satisfy it). Removing either one
+        # lets `installed` be claimed without an observed manifest change.
+        (
+            "installed requires an observed manifest change",
+            INSTALL,
+            """        # Every command succeeded. That is NOT yet an installed claim.
+        verified = project_satisfies_dependency(self.project_root, dependency_id)""",
+            """        # Every command succeeded. That is NOT yet an installed claim.
+        verified = True""",
+                ),
+            # --- 2. A failed command never reports installed ----------------------
     (
         "a failing command never reports installed",
         INSTALL,
@@ -120,14 +123,18 @@ MUTATIONS = [
             if False:""",
     ),
     # --- 6. No global install flag ---------------------------------------
-    (
-        "no global install flag is ever added",
-        INSTALL,
-        """    if argv and argv[0] == "npm":
-        return argv + ("install", package, "--save-exact", "--no-audit", "--no-fund")""",
-        """    if argv and argv[0] == "npm":
-        return argv + ("install", "--global", package, "--save-exact")""",
-    ),
+        # The anchor spans the RUNTIME argv only. The companion argv is covered by
+        # mutation 10 below ("a companion installs into devDependencies"), which
+        # proves the `--save-dev` branch independently; keeping the two anchors
+        # disjoint is what stops one replacement from silently matching the other.
+        (
+            "no global install flag is ever added",
+            INSTALL,
+            '''    if argv and argv[0] == "npm":
+        return argv + ("install", spec.spec, "--save-exact", "--no-audit", "--no-fund")''',
+            '''    if argv and argv[0] == "npm":
+            return argv + ("install", "--global", spec.spec, "--save-exact")''',
+                ),
     # --- 7. shadcn is pinned ---------------------------------------------
     # A floating `latest` inside a production build is a silent supply-chain
     # upgrade. The pin lives in the manager-specific prefix, where the version

@@ -35,10 +35,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.core.design_install import (
     ALLOWED_SHADCN_COMPONENTS,
+    DEPENDENCY_COMPANION_PACKAGES,
+    DEPENDENCY_PACKAGE_PINS,
     DEPENDENCY_PACKAGES,
     INSTALL_FAILED,
     INSTALL_STATES,
     REGISTRY_DEPENDENCY,
+    REASON_COMPANION_NOT_VERIFIED,
     REASON_COMPONENTS_NOT_VERIFIED,
     REASON_MANAGER_UNSUPPORTED,
     REASON_SHADCN_CONFIG_INVALID,
@@ -47,6 +50,7 @@ from app.core.design_install import (
     YARN_BERRY_CONFIG,
     DesignDependencyInstaller,
     approved_component_dir,
+    build_companion_install_argv,
     build_install_argv,
     build_registry_argv,
     detect_package_manager,
@@ -54,7 +58,11 @@ from app.core.design_install import (
     is_contained,
     package_name_is_well_formed,
     project_declares_dependency,
+    project_satisfies_dependency,
+    project_satisfies_spec,
     registry_invocation_prefix,
+    required_package_specs,
+    resolve_companion_packages,
     resolve_package,
     verify_components_materialized,
 )
@@ -121,18 +129,31 @@ class RecordingRunner:
             ["yarn", "add"],
         ):
             # Emulate the real effect of an install: the project manifest gains
-            # the allowlisted package. This is what verification observes.
-            manifest_path = Path(cwd) / "package.json"
-            try:
-                document = json.loads(manifest_path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                document = {}
-            package = next(
-                (arg for arg in command if arg in DEPENDENCY_PACKAGES.values()), None
-            )
-            if package:
-                document.setdefault("dependencies", {})[package] = "1.0.0"
-                manifest_path.write_text(json.dumps(document), encoding="utf-8")
+                    # the package AT THE EXACT PINNED VERSION, in the section the argv
+                    # selected. This is what verification observes, so the emulation has
+                    # to respect the same exactness the real package manager does --
+                    # writing a plausible-looking "1.0.0" here would let the test pass
+                    # while the production postcondition correctly rejected it.
+                    manifest_path = Path(cwd) / "package.json"
+                    try:
+                        document = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        document = {}
+                    section = "devDependencies" if "--save-dev" in command else "dependencies"
+                    pinned_names = set(DEPENDENCY_PACKAGES.values()) | {
+                        companion.package
+                        for companions in DEPENDENCY_COMPANION_PACKAGES.values()
+                        for companion in companions
+                    }
+                    for arg in command:
+                        if "@" not in arg or arg.startswith("-"):
+                            continue
+                        name, _, version = arg.partition("@")
+                        if name not in pinned_names:
+                            continue
+                        document.setdefault(section, {})[name] = version
+                        break
+                    manifest_path.write_text(json.dumps(document), encoding="utf-8")
 
         if self._materializes_components and "add" in command:
             target_dir = self._component_dir(cwd)
@@ -204,6 +225,22 @@ def project(tmp_path) -> Path:
 def _write_config(project: Path, document) -> None:
     """Overwrite the project's shadcn config with ``document`` (raw)."""
     (project / "components.json").write_text(document, encoding="utf-8")
+
+
+def _write_dependency(project: Path, package: str, version: str, *, section: str = "dependencies") -> None:
+    """Declare ``package`` at ``version`` in one section of the project manifest.
+
+    Verification is section- and version-exact, so a fixture that wants to
+    exercise the satisfied path has to write a genuinely satisfying entry
+    rather than "a plausible-looking version".
+    """
+    path = project / "package.json"
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        document = {}
+    document.setdefault(section, {})[package] = version
+    path.write_text(json.dumps(document), encoding="utf-8")
 
 
 @pytest.fixture
@@ -291,10 +328,13 @@ def test_install_command_is_built_for_the_projects_own_package_manager(project):
     """The manager is detected from the project's own lockfile."""
     assert detect_package_manager(project) == ("npm",)
 
-    argv = build_install_argv(("npm",), "gsap")
+    argv = build_install_argv(("npm",), GSAP)
     assert argv[0] == "npm"
-    assert "gsap" in argv
-    assert "--save-exact" in argv, "an unpinned dependency can float on a later build"
+    # The spec carries the exact pin, not the bare name: an unpinned dependency
+    # can float on a later build, which would make "verified installed" describe
+    # something that is not installed again tomorrow.
+    assert f"{GSAP}@{DEPENDENCY_PACKAGE_PINS[GSAP]}" in argv
+    assert "--save-exact" in argv
 
 
 def test_pnpm_and_yarn_projects_are_not_driven_with_npm(project):
@@ -387,9 +427,7 @@ def test_failed_install_never_reports_installed(project):
 
 def test_already_present_dependency_is_installed_without_a_command(project):
     """Idempotence: a satisfied dependency is not reinstalled."""
-    manifest = json.loads((project / "package.json").read_text(encoding="utf-8"))
-    manifest["dependencies"]["gsap"] = "3.12.5"
-    (project / "package.json").write_text(json.dumps(manifest), encoding="utf-8")
+    _write_dependency(project, GSAP, DEPENDENCY_PACKAGE_PINS[GSAP])
 
     runner = RecordingRunner()
     outcome = _installer(project, runner).install_dependency(GSAP)
@@ -506,7 +544,10 @@ def test_selected_dependency_does_install(project, manifest):
     report = _installer(project, runner).execute_selection(plan)
 
     assert GSAP in report.installed_ids
-    assert any("gsap" in c for c in runner.commands)
+    # The argv carries the exact pinned spec, so a substring match on the bare
+    # name would pass even if the version were dropped from the install.
+    spec = f"{GSAP}@{DEPENDENCY_PACKAGE_PINS[GSAP]}"
+    assert any(spec in command for command in runner.commands)
 
 
 def test_selection_alone_never_implies_installed(project, manifest):

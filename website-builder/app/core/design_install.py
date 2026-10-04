@@ -106,6 +106,119 @@ DEPENDENCY_PACKAGES: Dict[str, str] = {
 REGISTRY_DEPENDENCY = "shadcn"
 
 
+# ---------------------------------------------------------------------------
+# Exact pins -- reproducibility
+# ---------------------------------------------------------------------------
+#
+# A dependency id resolves to a NAME (above) and a VERSION (here), and both are
+# application-owned constants. Without the version the "verified installed"
+# claim describes something that will not be installed again tomorrow: an
+# unpinned `three` added today can float to a different release on the next
+# build, and the pin in the manifest would then describe a version nobody has.
+#
+# Versions are EXACT. No range operator, no ``latest``, no prerelease alias.
+# The regexp below is not an input filter -- it is applied to the three constant
+# strings above -- so it is a static safety net proving the allowlist has not
+# been edited into something that could resolve differently tomorrow.
+
+#: A pinned version is digits and dots only. Deliberately rejects ``^``, ``~``,
+#: ``>=``, ``>``, ``||``, ``*``, prerelease suffixes, and whitespace.
+_EXACT_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+
+#: The npm dependency sections this application writes and verifies against.
+DEPENDENCY_SECTIONS: Tuple[str, ...] = ("dependencies", "devDependencies")
+
+SECTION_DEPENDENCIES = "dependencies"
+SECTION_DEV_DEPENDENCIES = "devDependencies"
+
+
+@dataclass(frozen=True)
+class PackageSpec:
+    """One exact, application-owned package pin.
+
+    ``dependency_section`` is part of the spec because it is part of the
+    postcondition: a type-only companion belongs in ``devDependencies``, and
+    verification that accepts the package in *either* section would let a
+    project satisfy a runtime requirement with a dev-only declaration.
+    """
+
+    package: str
+    version: str
+    dependency_section: str = SECTION_DEPENDENCIES
+
+    @property
+    def spec(self) -> str:
+        """The ``name@version`` string handed to the package manager."""
+        return f"{self.package}@{self.version}"
+
+    def is_exact(self) -> bool:
+        return bool(_EXACT_VERSION_RE.match(self.version))
+
+
+def _runtime_spec(dependency_id: str) -> PackageSpec:
+    """The runtime :class:`PackageSpec` for an allowlisted dependency id."""
+    return PackageSpec(
+        package=DEPENDENCY_PACKAGES[dependency_id],
+        version=DEPENDENCY_PACKAGE_PINS[dependency_id],
+        dependency_section=SECTION_DEPENDENCIES,
+    )
+
+
+#: Exact versions, keyed by the same dependency ids as
+#: :data:`DEPENDENCY_PACKAGES`. The two mappings are deliberately separate:
+#: ``DEPENDENCY_PACKAGES`` answers "which package", these answer "which
+#: version", and a caller that wants an installable spec must consult
+#: :func:`required_package_specs` rather than pairing the maps by hand.
+DEPENDENCY_PACKAGE_PINS: Dict[str, str] = {
+    "gsap": "3.15.0",
+    "three": "0.186.1",
+    "lenis": "1.3.26",
+}
+
+
+@dataclass(frozen=True)
+class CompanionPackage:
+    """A package a dependency requires IN ADDITION to its runtime package.
+
+    Exists because ``three`` ships no bundled TypeScript declarations: the
+    runtime package alone installs cleanly and then fails the build with
+    ``TS7016``. The companion is the difference between "installed" and
+    "installed and typechecks", and treating it as optional would let the
+    postcondition report a capability the project does not have.
+    """
+
+    package: str
+    version: str
+    dependency_section: str
+
+    def to_spec(self) -> PackageSpec:
+        return PackageSpec(
+            package=self.package,
+            version=self.version,
+            dependency_section=self.dependency_section,
+        )
+
+
+#: dependency id -> the companion packages it needs, and ONLY those.
+#:
+#: **This mapping is the allowlist.** There is deliberately NO general
+#: ``@types/<runtime-package>`` derivation: inferring a companion from a package
+#: name is precisely the "arbitrary installer" this module forbids, because it
+#: would let any future runtime package acquire an arbitrary dev dependency
+#: without a human adding the row here. A caller-, model-, or resource-supplied
+#: companion name is never forwarded to npm; :func:`required_package_specs`
+#: resolves only through this map.
+DEPENDENCY_COMPANION_PACKAGES: Dict[str, Tuple[CompanionPackage, ...]] = {
+    "three": (
+        CompanionPackage(
+            package="@types/three",
+            version="0.186.0",
+            dependency_section=SECTION_DEV_DEPENDENCIES,
+        ),
+    ),
+}
+
+
 def resolve_package(dependency_id: str) -> Optional[str]:
     """The package for ``dependency_id``, or ``None`` if it is not allowlisted.
 
@@ -117,6 +230,39 @@ def resolve_package(dependency_id: str) -> Optional[str]:
     if not isinstance(dependency_id, str):
         return None
     return DEPENDENCY_PACKAGES.get(dependency_id)
+
+
+def resolve_companion_packages(dependency_id: str) -> Tuple[CompanionPackage, ...]:
+    """The closed companion packages for ``dependency_id``.
+
+    Mirrors :func:`resolve_package`'s contract exactly: an unrecognised id
+    yields an EMPTY tuple rather than a synthesised companion, and never echoes
+    its input. ``gsap`` and ``lenis`` ship their own types and therefore have no
+    entry here -- which is the point of the mapping being closed rather than
+    derived.
+    """
+    if not isinstance(dependency_id, str):
+        return ()
+    return DEPENDENCY_COMPANION_PACKAGES.get(dependency_id, ())
+
+
+def required_package_specs(dependency_id: str) -> Tuple[PackageSpec, ...]:
+    """Every package spec a dependency needs: its runtime pin plus companions.
+
+    This is what verification counts against and what an install may write. A
+    dependency is satisfied only when EVERY spec here is present at its exact
+    version in its exact section, so a runtime-only ``three`` is not installed.
+
+    An unrecognised id returns ``()`` -- the same "no package" answer
+    :func:`resolve_package` gives, for the same reason.
+    """
+    package = resolve_package(dependency_id)
+    if package is None:
+        return ()
+    return (PackageSpec(package, DEPENDENCY_PACKAGE_PINS[dependency_id]),) + tuple(
+        companion.to_spec()
+        for companion in resolve_companion_packages(dependency_id)
+    )
 
 
 def allowlisted_dependencies() -> Tuple[str, ...]:
@@ -197,6 +343,15 @@ REASON_NOT_VERIFIED = (
     "manifest; the state is not upgraded to installed"
 )
 REASON_PACKAGE_NOT_ALLOWLISTED = "no allowlisted package is declared for this dependency"
+REASON_PIN_NOT_EXACT = (
+    "the application-owned pin for this dependency is not an exact version; "
+    "no command was attempted"
+)
+REASON_COMPANION_NOT_VERIFIED = (
+    "the install commands succeeded but a required companion package is absent "
+    "from the project manifest, or is not at the exact pinned version in the "
+    "exact dependency section; the state is not upgraded to installed"
+)
 REASON_COMPONENT_NOT_ALLOWED = "requested component is not in the allowlist"
 REASON_COMPONENT_NONE_REQUESTED = "no component was selected, so no CLI was invoked"
 REASON_COMPONENTS_NOT_VERIFIED = (
@@ -210,6 +365,25 @@ REASON_SHADCN_CONFIG_INVALID = (
 REASON_MANAGER_UNSUPPORTED = (
     "the project's package manager has no supported pinned one-off mechanism"
 )
+
+
+def _incomplete_reason(dependency_id: str, project_root: Path) -> str:
+    """Static reason describing WHY verification did not pass.
+
+    Distinguishes "the runtime package never landed" from "the runtime landed
+    but its companion did not", because they are different operational problems
+    with the same terminal state. Both are static strings: the branch is chosen
+    by inspecting the manifest, and no value read from it is echoed into the
+    reason, so a receipt stays bounded and leaks no dependency layout.
+    """
+    package = resolve_package(dependency_id)
+    if package is None:
+        return REASON_NOT_VERIFIED
+    runtime_spec = required_package_specs(dependency_id)[0]
+    if not project_satisfies_spec(project_root, runtime_spec):
+        return REASON_NOT_VERIFIED
+    # The runtime package is present and correct, so the gap is a companion.
+    return REASON_COMPANION_NOT_VERIFIED
 REASON_OUTSIDE_PROJECT = "resolved path is outside the project workspace"
 REASON_TIMEOUT = "the project-local command exceeded its bounded timeout"
 REASON_NO_PACKAGE_MANAGER = "no project-local package manager is available"
@@ -338,10 +512,9 @@ def _read_project_manifest(project_root: Path) -> Optional[Dict[str, Any]]:
 def project_declares_dependency(project_root: Path, package: str) -> bool:
     """Whether ``package`` appears in the project's own dependencies.
 
-    This is the ONLY definition of "installed" this module recognises: an
-    observation about the project itself, not an inference from a command's exit
-    code. ``npm install`` can exit 0 having written nothing useful, and the only
-    durable answer is what the project manifest now says.
+    Retained as the loose membership question ("is this name mentioned
+    anywhere"), used where the section genuinely does not matter.
+    :func:`project_satisfies_spec` is what decides an INSTALL postcondition.
     """
     document = _read_project_manifest(project_root)
     if document is None or not package:
@@ -351,6 +524,48 @@ def project_declares_dependency(project_root: Path, package: str) -> bool:
         if isinstance(block, Mapping) and package in block:
             return True
     return False
+
+
+def project_satisfies_spec(project_root: Path, spec: PackageSpec) -> bool:
+    """Whether the project manifest satisfies ``spec`` EXACTLY.
+
+    Conjunctive on three axes, all three load-bearing:
+
+    * **presence** in the section the spec declares,
+    * **exact version** match, and
+    * **exact section**.
+
+    The section check is why a type-only companion in ``devDependencies`` is not
+    interchangeable with a runtime dependency, and why accepting the package in
+    ``optionalDependencies`` (which ``npm install --save-optional`` would write)
+    would not satisfy a runtime requirement.
+    """
+    document = _read_project_manifest(project_root)
+    if document is None or not spec.package:
+        return False
+
+    block = document.get(spec.dependency_section)
+    if not isinstance(block, Mapping):
+        return False
+
+    declared = block.get(spec.package)
+    if not isinstance(declared, str):
+        return False
+    return declared.strip() == spec.version
+
+
+def project_satisfies_dependency(project_root: Path, dependency_id: str) -> bool:
+    """Whether EVERY required spec for ``dependency_id`` is satisfied.
+
+    This is the ONLY definition of "installed" for an npm dependency. A
+    dependency with a companion therefore cannot be reported installed from the
+    runtime package alone, which is exactly the condition that produced
+    ``TS7016`` in the field: ``three`` installed, no declarations, build broken.
+    """
+    specs = required_package_specs(dependency_id)
+    if not specs:
+        return False
+    return all(project_satisfies_spec(project_root, spec) for spec in specs)
 
 
 def is_contained(root: Path, candidate: Path) -> bool:
@@ -679,21 +894,84 @@ def registry_invocation_prefix(
     return None
 
 
-def build_install_argv(manager: Sequence[str], package: str) -> Tuple[str, ...]:
-    """The install argv for an allowlisted package.
+def build_install_argv(
+    manager: Sequence[str], dependency_id: str
+) -> Tuple[str, ...]:
+    """The install argv for one allowlisted dependency's RUNTIME package.
 
-    ``--save-exact`` is deliberate. A dependency added without a pin can float to
-    a new version on a later build, which makes a "verified installed" claim
-    describe something that will not be installed again tomorrow.
+    Every spec is exact (``name@version``). ``--save-exact`` is deliberate: a
+    dependency added without a pin can float to a new version on a later build,
+    which makes a "verified installed" claim describe something that will not be
+    installed again tomorrow.
+
+    This returns the runtime command ONLY. Companions are a separate command
+    because they land in a DIFFERENT section of ``package.json``, and that
+    section is part of the postcondition -- see
+    :func:`build_companion_install_argv` and :func:`required_package_specs`.
     """
     argv = tuple(manager)
+    runtime = PackageSpec(
+        package=DEPENDENCY_PACKAGES[dependency_id],
+        version=DEPENDENCY_PACKAGE_PINS[dependency_id],
+    )
+    return _runtime_install_argv(argv, runtime)
+
+
+def build_companion_install_argv(
+    manager: Sequence[str], dependency_id: str
+) -> Tuple[Tuple[str, ...], ...]:
+    """One install command per companion of ``dependency_id``.
+
+    Returns an EMPTY tuple when the dependency has no companions, so a caller
+    can iterate the result and run zero commands without testing anything --
+    that is how "gsap and lenis install no companion" becomes a property of
+    control flow rather than a flag someone has to remember to check.
+
+    Each command is a flat argv list. There is deliberately no ``&&`` chaining
+    and no shell string: commands are executed as argument vectors, so a joined
+    string would pass ``&&`` to the package manager as a literal argument.
+    Failure of one companion therefore stops the sequence at the caller rather
+    than being papered over.
+    """
+    return tuple(
+        _companion_install_argv(tuple(manager), companion.to_spec())
+        for companion in resolve_companion_packages(dependency_id)
+    )
+
+
+def _runtime_install_argv(
+    argv: Sequence[str], spec: PackageSpec
+) -> Tuple[str, ...]:
+    """Manager-specific argv installing one runtime spec with ``--save-exact``."""
+    argv = tuple(argv)
     if argv and argv[0] == "npm":
-        return argv + ("install", package, "--save-exact", "--no-audit", "--no-fund")
+        return argv + ("install", spec.spec, "--save-exact", "--no-audit", "--no-fund")
     if argv and argv[0] == "pnpm":
-        return argv + ("add", "--save-exact", package)
+        return argv + ("add", "--save-exact", spec.spec)
     if argv and argv[0] == "yarn":
-        return argv + ("add", "--exact", package)
-    return argv + ("install", package, "--save-exact")
+        return argv + ("add", "--exact", spec.spec)
+    return argv + ("install", spec.spec, "--save-exact")
+
+
+def _companion_install_argv(
+    argv: Sequence[str], spec: PackageSpec
+) -> Tuple[str, ...]:
+    """Manager-specific argv installing one companion into the dev section."""
+    argv = tuple(argv)
+    if argv and argv[0] == "npm":
+        return argv + (
+            "install",
+            spec.spec,
+            "--save-dev",
+            "--save-exact",
+            "--no-audit",
+            "--no-fund",
+        )
+    if argv and argv[0] == "pnpm":
+        return argv + ("add", "--save-dev", "--save-exact", spec.spec)
+    if argv and argv[0] == "yarn":
+        return argv + ("add", "--dev", "--exact", spec.spec)
+    return argv + ("install", spec.spec, "--save-dev", "--save-exact")
 
 
 def build_registry_argv(
@@ -840,8 +1118,14 @@ class DesignDependencyInstaller:
 
         The sequence is: resolve the package from the allowlist, refuse an
         unselected or unknown dependency, detect the project's own package
-        manager, run one bounded install, then VERIFY against the project
-        manifest. ``installed`` is assigned only by that verification.
+        manager, run one bounded runtime install plus one bounded command per
+        companion, then VERIFY every required spec against the project manifest.
+
+        ``installed`` is assigned only by that verification. For a dependency
+        with a companion (``three`` -> ``@types/three``) the runtime package
+        alone is NOT sufficient: the project would install cleanly and then fail
+        ``tsc`` with ``TS7016``, which is precisely the condition this batch
+        closes.
         """
         package = resolve_package(dependency_id)
         if package is None:
@@ -862,7 +1146,19 @@ class DesignDependencyInstaller:
                 reason=REASON_PACKAGE_NOT_ALLOWLISTED,
             )
 
-        if project_declares_dependency(self.project_root, package):
+        runtime_spec = required_package_specs(dependency_id)[0]
+        if not runtime_spec.is_exact():
+            # The pin table has been edited into something that could resolve
+            # differently tomorrow. Refuse rather than install a range.
+            logger.error("Allowlisted package pin is not an exact version.")
+            return InstallOutcome(
+                dependency_id=dependency_id,
+                state=INSTALL_FAILED,
+                package=package,
+                reason=REASON_PIN_NOT_EXACT,
+            )
+
+        if project_satisfies_dependency(self.project_root, dependency_id):
             return InstallOutcome(
                 dependency_id=dependency_id,
                 state="installed",
@@ -880,8 +1176,11 @@ class DesignDependencyInstaller:
                 reason=REASON_NO_PACKAGE_MANAGER,
             )
 
-        argv = build_install_argv(manager, package)
-        process, timed_out = self._run(argv, INSTALL_TIMEOUT_SECONDS)
+        receipts: List[CommandReceipt] = []
+
+        process, timed_out = self._run(
+            build_install_argv(manager, dependency_id), INSTALL_TIMEOUT_SECONDS
+        )
         if timed_out:
             return InstallOutcome(
                 dependency_id=dependency_id,
@@ -902,16 +1201,56 @@ class DesignDependencyInstaller:
                 reason=REASON_INSTALL_FAILED,
                 receipt=receipt,
             )
+        receipts.append(CommandReceipt.from_process(process, cwd_label="<project>"))
 
-        # The command succeeded. That is NOT yet an installed claim.
-        verified = project_declares_dependency(self.project_root, package)
-        receipt = CommandReceipt.from_process(process, cwd_label="<project>")
+        # Companions are a SEPARATE command per companion, each into the dev
+        # section. No companion means no command at all -- the loop body never
+        # executes, which is how "gsap/lenis install no companion" is enforced
+        # by control flow rather than by a conditional someone could forget.
+        for argv in build_companion_install_argv(manager, dependency_id):
+            companion_process, companion_timed_out = self._run(
+                argv, INSTALL_TIMEOUT_SECONDS
+            )
+            if companion_timed_out:
+                return InstallOutcome(
+                    dependency_id=dependency_id,
+                    state=INSTALL_FAILED,
+                    package=package,
+                    reason=REASON_TIMEOUT,
+                    receipt=CommandReceipt.from_process(
+                        companion_process, cwd_label="<project>"
+                    )
+                    if companion_process is not None
+                    else receipts[-1],
+                )
+            if companion_process is None or companion_process.returncode != 0:
+                receipt = (
+                    CommandReceipt.from_process(
+                        companion_process, cwd_label="<project>"
+                    )
+                    if companion_process is not None
+                    else receipts[-1]
+                )
+                return InstallOutcome(
+                    dependency_id=dependency_id,
+                    state=INSTALL_FAILED,
+                    package=package,
+                    reason=REASON_INSTALL_FAILED,
+                    receipt=receipt,
+                )
+            receipts.append(
+                CommandReceipt.from_process(companion_process, cwd_label="<project>")
+            )
+
+        # Every command succeeded. That is NOT yet an installed claim.
+        verified = project_satisfies_dependency(self.project_root, dependency_id)
+        receipt = receipts[-1]
         if not verified:
             return InstallOutcome(
                 dependency_id=dependency_id,
                 state=INSTALL_FAILED,
                 package=package,
-                reason=REASON_NOT_VERIFIED,
+                reason=_incomplete_reason(dependency_id, self.project_root),
                 receipt=receipt,
                 verified_in_manifest=False,
             )
@@ -1144,10 +1483,14 @@ class DesignDependencyInstaller:
 __all__ = [
     "ALLOWED_SHADCN_COMPONENTS",
     "COMPONENT_SUFFIXES",
+    "DEPENDENCY_COMPANION_PACKAGES",
+    "DEPENDENCY_PACKAGE_PINS",
     "DEPENDENCY_PACKAGES",
+    "DEPENDENCY_SECTIONS",
     "INSTALL_FAILED",
     "INSTALL_STATES",
     "REASON_ALREADY_INSTALLED",
+    "REASON_COMPANION_NOT_VERIFIED",
     "REASON_COMPONENT_NOT_ALLOWED",
     "REASON_COMPONENT_NONE_REQUESTED",
     "REASON_COMPONENTS_NOT_VERIFIED",
@@ -1158,32 +1501,42 @@ __all__ = [
     "REASON_NO_PACKAGE_MANAGER",
     "REASON_OUTSIDE_PROJECT",
     "REASON_PACKAGE_NOT_ALLOWLISTED",
+    "REASON_PIN_NOT_EXACT",
     "REASON_PROJECT_INVALID",
     "REASON_SHADCN_CONFIG_INVALID",
     "REASON_TIMEOUT",
+    "SECTION_DEPENDENCIES",
+    "SECTION_DEV_DEPENDENCIES",
     "REGISTRY_DEPENDENCY",
     "SHADCN_CLI_VERSION",
     "SHADCN_CONFIG_FILENAME",
     "TERMINAL_INSTALL_STATES",
+    "CompanionPackage",
     "CommandReceipt",
     "InstallOutcome",
+    "PackageSpec",
     "allowlisted_dependencies",
     "allowed_shadcn_components",
     "approved_component_dir",
     "is_contained",
     "package_name_is_well_formed",
     "project_declares_dependency",
+    "project_satisfies_dependency",
+    "project_satisfies_spec",
     "InstallReport",
     "DesignDependencyInstaller",
     "LOCKFILES",
     "YARN_BERRY_CONFIG",
     "INSTALL_TIMEOUT_SECONDS",
     "REGISTRY_TIMEOUT_SECONDS",
+    "build_companion_install_argv",
     "build_install_argv",
     "build_registry_argv",
     "detect_package_manager",
     "filter_allowed_components",
     "registry_invocation_prefix",
+    "required_package_specs",
+    "resolve_companion_packages",
     "resolve_package",
     "verify_components_materialized",
 ]
