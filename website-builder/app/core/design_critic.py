@@ -6,17 +6,27 @@ schema D1 declared but nothing produced.
 **Why this module exists and why it is narrow.** D1 declared ``CriticFinding``
 and explicitly refused to write a parser for a resource that was absent, because
 a parser for an uninspected resource is an invented contract. Part I closes
-that gap only because the contract is now *verified against the source*, not
-the docs: the provisioned Hermes skill ships its own bundled engine under
-``scripts/bin/<os>-<arch>/impeccable`` and its launcher documents
+that gap only because the contract is now *verified against the official
+release*, not the docs: pbakaus/impeccable ``skill-v4.1.0`` publishes one
+asset, ``universal.zip``
+(sha256:a54d837f086ff2036ab0cf2cc2499249362d38fa27d42feb07d6248dfdd64a11),
+whose Hermes layout contains NO ``scripts/bin/`` and no native binary at all.
+The detector is a Node ESM entrypoint, ``scripts/detect.mjs``, whose own
+``--help`` documents
 
-    detect --json      emit findings as JSON on stdout, human text on stderr
+    detect --json --quiet    emit findings as JSON on stdout
 
-with the exit codes that this module depends on:
+and whose shipped source fixes the exit codes this module depends on:
 
     0   clean          (or nothing to scan)
     2   findings       (the normal "there is something to fix" answer)
     1   scan failure   (an honest failure, NOT an empty result)
+
+The JSON payload is a **bare array**, and each finding's real field names are
+``antipattern`` / ``name`` / ``description`` / ``severity`` / ``category`` /
+``file`` / ``line`` / ``snippet`` -- read from the shipped ``findings.mjs``
+factory, not guessed. Older key aliases are still accepted, because a parser
+that dropped an upstream rename would silently report zero findings.
 
 **Exit 1 is deliberately NOT treated as "no findings."** Collapsing a failed
 scan into a clean report would let a broken critic silently certify a design.
@@ -30,13 +40,18 @@ argv below is a fixed constant and the caller cannot extend it.
 
 **What is NOT faked.**
 
-* The engine path is resolved through the closed platform mapping in
-  :mod:`app.core.design_activation` and must be a contained, existing regular
-  file under the skill root. A missing engine is a *reported* absence, not a
-  fabricated empty report.
-* The argv is :data:`CRITIC_ARGV_SUFFIX` and nothing else. No caller-supplied
-  flags, no path arguments, no shell. ``shell=True`` is never used, so a path
-  containing shell metacharacters is an argv element, never a command.
+* The engine path is resolved through
+  :func:`app.core.design_activation.resolve_engine_path` and must be a
+  contained, existing, non-empty regular file under the skill root. A missing
+  engine is a *reported* absence, not a fabricated empty report.
+* The interpreter is the Node executable the caller supplies. It is never
+  searched for on ``PATH`` here, never installed, and never shimmed from inside
+  the project -- an unvetted interpreter is exactly the "npm shim" this batch
+  refused.
+* The engine flags are :data:`CRITIC_ENGINE_ARGV_SUFFIX` and nothing else. No
+  caller-supplied flags, no target paths, no shell. ``shell=True`` is never
+  used, so a path containing shell metacharacters is an argv element, never a
+  command.
 * JSON that does not parse, or that is not the expected shape, yields zero
   findings plus a static reason. It is never coerced into an empty pass.
 """
@@ -50,6 +65,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from app.core.design_activation import resolve_engine_path as _resolve_engine_path
 from app.core.design_install import is_contained
 from app.core.design_retrieval import CriticFinding
 
@@ -58,7 +74,13 @@ logger = logging.getLogger(__name__)
 #: The engine's ``detect`` subcommand with machine-readable output. **Fixed**:
 #: the caller may not add flags, paths, or targets. This is the reason the seam
 #: is safe -- there is no argument through which a caller can steer the engine.
-CRITIC_ARGV_SUFFIX: Tuple[str, ...] = ("detect", "--json", "--quiet")
+#: ``--quiet`` only suppresses the human summary on stderr; the JSON payload and
+#: the exit code are unaffected, and those are what this module reads.
+CRITIC_ENGINE_ARGV_SUFFIX: Tuple[str, ...] = ("detect", "--json", "--quiet")
+
+#: Backwards-compatible alias for the flag suffix. It names the FLAGS passed to
+#: the engine, never the engine path.
+CRITIC_ARGV_SUFFIX: Tuple[str, ...] = CRITIC_ENGINE_ARGV_SUFFIX
 
 #: Exit codes, as documented by the skill's own contract.
 EXIT_CLEAN = 0
@@ -109,35 +131,28 @@ class CriticOutcome:
         }
 
 
-def resolve_engine_path(skill_root: Path, engine_relative: str) -> Optional[Path]:
-    """The engine executable, or ``None`` if it is absent or uncontained.
-
-    Containment is checked against the skill root, not merely the project: the
-    engine executes, so a path that resolves outside the provisioned skill is
-    refused before anything runs. Returns ``None`` -- never a best guess.
-    """
-    if not engine_relative:
-        return None
-    candidate = Path(skill_root) / engine_relative
-    try:
-        if not candidate.is_file():
-            return None
-        if not is_contained(Path(skill_root), candidate):
-            logger.warning("Refused an Impeccable engine outside the skill root.")
-            return None
-    except OSError:
-        return None
-    return candidate
+#: The engine resolver is owned by :mod:`app.core.design_activation`, which
+#: encodes the VERIFIED upstream layout (a cross-platform Node ESM entrypoint and
+#: the detector facade it imports). It is re-exported here rather than
+#: reimplemented: two copies of "where the engine lives" would drift, and the
+#: drifted copy is exactly what made the previous revision report a correctly
+#: provisioned skill as unavailable.
+resolve_engine_path = _resolve_engine_path
 
 
-def build_critic_argv(engine_path: Path) -> Tuple[str, ...]:
+def build_critic_argv(node_executable: Any, engine_path: Path) -> Tuple[str, ...]:
     """The complete, fixed argv for one scan.
 
-    No caller-supplied fragment appears here, and the executable is an argv
-    element rather than a shell word -- so a path with spaces or metacharacters
-    is handled by the OS, not by a shell.
+    The shipped engine is a Node ESM module, so argv[0] is the interpreter and
+    argv[1] is the verified entrypoint. Neither is searched for on ``PATH``
+    here, and no caller-supplied fragment appears beyond the interpreter and the
+    already-resolved engine path. Both are argv elements rather than shell
+    words, so a path with spaces or metacharacters is handled by the OS.
     """
-    return (str(engine_path),) + CRITIC_ARGV_SUFFIX
+    return (
+        str(node_executable),
+        str(engine_path),
+    ) + CRITIC_ENGINE_ARGV_SUFFIX
 
 
 def _bound(text: object, limit: int = MAX_FIELD_CHARS) -> str:
@@ -180,17 +195,29 @@ def normalize_finding(document: Any) -> Optional[CriticFinding]:
     if not isinstance(document, Mapping):
         return None
 
-    finding = _first_text(document, "finding", "message", "title", "description")
-    rule_id = _first_text(document, "rule_id", "ruleId", "id", "rule", "code")
+    # The shipped `findings.mjs` factory stamps the rule id as `antipattern`;
+    # `rule_id`/`id`/`code` are the older or alternate spellings.
+    finding = _first_text(document, "description", "finding", "message", "title")
+    rule_id = _first_text(
+        document, "antipattern", "rule_id", "ruleId", "id", "rule", "code"
+    )
     if not finding or not rule_id:
         return None
+
+    # A real finding carries a human `name`; use it as a readable prefix.
+    display = _first_text(document, "name", "title")
 
     return CriticFinding(
         rule_id=rule_id,
         category=_first_text(document, "category", "group", "area") or "general",
-        severity=_normalize_severity(document.get("severity") or document.get("level")),
-        finding=finding,
-        evidence=_first_text(document, "evidence", "excerpt", "detail", "snippet"),
+        severity=_normalize_severity(
+            document.get("severity") or document.get("level")
+        ),
+        finding=finding if not display else f"{display}: {finding}",
+        # `snippet` is the shipped evidence field; `file`/`line` locate it.
+        evidence=_first_text(
+            document, "snippet", "evidence", "excerpt", "detail"
+        ),
         suggested_action=_first_text(
             document, "suggested_action", "suggestedAction", "remediation", "fix"
         ),
@@ -268,25 +295,32 @@ def parse_critic_output(stdout: str, returncode: int) -> CriticOutcome:
 def run_critic_scan(
     engine_path: Optional[Path],
     *,
+    node_executable: Optional[str] = None,
     skill_root: Optional[Path] = None,
     timeout_seconds: int = 120,
     runner: Any = None,
 ) -> CriticOutcome:
     """Run one bounded ``detect`` and return its outcome. **No repair path.**
 
+    ``node_executable`` is REQUIRED and is never discovered. Looking one up on
+    ``PATH`` would mean silently running whatever interpreter happens to be
+    installed, and ``npx``/an npm shim would download one into the project --
+    both refused by this batch. A caller that cannot name an interpreter reports
+    an absent engine rather than guessing at one.
+
     ``runner`` is injectable so tests can drive every exit-code and
     malformed-output branch without executing anything. The default runner is
-    :func:`subprocess.run` with ``shell=False`` -- the engine path is an argv
+    :func:`subprocess.run` with ``shell=False`` -- every argument is an argv
     element, never a shell word.
 
     An unresolvable engine is a *reported* absence. Returning
     ``ok=True`` with zero findings there would certify a design that was never
     scanned.
     """
-    if engine_path is None:
+    if engine_path is None or not isinstance(node_executable, str) or not node_executable.strip():
         return CriticOutcome(ok=False, reasons=("engine_unavailable",))
 
-    argv = build_critic_argv(engine_path)
+    argv = build_critic_argv(node_executable, engine_path)
     cwd = str(skill_root) if skill_root is not None else None
 
     execute = runner or subprocess.run
@@ -312,6 +346,7 @@ def run_critic_scan(
 
 __all__ = [
     "CRITIC_ARGV_SUFFIX",
+    "CRITIC_ENGINE_ARGV_SUFFIX",
     "CRITIC_REASONS",
     "EXIT_CLEAN",
     "EXIT_FINDINGS",

@@ -54,11 +54,39 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from app.core.design_registry import (
+    SOURCE_REACT_BITS,
+    SOURCE_TWENTY_FIRST,
+    approved_registry_components,
+)
 from app.core.design_resources import (
     DesignResource,
     DesignResourceManifest,
     design_profile_skills_dir,
 )
+
+
+def _has_live_discovery_adapter() -> bool:
+    """Whether a REAL, executable catalog discovery adapter is wired.
+
+    Answered from the application's own module surface, NOT from a network
+    probe: importing this module must stay local, offline and socket-free, so
+    "is there an adapter" has to be a static fact.
+
+    ``design_catalog_fetch`` is the adapter. It is IMPORTED HERE on purpose:
+    the import is local and pure (stdlib plus the offline normalizer), and it
+    makes the dependency explicit -- if that module is removed or fails to
+    import, discovery correctly reports itself absent instead of claiming a
+    capability that no longer exists.
+    """
+    try:
+        from app.core import design_catalog_fetch as _fetch
+    except Exception:  # pragma: no cover - import failure is the answer
+        return False
+    return bool(
+        getattr(_fetch, "CATALOG_ENDPOINTS", None)
+        and getattr(_fetch, "discover_catalog", None)
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -98,12 +126,18 @@ REASON_NO_OFFICIAL_MECHANISM = (
 REASON_CATALOG_REACHABLE = (
     "the official catalog is reachable without authentication for metadata"
 )
+REASON_NO_LIVE_ADAPTER = (
+    "no live discovery adapter is wired for this resource in this build"
+)
+REASON_NO_REVIEWED_COMPONENT = (
+    "no reviewed component is allowlisted for install from this resource"
+)
 REASON_CLI_PINNED = "a pinned, application-owned CLI is available for this resource"
 REASON_ENGINE_VERIFIED = (
-    "the provisioned skill's platform engine is present and verified"
+    "the provisioned skill's detector engine is present and verified"
 )
 REASON_ENGINE_MISSING = (
-    "the provisioned skill has no engine for this platform; no download is attempted"
+    "the provisioned skill has no detector engine; no download is attempted"
 )
 
 #: Exhaustive. A reason outside this set is a bug, and callers switch on these
@@ -118,6 +152,8 @@ ACTIVATION_REASONS: frozenset = frozenset(
         REASON_AUTH_OPTIONAL,
         REASON_NO_OFFICIAL_MECHANISM,
         REASON_CATALOG_REACHABLE,
+        REASON_NO_LIVE_ADAPTER,
+        REASON_NO_REVIEWED_COMPONENT,
         REASON_CLI_PINNED,
         REASON_ENGINE_VERIFIED,
         REASON_ENGINE_MISSING,
@@ -126,68 +162,75 @@ ACTIVATION_REASONS: frozenset = frozenset(
 
 
 # ---------------------------------------------------------------------------
-# Platform engine mapping -- CLOSED and application-owned
+# Engine resolution -- the VERIFIED upstream contract
 # ---------------------------------------------------------------------------
 #
-# Impeccable's engine ships as a per-platform binary inside its provisioned
-# skill. The manifest deliberately does NOT name a platform-specific path: a
-# manifest pinned to one OS would report unavailable on every other OS, which is
-# exactly the "claims capability it cannot deliver" failure this batch removes.
+# Verified against the official release (see `config/design_resources.yaml`):
+# pbakaus/impeccable `skill-v4.1.0` ships exactly one asset, `universal.zip`
+# (sha256:a54d837f086ff2036ab0cf2cc2499249362d38fa27d42feb07d6248dfdd64a11),
+# whose Hermes layout contains NO `scripts/bin/`, NO `scripts/impeccable`
+# launcher, and no per-platform native binary.
 #
-# So the manifest pins only the STABLE artifacts, and the adapter resolves the
-# platform here, through a closed mapping, then verifies the engine separately.
-# An unmapped platform yields NO engine path -- it never falls back to a
-# literal, and never triggers the launcher's download branch.
+# The detector is a Node ESM entrypoint, `scripts/detect.mjs`, which re-exports
+# `detectCli` from `detector/detect-antipatterns.mjs`. It is therefore
+# CROSS-PLATFORM: the same relative path is correct on every supported host, so
+# there is no `(system, machine)` mapping to get wrong.
+#
+# The previous revision resolved `scripts/bin/<os>-<arch>/impeccable` from a
+# closed platform table. That layout does not exist in the supported
+# distribution, so it reported `critic_available=False` on a fully and correctly
+# provisioned skill -- a fabricated contract, which is worse than an honest
+# absence because it also sent the manifest looking for a file upstream never
+# shipped.
+#
+# The Node interpreter is resolved from the application-owned pinned CLI table
+# (the same mechanism that runs shadcn and transitions-dev), never from an
+# arbitrary PATH binary and never from an npm shim inside the project.
 
-#: ``platform.system()``/``platform.machine()`` pairs this application supports.
-PLATFORM_ENGINE_IDS: Dict[Tuple[str, str], str] = {
-    ("darwin", "arm64"): "darwin-arm64",
-    ("darwin", "x86_64"): "darwin-x64",
-    ("linux", "x86_64"): "linux-x64",
-    ("linux", "arm64"): "linux-arm64",
-    ("windows", "x86_64"): "windows-x64",
-    ("windows", "arm64"): "windows-arm64",
-}
-
-#: Executable suffix per platform. Windows needs the extension or the spawn
-#: fails; POSIX must NOT have it.
-_WINDOWS = "windows"
+#: Skill-root-relative entrypoints, in the order the launcher chain tries them.
+#: The first is the shipped Hermes entrypoint; the second is the detector facade
+#: it imports. Both must exist, so a partial provisioning fails honestly.
+ENGINE_ENTRYPOINTS: Tuple[str, ...] = (
+    "scripts/detect.mjs",
+    "scripts/detector/detect-antipatterns.mjs",
+)
 
 
-def resolve_platform_engine_id(system: str, machine: str) -> Optional[str]:
-    """The engine directory id for ``(system, machine)``, or ``None``.
+def engine_relative_paths() -> Tuple[str, ...]:
+    """Every skill-root-relative path the engine consists of."""
+    return ENGINE_ENTRYPOINTS
 
-    ``None`` means "this platform is not one we ship an engine for". Callers
-    MUST treat that as "no critic available", never as "try something else".
+
+def resolve_engine_path(skill_root: Path) -> Optional[Path]:
+    """The engine entrypoint inside ``skill_root``, or ``None``.
+
+    Every entrypoint must be a contained, existing, non-empty regular file, so a
+    half-provisioned skill (docs without a detector, or a detector without its
+    facade) is an honest absence rather than a runtime failure. Containment is
+    checked on the RESOLVED path: a symlink inside the skill pointing outside it
+    is refused before anything executes.
     """
-    if not isinstance(system, str) or not isinstance(machine, str):
+    root = Path(skill_root)
+    try:
+        resolved_root = root.resolve()
+    except (OSError, RuntimeError):
         return None
-    return PLATFORM_ENGINE_IDS.get((system, machine))
 
-
-def engine_relative_path(platform_id: str, system: str) -> str:
-    """The skill-root-relative path to the engine binary for ``platform_id``.
-
-    Separate from :func:`resolve_platform_engine_id` so the EXECUTABLE-name
-    decision (``.exe`` or not) lives in exactly one place. Returns ``""`` for a
-    falsy ``platform_id`` so an unmapped platform produces no path at all rather
-    than a path containing an empty segment.
-    """
-    if not platform_id:
-        return ""
-    binary = "impeccable.exe" if system == _WINDOWS else "impeccable"
-    return f"scripts/bin/{platform_id}/{binary}"
-
-
-def current_platform_engine_id() -> Optional[str]:
-    """This host's engine directory id, or ``None`` if unmapped.
-
-    Reads :mod:`platform` lazily inside the function so a test can patch it and
-    so importing this module has no side effect.
-    """
-    import platform as _platform
-
-    return resolve_platform_engine_id(_platform.system(), _platform.machine())
+    for relative in ENGINE_ENTRYPOINTS:
+        path = root / relative
+        # A missing, EMPTY, or non-regular entrypoint is not an engine. The
+        # chain is checked in full so a half-provisioned skill -- docs without
+        # a detector, or an entrypoint without the facade it imports -- is an
+        # honest absence rather than something that fails at run time.
+        if not _is_readable_file(path):
+            return None
+        try:
+            # Containment on the RESOLVED path: a symlink inside the skill
+            # pointing outside it is refused before anything executes.
+            Path(path).resolve().relative_to(resolved_root)
+        except (OSError, ValueError, RuntimeError):
+            return None
+    return root / ENGINE_ENTRYPOINTS[0]
 
 
 # ---------------------------------------------------------------------------
@@ -499,6 +542,8 @@ def _catalog_capability(
     retrieval_requires_auth: bool,
     credential_names: Sequence[str],
     install_available: bool,
+    adapter_exists: bool,
+    reviewed_components: int = 0,
 ) -> ResourceActivationCapability:
     """A remote catalog resource (21st, React Bits).
 
@@ -515,31 +560,41 @@ def _catalog_capability(
     auth_present = credential_present(credential_names) if credential_names else False
 
     reasons: List[str] = []
-    if metadata_without_auth:
+    if not adapter_exists:
+        # The declaration alone cannot confer discovery. Without a live
+        # adapter nothing can list this catalog, so reporting it would
+        # repeat the exact lie this repair removes.
+        reasons.append(REASON_NO_LIVE_ADAPTER)
+    elif metadata_without_auth:
         reasons.append(REASON_CATALOG_REACHABLE)
     if auth_required:
         reasons.append(
             REASON_AUTH_PRESENT if auth_present else REASON_AUTH_REQUIRED
         )
-    if not metadata_without_auth and not auth_required:
+    if not metadata_without_auth and not auth_required and adapter_exists:
         reasons.append(REASON_NO_OFFICIAL_MECHANISM)
+    if install_available and reviewed_components <= 0:
+        # An install capability with nothing reviewed is not a capability.
+        reasons.append(REASON_NO_REVIEWED_COMPONENT)
+
+    discovery = adapter_exists and metadata_without_auth
+    install = install_available and reviewed_components > 0
 
     return ResourceActivationCapability(
         resource_id=resource_id,
-        discovery_available=metadata_without_auth,
+        discovery_available=discovery,
         # Retrieval follows the credential only when it is actually required.
-        retrieval_available=metadata_without_auth and (
+        retrieval_available=discovery and (
             not auth_required or auth_present
         ),
-        install_available=install_available and (
-            not auth_required or auth_present
-        ),
+        install_available=install and (not auth_required or auth_present),
         critic_available=False,
         authentication_required=auth_required,
         authentication_present=auth_present,
         locally_provisioned=False,
-        # Free metadata working is the designed state, not a degradation.
-        degraded=not metadata_without_auth,
+        # Free metadata working is the designed state; a MISSING adapter is
+        # a genuine reduction in what this build can do.
+        degraded=not discovery,
         reasons=_dedupe(reasons),
     )
 
@@ -573,45 +628,37 @@ def _impeccable_capability(
     system: str,
     machine: str,
 ) -> ResourceActivationCapability:
-    """Impeccable: provisioned skill PLUS a separately-verified platform engine.
+    """Impeccable: provisioned skill PLUS a verified Node detector engine.
 
     The critic is available only when BOTH hold:
 
     1. the STABLE skill artifacts verify (pinned by the manifest, cross-platform
        and OS-agnostic), and
-    2. the engine for the CURRENT platform exists as a contained file.
+    2. the shipped Node detector entrypoints exist as contained regular files.
 
-    The engine path is derived through the closed platform mapping, never from
-    the manifest and never from a literal. A missing engine yields
-    ``critic_available=False`` with a static reason -- and explicitly does NOT
-    fall back to the npm shim, which would download an opaque binary into the
-    user home from inside a build.
+    The engine is CROSS-PLATFORM, so ``system``/``machine`` are accepted for call
+    signature compatibility and deliberately NOT consulted: there is no
+    per-platform artifact to resolve, and inventing one would report a correctly
+    provisioned skill as unavailable on every host that differs from the one the
+    mapping happened to be written on.
+
+    A missing engine yields ``critic_available=False`` with a static reason, and
+    explicitly does NOT download anything: no clone, no artifact fetch, no npm
+    shim inside the project, no fallback to an arbitrary PATH binary. An absent
+    engine is a provisioning state an operator fixes by provisioning the skill,
+    and reaching for an interpreter instead would mean executing something that
+    was never reviewed.
     """
+    del system, machine  # cross-platform engine; nothing to resolve per-OS
+
     present, verified = verify_local_skill(hermes_home, resource)
     if not present:
         return _absent(resource_id, [REASON_SKILL_NOT_PROVISIONED])
     if not verified:
         return _absent(resource_id, [REASON_SKILL_ARTIFACTS_MISSING])
 
-    platform_id = resolve_platform_engine_id(system, machine)
-    if platform_id is None:
-        # An unmapped platform is not a reason to try something else.
-        return ResourceActivationCapability(
-            resource_id=resource_id,
-            locally_provisioned=True,
-            reasons=_dedupe([REASON_LOCALLY_PROVISIONED, REASON_ENGINE_MISSING]),
-        )
-
-    engine_rel = engine_relative_path(platform_id, system)
-    engine_path = design_profile_skills_dir(hermes_home) / resource.skill_name / engine_rel
-    engine_verified = _is_readable_file(engine_path)
-    if engine_verified:
-        try:
-            Path(engine_path).resolve().relative_to(
-                (design_profile_skills_dir(hermes_home) / resource.skill_name).resolve()
-            )
-        except (OSError, ValueError):
-            engine_verified = False
+    skill_root = design_profile_skills_dir(hermes_home) / str(resource.skill_name)
+    engine_verified = resolve_engine_path(skill_root) is not None
 
     if not engine_verified:
         return ResourceActivationCapability(
@@ -704,21 +751,33 @@ def activate_resource(
     if resource_id == "twenty_first":
         return _catalog_capability(
             resource_id,
-            # Upstream: `search` is metadata-only and free; `get_component` is paid.
+            # Upstream: `search` is metadata-only and free; `get_component` is
+            # paid. The free REST surface still requires a Bearer key, so
+            # discovery here is credential-gated exactly like retrieval --
+            # the upstream product is free, this application is not.
             metadata_without_auth=True,
             retrieval_requires_auth=True,
             credential_names=CREDENTIAL_ENV_NAMES["twenty_first"],
             install_available=True,
+            adapter_exists=_has_live_discovery_adapter(),
+            # Nothing is reviewed for 21st, so no component is installable.
+            reviewed_components=len(
+                approved_registry_components(SOURCE_TWENTY_FIRST)
+            ),
         )
     if resource_id == "react_bits":
-        # Upstream publishes a machine-readable catalog and a shadcn registry
-        # entry per component; no credential is required for either.
+        # Upstream publishes an agent index and a shadcn registry entry per
+        # component; no credential is required for either.
         return _catalog_capability(
             resource_id,
             metadata_without_auth=True,
             retrieval_requires_auth=False,
             credential_names=(),
             install_available=True,
+            adapter_exists=_has_live_discovery_adapter(),
+            reviewed_components=len(
+                approved_registry_components(SOURCE_REACT_BITS)
+            ),
         )
     if resource_id == "transitions_dev":
         return _pinned_cli_capability(resource_id)
@@ -781,17 +840,16 @@ def activate_design_resources(
 
 
 __all__ = [
-    "ACTIVATION_REASONS",
-    "CREDENTIAL_ENV_NAMES",
+        "ACTIVATION_REASONS",
+        "CREDENTIAL_ENV_NAMES",
+        "ENGINE_ENTRYPOINTS",
         "INSTALLABLE_ON_DEMAND",
-        "PLATFORM_ENGINE_IDS",
-    "DesignActivationReport",
-    "ResourceActivationCapability",
-    "activate_design_resources",
-    "activate_resource",
-    "credential_present",
-    "current_platform_engine_id",
-    "engine_relative_path",
-    "resolve_platform_engine_id",
-    "verify_local_skill",
+        "DesignActivationReport",
+        "ResourceActivationCapability",
+        "activate_design_resources",
+        "activate_resource",
+        "credential_present",
+        "engine_relative_paths",
+        "resolve_engine_path",
+        "verify_local_skill",
 ]

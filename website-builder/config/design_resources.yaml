@@ -97,25 +97,28 @@ resources:
     # There is NO repair path in either surface -- see design_critic's module
     # docstring.
     adapter: critic
-    # The official Impeccable skill ships a Hermes layout at
-    # .hermes/skills/impeccable/ in pbakaus/impeccable (CLI 4.1.0): SKILL.md,
-    # reference/*.md and scripts/impeccable.
+    # VERIFIED AGAINST THE OFFICIAL RELEASE (skill-v4.1.0) on a real host.
+    # pbakaus/impeccable publishes exactly ONE asset: `universal.zip`, 17,675,065
+    # bytes, sha256:a54d837f086ff2036ab0cf2cc2499249362d38fa27d42feb07d6248dfdd64a11.
+    # That archive has NO `scripts/bin/` directory, NO `scripts/impeccable`
+    # launcher, and no per-platform native binary of any kind. The git TAG of the
+    # same name is likewise source-only.
     #
-    # Provisioned EXPLICITLY (setup / deploy / profile update). A build never
-    # clones or updates it, and an absent skill is `unavailable_optional` --
-    # a degraded status that is never a startup failure.
+    # The Hermes layout is `.hermes/skills/impeccable/`: SKILL.md, reference/*.md,
+    # and `scripts/detect.mjs` -- a Node ESM entrypoint, not a native binary. It is
+    # CROSS-PLATFORM and identical on every host, so the engine needs no platform
+    # mapping here; `app.core.design_activation` verifies the Node engine's
+    # presence, and `app.core.design_critic` runs it.
     #
-    # CROSS-PLATFORM AND STABLE ONLY. No platform-specific literal appears here
-    # (no `scripts/bin/<os>-<arch>/...`): a manifest pinned to one OS would
-    # report the resource unavailable on every other OS, which is the exact
-    # "declares a capability it cannot deliver" failure this batch removes. The
-    # per-platform engine is resolved and verified SEPARATELY by
-    # app.core.design_activation through a CLOSED platform mapping.
+    # Provisioned EXPLICITLY (setup / deploy / profile update) at an
+    # application-owned version/ref with a verified artifact digest. A build never
+    # clones, downloads, or updates it. An absent skill is `unavailable_optional`
+    # -- a degraded status that is never a startup failure.
     data_entries:
       - SKILL.md
       - reference/critique.md
       - reference/audit.md
-      - scripts/impeccable
+      - scripts/detect.mjs
   refero:
     kind: skill
     required: false

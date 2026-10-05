@@ -31,7 +31,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.core.design_install import PINNED_CLIS, build_pinned_cli_prefix, is_contained
 from app.core.design_transitions import (
-    RECIPES_DIRNAME,
+        RECIPES_DIRNAME,
+    RECIPE_REQUIRED_SUFFIX,
+    RECIPE_SUFFIXES,
     TRANSITIONS_CLI_ID,
     WARNING_RECIPE_CATALOG_EMPTY,
     WARNING_RECIPE_CATALOG_MALFORMED,
@@ -253,8 +255,59 @@ def project(tmp_path) -> Path:
     return root
 
 
-def _materialize(project: Path, slug: str, suffixes=(".md", ".css")) -> None:
-    """A complete materialization: the CLI writes BOTH files per recipe."""
+#: The REAL ``transitions/card-resize.md`` body, transcribed from a live
+#: ``transitions-dev@0.3.0 add card-resize``. It matters that the CSS -- and the
+#: reduced-motion guard inside it -- is EMBEDDED in the Markdown: upstream emits
+#: no sibling ``.css``, so reduced-motion detection must read the recipe body
+#: rather than a companion file that does not exist.
+REAL_CARD_RESIZE_MARKDOWN = """# Card resize
+
+Scales a card up slightly while the pointer rests on it.
+
+## Usage
+
+```html
+<article class="card">...</article>
+```
+
+## Styles
+
+```css
+.card {
+  transition: transform 240ms cubic-bezier(0.2, 0, 0, 1);
+  will-change: transform;
+}
+
+.card:hover {
+  transform: scale(1.02);
+}
+```
+
+## Reduced motion
+
+```css
+@media (prefers-reduced-motion: reduce) {
+  .card {
+    transition: none;
+    transform: none;
+  }
+}
+```
+
+The `@media (prefers-reduced-motion: reduce)` guard at the bottom of the snippet
+is required -- keep it. It zeroes the transition for users who have asked for
+less motion at the OS level.
+
+## Orchestration
+
+Pair with a subtle shadow lift; do not stack with a scale on the same element.
+"""
+
+
+def _materialize(
+    project: Path, slug: str, suffixes=(RECIPE_REQUIRED_SUFFIX,)
+) -> None:
+    """A complete materialization: the CLI writes ONLY the Markdown."""
     target = project / RECIPES_DIRNAME
     target.mkdir(parents=True, exist_ok=True)
     for suffix in suffixes:
@@ -280,7 +333,7 @@ def test_a_destination_outside_the_project_verifies_nothing(project, tmp_path):
     """
     outside = tmp_path / "outside" / RECIPES_DIRNAME
     outside.mkdir(parents=True)
-    for suffix in (".md", ".css"):
+    for suffix in RECIPE_SUFFIXES:
         (outside / f"card-resize{suffix}").write_text("x\n", encoding="utf-8")
 
     assert verify_recipe_materialized(project, "card-resize", outside) == ()
@@ -323,14 +376,68 @@ def test_a_symlinked_recipes_dir_escaping_the_project_is_refused(project, tmp_pa
     assert approved_recipes_dir(project) is None
 
 
-def test_a_verified_recipe_reports_both_files(project):
+def test_a_verified_recipe_reports_the_markdown_alone(project):
+    """The REAL upstream result: one ``.md``, and no ``.css``.
+
+    Verified live against ``transitions-dev@0.3.0``: ``add card-resize``
+    writes only ``transitions/card-resize.md``. Requiring a companion CSS
+    file made every successful install fail verification.
+    """
     _materialize(project, "card-resize")
 
     verified = verify_recipe_materialized(
         project, "card-resize", approved_recipes_dir(project)
     )
 
+    assert verified == ("card-resize.md",)
+    assert not (project / RECIPES_DIRNAME / "card-resize.css").exists()
+
+
+def test_a_real_card_resize_recipe_verifies(project):
+    """Modeled on the real ``card-resize.md`` upstream materialized."""
+    _materialize(project, "card-resize")
+    recipe = project / RECIPES_DIRNAME / "card-resize.md"
+    recipe.write_text(REAL_CARD_RESIZE_MARKDOWN, encoding="utf-8")
+
+    verified = verify_recipe_materialized(
+        project, "card-resize", approved_recipes_dir(project)
+    )
+
+    assert verified == ("card-resize.md",)
+
+
+def test_an_optional_companion_is_verified_when_present(project):
+    """A companion upstream DID emit is accepted, and still contained.
+
+    Upstream emits no companion today, so the verifier's optional branch takes
+    an explicit suffix set. That keeps the "accept if present, never require"
+    rule reachable and testable without pretending `.css` is currently shipped.
+    """
+    _materialize(
+        project,
+        "card-resize",
+        suffixes=(RECIPE_REQUIRED_SUFFIX, ".css"),
+    )
+
+    verified = verify_recipe_materialized(
+        project,
+        "card-resize",
+        approved_recipes_dir(project),
+        optional_suffixes=(".css",),
+    )
+
     assert verified == ("card-resize.css", "card-resize.md")
+
+
+def test_an_optional_companion_is_not_required_by_default(project):
+    """The real, upstream-current shape: Markdown alone, and that is a success."""
+    _materialize(project, "card-resize")
+
+    verified = verify_recipe_materialized(
+        project, "card-resize", approved_recipes_dir(project)
+    )
+
+    assert verified == ("card-resize.md",)
 
 
 def test_a_missing_recipe_is_not_verified(project):
@@ -340,13 +447,61 @@ def test_a_missing_recipe_is_not_verified(project):
     )
 
 
-def test_a_partial_materialization_is_not_a_success(project):
-    """All-or-nothing: the caller builds immediately afterwards."""
+def test_a_missing_required_markdown_is_not_a_success(project):
+    """A companion alone does NOT satisfy the postcondition."""
     recipes = project / RECIPES_DIRNAME
     recipes.mkdir(parents=True)
-    (recipes / "card-resize.md").write_text("x\n", encoding="utf-8")
+    (recipes / "card-resize.css").write_text("x\n", encoding="utf-8")
 
     assert verify_recipe_materialized(project, "card-resize", recipes) == ()
+
+
+def test_a_companion_without_its_required_markdown_is_not_a_success(project):
+    """The required/optional distinction, in the only case it is observable.
+
+    With a companion present and the REQUIRED Markdown missing, the result must
+    still be empty. An implementation that treats every missing file as an
+    optional companion would return the companion's name here, which is exactly
+    reporting a partial materialization as a success.
+    """
+    recipes = project / RECIPES_DIRNAME
+    recipes.mkdir(parents=True)
+    (recipes / "card-resize.css").write_text("x\n", encoding="utf-8")
+
+    assert (
+        verify_recipe_materialized(
+            project, "card-resize", recipes, optional_suffixes=(".css",)
+        )
+        == ()
+    )
+
+
+def test_an_empty_markdown_is_not_a_success(project):
+    """A zero-byte recipe carries no transition at all."""
+    recipes = project / RECIPES_DIRNAME
+    recipes.mkdir(parents=True)
+    (recipes / "card-resize.md").write_text("", encoding="utf-8")
+
+    assert verify_recipe_materialized(project, "card-resize", recipes) == ()
+
+
+def test_a_directory_named_like_the_recipe_is_not_a_success(project):
+    recipes = project / RECIPES_DIRNAME
+    (recipes / "card-resize.md").mkdir(parents=True)
+
+    assert verify_recipe_materialized(project, "card-resize", recipes) == ()
+
+
+def test_no_css_is_ever_synthesized(project):
+    """Verification never writes; upstream owns what lands on disk."""
+    _materialize(project, "card-resize")
+
+    verify_recipe_materialized(
+        project, "card-resize", approved_recipes_dir(project)
+    )
+
+    written = sorted(p.name for p in (project / RECIPES_DIRNAME).iterdir())
+    assert written == ["card-resize.md"]
 
 
 def test_an_unrelated_file_cannot_satisfy_the_postcondition(project):

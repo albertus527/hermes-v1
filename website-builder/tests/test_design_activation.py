@@ -35,8 +35,9 @@ from app.core.design_activation import (
     ACTIVATION_REASONS,
     CREDENTIAL_ENV_NAMES,
     INSTALLABLE_ON_DEMAND,
-    PLATFORM_ENGINE_IDS,
     REASON_ENGINE_MISSING,
+    REASON_NO_LIVE_ADAPTER,
+    REASON_NO_REVIEWED_COMPONENT,
     REASON_ENGINE_VERIFIED,
     REASON_LOCALLY_PROVISIONED,
     REASON_SKILL_ARTIFACTS_MISSING,
@@ -45,9 +46,10 @@ from app.core.design_activation import (
     activate_design_resources,
     activate_resource,
     credential_present,
-    engine_relative_path,
-    resolve_platform_engine_id,
+    engine_relative_paths,
+    resolve_engine_path,
 )
+from app.core.design_activation import _has_live_discovery_adapter
 from app.core.design_resources import (
     DesignResource,
     load_design_resource_manifest,
@@ -242,15 +244,63 @@ def test_free_search_and_paid_retrieval_are_separate_axes(home, monkeypatch):
 
 
 def test_a_present_credential_enables_the_authenticated_axis(home, monkeypatch):
-    """Presence flips exactly the axes that credential gates -- and no more."""
+    """Presence flips exactly the axes a credential gates -- and no more.
+
+    It does NOT enable INSTALL. Nothing is reviewed for 21st.dev, so its install
+    axis is closed by review, not by the credential. The previous revision
+    asserted ``install_available is True`` off the back of a credential, which
+    claimed an install path for a source with an empty allowlist.
+    """
     monkeypatch.setenv("TWENTY_FIRST_API_KEY", "present-not-verified")
 
     capability = _activate(_manifest_resource(TWENTY_FIRST, skill_name="x"), home)
 
     assert capability.authentication_present is True
     assert capability.retrieval_available is True
-    assert capability.install_available is True
+    assert capability.install_available is False, (
+        "no 21st component is reviewed, so install must not be claimed"
+    )
+    assert REASON_NO_REVIEWED_COMPONENT in capability.reasons
     assert capability.degraded is False
+
+
+def test_discovery_is_only_reported_when_a_live_adapter_exists(home, monkeypatch):
+    """A declared catalog with no adapter behind it is not a capability.
+
+    The VPS-found defect: discovery was reported available purely because a
+    normalizer existed. This asserts the axis is now driven by the adapter.
+    """
+    import app.core.design_activation as activation
+
+    capability = _activate(_manifest_resource(REACT_BITS, skill_name="x"), home)
+    assert capability.discovery_available is True, "the adapter exists in this build"
+
+    monkeypatch.setattr(activation, "_has_live_discovery_adapter", lambda: False)
+    without = _activate(_manifest_resource(REACT_BITS, skill_name="x"), home)
+
+    assert without.discovery_available is False
+    assert without.retrieval_available is False
+    assert without.degraded is True
+    assert REASON_NO_LIVE_ADAPTER in without.reasons
+
+
+def test_the_live_adapter_probe_is_local_and_socket_free():
+    """Capability resolution must never touch the network to answer."""
+    assert _has_live_discovery_adapter() is True
+
+    import app.core.design_catalog_fetch as fetch
+
+    source = Path(fetch.__file__).read_text(encoding="utf-8")
+    # The adapter module itself performs I/O, but the PROBE must not call it.
+    assert callable(fetch.discover_catalog)
+
+
+def test_react_bits_reports_install_because_one_component_is_reviewed(home):
+    """The install axis tracks review, and SplitText is reviewed."""
+    capability = _activate(_manifest_resource(REACT_BITS, skill_name="x"), home)
+
+    assert capability.install_available is True
+    assert REASON_NO_REVIEWED_COMPONENT not in capability.reasons
 
 
 def test_an_unauthenticated_resource_needs_no_credential(home, monkeypatch):
@@ -445,23 +495,28 @@ def _impeccable_resource() -> DesignResource:
     return _manifest_resource(
         IMPECCABLE,
         skill_name="impeccable",
-        data_entries=("SKILL.md", "reference/critique.md", "scripts/impeccable"),
+        data_entries=("SKILL.md", "reference/critique.md", "scripts/detect.mjs"),
     )
 
 
 def _provision_impeccable(home: Path, *, with_engine: bool, system="linux", machine="x86_64"):
+    """Provision the REAL verified layout: SKILL.md, reference, scripts/detect.mjs.
+
+    ``system``/``machine`` are accepted and ignored: the shipped detector is a
+    cross-platform Node ESM entrypoint, so there is no per-platform artifact.
+    """
+    del system, machine
     _make_skill(
         home,
         "impeccable",
-        files=("SKILL.md", "reference/critique.md", "scripts/impeccable"),
+        files=("SKILL.md", "reference/critique.md", "scripts/detect.mjs"),
     )
     if not with_engine:
         return
-    platform_id = resolve_platform_engine_id(system, machine)
-    assert platform_id is not None
-    engine = home / "skills" / "impeccable" / engine_relative_path(platform_id, system)
-    engine.parent.mkdir(parents=True, exist_ok=True)
-    engine.write_text("binary", encoding="utf-8")
+    for relative in engine_relative_paths():
+        engine = home / "skills" / "impeccable" / relative
+        engine.parent.mkdir(parents=True, exist_ok=True)
+        engine.write_text("// node entrypoint", encoding="utf-8")
 
 
 def test_critic_needs_the_stable_artifacts(home):
@@ -525,53 +580,94 @@ def test_a_missing_engine_never_downloads(home, monkeypatch):
     assert capability.authentication_required is False
 
 
-def test_an_unmapped_platform_yields_no_engine(home):
-    """An unmapped platform must not fall back to a literal path."""
+def test_the_engine_is_present_on_every_platform(home):
+    """The shipped detector is cross-platform, so no host is special.
+
+    Regression guard for the VPS-found defect: the official ``skill-v4.1.0``
+    release contains NO ``scripts/bin/`` and no native binary, so the previous
+    per-platform mapping reported a correctly provisioned skill as unavailable.
+    """
     _provision_impeccable(home, with_engine=True, system="linux", machine="x86_64")
 
-    capability = _activate(
-        _impeccable_resource(), home, system="plan9", machine="vax"
+    for system, machine in (
+        ("linux", "x86_64"),
+        ("linux", "arm64"),
+        ("darwin", "arm64"),
+        ("darwin", "x86_64"),
+        ("windows", "x86_64"),
+        ("windows", "arm64"),
+        ("plan9", "vax"),
+    ):
+        capability = _activate(
+            _impeccable_resource(), home, system=system, machine=machine
+        )
+        assert capability.critic_available is True, (system, machine)
+
+
+def test_an_incomplete_engine_layout_does_not_activate(home):
+    """A half-provisioned skill is an honest absence, not a partial critic.
+
+    The declared artifacts all verify, so the skill IS provisioned -- but the
+    detector facade its entrypoint imports is missing, so no critic is claimed
+    and the reason names the engine rather than the skill.
+    """
+    _make_skill(
+        home,
+        "impeccable",
+        files=("SKILL.md", "reference/critique.md", "scripts/detect.mjs"),
     )
 
+    capability = _activate(_impeccable_resource(), home)
+
     assert capability.critic_available is False
+    assert capability.retrieval_available is False
+    assert capability.locally_provisioned is True
     assert REASON_ENGINE_MISSING in capability.reasons
 
 
-def test_the_engine_path_is_resolved_through_a_closed_mapping():
-    """Never derived from the manifest, never a literal in code paths."""
-    assert resolve_platform_engine_id("linux", "x86_64") == "linux-x64"
-    assert resolve_platform_engine_id("darwin", "arm64") == "darwin-arm64"
-    assert resolve_platform_engine_id("windows", "x86_64") == "windows-x64"
-    assert resolve_platform_engine_id("linux", "riscv64") is None
-    assert resolve_platform_engine_id(None, "x86_64") is None
+def test_a_missing_engine_is_reported_without_downloading(home, monkeypatch):
+    """No clone, no artifact fetch, no npm shim, no PATH fallback."""
+    _make_skill(
+        home,
+        "impeccable",
+        files=("SKILL.md", "reference/critique.md", "scripts/detect.mjs"),
+    )
+    for module in ("socket", "urllib.request", "http.client"):
+        monkeypatch.setitem(sys.modules, module, None)
+
+    capability = _activate(_impeccable_resource(), home)
+
+    assert capability.critic_available is False
+    assert capability.locally_provisioned is True
+    assert REASON_ENGINE_MISSING in capability.reasons
+
+
+def test_the_engine_path_is_the_verified_cross_platform_entrypoint(home):
+    """The resolved layout is the one upstream actually ships."""
+    assert engine_relative_paths() == (
+        "scripts/detect.mjs",
+        "scripts/detector/detect-antipatterns.mjs",
+    )
+    assert resolve_engine_path(home / "skills" / "impeccable") is None
 
 
 def test_the_manifest_never_names_a_platform_specific_artifact():
     """A platform literal in the manifest would break every other platform."""
     resource = _impeccable_resource()
     for entry in resource.data_entries:
-        assert not any(
-            token in entry for token in PLATFORM_ENGINE_IDS.values()
-        ), entry
         assert "bin/" not in entry, entry
+        assert not any(
+            token in entry
+            for token in ("darwin-arm64", "linux-x64", "windows-x64", "linux-arm64")
+        ), entry
 
 
-def test_the_engine_suffix_follows_the_platform():
-    assert engine_relative_path("windows-x64", "windows").endswith(".exe")
-    assert not engine_relative_path("linux-x64", "linux").endswith(".exe")
-    assert engine_relative_path("", "linux") == "", "an unmapped platform yields no path"
+def test_the_shipped_manifest_pins_the_verified_engine_entrypoint(manifest):
+    """The manifest names the real Node entrypoint, not a launcher that is absent."""
+    resource = manifest.resources[IMPECCABLE]
+    assert "scripts/detect.mjs" in resource.data_entries
+    assert "scripts/impeccable" not in resource.data_entries
 
-
-def test_the_windows_engine_is_verified_on_a_windows_host(home):
-    """The mapping is exercised per platform, not only on this host."""
-    _provision_impeccable(home, with_engine=True, system="windows", machine="x86_64")
-
-    capability = _activate(_impeccable_resource(), home, system="windows", machine="x86_64")
-
-    assert capability.critic_available is True
-
-
-# ---------------------------------------------------------------------------
 # Bounded, deterministic serialization
 # ---------------------------------------------------------------------------
 

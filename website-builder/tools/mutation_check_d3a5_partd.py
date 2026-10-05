@@ -337,12 +337,17 @@ MUTATIONS = [
         # A partial materialization leaves the caller importing a recipe whose
         # CSS was never written; the build fails far from the cause.
     (
-        "a partial recipe materialization is not a success",
+        "a missing required recipe artifact is not a success",
         TRANSITIONS,
-        """            if not candidate.is_file():
+        """        required = suffix == RECIPE_REQUIRED_SUFFIX
+        if not candidate.exists():
+            if required:
                 return ()""",
-        """            if not candidate.is_file():
-                continue""",
+        """        required = suffix == RECIPE_REQUIRED_SUFFIX
+        if not candidate.exists():
+            # MUTATED: a missing required artifact is treated as an
+            # optional companion, so a partial materialization would pass.
+            continue""",
     ),
     # --- 24. verification requires containment under the project ---------
         # Otherwise a symlinked recipe file writes through to a location the

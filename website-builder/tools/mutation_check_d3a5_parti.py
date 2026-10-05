@@ -40,7 +40,9 @@ ROOT = Path(__file__).resolve().parents[1]
 IGNORED = shutil.ignore_patterns("__pycache__", "*.pyc", ".git", ".venv", "venv")
 
 CRITIC_TESTS = "tests/test_design_critic.py"
+ACTIVATION_TESTS = "tests/test_design_activation.py"
 CRITIC = "app/core/design_critic.py"
+ACTIVATION = "app/core/design_activation.py"
 
 MUTATIONS = [
     # --- 1. a scan failure must never be a clean report ------------------
@@ -79,13 +81,13 @@ MUTATIONS = [
         return CriticOutcome(ok=False, reasons=("output_empty",))""",
         """        return CriticOutcome(ok=True)""",
     ),
-    # --- 5. a missing engine is an absence, not a pass ------------------
+    # --- 5. a missing engine or interpreter is an absence, not a pass ---
     (
         "an unresolved engine is reported, never a pass",
         CRITIC,
-        """    if engine_path is None:
+        """    if engine_path is None or not isinstance(node_executable, str) or not node_executable.strip():
         return CriticOutcome(ok=False, reasons=("engine_unavailable",))""",
-        """    if engine_path is None:
+        """    if engine_path is None or not isinstance(node_executable, str) or not node_executable.strip():
         return CriticOutcome(ok=True)""",
     ),
     # --- 6. a finding without identity must be dropped ------------------
@@ -132,29 +134,48 @@ MUTATIONS = [
         """    return text.strip()""",
     ),
     # --- 11. an engine outside the skill root is refused ----------------
+    #
+    # The resolver now lives ONCE in design_activation, which encodes the
+    # VERIFIED cross-platform Node entrypoint chain; design_critic re-exports
+    # it. Two copies would drift, and the drifted copy is what previously
+    # reported a correctly provisioned skill as unavailable.
     (
         "an engine resolving outside the skill is refused",
-        CRITIC,
-        """        if not is_contained(Path(skill_root), candidate):
-            logger.warning("Refused an Impeccable engine outside the skill root.")
+        ACTIVATION,
+        """        try:
+            # Containment on the RESOLVED path: a symlink inside the skill
+            # pointing outside it is refused before anything executes.
+            Path(path).resolve().relative_to(resolved_root)
+        except (OSError, ValueError, RuntimeError):
             return None""",
-        """        pass""",
+        """        try:
+            # Containment on the RESOLVED path: a symlink inside the skill
+            # pointing outside it is refused before anything executes.
+            pass
+        except (OSError, ValueError, RuntimeError):
+            return None""",
     ),
-    # --- 12. the engine must be a real file ------------------------------
+    # --- 12. the engine must be a real, non-empty file ------------------
     (
-        "a non-file engine path is refused",
-        CRITIC,
-        """        if not candidate.is_file():
+        "a non-file or empty engine path is refused",
+        ACTIVATION,
+        """        if not _is_readable_file(path):
             return None""",
-        """        if not candidate.exists():
+        """        if not path.exists():
             return None""",
     ),
-    # --- 13. the argv is fixed ------------------------------------------
+    # --- 13. the argv is fixed and takes no caller fragment ------------
     (
         "the critic argv takes no caller-supplied fragment",
         CRITIC,
-        """    return (str(engine_path),) + CRITIC_ARGV_SUFFIX""",
-        """    return (str(engine_path),) + CRITIC_ARGV_SUFFIX + ("--fix",)""",
+        """    return (
+        str(node_executable),
+        str(engine_path),
+    ) + CRITIC_ENGINE_ARGV_SUFFIX""",
+        """    return (
+        str(node_executable),
+        str(engine_path),
+    ) + CRITIC_ENGINE_ARGV_SUFFIX + (FIX,)""",
     ),
     # --- 14. the engine is never a shell word ---------------------------
     (
@@ -221,6 +242,16 @@ def main():
     for label, relative, present, replacement in MUTATIONS:
         target = ROOT / relative
         original = target.read_text(encoding="utf-8")
+        # The engine resolver moved into design_activation, but its guards are
+        # exercised from BOTH test files (the critic tests cover the empty-file
+        # and symlink-escape cases directly). Run both so a strong guard is never
+        # reported as "surviving" for want of a test that happens to live in the
+        # other file.
+        tests = CRITIC_TESTS
+        if str(relative).endswith("design_activation.py"):
+            # A TUPLE, not a joined string: run_tests passes these straight to
+            # pytest, and a single "a b" argument would be read as one filename.
+            tests = (CRITIC_TESTS, ACTIVATION_TESTS)
 
         if present not in original:
             print(f"[ANCHOR-MISS] {label}")
@@ -236,9 +267,16 @@ def main():
         with tempfile.TemporaryDirectory() as tmp:
             work = Path(tmp) / "tree"
             shutil.copytree(ROOT, work, ignore=IGNORED)
-            (work / relative).write_text(mutated, encoding="utf-8")
+            destination = work / relative
+            # Guard: the mutation MUST land in the temp copy. An absolute
+            # `relative` would resolve outside `work` and silently edit the
+            # real source tree, leaving mutated code behind for the next run.
+            if not destination.resolve().is_relative_to(work.resolve()):
+                print(f"[ABORT]      {label} -- target escapes the temp tree")
+                return 1
+            destination.write_text(mutated, encoding="utf-8")
 
-            code, tail = run_tests(work, CRITIC_TESTS)
+            code, tail = run_tests(work, tests)
             if code == 0:
                 print(f"[SURVIVED]   {label} -- tests still pass without this guard")
                 unproven.append(f"{label}: tests still pass without this guard")

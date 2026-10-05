@@ -129,19 +129,43 @@ def resolve_dependency_requirements(
 # unreviewed component out of a build.
 
 #: source -> canonical path suffix template. The placeholders are
-#: ``{component}`` (a validated component identity) and nothing else. Substituted
-#: with :func:`_format_locator`, which validates BOTH halves before joining.
+#: ``{component}`` (a validated component identity) and ``{variant}`` (an
+#: application-owned registry variant, where the source has variants). Both are
+#: validated before substitution by :func:`_format_locator`.
+#:
+#: **React Bits carries a variant, and that is verified, not assumed.** Upstream's
+#: own agent documentation states the shadcn install form is
+#: ``https://reactbits.dev/r/<Component>-<LANG>-<STYLE>`` with ``<LANG>`` in
+#: ``JS|TW``... concretely ``JS``/``TS`` and ``<STYLE>`` in ``CSS|TW``. Probed
+#: live: ``/r/SplitText-JS-CSS`` returns a real ``registry-item`` JSON document,
+#: while the bare ``/r/SplitText`` returns the marketing HTML page -- an HTML
+#: document handed to ``shadcn add`` would not be a registry item at all.
 _LOCATOR_TEMPLATES: Dict[str, str] = {
     SOURCE_TWENTY_FIRST: "https://21st.dev/r/{component}",
-    SOURCE_REACT_BITS: "https://reactbits.dev/r/{component}",
+    SOURCE_REACT_BITS: "https://reactbits.dev/r/{component}-{variant}",
 }
+
+#: Registry variants React Bits publishes, as the two-part ``LANG``/``STYLE``
+#: suffix its own docs specify. Application-owned and closed: a variant is never
+#: taken from a remote payload, because the payload proposes and this table
+#: decides. ``TS`` + ``TW`` (TypeScript + Tailwind) is the default this
+#: application installs, matching the shadcn/Tailwind toolchain the generated
+#: sites use.
+REACT_BITS_VARIANT = "TS-TW"
 
 #: Reviewed components per source. Kept small and explicit on purpose: an
 #: allowlist that grew to mirror the whole upstream catalog would stop being a
 #: review and become a copy.
+#:
+#: Exactly ONE React Bits component is reviewed so far, ``SplitText``. Its
+#: canonical locator ``https://reactbits.dev/r/SplitText-TS-TW`` was probed and
+#: confirmed to serve a real shadcn ``registry-item`` document whose declared
+#: dependencies are ``gsap`` and ``@gsap/react``. Both are in the closed
+#: dependency allowlist, which is why this component -- and only reviewed
+#: components like it -- is installable.
 _APPROVED_COMPONENTS: Dict[str, frozenset] = {
     SOURCE_TWENTY_FIRST: frozenset(),
-    SOURCE_REACT_BITS: frozenset(),
+    SOURCE_REACT_BITS: frozenset({"SplitText"}),
 }
 
 #: Component identities are PascalCase (React Bits' own convention, e.g.
@@ -174,20 +198,41 @@ def _format_locator(source: str, component_id: str) -> Optional[str]:
     re-validated as a whole against the source's host. Both halves matter: the
     first stops traversal at the identity, the second stops a template that was
     edited to point somewhere else.
+
+    ``{variant}`` is filled from :data:`REACT_BITS_VARIANT`, an
+    application-owned constant -- never from the caller and never from a remote
+    payload. A remote catalog proposing a different variant does not get to
+    choose one; it cannot reach this function with a URL at all.
     """
     template = _LOCATOR_TEMPLATES.get(source)
     if template is None or not component_id_is_well_formed(component_id):
         return None
-    locator = template.format(component=component_id)
+
+    try:
+        locator = template.format(component=component_id, variant=REACT_BITS_VARIANT)
+    except (KeyError, IndexError):
+        logger.error("A registry locator template has an unexpected placeholder; refusing.")
+        return None
 
     expected_host = REGISTRY_HOSTS.get(source)
     if not expected_host or not locator.startswith(f"https://{expected_host}/"):
         logger.error("A registry locator resolved outside its source's host; refusing.")
         return None
-    if not locator.endswith(component_id):
-        # A trailing-segment check catches a template that appends something of
-        # its own, which would silently change what gets installed.
-        logger.error("A registry locator did not end with its component id; refusing.")
+
+    # The tail must be EXACTLY what this source's documented form is, and the
+    # expected string is rebuilt from host + tail rather than read back out of
+    # the template. A template edited to append a suffix of its own would
+    # otherwise make this check agree with itself.
+    expected_tail = (
+        f"{component_id}-{REACT_BITS_VARIANT}"
+        if source == SOURCE_REACT_BITS
+        else component_id
+    )
+    if locator != f"https://{expected_host}/r/{expected_tail}":
+        logger.error(
+            "A registry locator did not match its source's canonical form; "
+            "refusing."
+        )
         return None
     return locator
 

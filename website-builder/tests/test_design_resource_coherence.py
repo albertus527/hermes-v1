@@ -98,22 +98,22 @@ def _provision(hermes_home: Path, manifest, resource_id: str) -> Path:
 
 
 def _provision_impeccable(
-    hermes_home: Path, manifest, *, system: str, machine: str
+    hermes_home: Path, manifest, *, system: str, machine: str, with_engine: bool = True
 ) -> Path:
-    """Provision Impeccable's skill, plus its engine only if one is mapped."""
-    from app.core.design_activation import (
-        engine_relative_path,
-        resolve_platform_engine_id,
-    )
+    """Provision Impeccable's skill plus its cross-platform Node engine.
+
+    ``system``/``machine`` are accepted and ignored: the shipped detector is the
+    same Node ESM entrypoint on every platform, so there is no per-OS artifact.
+    """
+    del system, machine
+    from app.core.design_activation import engine_relative_paths
 
     home = _provision(hermes_home, manifest, "impeccable")
-    platform_id = resolve_platform_engine_id(system, machine)
-    if platform_id:
-        engine = home / "skills" / "impeccable" / engine_relative_path(
-            platform_id, system
-        )
-        engine.parent.mkdir(parents=True, exist_ok=True)
-        engine.write_text("#!/bin/sh\n", encoding="utf-8")
+    if with_engine:
+        for relative in engine_relative_paths():
+            engine = home / "skills" / "impeccable" / relative
+            engine.parent.mkdir(parents=True, exist_ok=True)
+            engine.write_text("// node entrypoint\n", encoding="utf-8")
     return home
 
 
@@ -284,20 +284,11 @@ def test_impeccable_reports_a_critic_only_when_provisioned(manifest, tmp_path):
 
 
 def test_impeccable_activates_once_the_skill_and_engine_exist(manifest, tmp_path):
-    from app.core.design_activation import (
-        PLATFORM_ENGINE_IDS,
-        engine_relative_path,
-        resolve_platform_engine_id,
-    )
+    """The verified engine layout activates, and only if complete."""
+    from app.core.design_activation import engine_relative_paths
 
-    # The platform id must come from the CLOSED mapping, not from picking the
-    # first entry -- an unmapped (system, machine) pair must produce no engine.
-    platform_id = resolve_platform_engine_id(HOST["system"], HOST["machine"])
-    assert platform_id is not None
-    assert platform_id in PLATFORM_ENGINE_IDS.values()
-
-    relative = engine_relative_path(platform_id, HOST["system"])
-    assert relative
+    relative = engine_relative_paths()
+    assert relative, "the engine layout is application-owned and non-empty"
 
     home = _provision_impeccable(
         tmp_path, manifest, system=HOST["system"], machine=HOST["machine"]
@@ -309,17 +300,41 @@ def test_impeccable_activates_once_the_skill_and_engine_exist(manifest, tmp_path
     assert capability.locally_provisioned is True
 
 
-def test_an_unmapped_platform_gets_no_engine_and_no_fabricated_one(
+def test_the_critic_is_available_on_a_platform_with_no_upstream_binary(
     manifest, tmp_path
 ):
-    """An unmapped (os, arch) must yield None -- never a best-guess path."""
-    _provision_impeccable(tmp_path, manifest, system="Linux", machine="pdp11")
+    """Regression guard for the VPS-found defect.
 
-    capability = activate_design_resources(
-        tmp_path, manifest, system="Linux", machine="pdp11"
-    ).capabilities["impeccable"]
+    The official skill-v4.1.0 release ships NO ``scripts/bin/`` and no native
+    binary. A platform-specific engine mapping therefore reported a correctly
+    provisioned skill as unavailable on every host. There is no unmapped
+    platform now, because there is no per-platform artifact at all.
+    """
+    for system, machine in (("Linux", "pdp11"), ("Plan9", "vax"), ("Windows", "arm64")):
+        home = _provision_impeccable(
+            tmp_path / f"{system}-{machine}",
+            manifest,
+            system=system,
+            machine=machine,
+        )
+        capability = activate_design_resources(
+            home, manifest, system=system, machine=machine
+        ).capabilities["impeccable"]
+
+        assert capability.critic_available is True, (system, machine)
+
+
+def test_a_skill_without_the_engine_reports_no_critic(manifest, tmp_path):
+    """Honest absence: provisioned, but no engine, and no download attempted."""
+    home = _provision_impeccable(
+        tmp_path, manifest, system=HOST["system"], machine=HOST["machine"],
+        with_engine=False,
+    )
+
+    capability = _activate(home, manifest).capabilities["impeccable"]
 
     assert capability.critic_available is False
+    assert capability.locally_provisioned is True
     assert capability.reasons
 
 
@@ -339,11 +354,13 @@ def test_the_impeccable_engine_is_not_a_pinned_npm_cli():
 
 
 def test_the_critic_argv_names_no_package():
-    """The engine is a real binary, not an `npm exec` invocation."""
-    argv = build_critic_argv(Path("/skills/impeccable/scripts/bin/x/impeccable"))
+    """The engine is the skill's own Node entrypoint, never `npm exec`."""
+    argv = build_critic_argv("/usr/bin/node", Path("/skills/impeccable/scripts/detect.mjs"))
 
     assert "npm" not in argv
-    assert argv[1:] == CRITIC_ARGV_SUFFIX
+    assert "npx" not in argv
+    assert argv[0] == "/usr/bin/node"
+    assert argv[2:] == CRITIC_ARGV_SUFFIX
 
 
 def test_three_requires_its_companion_package():

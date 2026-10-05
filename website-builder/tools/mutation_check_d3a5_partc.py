@@ -77,29 +77,16 @@ MUTATIONS = [
     (
         "free metadata search stays available without a credential",
         ACTIVATION,
-        """    return ResourceActivationCapability(
-        resource_id=resource_id,
-        discovery_available=metadata_without_auth,
-        # Retrieval follows the credential only when it is actually required.
-        retrieval_available=metadata_without_auth and (
-            not auth_required or auth_present
-        ),""",
-        """    return ResourceActivationCapability(
-        resource_id=resource_id,
-        discovery_available=metadata_without_auth and (
-            not auth_required or auth_present
-        ),
-        # Retrieval follows the credential only when it is actually required.
-        retrieval_available=metadata_without_auth and (
-            not auth_required or auth_present
-        ),""",
+        """    discovery = adapter_exists and metadata_without_auth""",
+        """    discovery = adapter_exists and metadata_without_auth and (
+        not auth_required or auth_present
+    )""",
     ),
     # --- 3. a designed free tier is not a degradation --------------------
     (
         "an absent paid tier does not degrade a working free baseline",
         ACTIVATION,
-        """        # Free metadata working is the designed state, not a degradation.
-        degraded=not metadata_without_auth,""",
+        """        degraded=not discovery,""",
         """        degraded=True,""",
     ),
     # --- 3b. the free baseline is never reported as credential-blocked --
@@ -207,25 +194,36 @@ MUTATIONS = [
             critic_available=True,
             locally_provisioned=True,""",
     ),
-    # --- 10. the engine path comes from the closed mapping, not a literal -
+    # --- 10. the engine layout is the verified cross-platform chain ------
+    #
+    # Upstream ships NO native binary and NO per-platform directory, so the
+    # engine is one Node ESM entrypoint on every host. The mutation restores
+    # the fabricated per-OS layout the previous revision assumed.
     (
-        "the platform engine is resolved through a closed mapping",
+        "the engine layout is the verified cross-platform entrypoint chain",
         ACTIVATION,
-        """def engine_relative_path(platform_id: str, system: str) -> str:""",
-        """def engine_relative_path(platform_id: str, system: str) -> str:
-    if not platform_id:
-        return "scripts/bin/linux-x64/impeccable\"""",
+        """ENGINE_ENTRYPOINTS: Tuple[str, ...] = (
+    "scripts/detect.mjs",
+    "scripts/detector/detect-antipatterns.mjs",
+)""",
+        """ENGINE_ENTRYPOINTS: Tuple[str, ...] = (
+    "scripts/bin/linux-x64/impeccable",
+    "scripts/detector/detect-antipatterns.mjs",
+)""",
     ),
-    # --- 11. an unmapped platform yields no engine path -----------------
+    # --- 11. a missing engine file never yields a path -----------------
+    #
+    # There is no per-platform mapping to escape now, because upstream ships
+    # no native binary. The equivalent property is that an absent engine is an
+    # honest None rather than a fabricated path.
     (
-        "an unmapped platform produces no engine path at all",
+        "a missing engine file never yields a path",
         ACTIVATION,
-        """    if not platform_id:
-        return ""
-    binary = "impeccable.exe" if system == _WINDOWS else "impeccable\"""",
-        """    if not platform_id:
-        return "scripts/bin/linux-x64/impeccable"
-    binary = "impeccable.exe" if system == _WINDOWS else "impeccable\"""",
+        """        if not _is_readable_file(path):
+            return None""",
+        """        if not _is_readable_file(path):
+            fabricated = root / 'scripts/bin/linux-x64/impeccable'
+            return fabricated""",
     ),
     # --- 12. the reason vocabulary stays closed -------------------------
     (

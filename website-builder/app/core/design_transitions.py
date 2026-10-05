@@ -50,13 +50,34 @@ logger = logging.getLogger(__name__)
 #: assert the mapping is what actually gets used.
 TRANSITIONS_CLI_ID = "transitions_dev"
 
-#: Upstream writes recipes to ``./transitions/`` (its README documents ``--dir``
-#: to override). The default is what this application relies on, so it is
-#: recorded here rather than being inferred from a command's output.
+#: Upstream writes recipes to ``./transitions/`` (its ``--help`` documents
+#: ``--dir`` to override). The default is what this application relies on, so it
+#: is recorded here rather than being inferred from a command's output.
 RECIPES_DIRNAME = "transitions"
 
-#: Recipe file extensions upstream ships. Exact suffixes, never a prefix scan.
-RECIPE_SUFFIXES: Tuple[str, ...] = (".md", ".css")
+#: Recipe file extensions upstream ships, split by REQUIREMENT.
+#:
+#: Verified live against ``transitions-dev@0.3.0``: ``add card-resize`` reports
+#: ``Added Card resize -> transitions\card-resize.md`` and writes ONLY the
+#: Markdown. There is NO ``transitions/<slug>.css``. The recipe carries its CSS
+#: inline inside fenced ```css blocks in the Markdown, alongside the HTML usage,
+#: the transition rules, the orchestration notes, and the reduced-motion guard.
+#:
+#: The previous revision required BOTH ``.md`` and ``.css``, which meant a
+#: perfectly successful install failed verification on every single recipe. That
+#: is the fabrication this repair removes: the postcondition is now the real one.
+RECIPE_REQUIRED_SUFFIX: str = ".md"
+
+#: Companion files upstream MAY emit. Optional by construction: their absence is
+#: not a failure, and this application never synthesizes them. Upstream has no
+#: recipe that emits one, so the list is empty by default and exists so a future
+#: genuinely-shipped companion can be added without reintroducing a requirement.
+RECIPE_OPTIONAL_SUFFIXES: Tuple[str, ...] = ()
+
+#: Every suffix a materialized recipe may legitimately contain, required first.
+RECIPE_SUFFIXES: Tuple[str, ...] = (
+    RECIPE_REQUIRED_SUFFIX,
+) + RECIPE_OPTIONAL_SUFFIXES
 
 #: Bound on catalog entries. Upstream's manifest lists a few dozen; this is a
 #: ceiling against a payload that lists far more.
@@ -301,23 +322,46 @@ def approved_recipes_dir(project_root: Path) -> Optional[Path]:
 
 
 def verify_recipe_materialized(
-    project_root: Path, slug: str, recipes_dir: Optional[Path]
+    project_root: Path,
+    slug: str,
+    recipes_dir: Optional[Path],
+    *,
+    optional_suffixes: Sequence[str] = RECIPE_OPTIONAL_SUFFIXES,
 ) -> Tuple[str, ...]:
     """Which files for ``slug`` are present as contained regular files.
 
-    Returns ``()`` if ANY is missing: a partial materialization is not a success,
-    because the caller typechecks immediately afterwards and a missing recipe
-    fails the build. Only files whose names derive from the slug are accepted, so
-    a pre-existing unrelated file cannot satisfy the postcondition.
+    **The required artifact is ``transitions/<slug>.md`` and nothing more.**
+    Verified live: ``transitions-dev@0.3.0 add card-resize`` writes exactly one
+    file. A ``.css`` companion is accepted *if and only if* upstream emitted one,
+    and its absence is never a failure. Nothing is synthesized to make the set
+    look complete.
+
+    Returns ``()`` if the required Markdown is missing: a partial
+    materialization is not a success, because the caller typechecks immediately
+    afterwards and a missing recipe fails the build. Only files whose names
+    derive from the slug are accepted, so a pre-existing unrelated file cannot
+    satisfy the postcondition, and containment is checked on the resolved path so
+    a symlinked file cannot escape the project.
     """
     if recipes_dir is None or not recipe_slug_is_well_formed(slug):
         return ()
 
     verified: List[str] = []
-    for suffix in RECIPE_SUFFIXES:
+    for suffix in (RECIPE_REQUIRED_SUFFIX,) + tuple(optional_suffixes):
         candidate = Path(recipes_dir) / f"{slug}{suffix}"
+        required = suffix == RECIPE_REQUIRED_SUFFIX
+        if not candidate.exists():
+            if required:
+                return ()
+            # An OPTIONAL companion upstream did not emit. Not a failure.
+            continue
         try:
             if not candidate.is_file():
+                return ()
+            # A zero-byte artifact carries no recipe. Counting it as a success
+            # would report an install that produced nothing, and the caller
+            # typechecks immediately afterwards.
+            if candidate.stat().st_size <= 0:
                 return ()
             if not is_contained(project_root, candidate):
                 return ()
@@ -325,18 +369,26 @@ def verify_recipe_materialized(
             return ()
         verified.append(candidate.name)
 
-    if not verified:
-        return ()
+    # NOTE: no defensive re-check of the required name here. An earlier
+    # unreachable guard made the loop's `required` branch look redundant, and a
+    # guard nothing depends on is not a guard -- mutating it away changed
+    # nothing. The loop above is the single, load-bearing decision.
     return tuple(sorted(verified))
 
 
 def detect_reduced_motion_guard(recipe_text: str) -> bool:
     """Whether a recipe's text contains upstream's reduced-motion guard.
 
+    Verified live against the real ``card-resize.md``: the guard appears at
+    line 43 as a literal ``@media (prefers-reduced-motion: reduce) {`` INSIDE a
+    fenced ```css block, and is explained in prose on line 48. Because the CSS
+    is embedded in the Markdown rather than shipped beside it, detection runs
+    over the whole recipe body and needs no separate ``.css`` file.
+
     Reporting only. This function never INSERTS the guard, and a recipe without
     one is still a valid recipe: adding accessibility code to a third-party
-    transition after the fact would mean shipping motion behaviour upstream never
-    reviewed, under the guise of a safety improvement.
+    transition after the fact would mean shipping motion behaviour upstream
+    never reviewed, under the guise of a safety improvement.
     """
     if not isinstance(recipe_text, str):
         return False
@@ -346,6 +398,8 @@ def detect_reduced_motion_guard(recipe_text: str) -> bool:
 __all__ = [
     "MAX_RECIPE_ENTRIES",
     "RECIPES_DIRNAME",
+    "RECIPE_OPTIONAL_SUFFIXES",
+    "RECIPE_REQUIRED_SUFFIX",
     "RECIPE_SUFFIXES",
     "SUPPORTED_TIERS",
     "TIER_FREE",
