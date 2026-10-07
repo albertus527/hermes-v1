@@ -447,6 +447,18 @@ MUTATIONS = [
                 "project dependency."
             )""",
     ),
+    # 12d. The builtin registry packages are a SEPARATE set from the D2-selectable
+    #      dependencies. A registry helper must not be smuggled into the D2 set
+    #      (which would make it selectable).
+    (
+        "the builtin registry packages stay separate from the D2 dependencies",
+        INSTALL,
+        """DEPENDENCY_PACKAGES: Dict[str, str] = {
+    "gsap": "gsap",""",
+        """DEPENDENCY_PACKAGES: Dict[str, str] = {
+    "cn": "cn",
+    "gsap": "gsap",""",
+    ),
     # 12c. The reviewed contract's packages must be PRESENT, not just not-exceeded.
     (
         "a missing reviewed contract package is refused",

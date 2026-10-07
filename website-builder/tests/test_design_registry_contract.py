@@ -273,6 +273,51 @@ def test_reviewed_builtin_packages_are_all_exact_pinned():
             assert package in REGISTRY_INTRODUCED_PACKAGE_PINS, (component, package)
 
 
+def test_the_builtin_registry_packages_are_a_separate_application_owned_set():
+    """The pinned official shadcn builtin registry dependencies are a SEPARATE
+    application-owned set from the D2-selectable dependencies.
+
+    Three sets that must never be conflated:
+
+      A. DEPENDENCY_PACKAGES      -- D2-selectable ids a design decision may pick
+      B. builtin registry writes  -- what the pinned shadcn CLI writes (cn, radix-ui)
+      C. builtin registry imports -- what the CLI does NOT install (lucide-react)
+
+    B ∪ C is exactly REGISTRY_INTRODUCED_PACKAGE_PINS (its own table, not A), and
+    A shares no package NAME with B ∪ C. So a registry helper can never become
+    D2-selectable, and a D2 dependency can never be silently treated as a
+    registry-introduced helper.
+    """
+    from app.core.design_install import (
+        DEPENDENCY_PACKAGES,
+        REGISTRY_INTRODUCED_PACKAGE_PINS,
+        REVIEWED_BUILTIN_COMPONENT_DEPENDENCIES,
+        REVIEWED_BUILTIN_COMPONENT_IMPORTS,
+    )
+
+    d2_packages = set(DEPENDENCY_PACKAGES.values())
+
+    cli_written = set()
+    for packages in REVIEWED_BUILTIN_COMPONENT_DEPENDENCIES.values():
+        cli_written.update(packages)
+    source_imported = set()
+    for packages in REVIEWED_BUILTIN_COMPONENT_IMPORTS.values():
+        source_imported.update(packages)
+    registry_introduced = cli_written | source_imported
+
+    # B ∪ C is its own table, and equals exactly the registry-introduced set.
+    assert registry_introduced == set(REGISTRY_INTRODUCED_PACKAGE_PINS)
+    # No package NAME is shared between the D2 set and the registry set.
+    assert d2_packages.isdisjoint(registry_introduced)
+    # And the ids are distinct namespaces: a registry helper is not a D2 id.
+    for helper in registry_introduced:
+        assert helper not in DEPENDENCY_PACKAGES
+    # Concretely today.
+    assert cli_written == {"cn", "radix-ui"}
+    assert source_imported == {"lucide-react"}
+    assert d2_packages == {"gsap", "@gsap/react", "three", "lenis"}
+
+
 def test_the_pinned_cli_introduces_exactly_two_direct_packages():
     """The application-owned allowlist for DIRECT packages the pinned shadcn CLI
     writes into package.json. Verified live against shadcn@4.21.0: every builtin

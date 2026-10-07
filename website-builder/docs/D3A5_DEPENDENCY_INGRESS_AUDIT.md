@@ -116,6 +116,24 @@ from the external URL path:
 - `install_external_component` refuses a builtin request outright (no command),
   so the two paths cannot be crossed in either direction.
 
+### Four separate application-owned sets
+
+The dependency tables are deliberately **separate**, so a registry helper can
+never become D2-selectable and a D2 dependency can never be treated as a registry
+helper:
+
+| set | table | contents | role |
+|---|---|---|---|
+| **A** D2-selectable | `DEPENDENCY_PACKAGES` / `DEPENDENCY_PACKAGE_PINS` | `gsap`, `@gsap/react`, `three`, `lenis` (+ `@types/three` companion) | a design decision may pick these |
+| **B** builtin registry writes | `REVIEWED_BUILTIN_COMPONENT_DEPENDENCIES` | `cn`, `radix-ui` | what the pinned shadcn CLI writes |
+| **C** builtin registry imports | `REVIEWED_BUILTIN_COMPONENT_IMPORTS` (+ `REVIEWED_BUILTIN_COMPONENT_NESTED`) | `lucide-react` | what the CLI does NOT install; Hermes does |
+| **D** external contract | `_REVIEWED_COMPONENT_CONTRACTS` | `gsap`, `@gsap/react` | a reviewed external component's direct packages |
+
+The **pinned official shadcn builtin registry dependencies** (B ∪ C) are their own
+application-owned set, exactly `REGISTRY_INTRODUCED_PACKAGE_PINS` — **not** set A.
+No package NAME is shared between A and B ∪ C, and no registry helper is a D2 id.
+Proven by `test_the_builtin_registry_packages_are_a_separate_application_owned_set`.
+
 ### The external registry component path
 
 An external component's direct-package allowlist is its **reviewed contract**
