@@ -236,6 +236,24 @@ GET https://21st.dev/api/v1/components/search?q=<term>&scope=public&limit=24
 - **No fabrication.** A malformed or empty search response is a degraded empty
   result, never an invented entry.
 
+### The discovery-adapter probe is PER-SOURCE
+
+Introducing the 21st REST-search endpoint split discovery into two tables
+(`CATALOG_ENDPOINTS` for a plain index, `CATALOG_SEARCH_ENDPOINTS` for search).
+`_has_live_discovery_adapter()` was source-AGNOSTIC -- it only checked
+`CATALOG_ENDPOINTS` -- so a source's capability could be conferred by ANOTHER
+source's adapter:
+
+- 21st's adapter was INVISIBLE when only the search table was populated (its
+  capability reported absent though the endpoint existed).
+- 21st reported an adapter while having NO endpoint at all, because React Bits
+  happened to populate the other table.
+
+Fix: the probe takes a `source` and consults BOTH tables for THAT source. A
+source is "adapter-backed" only when an endpoint for the same source exists.
+Verified: a search-only source keeps its adapter; another source cannot confer
+one; an unknown source is absent.
+
 ### No unexpected package.json SECTION mutation
 
 An install may change the four reviewed dependency sections

@@ -66,12 +66,20 @@ from app.core.design_resources import (
 )
 
 
-def _has_live_discovery_adapter() -> bool:
-    """Whether a REAL, executable catalog discovery adapter is wired.
+def _has_live_discovery_adapter(source: str) -> bool:
+    """Whether a REAL, executable discovery adapter exists FOR ``source``.
 
     Answered from the application's own module surface, NOT from a network
     probe: importing this module must stay local, offline and socket-free, so
     "is there an adapter" has to be a static fact.
+
+    **Per-source, deliberately.** A source's discovery surface may be a plain
+    index endpoint (``CATALOG_ENDPOINTS``) OR an authenticated REST search
+    (``CATALOG_SEARCH_ENDPOINTS``). A source-agnostic check would confer one
+    source's capability on another -- reporting 21st's adapter available because
+    React Bits happens to populate a table, or vice versa. The question is
+    always "does THIS source have an endpoint this module can build a request
+    for", so both tables are consulted for the SAME source.
 
     ``design_catalog_fetch`` is the adapter. It is IMPORTED HERE on purpose:
     the import is local and pure (stdlib plus the offline normalizer), and it
@@ -83,10 +91,11 @@ def _has_live_discovery_adapter() -> bool:
         from app.core import design_catalog_fetch as _fetch
     except Exception:  # pragma: no cover - import failure is the answer
         return False
-    return bool(
-        getattr(_fetch, "CATALOG_ENDPOINTS", None)
-        and getattr(_fetch, "discover_catalog", None)
-    )
+    if not getattr(_fetch, "discover_catalog", None):
+        return False
+    index_endpoints = getattr(_fetch, "CATALOG_ENDPOINTS", None) or {}
+    search_endpoints = getattr(_fetch, "CATALOG_SEARCH_ENDPOINTS", None) or {}
+    return source in index_endpoints or source in search_endpoints
 
 logger = logging.getLogger(__name__)
 
@@ -879,7 +888,7 @@ def activate_resource(
             retrieval_requires_auth=True,
             credential_names=CREDENTIAL_ENV_NAMES["twenty_first"],
             install_available=True,
-            adapter_exists=_has_live_discovery_adapter(),
+            adapter_exists=_has_live_discovery_adapter(SOURCE_TWENTY_FIRST),
             # Nothing is reviewed for 21st, so no component is installable.
             reviewed_components=len(
                 approved_registry_components(SOURCE_TWENTY_FIRST)
@@ -894,7 +903,7 @@ def activate_resource(
             retrieval_requires_auth=False,
             credential_names=(),
             install_available=True,
-            adapter_exists=_has_live_discovery_adapter(),
+            adapter_exists=_has_live_discovery_adapter(SOURCE_REACT_BITS),
             reviewed_components=len(
                 approved_registry_components(SOURCE_REACT_BITS)
             ),

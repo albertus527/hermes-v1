@@ -282,7 +282,9 @@ def test_discovery_is_only_reported_when_a_live_adapter_exists(home, monkeypatch
     capability = _activate(_manifest_resource(REACT_BITS, skill_name="x"), home)
     assert capability.discovery_available is True, "the adapter exists in this build"
 
-    monkeypatch.setattr(activation, "_has_live_discovery_adapter", lambda: False)
+    monkeypatch.setattr(
+        activation, "_has_live_discovery_adapter", lambda _source: False
+    )
     without = _activate(_manifest_resource(REACT_BITS, skill_name="x"), home)
 
     assert without.discovery_available is False
@@ -293,7 +295,9 @@ def test_discovery_is_only_reported_when_a_live_adapter_exists(home, monkeypatch
 
 def test_the_live_adapter_probe_is_local_and_socket_free():
     """Capability resolution must never touch the network to answer."""
-    assert _has_live_discovery_adapter() is True
+    from app.core.design_registry import SOURCE_REACT_BITS
+
+    assert _has_live_discovery_adapter(SOURCE_REACT_BITS) is True
 
     import app.core.design_catalog_fetch as fetch
 
@@ -759,3 +763,50 @@ def test_the_report_covers_every_declared_resource(home, manifest):
     report = activate_design_resources(home, manifest, system="linux", machine="x86_64")
 
     assert set(report.capabilities) == set(manifest.resources)
+
+
+# ---------------------------------------------------------------------------
+# The discovery-adapter detector is PER-SOURCE
+# ---------------------------------------------------------------------------
+#
+# A source's discovery surface may be a plain index endpoint
+# (CATALOG_ENDPOINTS) OR an authenticated REST search
+# (CATALOG_SEARCH_ENDPOINTS). A source-agnostic check would confer one source's
+# capability on another -- the exact false positive this guards.
+
+
+def test_the_adapter_probe_is_per_source():
+    from app.core.design_registry import SOURCE_REACT_BITS, SOURCE_TWENTY_FIRST
+
+    assert _has_live_discovery_adapter(SOURCE_REACT_BITS) is True
+    assert _has_live_discovery_adapter(SOURCE_TWENTY_FIRST) is True
+    assert _has_live_discovery_adapter("some_other_source") is False
+
+
+def test_a_search_only_source_still_has_its_adapter(monkeypatch):
+    """21st's endpoint lives in the SEARCH table; the probe must see it."""
+    import app.core.design_catalog_fetch as fetch
+    from app.core.design_registry import SOURCE_REACT_BITS, SOURCE_TWENTY_FIRST
+
+    monkeypatch.setattr(fetch, "CATALOG_ENDPOINTS", {})
+    assert _has_live_discovery_adapter(SOURCE_TWENTY_FIRST) is True
+    assert _has_live_discovery_adapter(SOURCE_REACT_BITS) is False
+
+
+def test_another_source_cannot_confer_a_capability(monkeypatch):
+    """21st with NO endpoint is absent, even while React Bits is present."""
+    import app.core.design_catalog_fetch as fetch
+    from app.core.design_registry import SOURCE_REACT_BITS, SOURCE_TWENTY_FIRST
+
+    monkeypatch.setattr(fetch, "CATALOG_SEARCH_ENDPOINTS", {})
+    assert _has_live_discovery_adapter(SOURCE_TWENTY_FIRST) is False
+    assert _has_live_discovery_adapter(SOURCE_REACT_BITS) is True
+
+
+def test_a_missing_discover_function_is_absent_for_every_source(monkeypatch):
+    import app.core.design_catalog_fetch as fetch
+    from app.core.design_registry import SOURCE_REACT_BITS, SOURCE_TWENTY_FIRST
+
+    monkeypatch.setattr(fetch, "discover_catalog", None, raising=False)
+    assert _has_live_discovery_adapter(SOURCE_REACT_BITS) is False
+    assert _has_live_discovery_adapter(SOURCE_TWENTY_FIRST) is False

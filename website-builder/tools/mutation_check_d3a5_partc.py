@@ -132,6 +132,18 @@ MUTATIONS = [
             return True
     return False""",
     ),
+    # --- 5b. the adapter probe is PER-SOURCE ----------------------------
+    # A source-agnostic check would confer one source's capability on another.
+    (
+        "the discovery adapter probe is per-source",
+        ACTIVATION,
+        """    index_endpoints = getattr(_fetch, "CATALOG_ENDPOINTS", None) or {}
+    search_endpoints = getattr(_fetch, "CATALOG_SEARCH_ENDPOINTS", None) or {}
+    return source in index_endpoints or source in search_endpoints""",
+        """    index_endpoints = getattr(_fetch, "CATALOG_ENDPOINTS", None) or {}
+    search_endpoints = getattr(_fetch, "CATALOG_SEARCH_ENDPOINTS", None) or {}
+    return bool(index_endpoints or search_endpoints)""",
+    ),
     # --- 6. declared does not mean capable --------------------------------
     (
         "a declared-but-unactivated resource claims no capability",
