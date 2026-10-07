@@ -50,7 +50,13 @@ from app.core.design_install import (
     DEPENDENCY_PACKAGE_PINS,
     DEPENDENCY_PACKAGES,
     INSTALL_FAILED,
+    PINNED_CLIS,
+    REGISTRY_INTRODUCED_PACKAGE_PINS,
     REASON_COMPONENT_NOT_ALLOWED,
+    REVIEWED_BUILTIN_COMPONENT_DEPENDENCIES,
+    REVIEWED_BUILTIN_COMPONENT_IMPORTS,
+    REVIEWED_BUILTIN_COMPONENT_NESTED,
+    PackageSpec,
 )
 from app.core.design_npm_spec import (
     REJECTED_SPEC_LABEL,
@@ -356,6 +362,160 @@ def reviewed_component_contract(
     if not isinstance(source, str) or not isinstance(component_id, str):
         return None
     return _REVIEWED_COMPONENT_CONTRACTS.get((source, component_id))
+
+
+# ---------------------------------------------------------------------------
+# The trusted registry boundary -- a TYPE, consistent with D3a
+# ---------------------------------------------------------------------------
+#
+# D3a expresses a boundary as a frozen dataclass whose ``__post_init__`` makes
+# the invariant a property of CONSTRUCTION (see RegistryInstallRequest,
+# ReviewedComponentContract). This is the same idiom applied to the trust model
+# itself: one object holding every input the registry boundary TRUSTS, validated
+# on construction, so a drift in any trusted table fails HERE rather than
+# silently widening what a registry install may introduce.
+#
+# TRUSTED (these fields): sources, hosts, locator templates, approved
+# identities, reviewed contracts, the builtin allowlist and its reviewed
+# dep/import/nested rows, the exact registry-introduced pins, the pinned CLI.
+# UNTRUSTED (never a field here): the registry response -- the file it
+# materializes, its declared dependency fields, the ranges it writes, and the
+# emitted source's imports. Those are only ever compared against this object.
+
+
+@dataclass(frozen=True)
+class TrustedRegistryBoundary:
+    """The application-owned inputs the registry boundary trusts, as one type.
+
+    Constructing one validates that the trusted tables are closed and coherent.
+    A violation raises ``ValueError`` at construction -- the same fail-closed
+    shape D3a uses -- so an incoherent trust boundary cannot be assembled at all.
+    """
+
+    sources: Tuple[str, ...]
+    hosts: Mapping[str, str]
+    locator_templates: Mapping[str, str]
+    approved_components: Mapping[str, Tuple[str, ...]]
+    reviewed_contracts: Mapping[Tuple[str, str], ReviewedComponentContract]
+    builtin_components: Tuple[str, ...]
+    builtin_packages: Mapping[str, Tuple[str, ...]]
+    builtin_imports: Mapping[str, Tuple[str, ...]]
+    builtin_nested: Mapping[str, Tuple[str, ...]]
+    introduced_pins: Mapping[str, str]
+    shadcn_cli_spec: str
+
+    def __post_init__(self) -> None:
+        if not self.sources or len(set(self.sources)) != len(self.sources):
+            raise ValueError("registry sources must be a non-empty closed set")
+
+        # Every host names a source, and every NON-builtin source names a host.
+        for source in self.hosts:
+            if source not in self.sources:
+                raise ValueError(f"registry host for an unknown source: {source!r}")
+        for source in self.sources:
+            if source != SOURCE_SHADCN_BUILTIN and source not in self.hosts:
+                raise ValueError(f"a non-builtin source has no host: {source!r}")
+
+        # A locator template exists for exactly the hosted sources.
+        if set(self.locator_templates) != set(self.hosts):
+            raise ValueError("locator templates must exist for exactly the hosted sources")
+
+        # Approved identities are a projection of the reviewed contracts.
+        for source in self.approved_components:
+            if source not in self.sources:
+                raise ValueError(f"approved components for an unknown source: {source!r}")
+        for (source, component_id) in self.reviewed_contracts:
+            if source not in self.sources:
+                raise ValueError(f"reviewed contract for an unknown source: {source!r}")
+            if component_id not in self.approved_components.get(source, ()):
+                raise ValueError(
+                    f"reviewed contract without an approved identity: {component_id!r}"
+                )
+
+        # The builtin allowlist and its per-component rows share one key domain.
+        if not self.builtin_components or len(set(self.builtin_components)) != len(
+            self.builtin_components
+        ):
+            raise ValueError("the builtin allowlist must be a non-empty closed set")
+        builtin = set(self.builtin_components)
+        if set(self.builtin_packages) != builtin:
+            raise ValueError("builtin dependency rows must cover exactly the allowlist")
+        if set(self.builtin_imports) != builtin:
+            raise ValueError("builtin import rows must cover exactly the allowlist")
+        for component, targets in self.builtin_nested.items():
+            if component not in builtin:
+                raise ValueError(f"nested row for an unknown builtin: {component!r}")
+            for target in targets:
+                if target not in builtin:
+                    raise ValueError(
+                        f"nested builtin outside the allowlist: {target!r}"
+                    )
+
+        # Every introduced pin is exact, and every package the builtins
+        # introduce (written or imported) has one.
+        for package, version in self.introduced_pins.items():
+            if not PackageSpec(package=package, version=version).is_exact():
+                raise ValueError(f"registry-introduced pin is not exact: {package!r}")
+        introduced = set()
+        for packages in self.builtin_packages.values():
+            introduced.update(packages)
+        for packages in self.builtin_imports.values():
+            introduced.update(packages)
+        if not introduced <= set(self.introduced_pins):
+            raise ValueError(
+                "a package the builtins introduce has no exact application-owned pin"
+            )
+
+        # The pinned CLI is exact.
+        name, _, version = self.shadcn_cli_spec.rpartition("@")
+        if not name or not PackageSpec(package=name, version=version).is_exact():
+            raise ValueError("the pinned shadcn CLI spec is not an exact pin")
+
+    def introduced_packages(self) -> Tuple[str, ...]:
+        """Every direct package the builtin registry install may introduce."""
+        return tuple(sorted(self.introduced_pins))
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "sources": list(self.sources),
+            "hosts": dict(self.hosts),
+            "builtin_components": list(self.builtin_components),
+            "introduced_packages": list(self.introduced_packages()),
+            "shadcn_cli_spec": self.shadcn_cli_spec,
+        }
+
+
+def trusted_registry_boundary() -> TrustedRegistryBoundary:
+    """Assemble the trusted boundary from the live application-owned tables.
+
+    Raises ``ValueError`` if the tables are internally incoherent, so a drift in
+    any of them surfaces at the boundary rather than in a later install.
+    """
+    return TrustedRegistryBoundary(
+        sources=tuple(REGISTRY_SOURCES),
+        hosts=dict(REGISTRY_HOSTS),
+        locator_templates=dict(_LOCATOR_TEMPLATES),
+        approved_components={
+            source: tuple(sorted(components))
+            for source, components in _APPROVED_COMPONENTS.items()
+        },
+        reviewed_contracts=dict(_REVIEWED_COMPONENT_CONTRACTS),
+        builtin_components=tuple(ALLOWED_SHADCN_COMPONENTS),
+        builtin_packages={
+            component: tuple(packages)
+            for component, packages in REVIEWED_BUILTIN_COMPONENT_DEPENDENCIES.items()
+        },
+        builtin_imports={
+            component: tuple(packages)
+            for component, packages in REVIEWED_BUILTIN_COMPONENT_IMPORTS.items()
+        },
+        builtin_nested={
+            component: tuple(targets)
+            for component, targets in REVIEWED_BUILTIN_COMPONENT_NESTED.items()
+        },
+        introduced_pins=dict(REGISTRY_INTRODUCED_PACKAGE_PINS),
+        shadcn_cli_spec=PINNED_CLIS["shadcn"].spec,
+    )
 
 #: Component identities are PascalCase (React Bits' own convention, e.g.
 #: ``SplitText``) or kebab/lowercase slugs. Anything containing a path
@@ -782,10 +942,12 @@ __all__ = [
     "SOURCE_TWENTY_FIRST",
     "RegistryInstallRequest",
     "RegistryRequestOutcome",
+    "TrustedRegistryBoundary",
     "approved_registry_components",
     "build_registry_argv",
     "build_registry_request",
     "component_id_is_well_formed",
     "resolve_dependency_requirements",
     "resolve_registry_locator",
+    "trusted_registry_boundary",
 ]

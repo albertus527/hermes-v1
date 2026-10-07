@@ -91,6 +91,35 @@ package. Post-repair: the reviewed contract's *expected set* must equal the
 live declared set, so an added dependency makes the component non-installable
 until reviewed.
 
+## The trusted registry boundary is a TYPE (consistent with D3a)
+
+D3a expresses a boundary as a **frozen dataclass whose `__post_init__` makes the
+invariant a property of construction** (`RegistryInstallRequest`,
+`ReviewedComponentContract`) — not a convention every call site must remember.
+The trust boundary follows the SAME idiom: `TrustedRegistryBoundary`
+(`app.core.design_registry`), assembled by `trusted_registry_boundary()`.
+
+- It holds every input the registry boundary **trusts** (sources, hosts, locator
+  templates, approved identities, reviewed contracts, the builtin allowlist and
+  its reviewed dep/import/nested rows, the exact registry-introduced pins, the
+  pinned CLI spec) and validates them on construction. An incoherent boundary
+  raises `ValueError` at construction — it cannot be assembled at all.
+- What it deliberately does **NOT** hold: the registry response (the materialized
+  file, the declared dependency fields, the ranges, the emitted imports). Those
+  are only ever **compared against** the boundary.
+- Validated incoherences (each refused): empty/duplicate sources; a host for an
+  unknown source; a non-builtin source with no host; a locator template without a
+  host; a builtin row missing from the allowlist; a nested builtin outside the
+  allowlist; a non-exact introduced pin; a builtin-introduced package with no
+  pin; a floating pinned CLI.
+
+Pinned by `tests/test_design_registry_contract.py`
+(`test_the_live_trusted_boundary_is_coherent`,
+`test_an_incoherent_trusted_boundary_cannot_be_constructed`,
+`test_the_boundary_serializes_without_untrusted_data`) and the `partbc` guards
+*"the trusted boundary type validates on construction"* and *"a non-builtin
+registry source must have a host"*.
+
 ## The trusted registry boundary (one structural property)
 
 **TRUSTED** — application-owned, in code, never supplied at runtime:

@@ -514,3 +514,78 @@ def test_the_trusted_tables_are_the_only_source_of_truth():
         assert install._EXACT_VERSION_RE.match(version)
     # the ONLY reviewed external contract today
     assert set(registry._REVIEWED_COMPONENT_CONTRACTS) == {("react_bits", "SplitText")}
+
+
+# ---------------------------------------------------------------------------
+# The trusted boundary as a TYPE (D3a idiom: fail-closed at construction)
+# ---------------------------------------------------------------------------
+
+
+def test_the_live_trusted_boundary_is_coherent():
+    from app.core.design_registry import trusted_registry_boundary
+
+    boundary = trusted_registry_boundary()
+
+    assert boundary.sources == ("shadcn_builtin", "twenty_first", "react_bits")
+    assert boundary.hosts == {"twenty_first": "21st.dev", "react_bits": "reactbits.dev"}
+    assert boundary.approved_components == {
+        "shadcn_builtin": (), "twenty_first": (), "react_bits": ("SplitText",),
+    }
+    assert boundary.introduced_packages() == ("cn", "lucide-react", "radix-ui")
+    assert boundary.shadcn_cli_spec == "shadcn@4.21.0"
+    assert len(boundary.builtin_components) == 16
+
+
+def test_an_incoherent_trusted_boundary_cannot_be_constructed():
+    """A drift in any trusted table fails at CONSTRUCTION, the D3a shape."""
+    import dataclasses
+
+    from app.core.design_registry import (
+        SOURCE_REACT_BITS,
+        TrustedRegistryBoundary,
+        trusted_registry_boundary,
+    )
+
+    base = trusted_registry_boundary()
+
+    def rebuild(**over):
+        fields = {f.name: getattr(base, f.name) for f in dataclasses.fields(base)}
+        fields.update(over)
+        return TrustedRegistryBoundary(**fields)
+
+    # a host for an unknown source
+    with pytest.raises(ValueError):
+        rebuild(hosts={**base.hosts, "evil": "evil.example"})
+    # a non-builtin source with no host (remove its locator template too, so the
+    # template/host coherence check cannot be the guard that fires instead)
+    with pytest.raises(ValueError):
+        rebuild(
+            hosts={SOURCE_REACT_BITS: "reactbits.dev"},
+            locator_templates={SOURCE_REACT_BITS: base.locator_templates[SOURCE_REACT_BITS]},
+        )
+    # a builtin dependency row removed
+    with pytest.raises(ValueError):
+        rebuild(builtin_packages={k: v for k, v in base.builtin_packages.items() if k != "button"})
+    # a nested builtin outside the allowlist
+    with pytest.raises(ValueError):
+        rebuild(builtin_nested={"dialog": ("evil-widget",)})
+    # a non-exact introduced pin
+    with pytest.raises(ValueError):
+        rebuild(introduced_pins={**base.introduced_pins, "cn": "^0.4.0"})
+    # a package the builtins introduce with no pin
+    with pytest.raises(ValueError):
+        rebuild(introduced_pins={k: v for k, v in base.introduced_pins.items() if k != "lucide-react"})
+    # a floating pinned CLI
+    with pytest.raises(ValueError):
+        rebuild(shadcn_cli_spec="shadcn@^4.21.0")
+
+
+def test_the_boundary_serializes_without_untrusted_data():
+    import json
+
+    from app.core.design_registry import trusted_registry_boundary
+
+    payload = json.dumps(trusted_registry_boundary().to_dict())
+
+    assert "http" not in payload and "/r/" not in payload
+    assert "token" not in payload and "secret" not in payload

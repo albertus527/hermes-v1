@@ -447,6 +447,30 @@ MUTATIONS = [
                 "project dependency."
             )""",
     ),
+    # 12f. The trusted boundary TYPE must validate on construction (D3a idiom).
+    (
+        "the trusted boundary type validates on construction",
+        REGISTRY,
+        """        if not introduced <= set(self.introduced_pins):
+            raise ValueError(
+                "a package the builtins introduce has no exact application-owned pin"
+            )""",
+        """        if False:
+            raise ValueError(
+                "a package the builtins introduce has no exact application-owned pin"
+            )""",
+    ),
+    # 12g. A non-builtin source must have a host.
+    (
+        "a non-builtin registry source must have a host",
+        REGISTRY,
+        """        for source in self.sources:
+            if source != SOURCE_SHADCN_BUILTIN and source not in self.hosts:
+                raise ValueError(f"a non-builtin source has no host: {source!r}")""",
+        """        for source in ():
+            if source != SOURCE_SHADCN_BUILTIN and source not in self.hosts:
+                raise ValueError(f"a non-builtin source has no host: {source!r}")""",
+    ),
     # 12e. The trusted tables are the only source of truth: an untrusted host is
     #      never added to the closed host table.
     (
