@@ -89,6 +89,35 @@ REGISTRY_HOSTS: Dict[str, str] = {
     SOURCE_REACT_BITS: "reactbits.dev",
 }
 
+#: Route / highlight / category segments that appear in a source's PUBLIC index
+#: but are NOT component identities. 21st documents component PAGES as
+#: ``/@author/components/<slug>`` and CATEGORY pages as
+#: ``/community/components/s/<tag>``, plus HIGHLIGHT pages
+#: ``/community/components/popular``, ``/newest``, ``/featured``, ``/week``. The
+#: single-letter category prefix (``s``) and the bare highlight slugs are page
+#: ROUTES, not components.
+#:
+#: This lives HERE, in the module that decides installability, not only in the
+#: catalog vocabulary: ``design_catalog`` imports THIS module, so the catalog
+#: cannot be the single source of the rule. A reserved segment can never be a
+#: reviewed contract, so no install path -- however a contract table is edited --
+#: can make one installable. The set is application-owned and closed.
+RESERVED_COMPONENT_IDS: Dict[str, frozenset] = {
+    SOURCE_TWENTY_FIRST: frozenset({"s", "popular", "newest", "featured", "week"}),
+}
+
+
+def component_id_is_reserved(source: str, component_id: object) -> bool:
+    """Whether ``component_id`` is a reserved ROUTE segment, never a component.
+
+    A reserved segment is refused at the identity vocabulary and can never
+    acquire a reviewed contract, so it is unrepresentable as an installable
+    thing on every path.
+    """
+    if not isinstance(component_id, str):
+        return False
+    return component_id in RESERVED_COMPONENT_IDS.get(source, frozenset())
+
 
 # ---------------------------------------------------------------------------
 # Dependency requirements -- closed, application-owned
@@ -301,6 +330,17 @@ class ReviewedComponentContract:
     component_id: str
     expected_dependency_ids: Tuple[str, ...] = ()
     expected_registry_dependencies: Tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        # A reserved ROUTE segment is not a component and can never have a
+        # reviewed contract. Enforced at construction so a mistaken table edit
+        # cannot make one installable: the invariant is a property of the TYPE,
+        # not of whoever edits _REVIEWED_COMPONENT_CONTRACTS.
+        if component_id_is_reserved(self.source, self.component_id):
+            raise ValueError(
+                f"a reserved route segment is not a component id: "
+                f"{self.component_id!r} for source {self.source!r}"
+            )
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -630,6 +670,12 @@ def resolve_registry_locator(source: str, component_id: str) -> Optional[str]:
         return None
 
     if component_id not in _APPROVED_COMPONENTS.get(source, frozenset()):
+        return None
+    if component_id_is_reserved(source, component_id):
+        # Defense in depth: the approved table is derived from reviewed
+        # contracts (which refuse reserved segments at construction), but this
+        # is the ONLY function that can produce an installable locator, so it
+        # re-checks rather than trusting the table's provenance.
         return None
     return _format_locator(source, component_id)
 
@@ -1000,6 +1046,7 @@ def build_registry_argv(request: Optional[RegistryInstallRequest]) -> Tuple[str,
 __all__ = [
     "REGISTRY_HOSTS",
     "REGISTRY_SOURCES",
+    "RESERVED_COMPONENT_IDS",
     "REASON_BOUNDARY_INCOHERENT",
     "REASON_BUILTIN_CARRIES_DEPENDENCIES",
     "REASON_COMPONENT_NOT_BUILTIN",
@@ -1016,6 +1063,7 @@ __all__ = [
     "approved_registry_components",
     "build_registry_argv",
     "build_registry_request",
+    "component_id_is_reserved",
     "component_id_is_well_formed",
     "resolve_dependency_requirements",
     "resolve_registry_locator",

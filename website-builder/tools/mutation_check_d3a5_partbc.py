@@ -244,6 +244,19 @@ MUTATIONS = [
     return found""",
     ),
     # ------------------------------------------------------------------
+    # Reserved route segments are refused at the REGISTRY (installability)
+    # ------------------------------------------------------------------
+    # A reserved route segment can never have a reviewed contract, so a
+    # mistaken table edit cannot make one installable.
+    (
+        "a reserved route segment cannot have a reviewed contract",
+        REGISTRY,
+        """        if component_id_is_reserved(self.source, self.component_id):
+            raise ValueError(""",
+        """        if False:
+            raise ValueError(""",
+    ),
+    # ------------------------------------------------------------------
     # Part G -- 21st discovery is the REAL authenticated REST search
     # ------------------------------------------------------------------
     # No credential -> no request at all. A 401 round-trip is not a useful

@@ -236,6 +236,36 @@ GET https://21st.dev/api/v1/components/search?q=<term>&scope=public&limit=24
 - **No fabrication.** A malformed or empty search response is a degraded empty
   result, never an invented entry.
 
+### The reserved-route rule lives at the INSTALLABILITY authority
+
+The catalog vocabulary refused the five reserved route segments, but
+installability is decided by `design_registry` -- a SEPARATE table
+(`_REVIEWED_COMPONENT_CONTRACTS`). Nothing tied the two, so a mistaken reviewed
+contract made a reserved word installable. Confirmed by repro: adding a contract
+for `popular` yielded
+
+```
+resolve_registry_locator('twenty_first', 'popular') -> https://21st.dev/r/popular
+build_registry_request('twenty_first', 'popular').ok -> True
+```
+
+The catalog refused it; the registry did not.
+
+Fix: the single source of truth `RESERVED_COMPONENT_IDS` (and
+`component_id_is_reserved`) moved INTO `design_registry` -- the module that
+decides installability -- and `design_catalog` imports it (it already imports the
+registry, so the dependency direction is correct). Enforcement is now threefold:
+
+1. `ReviewedComponentContract.__post_init__` raises `ValueError` for a reserved
+   segment, so no contract (hence no approved identity) can exist for one.
+2. `resolve_registry_locator` -- the ONLY function that can produce an
+   installable locator -- re-checks, so even a directly-widened approved table
+   yields `None`.
+3. The catalog vocabulary refuses the same set.
+
+Verified: a mistaken contract for `popular` now raises at construction; a
+directly-injected approved entry still resolves to no locator.
+
 ### Reserved 21st route segments are refused at the identity vocabulary
 
 21st's public index publishes CATEGORY pages (``/community/components/s/<tag>``)

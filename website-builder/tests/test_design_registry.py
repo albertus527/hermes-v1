@@ -31,6 +31,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.core.design_install import ALLOWED_SHADCN_COMPONENTS, DEPENDENCY_PACKAGES
 from app.core.design_registry import (
+    component_id_is_reserved,
+    ReviewedComponentContract,
     REGISTRY_HOSTS,
     REGISTRY_SOURCES,
     REASON_BUILTIN_CARRIES_DEPENDENCIES,
@@ -496,3 +498,57 @@ def test_no_builtin_is_keyed_into_the_external_contract_table():
 def test_a_builtin_never_resolves_to_a_react_bits_locator():
     for component in ("button", "dialog", "card"):
         assert resolve_registry_locator(SOURCE_REACT_BITS, component) is None
+
+
+# ---------------------------------------------------------------------------
+# Reserved route segments are refused at the REGISTRY, not just the catalog
+# ---------------------------------------------------------------------------
+#
+# The catalog vocabulary refuses s/popular/newest/featured/week, but
+# installability is decided HERE. A mistaken reviewed contract must not be able
+# to make a reserved route segment installable.
+
+RESERVED_21ST = ("s", "popular", "newest", "featured", "week")
+
+
+@pytest.mark.parametrize("segment", RESERVED_21ST)
+def test_a_reserved_route_segment_cannot_have_a_reviewed_contract(segment):
+    with pytest.raises(ValueError):
+        ReviewedComponentContract(
+            source=SOURCE_TWENTY_FIRST,
+            component_id=segment,
+            expected_dependency_ids=(),
+        )
+
+
+@pytest.mark.parametrize("segment", RESERVED_21ST)
+def test_a_reserved_route_segment_resolves_to_no_locator(segment):
+    assert component_id_is_reserved(SOURCE_TWENTY_FIRST, segment) is True
+    assert resolve_registry_locator(SOURCE_TWENTY_FIRST, segment) is None
+
+
+def test_the_reserved_table_lives_in_the_registry():
+    """The installability authority owns the rule, not only the catalog."""
+    from app.core.design_registry import RESERVED_COMPONENT_IDS
+
+    assert RESERVED_COMPONENT_IDS[SOURCE_TWENTY_FIRST] == frozenset(RESERVED_21ST)
+
+
+def test_a_reserved_segment_cannot_be_approved_even_if_injected(monkeypatch):
+    """Defense in depth: even a directly-widened approved table is refused."""
+    import app.core.design_registry as registry
+
+    widened = dict(registry._APPROVED_COMPONENTS)
+    widened[SOURCE_TWENTY_FIRST] = frozenset({"popular"})
+    monkeypatch.setattr(registry, "_APPROVED_COMPONENTS", widened)
+
+    # The contract constructor already refuses it, so no contract could exist;
+    # resolve_registry_locator re-checks anyway and returns None.
+    assert registry.resolve_registry_locator(SOURCE_TWENTY_FIRST, "popular") is None
+
+
+def test_the_catalog_and_registry_agree_on_the_reserved_set():
+    from app.core import design_catalog as catalog
+    from app.core.design_registry import RESERVED_COMPONENT_IDS
+
+    assert catalog._RESERVED_COMPONENT_IDS is RESERVED_COMPONENT_IDS

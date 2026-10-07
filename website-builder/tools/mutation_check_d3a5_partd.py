@@ -77,8 +77,10 @@ MUTATIONS = [
         REGISTRY,
         """    if component_id not in _APPROVED_COMPONENTS.get(source, frozenset()):
         return None
-    return _format_locator(source, component_id)""",
-        """    return _format_locator(source, component_id)""",
+    if component_id_is_reserved(source, component_id):""",
+        """    if False:
+        return None
+    if component_id_is_reserved(source, component_id):""",
     ),
     # --- 3. approval is required ------------------------------------------
         # The pre-repair external path had NO approval enforcement and NO
@@ -212,9 +214,9 @@ MUTATIONS = [
     # --- 11a2. the reserved set is COMPLETE (dropping a word fails) ------
     (
         "the reserved 21st route set is complete",
-        CATALOG,
-        """        {"s", "popular", "newest", "featured", "week"}""",
-        """        {"s", "popular", "featured", "week"}""",
+        REGISTRY,
+        """    SOURCE_TWENTY_FIRST: frozenset({"s", "popular", "newest", "featured", "week"}),""",
+        """    SOURCE_TWENTY_FIRST: frozenset({"s", "popular", "featured", "week"}),""",
     ),
     # --- 11b. installable requires a REVIEWED locator, not just clean deps
     #          (the false positive: 64 listed, 1 installable)

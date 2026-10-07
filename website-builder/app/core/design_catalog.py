@@ -42,6 +42,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from app.core.design_registry import (
     PACKAGE_TO_DEPENDENCY_ID,
+    RESERVED_COMPONENT_IDS,
     SOURCE_REACT_BITS,
     SOURCE_TWENTY_FIRST,
     resolve_dependency_requirements,
@@ -70,24 +71,12 @@ MAX_FIELD_CHARS = 400
 _SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _PASCAL_RE = re.compile(r"^[A-Z][A-Za-z0-9]*$")
 
-#: Route / highlight / category segments that appear in 21st's PUBLIC index but
-#: are NOT component identities. The registry's own comment names them: 21st
-#: documents component PAGES as ``/@author/components/<slug>`` and CATEGORY pages
-#: as ``/community/components/s/<tag>``, ``/community/components/popular``,
-#: ``/newest``, ``/featured``, ``/week``. The single-letter category prefix
-#: (``s`` in ``/components/s/hero``) and the bare highlight slugs are page
-#: ROUTES, so a parser that scanned route text produced exactly these as
-#: fabricated identities.
-#:
-#: They are refused HERE, at the identity vocabulary itself, so no path -- a
-#: parser, a JSON payload, or a direct call -- can turn one into a component id.
-#: The set is application-owned and closed; it is the vocabulary of the ONE
-#: source that publishes such routes, so it is keyed by source.
-_RESERVED_COMPONENT_IDS: Dict[str, frozenset] = {
-    SOURCE_TWENTY_FIRST: frozenset(
-        {"s", "popular", "newest", "featured", "week"}
-    ),
-}
+#: Route / highlight / category segments that are NOT component identities. The
+#: single source of truth is :data:`app.core.design_registry.RESERVED_COMPONENT_IDS`
+#: -- it lives in the module that decides INSTALLABILITY, and this module (which
+#: imports it) refuses the same set at the identity vocabulary. Re-exported here
+#: under the historical private name so existing callers keep working.
+_RESERVED_COMPONENT_IDS: Dict[str, frozenset] = RESERVED_COMPONENT_IDS
 
 
 @dataclass(frozen=True)
