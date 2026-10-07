@@ -206,6 +206,26 @@ application-owned set, exactly `REGISTRY_INTRODUCED_PACKAGE_PINS` — **not** se
 No package NAME is shared between A and B ∪ C, and no registry helper is a D2 id.
 Proven by `test_the_builtin_registry_packages_are_a_separate_application_owned_set`.
 
+### No arbitrary PACKAGE SOURCE
+
+A package's *source* can be redirected two ways, and both are closed:
+
+1. **In the spec.** A dependency spec naming a source -- `https://…tgz`,
+   `git+https://…`, `github:user/repo`, `file:`/`link:`/`workspace:`, `npm:`,
+   a bare registry host -- is refused by `parse_npm_package_spec` (returns
+   `None`). No install argv carries a `--registry`/`--prefix`/`--global` flag;
+   every argv is `install/add <name>@<exact pin>`.
+2. **In a config file.** A registry install may write `package.json` and its
+   lockfile; it must never write or change a package-manager **config** file,
+   because one `registry=` line in `.npmrc` points every later install at an
+   arbitrary source. Confirmed live: a CLI that wrote a root `.npmrc` was
+   reported `installed`. Now a snapshot of `PACKAGE_SOURCE_CONFIG_FILES`
+   (`.npmrc`, `.yarnrc`, `.yarnrc.yml`, `.pnpmfile.cjs`, `.pnpmfile.js`,
+   `npm-shrinkwrap.json`) is taken before and after; any creation, change, or
+   removal fails with `REASON_PACKAGE_SOURCE_CHANGED`, on BOTH paths. The
+   starter's legitimate `.npmrc` is unchanged by an install, so it is not
+   flagged.
+
 ### No arbitrary registry URL reaches argv
 
 `RegistryInstallRequest` validates the locator at construction, but

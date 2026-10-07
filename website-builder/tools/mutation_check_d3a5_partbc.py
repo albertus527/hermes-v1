@@ -451,6 +451,24 @@ MUTATIONS = [
                 "project dependency."
             )""",
     ),
+    # 12n. A package-source config (e.g. a root .npmrc registry= line) must not
+    #      be written or changed by an install.
+    (
+        "a package-source config change is refused",
+        INSTALL,
+        """        if changed_package_source_configs(
+            source_config_before, package_source_config_snapshot(self.project_root)
+        ):
+            logger.warning(
+                "Refusing a registry install that wrote or changed a "
+                "package-source config file."
+            )""",
+        """        if False:
+            logger.warning(
+                "Refusing a registry install that wrote or changed a "
+                "package-source config file."
+            )""",
+    ),
     # 12m. The locator must be re-resolved to the canonical one before argv, so
     #      a duck-typed request cannot smuggle an arbitrary URL into the CLI.
     (

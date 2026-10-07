@@ -722,6 +722,10 @@ REASON_REGISTRY_FILE_UNREVIEWED = (
     "a registry install materialized a file outside the reviewed component set; "
     "the state is not upgraded to installed"
 )
+REASON_PACKAGE_SOURCE_CHANGED = (
+    "a registry install wrote or changed a package-manager config file that can "
+    "redirect the package source; the state is not upgraded to installed"
+)
 REASON_LOCATOR_NOT_CANONICAL = (
     "the external registry install's locator is not the application's canonical "
     "locator for its component; no command was attempted"
@@ -1450,6 +1454,62 @@ def unreviewed_materialized_files(
     return tuple(sorted(name for name in new_files if name not in allowed_names))
 
 
+#: Package-manager config files that can REDIRECT THE PACKAGE SOURCE for every
+#: subsequent install in the project: an ``.npmrc`` ``registry=`` line, a yarn
+#: config, a pnpm hook, etc. A design install has no business writing any of
+#: these, so their appearance or change fails the install.
+PACKAGE_SOURCE_CONFIG_FILES: Tuple[str, ...] = (
+    ".npmrc",
+    ".yarnrc",
+    ".yarnrc.yml",
+    ".pnpmfile.cjs",
+    ".pnpmfile.js",
+    "npm-shrinkwrap.json",
+)
+
+
+def package_source_config_snapshot(project_root: Path) -> Dict[str, Optional[str]]:
+    """The content of each package-source config file at the project ROOT.
+
+    A registry install may write ``package.json`` and its lockfile; it must never
+    write or change a package-manager CONFIG file, because a single ``registry=``
+    line in ``.npmrc`` would point every later install at an arbitrary package
+    source. ``None`` means the file is absent. A missing project root yields all
+    ``None``.
+    """
+    snapshot: Dict[str, Optional[str]] = {}
+    root = Path(project_root)
+    for name in PACKAGE_SOURCE_CONFIG_FILES:
+        path = root / name
+        try:
+            if path.is_file():
+                with path.open("r", encoding="utf-8", errors="replace") as handle:
+                    snapshot[name] = handle.read(_MAX_COMPONENT_SOURCE_CHARS)
+            else:
+                snapshot[name] = None
+        except OSError:
+            snapshot[name] = None
+    return snapshot
+
+
+def changed_package_source_configs(
+    before: Mapping[str, Optional[str]],
+    after: Mapping[str, Optional[str]],
+) -> Tuple[str, ...]:
+    """Config file names whose content was created, removed, or changed.
+
+    Returns the bounded file NAMES (never their content) that differ between the
+    two snapshots. A non-empty result means a package-source config was mutated
+    by the install and the source boundary may have been redirected.
+    """
+    changed = [
+        name
+        for name in PACKAGE_SOURCE_CONFIG_FILES
+        if before.get(name) != after.get(name)
+    ]
+    return tuple(sorted(changed))
+
+
 # ---------------------------------------------------------------------------
 # Command construction
 # ---------------------------------------------------------------------------
@@ -2137,6 +2197,7 @@ class DesignDependencyInstaller:
         # application-owned baseline rather than trusting a zero exit code.
         before = snapshot_direct_dependencies(self.project_root)
         files_before = snapshot_component_files(component_dir)
+        source_config_before = package_source_config_snapshot(self.project_root)
         process, timed_out = self._run(argv, REGISTRY_TIMEOUT_SECONDS)
         if timed_out:
             return (
@@ -2275,6 +2336,30 @@ class DesignDependencyInstaller:
                     state=INSTALL_FAILED,
                     package=None,
                     reason=REASON_REGISTRY_FILE_UNREVIEWED,
+                    receipt=imports_receipt or boundary.receipt or receipt,
+                    verified_components=(),
+                ),
+                allowed,
+                rejected,
+            )
+
+        # 4b. PACKAGE-SOURCE config. A registry install may write package.json
+        #     and its lockfile; it must never write or change a package-manager
+        #     config file, because a single ``registry=`` line in ``.npmrc``
+        #     points every later install at an arbitrary package source.
+        if changed_package_source_configs(
+            source_config_before, package_source_config_snapshot(self.project_root)
+        ):
+            logger.warning(
+                "Refusing a registry install that wrote or changed a "
+                "package-source config file."
+            )
+            return (
+                InstallOutcome(
+                    dependency_id=REGISTRY_DEPENDENCY,
+                    state=INSTALL_FAILED,
+                    package=None,
+                    reason=REASON_PACKAGE_SOURCE_CHANGED,
                     receipt=imports_receipt or boundary.receipt or receipt,
                     verified_components=(),
                 ),
@@ -2666,6 +2751,7 @@ class DesignDependencyInstaller:
         argv = tuple(prefix) + ("add", locator, "--yes", "--overwrite")
         before = snapshot_direct_dependencies(self.project_root)
         files_before = snapshot_component_files(component_dir)
+        source_config_before = package_source_config_snapshot(self.project_root)
         process, timed_out = self._run(argv, REGISTRY_TIMEOUT_SECONDS)
         if timed_out:
             return InstallOutcome(
@@ -2747,6 +2833,25 @@ class DesignDependencyInstaller:
                 state=INSTALL_FAILED,
                 package=None,
                 reason=REASON_REGISTRY_FILE_UNREVIEWED,
+                receipt=boundary.receipt or receipt,
+                verified_components=(),
+            )
+
+        # The PACKAGE-SOURCE config must be untouched. A single ``registry=``
+        # line in ``.npmrc`` would point every later install at an arbitrary
+        # package source.
+        if changed_package_source_configs(
+            source_config_before, package_source_config_snapshot(self.project_root)
+        ):
+            logger.warning(
+                "Refusing an external registry install that wrote or changed a "
+                "package-source config file."
+            )
+            return InstallOutcome(
+                dependency_id=REGISTRY_DEPENDENCY,
+                state=INSTALL_FAILED,
+                package=None,
+                reason=REASON_PACKAGE_SOURCE_CHANGED,
                 receipt=boundary.receipt or receipt,
                 verified_components=(),
             )
@@ -2887,6 +2992,7 @@ __all__ = [
     "REASON_REGISTRY_PACKAGE_NOT_EXACT",
     "REASON_REGISTRY_IMPORT_UNRESOLVED",
     "REASON_LOCATOR_NOT_CANONICAL",
+    "REASON_PACKAGE_SOURCE_CHANGED",
     "REASON_REGISTRY_FILE_UNREVIEWED",
     "REASON_REGISTRY_SOURCE_IMPORT_UNREVIEWED",
     "REASON_BUILTIN_COMPONENT_UNREVIEWED",
@@ -2927,6 +3033,9 @@ __all__ = [
     "removed_direct_dependencies",
     "required_registry_packages",
     "reviewed_registry_package_pins",
+    "PACKAGE_SOURCE_CONFIG_FILES",
+    "changed_package_source_configs",
+    "package_source_config_snapshot",
     "snapshot_component_files",
     "snapshot_direct_dependencies",
     "verify_external_component_materialized",

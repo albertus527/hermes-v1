@@ -36,6 +36,7 @@ from app.core.design_install import (
     REASON_COMPONENTS_NOT_VERIFIED,
     REASON_REGISTRY_DEPENDENCY_DRIFT,
     REASON_LOCATOR_NOT_CANONICAL,
+    REASON_PACKAGE_SOURCE_CHANGED,
     REASON_REGISTRY_FILE_UNREVIEWED,
     REASON_REGISTRY_IMPORT_UNRESOLVED,
     REASON_REGISTRY_PACKAGE_NOT_EXACT,
@@ -101,6 +102,7 @@ class RegistryRunner:
         install_fails_for: str | None = None,
         source_imports: Sequence[str] = (),
         extra_files: Sequence[str] = (),
+        source_config_writes: dict | None = None,
     ):
         self.commands: List[List[str]] = []
         self._writes = dependency_writes or {}
@@ -113,6 +115,7 @@ class RegistryRunner:
         self._install_fails_for = install_fails_for
         self._source_imports = tuple(source_imports)
         self._extra_files = tuple(extra_files)
+        self._source_config_writes = source_config_writes or {}
 
     def run_command(self, project_id, command, cwd=None, env=None, timeout=300.0):
         command = list(command)
@@ -177,6 +180,8 @@ class RegistryRunner:
                             )
                         for extra in self._extra_files:
                             (target / extra).write_text("export const Evil = 1\n", encoding="utf-8")
+                for name, content in self._source_config_writes.items():
+                    (root / name).write_text(content, encoding="utf-8")
 
         return subprocess.CompletedProcess(
             args=command, returncode=self._exitcode, stdout="ok", stderr=""
@@ -1261,3 +1266,74 @@ def test_install_components_refuses_a_url_component_with_no_command(project):
     assert outcome.state == INSTALL_FAILED
     assert rejected == ("https://evil.example/r/x",)
     assert runner.commands == []
+
+
+# ---------------------------------------------------------------------------
+# An install cannot redirect the PACKAGE SOURCE via a config file
+# ---------------------------------------------------------------------------
+#
+# A single `registry=` line in a root `.npmrc` points every later install at an
+# arbitrary package source. A design install may write package.json and its
+# lockfile; it must never write or change a package-manager config file.
+
+
+def test_a_registry_install_that_writes_a_root_npmrc_is_refused(project):
+    runner = RegistryRunner(
+        dependency_writes={"dependencies": {"cn": "^0.4.0", "radix-ui": "^1.7.0"}},
+        materializes=True,
+        component_name="button",
+        source_config_writes={".npmrc": "registry=https://evil.example/npm/\n"},
+    )
+
+    outcome, _, _ = _installer(project, runner).install_components(["button"])
+
+    assert outcome.state == INSTALL_FAILED
+    assert outcome.reason == REASON_PACKAGE_SOURCE_CHANGED
+    assert outcome.installed is False
+
+
+def test_an_install_that_changes_an_existing_npmrc_is_refused(project):
+    """The starter ships a legitimate .npmrc; CHANGING it is the defect."""
+    (project / ".npmrc").write_text("engine-strict=true\n", encoding="utf-8")
+    runner = RegistryRunner(
+        dependency_writes={"dependencies": {"cn": "^0.4.0", "radix-ui": "^1.7.0"}},
+        materializes=True,
+        component_name="button",
+        source_config_writes={".npmrc": "engine-strict=true\nregistry=https://evil.example/\n"},
+    )
+
+    outcome, _, _ = _installer(project, runner).install_components(["button"])
+
+    assert outcome.state == INSTALL_FAILED
+    assert outcome.reason == REASON_PACKAGE_SOURCE_CHANGED
+
+
+def test_an_install_that_leaves_the_existing_npmrc_alone_is_accepted(project):
+    """The control: an unchanged .npmrc does not fail the install."""
+    (project / ".npmrc").write_text("engine-strict=true\n", encoding="utf-8")
+    runner = RegistryRunner(
+        dependency_writes={"dependencies": {"cn": "^0.4.0", "radix-ui": "^1.7.0"}},
+        materializes=True,
+        component_name="button",
+    )
+
+    outcome, _, _ = _installer(project, runner).install_components(["button"])
+
+    assert outcome.state == "installed", outcome.reason
+
+
+def test_the_package_source_config_primitives(project):
+    from app.core.design_install import (
+        PACKAGE_SOURCE_CONFIG_FILES,
+        changed_package_source_configs,
+        package_source_config_snapshot,
+    )
+
+    before = package_source_config_snapshot(project)
+    assert set(before) == set(PACKAGE_SOURCE_CONFIG_FILES)
+    assert all(v is None for v in before.values())
+    # A created file is a change; an unchanged one is not.
+    (project / ".npmrc").write_text("registry=https://evil.example/\n", encoding="utf-8")
+    after = package_source_config_snapshot(project)
+    assert changed_package_source_configs(before, after) == (".npmrc",)
+    assert changed_package_source_configs(after, after) == ()
