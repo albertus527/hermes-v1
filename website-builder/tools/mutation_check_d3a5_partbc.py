@@ -284,11 +284,7 @@ MUTATIONS = [
     (
         "the installer derives the accepted set from the contract",
         INSTALL,
-        """        from app.core.design_registry import reviewed_component_contract
-
-        source = getattr(request, "source", "")
-        component_id = getattr(request, "component_id", "")
-        contract = reviewed_component_contract(source, component_id)
+        """        contract = reviewed_component_contract(source, component_id)
         if contract is None:
             return InstallOutcome(
                 dependency_id=REGISTRY_DEPENDENCY,
@@ -303,7 +299,15 @@ MUTATIONS = [
                 if dependency_id in DEPENDENCY_PACKAGES
             )
         )""",
-        """        allowed_packages = tuple(
+        """        contract = reviewed_component_contract(source, component_id)
+        if contract is None:
+            return InstallOutcome(
+                dependency_id=REGISTRY_DEPENDENCY,
+                state=INSTALL_FAILED,
+                package=None,
+                reason=REASON_COMPONENT_NOT_ALLOWED,
+            )
+        allowed_packages = tuple(
             sorted(
                 DEPENDENCY_PACKAGES[dependency_id]
                 for dependency_id in getattr(request, "required_dependency_ids", ())
@@ -446,6 +450,16 @@ MUTATIONS = [
                 "Refusing a registry install that removed a pre-existing "
                 "project dependency."
             )""",
+    ),
+    # 12m. The locator must be re-resolved to the canonical one before argv, so
+    #      a duck-typed request cannot smuggle an arbitrary URL into the CLI.
+    (
+        "an arbitrary registry URL never reaches argv",
+        INSTALL,
+        """        canonical_locator = resolve_registry_locator(source, component_id)
+        if canonical_locator is None or locator != canonical_locator:""",
+        """        canonical_locator = resolve_registry_locator(source, component_id)
+        if False:""",
     ),
     # 12l. The FILE delta must be checked: an extra materialized file is refused.
     (

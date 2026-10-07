@@ -722,6 +722,10 @@ REASON_REGISTRY_FILE_UNREVIEWED = (
     "a registry install materialized a file outside the reviewed component set; "
     "the state is not upgraded to installed"
 )
+REASON_LOCATOR_NOT_CANONICAL = (
+    "the external registry install's locator is not the application's canonical "
+    "locator for its component; no command was attempted"
+)
 REASON_MANAGER_UNSUPPORTED = (
     "the project's package manager has no supported pinned one-off mechanism"
 )
@@ -2586,10 +2590,34 @@ class DesignDependencyInstaller:
         # ``required_dependency_ids`` therefore cannot expand what the boundary
         # accepts: the contract is the single source of truth, resolved here
         # rather than trusted from the argument.
-        from app.core.design_registry import reviewed_component_contract
+        from app.core.design_registry import (
+            resolve_registry_locator,
+            reviewed_component_contract,
+        )
 
         source = getattr(request, "source", "")
         component_id = getattr(request, "component_id", "")
+
+        # The locator is re-resolved from (source, component_id) and the request
+        # must carry EXACTLY that. ``RegistryInstallRequest`` validates this at
+        # construction, but ``install_external_component`` is public and a
+        # duck-typed stand-in bypasses the constructor -- so an arbitrary URL
+        # could otherwise reach the argv (verified: it did). Re-validating here
+        # makes "only the canonical, application-owned locator reaches argv" a
+        # property of THIS function, not of the caller using the right type.
+        canonical_locator = resolve_registry_locator(source, component_id)
+        if canonical_locator is None or locator != canonical_locator:
+            logger.warning(
+                "Refusing an external registry install whose locator is not the "
+                "application's canonical locator for its component."
+            )
+            return InstallOutcome(
+                dependency_id=REGISTRY_DEPENDENCY,
+                state=INSTALL_FAILED,
+                package=None,
+                reason=REASON_LOCATOR_NOT_CANONICAL,
+            )
+
         contract = reviewed_component_contract(source, component_id)
         if contract is None:
             return InstallOutcome(
@@ -2858,6 +2886,7 @@ __all__ = [
     "REASON_REGISTRY_DEPENDENCY_DRIFT",
     "REASON_REGISTRY_PACKAGE_NOT_EXACT",
     "REASON_REGISTRY_IMPORT_UNRESOLVED",
+    "REASON_LOCATOR_NOT_CANONICAL",
     "REASON_REGISTRY_FILE_UNREVIEWED",
     "REASON_REGISTRY_SOURCE_IMPORT_UNREVIEWED",
     "REASON_BUILTIN_COMPONENT_UNREVIEWED",

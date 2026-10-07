@@ -35,6 +35,7 @@ from app.core.design_install import (
     REGISTRY_INTRODUCED_PACKAGE_PINS,
     REASON_COMPONENTS_NOT_VERIFIED,
     REASON_REGISTRY_DEPENDENCY_DRIFT,
+    REASON_LOCATOR_NOT_CANONICAL,
     REASON_REGISTRY_FILE_UNREVIEWED,
     REASON_REGISTRY_IMPORT_UNRESOLVED,
     REASON_REGISTRY_PACKAGE_NOT_EXACT,
@@ -1191,3 +1192,72 @@ def test_the_file_delta_primitives():
     assert unreviewed_materialized_files(
         frozenset(), frozenset({"button.tsx"}), allowed_components=["button"]
     ) == ()
+
+
+# ---------------------------------------------------------------------------
+# No arbitrary registry URL can reach argv
+# ---------------------------------------------------------------------------
+#
+# RegistryInstallRequest validates the locator at construction, but
+# install_external_component is public and a duck-typed stand-in bypasses the
+# constructor. The installer must re-resolve the locator from (source, component)
+# and require EXACTLY the canonical one, so an arbitrary URL never reaches argv.
+
+
+def test_a_duck_typed_request_with_an_arbitrary_url_runs_no_command(project):
+    class FakeRequest:
+        source = "react_bits"
+        component_id = "SplitText"
+        registry_locator_id = "https://evil.example/r/SplitText"
+        required_dependency_ids = ("gsap", "gsap_react")
+        is_builtin = False
+
+    runner = RegistryRunner()
+    outcome = _installer(project, runner).install_external_component(FakeRequest())
+
+    assert outcome.state == INSTALL_FAILED
+    assert outcome.reason == REASON_LOCATOR_NOT_CANONICAL
+    assert runner.commands == [], "an arbitrary URL must never reach argv"
+
+
+def test_a_duck_typed_request_with_the_wrong_real_url_runs_no_command(project):
+    """Even a URL on the RIGHT host but not the canonical component URL is refused."""
+    class FakeRequest:
+        source = "react_bits"
+        component_id = "SplitText"
+        registry_locator_id = "https://reactbits.dev/r/Evil-TS-TW"
+        required_dependency_ids = ("gsap", "gsap_react")
+        is_builtin = False
+
+    runner = RegistryRunner()
+    outcome = _installer(project, runner).install_external_component(FakeRequest())
+
+    assert outcome.state == INSTALL_FAILED
+    assert outcome.reason == REASON_LOCATOR_NOT_CANONICAL
+    assert runner.commands == []
+
+
+def test_the_canonical_locator_still_reaches_argv(project):
+    """The control: the real request installs and its argv carries the canonical URL."""
+    runner = RegistryRunner(
+        dependency_writes={"dependencies": {"gsap": "^3.15.0", "@gsap/react": "^2.1.2"}},
+        materializes=True,
+        component_name="SplitText",
+        external_dir=True,
+    )
+    outcome = _installer(project, runner).install_external_component(_split_text_request())
+
+    assert outcome.state == "installed", outcome.reason
+    add_argv = next(c for c in runner.commands if "add" in c)
+    assert "https://reactbits.dev/r/SplitText-TS-TW" in add_argv
+
+
+def test_install_components_refuses_a_url_component_with_no_command(project):
+    """A URL handed to the builtin path is a rejected component, not argv."""
+    runner = RegistryRunner()
+    outcome, _, rejected = _installer(project, runner).install_components(
+        ["https://evil.example/r/x"]
+    )
+    assert outcome.state == INSTALL_FAILED
+    assert rejected == ("https://evil.example/r/x",)
+    assert runner.commands == []
