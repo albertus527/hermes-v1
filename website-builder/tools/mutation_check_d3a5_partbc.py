@@ -501,6 +501,27 @@ MUTATIONS = [
                 "project dependency."
             )""",
     ),
+    # 12q. A file written outside the component dir must be refused.
+    (
+        "a file outside the component dir is refused",
+        INSTALL,
+        """        if unreviewed_project_files(
+            project_files_before,
+            snapshot_project_files(self.project_root),
+            allowed_components=effective,
+            component_dir=component_dir,
+            project_root=self.project_root,
+        ):
+            logger.warning(
+                "Refusing a registry install that wrote a file outside the "
+                "reviewed artifact set."
+            )""",
+        """        if False:
+            logger.warning(
+                "Refusing a registry install that wrote a file outside the "
+                "reviewed artifact set."
+            )""",
+    ),
     # 12p. An unexpected package.json section mutation must be refused.
     (
         "an unexpected package.json section mutation is refused",

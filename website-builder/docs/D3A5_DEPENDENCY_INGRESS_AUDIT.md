@@ -236,6 +236,22 @@ GET https://21st.dev/api/v1/components/search?q=<term>&scope=public&limit=24
 - **No fabrication.** A malformed or empty search response is a degraded empty
   result, never an invented entry.
 
+### The FILE boundary is project-wide, not component-dir-only
+
+The file-delta guard (step 4) snapshots only the APPROVED COMPONENT DIRECTORY,
+but its stated invariant is "an install writes its reviewed artifacts and
+NOTHING else". Confirmed by repro: a CLI that wrote `.env`, `src/evil.ts`,
+`scripts/evil.mjs`, or `.vscode/settings.json` -- all OUTSIDE the component dir
+-- was reported `installed`.
+
+Fix: `snapshot_project_files` (prunes `node_modules`/`.git`/caches rather than
+walking them) + `unreviewed_project_files`, wired as step 4d on BOTH paths. A
+new file anywhere in the project that is neither a reviewed component file (under
+the approved dir) nor a reviewed manifest file fails with
+`REASON_UNREVIEWED_PROJECT_FILE`. Verified the real pinned CLI writes only
+`package-lock.json` and `src/components/ui/<name>.tsx`, so a legitimate install
+is not flagged; a growing lockfile (transitive deps) is still accepted.
+
 ### The reserved-route rule lives at the INSTALLABILITY authority
 
 The catalog vocabulary refused the five reserved route segments, but

@@ -38,6 +38,7 @@ from app.core.design_install import (
     REASON_LOCATOR_NOT_CANONICAL,
     REASON_PACKAGE_SOURCE_CHANGED,
     REASON_MANIFEST_SECTION_CHANGED,
+    REASON_UNREVIEWED_PROJECT_FILE,
     REASON_REGISTRY_FILE_UNREVIEWED,
     REASON_REGISTRY_IMPORT_UNRESOLVED,
     REASON_REGISTRY_PACKAGE_NOT_EXACT,
@@ -105,6 +106,7 @@ class RegistryRunner:
         extra_files: Sequence[str] = (),
         source_config_writes: dict | None = None,
         manifest_section_writes: dict | None = None,
+        extra_project_files: dict | None = None,
     ):
         self.commands: List[List[str]] = []
         self._writes = dependency_writes or {}
@@ -119,6 +121,7 @@ class RegistryRunner:
         self._extra_files = tuple(extra_files)
         self._source_config_writes = source_config_writes or {}
         self._manifest_section_writes = manifest_section_writes or {}
+        self._extra_project_files = extra_project_files or {}
 
     def run_command(self, project_id, command, cwd=None, env=None, timeout=300.0):
         command = list(command)
@@ -189,6 +192,10 @@ class RegistryRunner:
                     doc = json.loads((root / "package.json").read_text())
                     doc.update(self._manifest_section_writes)
                     (root / "package.json").write_text(json.dumps(doc))
+                for name, content in self._extra_project_files.items():
+                    path = root / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(content, encoding="utf-8")
 
         return subprocess.CompletedProcess(
             args=command, returncode=self._exitcode, stdout="ok", stderr=""
@@ -1417,3 +1424,83 @@ def test_the_manifest_section_primitives(project):
     after = snapshot_manifest_sections(project)
     assert changed_manifest_sections(before, after) == ("overrides",)
     assert changed_manifest_sections(after, after) == ()
+
+
+# ---------------------------------------------------------------------------
+# An install may write its reviewed artifacts and NOTHING else, project-wide
+# ---------------------------------------------------------------------------
+#
+# The component-dir guard only sees the approved component directory. The
+# invariant is project-wide: a new .env, src/evil.ts, or .vscode/settings.json is
+# an unreviewed artifact even though it sits outside that directory.
+
+
+def _project_file_runner(extra_file):
+    """A RegistryRunner that ALSO writes ``extra_file`` at the project root."""
+    return RegistryRunner(
+        dependency_writes={"dependencies": {"cn": "^0.4.0", "radix-ui": "^1.7.0"}},
+        materializes=True,
+        component_name="button",
+        extra_project_files={extra_file: "evil\n"},
+    )
+
+
+@pytest.mark.parametrize(
+    "extra_file",
+    [".env", "src/evil.ts", "scripts/evil.mjs", ".vscode/settings.json"],
+)
+def test_a_file_outside_the_component_dir_is_refused(project, extra_file):
+    outcome, _, _ = _installer(project, _project_file_runner(extra_file)).install_components(
+        ["button"]
+    )
+
+    assert outcome.state == INSTALL_FAILED
+    assert outcome.reason == REASON_UNREVIEWED_PROJECT_FILE
+
+
+def test_a_reviewed_install_writes_only_reviewed_files(project):
+    """The control: no extra file -> installed."""
+    runner = RegistryRunner(
+        dependency_writes={"dependencies": {"cn": "^0.4.0", "radix-ui": "^1.7.0"}},
+        materializes=True,
+        component_name="button",
+    )
+
+    outcome, _, _ = _installer(project, runner).install_components(["button"])
+
+    assert outcome.state == "installed", outcome.reason
+
+
+def test_the_project_file_primitives(project):
+    from app.core.design_install import (
+        snapshot_project_files,
+        unreviewed_project_files,
+    )
+
+    before = snapshot_project_files(project)
+    (project / ".env").write_text("x")
+    (project / "src").mkdir(exist_ok=True)
+    (project / "src" / "evil.ts").write_text("x")
+    after = snapshot_project_files(project)
+
+    unreviewed = unreviewed_project_files(
+        before,
+        after,
+        allowed_components=("button",),
+        component_dir=project / "src" / "components" / "ui",
+        project_root=project,
+    )
+    assert set(unreviewed) == {".env", "src/evil.ts"}
+
+
+def test_the_project_file_snapshot_never_descends_into_node_modules(project):
+    """A node_modules tree must not be walked (enormous, and not an artifact)."""
+    from app.core.design_install import snapshot_project_files
+
+    nested = project / "node_modules" / "pkg"
+    nested.mkdir(parents=True)
+    (nested / "index.js").write_text("x")
+
+    snapshot = snapshot_project_files(project)
+
+    assert not any("node_modules" in name for name in snapshot)

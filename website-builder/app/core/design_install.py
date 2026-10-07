@@ -722,6 +722,10 @@ REASON_REGISTRY_FILE_UNREVIEWED = (
     "a registry install materialized a file outside the reviewed component set; "
     "the state is not upgraded to installed"
 )
+REASON_UNREVIEWED_PROJECT_FILE = (
+    "a registry install wrote a file outside the reviewed artifact set; the "
+    "state is not upgraded to installed"
+)
 REASON_MANIFEST_SECTION_CHANGED = (
     "a registry install changed a package.json section outside the reviewed "
     "dependency surface; the state is not upgraded to installed"
@@ -1509,6 +1513,113 @@ def unreviewed_materialized_files(
     return tuple(sorted(name for name in new_files if name not in allowed_names))
 
 
+#: Directory names a registry install is expected to create or churn and that are
+#: NOT part of the reviewed artifact set: the installed dependency tree, the
+#: package-manager cache, and version control. A project-wide FILE delta skips
+#: these so a normal install does not read as thousands of unreviewed files.
+_PROJECT_FILE_SNAPSHOT_IGNORED_DIRS: frozenset = frozenset(
+    {"node_modules", ".git", ".pnpm-store", ".yarn", ".cache"}
+)
+
+#: Top-level files a registry install is reviewed to write. ``package.json`` and
+#: the lockfile are the manifest surface (their CONTENTS are governed by the
+#: delta/section/removal guards); the rest are the component files, which the
+#: component-dir guard covers. Anything else new at the project level is
+#: unreviewed.
+_REVIEWED_PROJECT_FILE_NAMES: frozenset = frozenset(
+    {"package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "npm-shrinkwrap.json"}
+)
+
+
+def snapshot_project_files(project_root: Path) -> frozenset:
+    """Every regular file under ``project_root``, relative to it, bounded.
+
+    PRUNES the dependency tree and VCS metadata (see
+    :data:`_PROJECT_FILE_SNAPSHOT_IGNORED_DIRS`) rather than filtering after the
+    walk, so an installed ``node_modules`` is never descended into -- a full
+    walk of it would be enormous and is never part of the reviewed artifact set.
+    Used to catch a file a registry install writes ANYWHERE in the project: the
+    component-dir guard only sees the approved component directory, but the
+    invariant is "the install may write its reviewed artifacts and nothing
+    else".
+    """
+    root = Path(project_root)
+    if not root.is_dir():
+        return frozenset()
+    found = set()
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = list(current.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if entry.is_dir():
+                    if entry.name in _PROJECT_FILE_SNAPSHOT_IGNORED_DIRS:
+                        continue  # prune: never descend
+                    stack.append(entry)
+                elif entry.is_file():
+                    try:
+                        found.add(str(entry.relative_to(root)))
+                    except ValueError:
+                        continue
+            except OSError:
+                continue
+    return frozenset(found)
+
+
+def unreviewed_project_files(
+    before: frozenset,
+    after: frozenset,
+    *,
+    allowed_components: Sequence[str],
+    component_dir: Optional[Path],
+    project_root: Path,
+    suffixes: Sequence[str] = COMPONENT_SUFFIXES,
+) -> Tuple[str, ...]:
+    """New files ANYWHERE in the project that are not a reviewed artifact.
+
+    Returns the bounded relative paths of files that appeared during the install
+    and are neither a reviewed component file (under the approved component
+    directory) nor a reviewed manifest file. An empty result means every new
+    file is a reviewed artifact.
+
+    This is the project-wide counterpart of
+    :func:`unreviewed_materialized_files`: the invariant is that an install
+    writes its reviewed artifacts and NOTHING else, so a new ``.env``, a
+    ``src/evil.ts``, or a ``.vscode/settings.json`` is an unreviewed artifact
+    even though it sits outside the component directory.
+    """
+    allowed_names = {
+        f"{component}{suffix}"
+        for component in allowed_components
+        for suffix in suffixes
+    }
+    component_prefix = ""
+    if component_dir is not None:
+        try:
+            component_prefix = str(Path(component_dir).relative_to(project_root))
+        except ValueError:
+            component_prefix = ""
+        if component_prefix and not component_prefix.endswith("/"):
+            component_prefix += "/"
+
+    unreviewed: list = []
+    for name in set(after) - set(before):
+        if name in _REVIEWED_PROJECT_FILE_NAMES:
+            continue
+        if component_prefix and name.startswith(component_prefix):
+            # A file inside the approved component dir: reviewed only if it is
+            # a component file (the component-dir guard checks the same thing).
+            tail = name[len(component_prefix):]
+            if tail in allowed_names:
+                continue
+        unreviewed.append(name)
+    return tuple(sorted(unreviewed))
+
+
 #: Package-manager config files that can REDIRECT THE PACKAGE SOURCE for every
 #: subsequent install in the project: an ``.npmrc`` ``registry=`` line, a yarn
 #: config, a pnpm hook, etc. A design install has no business writing any of
@@ -2252,6 +2363,7 @@ class DesignDependencyInstaller:
         # application-owned baseline rather than trusting a zero exit code.
         before = snapshot_direct_dependencies(self.project_root)
         files_before = snapshot_component_files(component_dir)
+        project_files_before = snapshot_project_files(self.project_root)
         source_config_before = package_source_config_snapshot(self.project_root)
         sections_before = snapshot_manifest_sections(self.project_root)
         process, timed_out = self._run(argv, REGISTRY_TIMEOUT_SECONDS)
@@ -2441,6 +2553,34 @@ class DesignDependencyInstaller:
                     state=INSTALL_FAILED,
                     package=None,
                     reason=REASON_MANIFEST_SECTION_CHANGED,
+                    receipt=imports_receipt or boundary.receipt or receipt,
+                    verified_components=(),
+                ),
+                allowed,
+                rejected,
+            )
+
+        # 4d. PROJECT-WIDE FILE delta. The component-dir guard (step 4) only sees
+        #     the approved component directory; the invariant is that an install
+        #     writes its reviewed artifacts and NOTHING else. A new .env, a
+        #     src/evil.ts, or a .vscode/settings.json is an unreviewed artifact.
+        if unreviewed_project_files(
+            project_files_before,
+            snapshot_project_files(self.project_root),
+            allowed_components=effective,
+            component_dir=component_dir,
+            project_root=self.project_root,
+        ):
+            logger.warning(
+                "Refusing a registry install that wrote a file outside the "
+                "reviewed artifact set."
+            )
+            return (
+                InstallOutcome(
+                    dependency_id=REGISTRY_DEPENDENCY,
+                    state=INSTALL_FAILED,
+                    package=None,
+                    reason=REASON_UNREVIEWED_PROJECT_FILE,
                     receipt=imports_receipt or boundary.receipt or receipt,
                     verified_components=(),
                 ),
@@ -2832,6 +2972,7 @@ class DesignDependencyInstaller:
         argv = tuple(prefix) + ("add", locator, "--yes", "--overwrite")
         before = snapshot_direct_dependencies(self.project_root)
         files_before = snapshot_component_files(component_dir)
+        project_files_before = snapshot_project_files(self.project_root)
         source_config_before = package_source_config_snapshot(self.project_root)
         sections_before = snapshot_manifest_sections(self.project_root)
         process, timed_out = self._run(argv, REGISTRY_TIMEOUT_SECONDS)
@@ -2953,6 +3094,28 @@ class DesignDependencyInstaller:
                 state=INSTALL_FAILED,
                 package=None,
                 reason=REASON_MANIFEST_SECTION_CHANGED,
+                receipt=boundary.receipt or receipt,
+                verified_components=(),
+            )
+
+        # The PROJECT-WIDE FILE delta: the install may write its reviewed
+        # component file and nothing else, anywhere in the project.
+        if unreviewed_project_files(
+            project_files_before,
+            snapshot_project_files(self.project_root),
+            allowed_components=(request.component_id,),
+            component_dir=component_dir,
+            project_root=self.project_root,
+        ):
+            logger.warning(
+                "Refusing an external registry install that wrote a file outside "
+                "the reviewed artifact set."
+            )
+            return InstallOutcome(
+                dependency_id=REGISTRY_DEPENDENCY,
+                state=INSTALL_FAILED,
+                package=None,
+                reason=REASON_UNREVIEWED_PROJECT_FILE,
                 receipt=boundary.receipt or receipt,
                 verified_components=(),
             )
@@ -3094,6 +3257,7 @@ __all__ = [
     "REASON_REGISTRY_IMPORT_UNRESOLVED",
     "REASON_LOCATOR_NOT_CANONICAL",
     "REASON_MANIFEST_SECTION_CHANGED",
+    "REASON_UNREVIEWED_PROJECT_FILE",
     "REASON_PACKAGE_SOURCE_CHANGED",
     "REASON_REGISTRY_FILE_UNREVIEWED",
     "REASON_REGISTRY_SOURCE_IMPORT_UNREVIEWED",
@@ -3124,7 +3288,9 @@ __all__ = [
     "dependency_delta",
     "expand_reviewed_component_closure",
     "unreviewed_imports",
+    "snapshot_project_files",
     "unreviewed_materialized_files",
+    "unreviewed_project_files",
     "expected_registry_packages",
     "is_contained",
     "package_name_is_well_formed",
