@@ -447,6 +447,31 @@ MUTATIONS = [
                 "project dependency."
             )""",
     ),
+    # 12h. The trusted boundary must be CONSULTED by build_registry_request.
+    (
+        "build_registry_request consults the trusted boundary",
+        REGISTRY,
+        """    try:
+        trusted_registry_boundary()
+    except ValueError:
+        logger.error(
+            "The trusted registry boundary is incoherent; refusing to build a "
+            "registry request."
+        )
+        return RegistryRequestOutcome(
+            ok=False, request=None, reason=REASON_BOUNDARY_INCOHERENT
+        )""",
+        """    try:
+        pass
+    except ValueError:
+        logger.error(
+            "The trusted registry boundary is incoherent; refusing to build a "
+            "registry request."
+        )
+        return RegistryRequestOutcome(
+            ok=False, request=None, reason=REASON_BOUNDARY_INCOHERENT
+        )""",
+    ),
     # 12f. The trusted boundary TYPE must validate on construction (D3a idiom).
     (
         "the trusted boundary type validates on construction",
@@ -458,6 +483,25 @@ MUTATIONS = [
         """        if False:
             raise ValueError(
                 "a package the builtins introduce has no exact application-owned pin"
+            )""",
+    ),
+    # 12i. install_components must consult the trusted boundary (builtin path).
+    (
+        "install_components consults the trusted boundary",
+        INSTALL,
+        """        try:
+            trusted_registry_boundary()
+        except ValueError:
+            logger.error(
+                "The trusted registry boundary is incoherent; refusing the "
+                "builtin registry install."
+            )""",
+        """        try:
+            pass
+        except ValueError:
+            logger.error(
+                "The trusted registry boundary is incoherent; refusing the "
+                "builtin registry install."
             )""",
     ),
     # 12g. A non-builtin source must have a host.

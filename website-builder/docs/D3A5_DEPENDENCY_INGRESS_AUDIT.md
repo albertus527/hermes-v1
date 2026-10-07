@@ -113,6 +113,15 @@ The trust boundary follows the SAME idiom: `TrustedRegistryBoundary`
   allowlist; a non-exact introduced pin; a builtin-introduced package with no
   pin; a floating pinned CLI.
 
+**It is load-bearing, not decorative.** `trusted_registry_boundary()` is
+CONSULTED on BOTH install paths — the external path in `build_registry_request`
+(which builds the only installable request) and the builtin path in
+`install_components` (which never goes through the request builder). An
+incoherent boundary refuses the request / runs **no command**
+(`REASON_BOUNDARY_INCOHERENT`), so a drifted trust model cannot drive a registry
+command. "A guard that no execution path depends on is not a guard" is
+satisfied by construction: both paths call it.
+
 Pinned by `tests/test_design_registry_contract.py`
 (`test_the_live_trusted_boundary_is_coherent`,
 `test_an_incoherent_trusted_boundary_cannot_be_constructed`,

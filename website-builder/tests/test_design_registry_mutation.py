@@ -1060,3 +1060,64 @@ def test_a_project_already_shipping_lucide_at_the_pin_installs_nothing(project):
         and any("lucide-react" in a for a in c)
     ]
     assert installs == [], "a project already at the exact pin needs no lucide install"
+
+
+# ---------------------------------------------------------------------------
+# The trusted boundary is LOAD-BEARING, not decorative
+# ---------------------------------------------------------------------------
+#
+# "A guard that no execution path depends on is not a guard." These prove the
+# boundary is CONSULTED on both install paths: an incoherent trust model refuses
+# the request/install instead of silently proceeding.
+
+
+def test_build_registry_request_consults_the_trusted_boundary(monkeypatch):
+    import app.core.design_registry as registry
+
+    def _broken():
+        raise ValueError("drift")
+
+    monkeypatch.setattr(registry, "trusted_registry_boundary", _broken)
+
+    outcome = registry.build_registry_request(
+        registry.SOURCE_REACT_BITS,
+        "SplitText",
+        declared_dependencies=["gsap", "@gsap/react"],
+    )
+
+    assert outcome.ok is False
+    assert outcome.request is None
+    assert outcome.reason == registry.REASON_BOUNDARY_INCOHERENT
+
+
+def test_install_components_consults_the_trusted_boundary(project, monkeypatch):
+    """The builtin path (which does NOT go through build_registry_request) still
+    consults the boundary, and an incoherent boundary runs NO command."""
+    import app.core.design_registry as registry
+
+    def _broken():
+        raise ValueError("drift")
+
+    monkeypatch.setattr(registry, "trusted_registry_boundary", _broken)
+
+    runner = RegistryRunner(
+        dependency_writes={"dependencies": {"cn": "^0.4.0", "radix-ui": "^1.7.0"}},
+        materializes=True,
+        component_name="button",
+    )
+    outcome, _, _ = _installer(project, runner).install_components(["button"])
+
+    assert outcome.state == INSTALL_FAILED
+    assert outcome.reason == registry.REASON_BOUNDARY_INCOHERENT
+    assert runner.commands == [], "an incoherent boundary must run no command"
+
+
+def test_a_coherent_boundary_does_not_block_a_normal_install(project):
+    """The consult is a gate, not a new failure mode for the normal path."""
+    runner = RegistryRunner(
+        dependency_writes={"dependencies": {"cn": "^0.4.0", "radix-ui": "^1.7.0"}},
+        materializes=True,
+        component_name="button",
+    )
+    outcome, _, _ = _installer(project, runner).install_components(["button"])
+    assert outcome.state == "installed", outcome.reason

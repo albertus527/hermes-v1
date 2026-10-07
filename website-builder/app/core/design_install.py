@@ -1993,6 +1993,36 @@ class DesignDependencyInstaller:
                 rejected,
             )
 
+        # The trusted boundary is CONSULTED, not merely declared: this is the
+        # ONLY place a builtin install is assembled, and it validates the
+        # application-owned tables (allowlist, reviewed dep/import/nested rows,
+        # exact pins, pinned CLI) before any command is built. An incoherent
+        # boundary refuses the whole install, so a drifted trust model cannot
+        # drive a registry command. Imported lazily to avoid an import cycle
+        # (design_registry imports design_install).
+        from app.core.design_registry import (
+            REASON_BOUNDARY_INCOHERENT,
+            trusted_registry_boundary,
+        )
+
+        try:
+            trusted_registry_boundary()
+        except ValueError:
+            logger.error(
+                "The trusted registry boundary is incoherent; refusing the "
+                "builtin registry install."
+            )
+            return (
+                InstallOutcome(
+                    dependency_id=REGISTRY_DEPENDENCY,
+                    state=INSTALL_FAILED,
+                    package=None,
+                    reason=REASON_BOUNDARY_INCOHERENT,
+                ),
+                allowed,
+                rejected,
+            )
+
         # Expand to the REVIEWED nested closure. Some builtins' emitted source
         # imports a sibling builtin the registry item does not declare (live:
         # ``dialog`` imports ``@/components/ui/button``), so requesting only

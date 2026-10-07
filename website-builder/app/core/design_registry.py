@@ -768,6 +768,10 @@ REASON_CONSTRAINT_UNSATISFIED = (
     "the application-owned pin does not satisfy the component's declared "
     "version constraint"
 )
+REASON_BOUNDARY_INCOHERENT = (
+    "the application-owned trusted registry boundary is incoherent; no command "
+    "was attempted"
+)
 
 
 def build_registry_request(
@@ -794,6 +798,22 @@ def build_registry_request(
     """
     if not isinstance(source, str) or source not in REGISTRY_SOURCES:
         return RegistryRequestOutcome(ok=False, request=None, reason=REASON_SOURCE_UNKNOWN)
+
+    # The trusted boundary is CONSULTED, not merely declared: assembling it here
+    # validates the application-owned tables on every request. An incoherent
+    # boundary refuses the request outright, so no command can be built from a
+    # trust model that has drifted. This makes the type load-bearing on the only
+    # path that assembles a registry install.
+    try:
+        trusted_registry_boundary()
+    except ValueError:
+        logger.error(
+            "The trusted registry boundary is incoherent; refusing to build a "
+            "registry request."
+        )
+        return RegistryRequestOutcome(
+            ok=False, request=None, reason=REASON_BOUNDARY_INCOHERENT
+        )
 
     if not component_id_is_well_formed(component_id):
         return RegistryRequestOutcome(
@@ -932,6 +952,7 @@ def build_registry_argv(request: Optional[RegistryInstallRequest]) -> Tuple[str,
 __all__ = [
     "REGISTRY_HOSTS",
     "REGISTRY_SOURCES",
+    "REASON_BOUNDARY_INCOHERENT",
     "REASON_COMPONENT_NOT_BUILTIN",
     "REASON_COMPONENT_UNKNOWN",
     "REASON_DEPENDENCY_UNKNOWN",

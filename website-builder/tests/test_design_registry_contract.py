@@ -170,11 +170,20 @@ def test_an_unexpected_registry_dependency_is_refused():
 
 
 def test_a_component_with_no_contract_is_not_installable(monkeypatch):
-    """Approving an identity without a contract does not make it installable."""
+    """Approving an identity without a contract does not make it installable.
+
+    The approved-identity table is DERIVED from the reviewed contracts, so in the
+    live tables "approved but no contract" cannot occur. Here an EXTRA identity
+    is approved while the contracted one is retained (so the trust boundary stays
+    coherent) -- proving that an approved identity with no contract is refused
+    with REASON_CONTRACT_MISSING rather than built into a request.
+    """
     monkeypatch.setattr(
         registry,
         "_APPROVED_COMPONENTS",
-        {SOURCE_REACT_BITS: frozenset({"UnreviewedButApproved"})},
+        {
+            SOURCE_REACT_BITS: frozenset({"SplitText", "UnreviewedButApproved"}),
+        },
     )
 
     outcome = build_registry_request(SOURCE_REACT_BITS, "UnreviewedButApproved")
