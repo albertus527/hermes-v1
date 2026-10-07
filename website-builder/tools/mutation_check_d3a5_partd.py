@@ -200,6 +200,15 @@ MUTATIONS = [
     # ------------------------------------------------------------------
     # Parts F/G: catalog normalization (21st.dev + React Bits)
     # ------------------------------------------------------------------
+    # --- 11a. a reserved 21st route segment is never a component id -----
+    (
+        "a reserved 21st route segment is not a component id",
+        CATALOG,
+        """    if component_id in _RESERVED_COMPONENT_IDS.get(source, frozenset()):
+        return False""",
+        """    if False:
+        return False""",
+    ),
     # --- 11b. installable requires a REVIEWED locator, not just clean deps
     #          (the false positive: 64 listed, 1 installable)
     (

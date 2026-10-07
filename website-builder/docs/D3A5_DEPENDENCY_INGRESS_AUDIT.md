@@ -236,6 +236,27 @@ GET https://21st.dev/api/v1/components/search?q=<term>&scope=public&limit=24
 - **No fabrication.** A malformed or empty search response is a degraded empty
   result, never an invented entry.
 
+### Reserved 21st route segments are refused at the identity vocabulary
+
+21st's public index publishes CATEGORY pages (``/community/components/s/<tag>``)
+and HIGHLIGHT pages (``/community/components/popular``, ``/newest``,
+``/featured``, ``/week``). The single-letter category prefix and the bare
+highlight slugs are page ROUTES, not components -- the five segments
+``s``, ``popular``, ``newest``, ``featured``, ``week``.
+
+Removing the false-positive parser stopped them being EXTRACTED, but they were
+still slug-shaped, so ``component_id_is_valid('twenty_first', 'popular')``
+returned True and a JSON payload claiming ``{"id": "popular"}`` built an entry.
+The documented invariant ("routes are not identities") was a property of one
+parser, not of the vocabulary.
+
+Fix: a closed, application-owned table ``_RESERVED_COMPONENT_IDS`` refuses them
+inside ``component_id_is_valid`` itself, so no path -- parser, JSON payload, or
+direct call -- can turn one into a component id. Verified: all five are refused
+by the vocabulary, produce no entry, resolve to no locator, and cannot build a
+request; ordinary slug-shaped ids (``hero``, ``card``, ``pricing-section``) are
+unaffected.
+
 ### `installable` means REVIEWED, not merely listed
 
 `CatalogEntry.installable` (and `installable_ids()`) derived installability from

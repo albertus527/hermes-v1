@@ -230,7 +230,7 @@ MUTATIONS = [
     return found""",
         """    import re as _re
 
-    for match in _re.finditer(r"/components/([a-z0-9]+(?:-[a-z0-9]+)*)\\b", text):
+    for match in _re.finditer(r"/components/(?:s/)?([a-z0-9]+(?:-[a-z0-9]+)*)\\b", text):
         identity = match.group(1).strip()
         if not component_id_is_valid(source, identity):
             continue

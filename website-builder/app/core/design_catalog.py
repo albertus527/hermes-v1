@@ -70,6 +70,25 @@ MAX_FIELD_CHARS = 400
 _SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _PASCAL_RE = re.compile(r"^[A-Z][A-Za-z0-9]*$")
 
+#: Route / highlight / category segments that appear in 21st's PUBLIC index but
+#: are NOT component identities. The registry's own comment names them: 21st
+#: documents component PAGES as ``/@author/components/<slug>`` and CATEGORY pages
+#: as ``/community/components/s/<tag>``, ``/community/components/popular``,
+#: ``/newest``, ``/featured``, ``/week``. The single-letter category prefix
+#: (``s`` in ``/components/s/hero``) and the bare highlight slugs are page
+#: ROUTES, so a parser that scanned route text produced exactly these as
+#: fabricated identities.
+#:
+#: They are refused HERE, at the identity vocabulary itself, so no path -- a
+#: parser, a JSON payload, or a direct call -- can turn one into a component id.
+#: The set is application-owned and closed; it is the vocabulary of the ONE
+#: source that publishes such routes, so it is keyed by source.
+_RESERVED_COMPONENT_IDS: Dict[str, frozenset] = {
+    SOURCE_TWENTY_FIRST: frozenset(
+        {"s", "popular", "newest", "featured", "week"}
+    ),
+}
+
 
 @dataclass(frozen=True)
 class CatalogEntry:
@@ -180,8 +199,16 @@ def component_id_is_valid(source: str, component_id: object) -> bool:
     Per-source rather than one shared rule, because the vocabularies genuinely
     differ and accepting either form everywhere would let a React Bits
     component be requested as a 21st component.
+
+    A RESERVED route/highlight segment (``s``, ``popular``, ``newest``,
+    ``featured``, ``week``) is refused even though it is slug-shaped: those are
+    page ROUTES in 21st's index, not components, and the false-positive parser
+    turned exactly them into fabricated identities. Refusing them at the
+    vocabulary makes that impossible on EVERY path, not just the parser's.
     """
     if not isinstance(component_id, str) or not component_id or len(component_id) > 64:
+        return False
+    if component_id in _RESERVED_COMPONENT_IDS.get(source, frozenset()):
         return False
     if source == SOURCE_TWENTY_FIRST:
         return bool(_SLUG_RE.match(component_id))
@@ -353,6 +380,7 @@ def find_catalog_entry(result: CatalogResult, component_id: str) -> Optional[Cat
 
 __all__ = [
     "MAX_CATALOG_ENTRIES",
+    "_RESERVED_COMPONENT_IDS",
     "MAX_FIELD_CHARS",
     "SOURCE_HOSTS",
     "WARNING_CATALOG_EMPTY",

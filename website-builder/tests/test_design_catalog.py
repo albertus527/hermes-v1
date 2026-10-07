@@ -509,3 +509,56 @@ def test_the_serialized_entry_reports_both_conditions():
     assert payload["dependencies_in_policy"] is True
     assert payload["has_approved_locator"] is False
     assert payload["installable"] is False
+
+
+# ---------------------------------------------------------------------------
+# Reserved 21st route/highlight segments are NEVER component identities
+# ---------------------------------------------------------------------------
+#
+# 21st's public index publishes CATEGORY pages (`/community/components/s/<tag>`)
+# and HIGHLIGHT pages (`/community/components/popular|newest|featured|week`).
+# Those segments are page ROUTES, not components. The false-positive parser
+# turned exactly them into fabricated identities. They are now refused at the
+# identity vocabulary itself, so no path can reintroduce them.
+
+RESERVED_21ST_SEGMENTS = ("s", "popular", "newest", "featured", "week")
+
+
+@pytest.mark.parametrize("segment", RESERVED_21ST_SEGMENTS)
+def test_a_reserved_21st_route_segment_is_not_a_component_id(segment):
+    assert component_id_is_valid(SOURCE_TWENTY_FIRST, segment) is False
+
+
+@pytest.mark.parametrize("segment", RESERVED_21ST_SEGMENTS)
+def test_a_reserved_segment_cannot_become_a_catalog_entry(segment):
+    """Not just the parser: a JSON payload claiming one invents nothing."""
+    result = normalize_catalog(
+        SOURCE_TWENTY_FIRST, {"components": [{"id": segment}]}
+    )
+
+    assert result.entries == ()
+    assert result.installable_ids() == ()
+
+
+def test_a_reserved_segment_is_not_a_dependency_or_installable_thing():
+    from app.core.design_registry import (
+        build_registry_request,
+        resolve_registry_locator,
+    )
+
+    for segment in RESERVED_21ST_SEGMENTS:
+        assert resolve_registry_locator(SOURCE_TWENTY_FIRST, segment) is None
+        assert build_registry_request(SOURCE_TWENTY_FIRST, segment).ok is False
+
+
+def test_a_slug_shaped_non_reserved_id_is_still_valid():
+    """The refusal is exactly the reserved set, not all short slugs."""
+    for ok in ("aurora-hero", "hero", "pricing-section", "ai-chat"):
+        assert component_id_is_valid(SOURCE_TWENTY_FIRST, ok) is True, ok
+
+
+def test_the_reserved_set_is_source_scoped():
+    """React Bits has no such routes, and PascalCase can't collide anyway."""
+    for segment in RESERVED_21ST_SEGMENTS:
+        assert component_id_is_valid(SOURCE_REACT_BITS, segment) is False  # not PascalCase
+    assert component_id_is_valid(SOURCE_REACT_BITS, "SplitText") is True
