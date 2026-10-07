@@ -447,6 +447,13 @@ MUTATIONS = [
                 "project dependency."
             )""",
     ),
+    # 12c. The reviewed contract's packages must be PRESENT, not just not-exceeded.
+    (
+        "a missing reviewed contract package is refused",
+        INSTALL,
+        """        if not self._contract_packages_present(allowed_packages):""",
+        """        if False:""",
+    ),
     # 12b. A builtin request must not carry dependency ids at all.
     (
         "a builtin request cannot carry dependency ids",

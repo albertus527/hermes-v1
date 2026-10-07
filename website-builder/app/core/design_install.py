@@ -2218,6 +2218,23 @@ class DesignDependencyInstaller:
         after = snapshot_direct_dependencies(self.project_root)
         return bool(removed_direct_dependencies(before, after))
 
+    def _contract_packages_present(self, packages: Sequence[str]) -> bool:
+        """Whether every reviewed contract package is present at its exact pin.
+
+        The delta guard refuses an EXTRA package; this refuses a MISSING one. A
+        reviewed external component's own source imports its contract packages
+        (SplitText imports ``gsap`` and ``@gsap/react``), so a registry that drops
+        one produces a component that cannot build. Each must be in the runtime
+        section at the exact application-owned pin.
+        """
+        manifest = snapshot_direct_dependencies(self.project_root)
+        installed = manifest.get(SECTION_DEPENDENCIES, {})
+        pins = reviewed_registry_package_pins()
+        for package in packages:
+            if installed.get(package) != pins.get(package):
+                return False
+        return True
+
     def _enforce_registry_source_import_boundary(
         self,
         components: Sequence[str],
@@ -2571,6 +2588,25 @@ class DesignDependencyInstaller:
                 state=INSTALL_FAILED,
                 package=None,
                 reason=REASON_REGISTRY_SOURCE_IMPORT_UNREVIEWED,
+                receipt=boundary.receipt or receipt,
+                verified_components=(),
+            )
+
+        # The reviewed contract's packages must be PRESENT at their exact
+        # application pins. The delta guard refuses EXTRA packages; this refuses a
+        # MISSING one -- the component's own imports (e.g. SplitText's useGSAP from
+        # @gsap/react) cannot resolve otherwise. A registry that drops a reviewed
+        # dependency is refused rather than reported installed.
+        if not self._contract_packages_present(allowed_packages):
+            logger.error(
+                "A reviewed external component's contract package is absent from "
+                "the project manifest."
+            )
+            return InstallOutcome(
+                dependency_id=REGISTRY_DEPENDENCY,
+                state=INSTALL_FAILED,
+                package=None,
+                reason=REASON_REGISTRY_PACKAGE_NOT_EXACT,
                 receipt=boundary.receipt or receipt,
                 verified_components=(),
             )

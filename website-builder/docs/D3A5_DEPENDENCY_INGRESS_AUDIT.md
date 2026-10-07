@@ -116,6 +116,24 @@ from the external URL path:
 - `install_external_component` refuses a builtin request outright (no command),
   so the two paths cannot be crossed in either direction.
 
+### The external registry component path
+
+An external component's direct-package allowlist is its **reviewed contract**
+(`_REVIEWED_COMPONENT_CONTRACTS`), keyed by `(source, component_id)` and today
+exactly one entry: `(react_bits, SplitText)` → packages `{gsap, @gsap/react}`,
+no nested `registryDependencies`. `install_external_component` derives its
+accepted set from that contract — never from a field on the passed object — and
+enforces it in BOTH directions:
+
+- **EXTRA package** (an unreviewed addition) → `REASON_REGISTRY_DEPENDENCY_DRIFT`.
+- **MISSING contract package** (a reviewed dependency the registry dropped) →
+  `REASON_REGISTRY_PACKAGE_NOT_EXACT`. SplitText's source imports both `gsap`
+  and `@gsap/react`, so a run that lands only `gsap` cannot build and must fail.
+- Both packages are installed at their exact application pins (`gsap 3.15.0`,
+  `@gsap/react 2.1.2`); an emitted-source import outside the contract is refused
+  (`REASON_REGISTRY_SOURCE_IMPORT_UNREVIEWED`).
+- A component with no reviewed contract is non-installable (`REASON_CONTRACT_MISSING`).
+
 ### Intended policy, stated explicitly (Option 1)
 
 **`package.json` direct-dependency declarations are authoritative. The

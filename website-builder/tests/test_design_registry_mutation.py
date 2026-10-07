@@ -954,3 +954,42 @@ def test_a_new_direct_dependency_is_refused_even_if_the_lockfile_also_grows(proj
 
     assert outcome.state == INSTALL_FAILED
     assert outcome.reason == REASON_REGISTRY_DEPENDENCY_DRIFT
+
+
+# ---------------------------------------------------------------------------
+# The reviewed contract's packages must be PRESENT (not just not-exceeded)
+# ---------------------------------------------------------------------------
+#
+# The delta guard refuses EXTRA packages. A registry that DROPS a reviewed
+# contract package is the mirror case: the component's own source imports it
+# (SplitText imports gsap and @gsap/react), so the build cannot resolve.
+
+
+def test_an_external_install_missing_a_contract_package_is_refused(project):
+    """SplitText's contract is {gsap, @gsap/react}; a run that lands only gsap
+    must fail closed -- useGSAP from @gsap/react would not resolve."""
+    runner = RegistryRunner(
+        dependency_writes={"dependencies": {"gsap": "^3.15.0"}},  # @gsap/react absent
+        materializes=True,
+        component_name="SplitText",
+        external_dir=True,
+    )
+
+    outcome = _installer(project, runner).install_external_component(_split_text_request())
+
+    assert outcome.state == INSTALL_FAILED
+    assert outcome.reason == REASON_REGISTRY_PACKAGE_NOT_EXACT
+    assert outcome.installed is False
+
+
+def test_an_external_install_with_every_contract_package_is_accepted(project):
+    runner = RegistryRunner(
+        dependency_writes={"dependencies": {"gsap": "^3.15.0", "@gsap/react": "^2.1.2"}},
+        materializes=True,
+        component_name="SplitText",
+        external_dir=True,
+    )
+
+    outcome = _installer(project, runner).install_external_component(_split_text_request())
+
+    assert outcome.state == "installed", outcome.reason
