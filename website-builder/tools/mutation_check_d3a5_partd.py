@@ -209,6 +209,13 @@ MUTATIONS = [
         """    if False:
         return False""",
     ),
+    # --- 11a2. the reserved set is COMPLETE (dropping a word fails) ------
+    (
+        "the reserved 21st route set is complete",
+        CATALOG,
+        """        {"s", "popular", "newest", "featured", "week"}""",
+        """        {"s", "popular", "featured", "week"}""",
+    ),
     # --- 11b. installable requires a REVIEWED locator, not just clean deps
     #          (the false positive: 64 listed, 1 installable)
     (

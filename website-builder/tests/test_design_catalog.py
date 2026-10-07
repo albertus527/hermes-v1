@@ -562,3 +562,38 @@ def test_the_reserved_set_is_source_scoped():
     for segment in RESERVED_21ST_SEGMENTS:
         assert component_id_is_valid(SOURCE_REACT_BITS, segment) is False  # not PascalCase
     assert component_id_is_valid(SOURCE_REACT_BITS, "SplitText") is True
+
+
+def test_the_reserved_set_is_exactly_the_route_derived_segments():
+    """Derive the reserved set from the DOCUMENTED route shapes.
+
+    21st's index uses two route shapes that are NOT components:
+      * ``/community/components/s/<tag>``  -> the ``s`` category prefix
+      * ``/community/components/<highlight>`` -> terminal highlight segments
+    The reserved table must equal exactly those, so it cannot silently drift.
+    """
+    import re
+
+    from app.core.design_catalog import _RESERVED_COMPONENT_IDS
+
+    routes = (
+        "https://21st.dev/community/components/s/hero\n"
+        "https://21st.dev/community/components/s/card\n"
+        "https://21st.dev/community/components/popular\n"
+        "https://21st.dev/community/components/newest\n"
+        "https://21st.dev/community/components/featured\n"
+        "https://21st.dev/community/components/week\n"
+    )
+    derived = set(re.findall(r"/community/components/([a-z0-9-]+)/", routes))   # prefix
+    derived |= set(
+        re.findall(r"/community/components/([a-z0-9-]+)(?=[\s]|$)", routes)     # terminal
+    )
+    assert _RESERVED_COMPONENT_IDS[SOURCE_TWENTY_FIRST] == frozenset(derived)
+
+
+def test_no_route_derived_segment_is_installable():
+    """Every route-derived segment resolves to no approved locator."""
+    from app.core.design_registry import resolve_registry_locator
+
+    for segment in RESERVED_21ST_SEGMENTS:
+        assert resolve_registry_locator(SOURCE_TWENTY_FIRST, segment) is None
