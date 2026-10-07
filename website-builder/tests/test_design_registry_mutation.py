@@ -107,6 +107,7 @@ class RegistryRunner:
         source_config_writes: dict | None = None,
         manifest_section_writes: dict | None = None,
         extra_project_files: dict | None = None,
+        source_text: str | None = None,
     ):
         self.commands: List[List[str]] = []
         self._writes = dependency_writes or {}
@@ -122,6 +123,7 @@ class RegistryRunner:
         self._source_config_writes = source_config_writes or {}
         self._manifest_section_writes = manifest_section_writes or {}
         self._extra_project_files = extra_project_files or {}
+        self._source_text = source_text
 
     def run_command(self, project_id, command, cwd=None, env=None, timeout=300.0):
         command = list(command)
@@ -208,6 +210,8 @@ class RegistryRunner:
         plus any ``source_imports`` the test asks for), so the source-import
         boundary can be driven the way a drifted registry would drive it.
         """
+        if self._source_text is not None:
+            return self._source_text
         lines = ['import * as React from "react"', 'import { cn } from "cn"']
         for spec in self._source_imports:
             lines.append(f'import {{ X }} from "{spec}"')
@@ -1504,3 +1508,70 @@ def test_the_project_file_snapshot_never_descends_into_node_modules(project):
     snapshot = snapshot_project_files(project)
 
     assert not any("node_modules" in name for name in snapshot)
+
+
+# ---------------------------------------------------------------------------
+# The import boundary sees EVERY module-loading form, not just `import ... from`
+# ---------------------------------------------------------------------------
+#
+# The invariant is "every bare package the emitted source imports is reviewed".
+# A regex that only knows `import ... from` misses require() and dynamic
+# import(), so an unreviewed package reached that way slips through.
+
+
+@pytest.mark.parametrize(
+    "source,expected",
+    [
+        ('import x from "gsap"', ("gsap",)),
+        ('export { x } from "gsap"', ("gsap",)),
+        ('import "gsap"', ("gsap",)),
+        ('const x = require("evil-pkg")', ("evil-pkg",)),
+        ('const x = await import("evil-pkg")', ("evil-pkg",)),
+        ('import("evil-pkg")', ("evil-pkg",)),
+        ('require( "evil-pkg" )', ("evil-pkg",)),
+        ("const x = require('evil-pkg')", ("evil-pkg",)),
+        ('import x from "@gsap/react"', ("@gsap/react",)),
+        ('import * as R from "react"', ("react",)),
+        ('import x from "gsap/ScrollTrigger"', ("gsap",)),
+    ],
+)
+def test_every_module_loading_form_is_seen(source, expected):
+    from app.core.design_install import declared_imports
+
+    assert declared_imports(source) == expected
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'import x from "./local"',
+        'import x from "../up"',
+        'import x from "@/components/ui/button"',
+        'import x from "/abs/path"',
+    ],
+)
+def test_non_package_specifiers_are_not_packages(source):
+    from app.core.design_install import declared_imports
+
+    assert declared_imports(source) == ()
+
+
+@pytest.mark.parametrize("form", ["require", "import"])
+def test_an_unreviewed_require_or_dynamic_import_is_refused(project, form):
+    """The reachable gap: the emitted source reaches an unreviewed package."""
+    if form == "require":
+        source = 'const e = require("evil-pkg")\nexport const X = 1\n'
+    else:
+        source = 'const e = await import("evil-pkg")\nexport const X = 1\n'
+
+    runner = RegistryRunner(
+        dependency_writes={"dependencies": {"cn": "^0.4.0", "radix-ui": "^1.7.0"}},
+        materializes=True,
+        component_name="button",
+        source_text=source,
+    )
+
+    outcome, _, _ = _installer(project, runner).install_components(["button"])
+
+    assert outcome.state == INSTALL_FAILED
+    assert outcome.reason == REASON_REGISTRY_SOURCE_IMPORT_UNREVIEWED

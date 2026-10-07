@@ -501,6 +501,21 @@ MUTATIONS = [
                 "project dependency."
             )""",
     ),
+    # 12r. The import boundary must see require() and dynamic import().
+    (
+        "require() and dynamic import() are seen by the import boundary",
+        INSTALL,
+        """    for pattern in (
+        _IMPORT_FROM_RE,
+        _SIDE_EFFECT_IMPORT_RE,
+        _REQUIRE_RE,
+        _DYNAMIC_IMPORT_RE,
+    ):""",
+        """    for pattern in (
+        _IMPORT_FROM_RE,
+        _SIDE_EFFECT_IMPORT_RE,
+    ):""",
+    ),
     # 12q. A file written outside the component dir must be refused.
     (
         "a file outside the component dir is refused",

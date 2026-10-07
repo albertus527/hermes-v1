@@ -451,6 +451,12 @@ _MAX_COMPONENT_SOURCE_CHARS = 400_000
 
 _IMPORT_FROM_RE = re.compile(r"""\bfrom\s*["']([^"']+)["']""")
 _SIDE_EFFECT_IMPORT_RE = re.compile(r"""\bimport\s*["']([^"']+)["']""")
+#: CommonJS ``require("x")`` and dynamic ``import("x")``. Both load a runtime
+#: module, so an unreviewed package reached this way is exactly the gap the
+#: import boundary exists to close. Matched with an optional ``await``/``(``
+#: prefix and either quote style.
+_REQUIRE_RE = re.compile(r"""\brequire\s*\(\s*["']([^"']+)["']""")
+_DYNAMIC_IMPORT_RE = re.compile(r"""\bimport\s*\(\s*["']([^"']+)["']""")
 
 
 def bare_package_of(specifier: object) -> Optional[str]:
@@ -477,21 +483,28 @@ def bare_package_of(specifier: object) -> Optional[str]:
 def declared_imports(source: str) -> Tuple[str, ...]:
     """Every BARE package specifier ``source`` imports, sorted and deduped.
 
-    Matches ``import ... from "x"``, ``export ... from "x"`` and the side-effect
-    form ``import "x"``. Relative paths and the ``@/`` project alias are not
-    packages and are ignored.
+    Matches ``import ... from "x"``, ``export ... from "x"``, the side-effect
+    form ``import "x"``, CommonJS ``require("x")``, and dynamic
+    ``import("x")``. Relative paths and the ``@/`` project alias are not packages
+    and are ignored.
+
+    The four patterns cover every module-loading form the ecosystem uses; a form
+    this cannot classify would be a gap in the boundary, so the set is kept
+    exhaustive for JavaScript/TypeScript module syntax.
     """
     if not isinstance(source, str) or not source:
         return ()
     found: set = set()
-    for match in _IMPORT_FROM_RE.finditer(source):
-        package = bare_package_of(match.group(1))
-        if package:
-            found.add(package)
-    for match in _SIDE_EFFECT_IMPORT_RE.finditer(source):
-        package = bare_package_of(match.group(1))
-        if package:
-            found.add(package)
+    for pattern in (
+        _IMPORT_FROM_RE,
+        _SIDE_EFFECT_IMPORT_RE,
+        _REQUIRE_RE,
+        _DYNAMIC_IMPORT_RE,
+    ):
+        for match in pattern.finditer(source):
+            package = bare_package_of(match.group(1))
+            if package:
+                found.add(package)
     return tuple(sorted(found))
 
 

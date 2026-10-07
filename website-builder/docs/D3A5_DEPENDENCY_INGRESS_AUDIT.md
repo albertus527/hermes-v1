@@ -236,6 +236,30 @@ GET https://21st.dev/api/v1/components/search?q=<term>&scope=public&limit=24
 - **No fabrication.** A malformed or empty search response is a degraded empty
   result, never an invented entry.
 
+### The import boundary sees EVERY module-loading form
+
+`declared_imports` is the generic scanner over UNTRUSTED emitted source, and its
+invariant is "every bare package the source imports is reviewed". It only knew
+three forms -- `import ... from`, `export ... from`, `import "x"` -- so two
+reachable forms were missed:
+
+```
+const e = require("evil-pkg")          -> install reported `installed`
+const e = await import("evil-pkg")     -> install reported `installed`
+```
+
+An unreviewed package reached either way slipped through the boundary.
+
+Fix: added `_REQUIRE_RE` and `_DYNAMIC_IMPORT_RE`, and `declared_imports` now
+scans all four patterns. The set is exhaustive for JS/TS module syntax: a
+template-literal specifier (`import x from \`pkg\``) is a SYNTAX ERROR in
+TypeScript, so no emitted source can contain one and it is not a gap.
+
+Verified against all 16 real builtins emitted by the pinned CLI: 0
+false-refusals (every import is `cn`/`lucide-react`/`radix-ui`/`react`/
+`class-variance-authority`). Residual over-matching (a `from "x"` inside a
+comment or string literal) is fail-CLOSED, and no reviewed source contains one.
+
 ### The FILE boundary is project-wide, not component-dir-only
 
 The file-delta guard (step 4) snapshots only the APPROVED COMPONENT DIRECTORY,
