@@ -206,6 +206,27 @@ application-owned set, exactly `REGISTRY_INTRODUCED_PACKAGE_PINS` — **not** se
 No package NAME is shared between A and B ∪ C, and no registry helper is a D2 id.
 Proven by `test_the_builtin_registry_packages_are_a_separate_application_owned_set`.
 
+### git / file / http npm specs are refused
+
+The bounded spec parser (`parse_npm_package_spec`) accepts ONLY the approved
+grammar -- a bare name, a versioned name, or a scoped name, with a bounded semver
+constraint. Every source-bearing form returns `None`:
+
+- **http(s)**: `https://…tgz`, `http://…`, `gsap@https://…`
+- **git**: `git+https://…`, `git+ssh://…`, `git://…`, `git+http://…`,
+  `github:user/repo`, `gitlab:`/`bitbucket:`, bare `user/repo`
+- **file/link/workspace**: `file:…`, `link:…`, `workspace:*`, `workspace:…`
+- **npm alias**: `npm:other`, `npm:@scope/other`
+- **encoded/unicode**: `gsap%2F..%2Fevil`, `gsap%00`, control chars, homoglyphs
+
+A refused spec never becomes a package identity: it is not a
+`PACKAGE_TO_DEPENDENCY_ID` key, `resolve_dependency_requirements` returns it as
+unknown (never echoed as a package name), and a component declaring one is
+refused whole. Verified across the parser (56+ hostile specs), the registry
+declared-dependency path, and the install-request path. The version constraint is
+**checked, never installed**: a declared `gsap@>=1` yields dependency ids, and
+the exact application pin (`gsap@3.15.0`) is what installs.
+
 ### No arbitrary PACKAGE SOURCE
 
 A package's *source* can be redirected two ways, and both are closed:

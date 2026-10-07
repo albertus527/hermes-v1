@@ -451,6 +451,15 @@ MUTATIONS = [
                 "project dependency."
             )""",
     ),
+    # 12o. A git/file/http npm spec must never become a package identity.
+    (
+        "a git/file/http npm spec is refused",
+        NPM_SPEC,
+        """    if not name or not _PACKAGE_NAME_RE.match(name):
+        return None""",
+        """    if not name:
+        return None""",
+    ),
     # 12n. A package-source config (e.g. a root .npmrc registry= line) must not
     #      be written or changed by an install.
     (

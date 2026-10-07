@@ -47,6 +47,7 @@ from app.core.design_registry import (
     SOURCE_REACT_BITS,
     SOURCE_TWENTY_FIRST,
     build_registry_request,
+    resolve_dependency_requirements,
     dependency_specs_are_satisfied,
     reviewed_component_contract,
     resolve_reviewed_dependency_specs,
@@ -674,3 +675,41 @@ def test_no_builtin_name_is_an_approved_external_identity_in_the_live_tables():
     for (source, component_id) in _REVIEWED_COMPONENT_CONTRACTS:
         assert source != "shadcn_builtin"
         assert component_id not in builtin
+
+
+def test_no_source_spec_can_reach_the_install_request():
+    """A git/file/http npm spec declared by a component cannot become a
+    dependency id, so it can never reach an install argv."""
+    for source_spec in (
+        "https://evil.example/x.tgz",
+        "git+https://evil.example/x.git",
+        "git+ssh://git@evil.example/x.git",
+        "file:../x",
+        "link:../x",
+        "workspace:*",
+        "npm:other-package",
+        "gsap@github:user/repo",
+    ):
+        outcome = build_registry_request(
+            SOURCE_REACT_BITS,
+            "SplitText",
+            declared_dependencies=["gsap", "@gsap/react", source_spec],
+        )
+        assert outcome.ok is False, source_spec
+        assert outcome.request is None, source_spec
+
+
+def test_a_source_spec_is_never_a_dependency_id():
+    from app.core.design_registry import PACKAGE_TO_DEPENDENCY_ID
+
+    for source_spec in (
+        "https://evil.example/x.tgz",
+        "git+https://evil.example/x.git",
+        "file:../x",
+        "workspace:*",
+        "npm:other-package",
+    ):
+        assert source_spec not in PACKAGE_TO_DEPENDENCY_ID
+        known, unknown = resolve_dependency_requirements([source_spec])
+        assert known == ()
+        assert unknown  # refused, and never echoed as a package name
