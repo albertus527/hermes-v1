@@ -2026,6 +2026,32 @@ class DesignDependencyInstaller:
                 reason=REASON_COMPONENT_NOT_ALLOWED,
             )
 
+        # The accepted package set is derived from the APPLICATION-OWNED reviewed
+        # contract for this (source, component) -- NOT from a field on the passed
+        # object. A duck-typed stand-in with a widened
+        # ``required_dependency_ids`` therefore cannot expand what the boundary
+        # accepts: the contract is the single source of truth, resolved here
+        # rather than trusted from the argument.
+        from app.core.design_registry import reviewed_component_contract
+
+        source = getattr(request, "source", "")
+        component_id = getattr(request, "component_id", "")
+        contract = reviewed_component_contract(source, component_id)
+        if contract is None:
+            return InstallOutcome(
+                dependency_id=REGISTRY_DEPENDENCY,
+                state=INSTALL_FAILED,
+                package=None,
+                reason=REASON_COMPONENT_NOT_ALLOWED,
+            )
+        allowed_packages = tuple(
+            sorted(
+                DEPENDENCY_PACKAGES[dependency_id]
+                for dependency_id in contract.expected_dependency_ids
+                if dependency_id in DEPENDENCY_PACKAGES
+            )
+        )
+
         component_dir = approved_external_component_dir(self.project_root)
         if component_dir is None:
             return InstallOutcome(
@@ -2054,18 +2080,6 @@ class DesignDependencyInstaller:
                 package=None,
                 reason=REASON_MANAGER_UNSUPPORTED,
             )
-
-        # The reviewed packages this component may introduce, mapped from the
-        # contract's application-owned dependency ids to their exact packages.
-        allowed_packages = tuple(
-            sorted(
-                DEPENDENCY_PACKAGES[dependency_id]
-                for dependency_id in getattr(
-                    request, "required_dependency_ids", ()
-                )
-                if dependency_id in DEPENDENCY_PACKAGES
-            )
-        )
 
         argv = tuple(prefix) + ("add", locator, "--yes", "--overwrite")
         before = snapshot_direct_dependencies(self.project_root)

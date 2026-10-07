@@ -97,6 +97,34 @@ Per the task, Hermes does **not** attempt to pin the universe of transitive npm
 dependencies. The guarded boundary is the set of dependencies introduced
 **directly** by a design registry or resource installation operation.
 
+## Second-pass audit (same class, one layer down)
+
+After the first repair, the whole design-resource ingress was re-swept for the
+**same class** of bug — a dependency set that a caller/registry could widen:
+
+- **Execution surface.** Only two design modules execute anything:
+  `design_critic` (fixed argv, `shell=False`) and `design_install` (five
+  `_run` sites, every one fed a builder-produced argv). All other `run_command`
+  call sites in the app use hardcoded argv (`npm ci`, `npm run build`, …). No
+  design string reaches a shell.
+- **Non-execution modules** (`design_retrieval`, `design_context`,
+  `design_selection`, `design_policies`, `design_capabilities`, `design_dna`,
+  `design_catalog`, `design_resources`) only READ files — no writes, subprocess,
+  or network.
+- **Two layer-2 gaps found and closed:**
+  1. `RegistryInstallRequest.__post_init__` only checked that dependency ids
+     were *allowlisted*, not that they matched the **reviewed contract**. The
+     type is public, so a directly-constructed request could carry a **superset**
+     of allowlisted ids. Now the constructor binds the set to the contract
+     (external path) and the allowlist check still guards the builtin path.
+  2. `install_external_component` derived its accepted package set from a field
+     on the passed object. A duck-typed stand-in could widen it. It now resolves
+     the **reviewed contract** itself and derives the accepted set from that, so
+     the argument cannot expand the boundary.
+- **Coherence guard added:** `ALLOWED_SHADCN_COMPONENTS` and
+  `REVIEWED_BUILTIN_COMPONENT_DEPENDENCIES` must have identical key sets, and
+  every reviewed builtin package must be exact-pinned.
+
 ## Final dependency policy (post-repair)
 
 - **Package identity is closed and application-owned.** `DEPENDENCY_PACKAGES`

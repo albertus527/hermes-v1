@@ -255,6 +255,62 @@ MUTATIONS = [
         """    stderr = getattr(completed, "stderr", "") or ""
     if False:""",
     ),
+    # ------------------------------------------------------------------
+    # Part B (layer 2) -- the request CONSTRUCTOR binds to the contract
+    # ------------------------------------------------------------------
+    # A directly-constructed request must not widen the dependency set beyond
+    # the reviewed contract.
+    (
+        "a directly-constructed request is bound to the reviewed contract",
+        REGISTRY,
+        """            if set(self.required_dependency_ids) != set(
+                contract.expected_dependency_ids
+            ):
+                raise ValueError(
+                    "required dependency ids do not match the component's reviewed "
+                    "contract"
+                )""",
+        """            if False:
+                raise ValueError(
+                    "required dependency ids do not match the component's reviewed "
+                    "contract"
+                )""",
+    ),
+    # ------------------------------------------------------------------
+    # Part C (layer 2) -- the accepted set is derived from the CONTRACT
+    # ------------------------------------------------------------------
+    # The installer must not trust a field on the passed object; it must resolve
+    # the contract itself, so a duck-typed stand-in cannot widen the boundary.
+    (
+        "the installer derives the accepted set from the contract",
+        INSTALL,
+        """        from app.core.design_registry import reviewed_component_contract
+
+        source = getattr(request, "source", "")
+        component_id = getattr(request, "component_id", "")
+        contract = reviewed_component_contract(source, component_id)
+        if contract is None:
+            return InstallOutcome(
+                dependency_id=REGISTRY_DEPENDENCY,
+                state=INSTALL_FAILED,
+                package=None,
+                reason=REASON_COMPONENT_NOT_ALLOWED,
+            )
+        allowed_packages = tuple(
+            sorted(
+                DEPENDENCY_PACKAGES[dependency_id]
+                for dependency_id in contract.expected_dependency_ids
+                if dependency_id in DEPENDENCY_PACKAGES
+            )
+        )""",
+        """        allowed_packages = tuple(
+            sorted(
+                DEPENDENCY_PACKAGES[dependency_id]
+                for dependency_id in getattr(request, "required_dependency_ids", ())
+                if dependency_id in DEPENDENCY_PACKAGES
+            )
+        )""",
+    ),
 ]
 
 

@@ -184,6 +184,96 @@ def test_a_component_with_no_contract_is_not_installable(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# The constructor binds the dependency set to the contract too
+# ---------------------------------------------------------------------------
+#
+# The type is public. A caller that constructs a request DIRECTLY must not be
+# able to widen the accepted dependency set beyond the reviewed contract -- that
+# is the same class of bug, one layer down.
+
+
+def test_a_direct_request_cannot_carry_a_superset_of_contract_dependencies():
+    from app.core.design_registry import RegistryInstallRequest
+
+    with pytest.raises(ValueError):
+        RegistryInstallRequest(
+            source=SOURCE_REACT_BITS,
+            component_id="SplitText",
+            registry_locator_id="https://reactbits.dev/r/SplitText-TS-TW",
+            # gsap + gsap_react is the reviewed set; adding `three` widens it.
+            required_dependency_ids=("gsap", "gsap_react", "three"),
+        )
+
+
+def test_a_direct_request_cannot_carry_a_subset_of_contract_dependencies():
+    from app.core.design_registry import RegistryInstallRequest
+
+    with pytest.raises(ValueError):
+        RegistryInstallRequest(
+            source=SOURCE_REACT_BITS,
+            component_id="SplitText",
+            registry_locator_id="https://reactbits.dev/r/SplitText-TS-TW",
+            required_dependency_ids=("gsap",),
+        )
+
+
+def test_a_direct_request_matching_the_contract_is_accepted():
+    from app.core.design_registry import RegistryInstallRequest
+
+    request = RegistryInstallRequest(
+        source=SOURCE_REACT_BITS,
+        component_id="SplitText",
+        registry_locator_id="https://reactbits.dev/r/SplitText-TS-TW",
+        required_dependency_ids=("gsap", "gsap_react"),
+    )
+
+    assert request.required_dependency_ids == ("gsap", "gsap_react")
+
+
+def test_a_direct_request_for_a_component_without_a_contract_is_refused():
+    from app.core.design_registry import RegistryInstallRequest
+
+    with pytest.raises(ValueError):
+        RegistryInstallRequest(
+            source=SOURCE_TWENTY_FIRST,
+            component_id="aurora-hero",
+            registry_locator_id="https://21st.dev/r/aurora-hero",
+            required_dependency_ids=(),
+        )
+
+
+# ---------------------------------------------------------------------------
+# The builtin allowlist and the reviewed-dependency table stay coherent
+# ---------------------------------------------------------------------------
+
+
+def test_every_allowed_builtin_has_a_reviewed_dependency_row():
+    """A builtin with no reviewed row would install with an empty expected set,
+    so the delta guard would refuse any package it legitimately introduces --
+    and, worse, an unreviewed builtin could slip in silently. The two sets must
+    be identical."""
+    from app.core.design_install import (
+        ALLOWED_SHADCN_COMPONENTS,
+        REVIEWED_BUILTIN_COMPONENT_DEPENDENCIES,
+    )
+
+    assert set(ALLOWED_SHADCN_COMPONENTS) == set(
+        REVIEWED_BUILTIN_COMPONENT_DEPENDENCIES
+    )
+
+
+def test_reviewed_builtin_packages_are_all_exact_pinned():
+    from app.core.design_install import (
+        REGISTRY_INTRODUCED_PACKAGE_PINS,
+        REVIEWED_BUILTIN_COMPONENT_DEPENDENCIES,
+    )
+
+    for component, packages in REVIEWED_BUILTIN_COMPONENT_DEPENDENCIES.items():
+        for package in packages:
+            assert package in REGISTRY_INTRODUCED_PACKAGE_PINS, (component, package)
+
+
+# ---------------------------------------------------------------------------
 # The version constraint is CHECKED, never installed
 # ---------------------------------------------------------------------------
 

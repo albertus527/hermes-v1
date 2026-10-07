@@ -338,6 +338,23 @@ def test_a_request_cannot_carry_a_non_allowlisted_dependency(approved):
         )
 
 
+def test_a_builtin_request_cannot_carry_a_non_allowlisted_dependency():
+    """The allowlist check is load-bearing for the BUILTIN path.
+
+    The reviewed-contract check applies only to external components, so a
+    builtin is guarded by the allowlist membership check alone. This proves that
+    guard still fires: a builtin request carrying an un-allowlisted id is
+    refused even though no contract governs builtins.
+    """
+    with pytest.raises(ValueError):
+        RegistryInstallRequest(
+            source=SOURCE_SHADCN_BUILTIN,
+            component_id="button",
+            registry_locator_id="",
+            required_dependency_ids=("left-pad",),
+        )
+
+
 def test_declared_dependencies_are_deduplicated_and_sorted():
     known, unknown = resolve_dependency_requirements(["three", "gsap", "three"])
 

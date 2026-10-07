@@ -414,3 +414,51 @@ def test_the_upstream_range_is_normalized_to_the_exact_pin(project):
     doc = json.loads((project / "package.json").read_text(encoding="utf-8"))
     assert doc["dependencies"]["gsap"] == "3.15.0"
     assert "^" not in doc["dependencies"]["gsap"]
+
+
+def test_a_duck_typed_request_cannot_widen_the_accepted_set(project):
+    """The accepted package set comes from the CONTRACT, not the request object.
+
+    A stand-in whose ``required_dependency_ids`` claims extra allowlisted ids
+    must not cause the boundary to accept a package outside the reviewed
+    contract. Here the object claims ``three`` (allowlisted), but the reviewed
+    SplitText contract does not include it -- so a registry that writes ``three``
+    is refused.
+    """
+    runner = RegistryRunner(
+        dependency_writes={
+            "dependencies": {
+                "gsap": "^3.15.0",
+                "@gsap/react": "^2.1.2",
+                "three": "^0.186.1",
+            }
+        },
+        materializes=True,
+        component_name="SplitText",
+        external_dir=True,
+    )
+    widened = _FakeRequest(
+        component_id="SplitText",
+        locator="https://reactbits.dev/r/SplitText-TS-TW",
+        dependency_ids=("gsap", "gsap_react", "three"),
+    )
+
+    outcome = _installer(project, runner).install_external_component(widened)
+
+    assert outcome.state == INSTALL_FAILED
+    assert outcome.reason == REASON_REGISTRY_DEPENDENCY_DRIFT
+
+
+def test_an_external_request_for_an_unknown_contract_runs_nothing(project):
+    """A request whose (source, component) has no contract is refused pre-run."""
+    runner = RegistryRunner()
+    bogus = _FakeRequest(
+        component_id="NeverReviewed",
+        locator="https://reactbits.dev/r/NeverReviewed-TS-TW",
+        dependency_ids=(),
+    )
+
+    outcome = _installer(project, runner).install_external_component(bogus)
+
+    assert outcome.state == INSTALL_FAILED
+    assert runner.commands == []

@@ -514,6 +514,29 @@ class RegistryInstallRequest:
                     f"required dependency is not allowlisted: {dependency_id!r}"
                 )
 
+        # The dependency SET is bound to the reviewed contract AT CONSTRUCTION,
+        # not only in :func:`build_registry_request`. Without this, a caller that
+        # constructs a request directly (the type is public) could supply a
+        # SUPERSET of allowlisted ids, and :meth:`install_external_component`
+        # derives its accepted-package set from this field -- so the extra ids
+        # would widen the registry dependency boundary for a component that was
+        # never reviewed to introduce them. That is the same class of bug this
+        # batch closes, one layer down, so it fails closed here too.
+        if not self.is_builtin:
+            contract = reviewed_component_contract(self.source, self.component_id)
+            if contract is None:
+                raise ValueError(
+                    "an external registry request requires a reviewed dependency "
+                    "contract"
+                )
+            if set(self.required_dependency_ids) != set(
+                contract.expected_dependency_ids
+            ):
+                raise ValueError(
+                    "required dependency ids do not match the component's reviewed "
+                    "contract"
+                )
+
     def to_dict(self) -> Dict[str, object]:
         """Serializable. A locator is application-owned, not caller data, so it
         is safe to include; no credential or path appears."""
