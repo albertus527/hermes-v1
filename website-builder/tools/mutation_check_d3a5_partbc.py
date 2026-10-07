@@ -447,6 +447,21 @@ MUTATIONS = [
                 "project dependency."
             )""",
     ),
+    # 12e. The trusted tables are the only source of truth: an untrusted host is
+    #      never added to the closed host table.
+    (
+        "the trusted host table is closed",
+        REGISTRY,
+        """REGISTRY_HOSTS: Dict[str, str] = {
+    SOURCE_TWENTY_FIRST: "21st.dev",
+    SOURCE_REACT_BITS: "reactbits.dev",
+}""",
+        """REGISTRY_HOSTS: Dict[str, str] = {
+    SOURCE_TWENTY_FIRST: "21st.dev",
+    SOURCE_REACT_BITS: "reactbits.dev",
+    "evil": "evil.example",
+}""",
+    ),
     # 12d. The builtin registry packages are a SEPARATE set from the D2-selectable
     #      dependencies. A registry helper must not be smuggled into the D2 set
     #      (which would make it selectable).

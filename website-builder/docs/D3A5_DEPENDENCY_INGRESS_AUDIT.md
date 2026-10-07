@@ -91,6 +91,40 @@ package. Post-repair: the reviewed contract's *expected set* must equal the
 live declared set, so an added dependency makes the component non-installable
 until reviewed.
 
+## The trusted registry boundary (one structural property)
+
+**TRUSTED** — application-owned, in code, never supplied at runtime:
+
+- registry **sources** (`REGISTRY_SOURCES`, closed) and **hosts**
+  (`REGISTRY_HOSTS`, closed); **locator templates** (`_LOCATOR_TEMPLATES`)
+- **approved identities** (`_APPROVED_COMPONENTS`, derived from contracts) and
+  **reviewed contracts** (`_REVIEWED_COMPONENT_CONTRACTS`)
+- the builtin **allowlist** (`ALLOWED_SHADCN_COMPONENTS`, 16 names), the
+  per-component reviewed **deps/imports/nested** tables
+- the **pinned CLI** (`PINNED_CLIS["shadcn"] == shadcn@4.21.0`) and every
+  **exact pin** (`REGISTRY_INTRODUCED_PACKAGE_PINS`, `DEPENDENCY_PACKAGE_PINS`)
+
+**UNTRUSTED** — the registry response:
+
+- the component **file** it materializes
+- its declared `dependencies` / `registryDependencies` / dev / peer fields
+- the **ranges** it writes into `package.json`
+- the emitted source's **imports**
+
+**The boundary:** every untrusted value is compared against a trusted table, and
+nothing untrusted reaches argv or the manifest without that check —
+declared deps must **equal** the contract; a locator must be the **canonical**
+one; the manifest delta must be the **reviewed set** at **exact pins**; emitted
+imports must be **reviewed**; and **no removal** may occur. `unapproved =>
+nothing runs` is structural: a refused request produces **no argv**.
+
+Pinned by `tests/test_design_registry_contract.py`
+(`test_no_untrusted_identity_can_reach_argv`,
+`test_a_trusted_identity_with_a_hostile_declaration_is_refused`,
+`test_a_trusted_identity_with_an_unexpected_nested_dep_is_refused`,
+`test_the_trusted_tables_are_the_only_source_of_truth`) and the
+`partbc` mutation guard *"the trusted host table is closed"*.
+
 ## Boundary statement
 
 Per the task, Hermes does **not** attempt to pin the universe of transitive npm

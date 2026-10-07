@@ -435,3 +435,82 @@ def test_a_raw_url_is_never_a_component_identity(candidate):
 
     assert outcome.ok is False
     assert outcome.reason == REASON_COMPONENT_UNKNOWN
+
+
+# ---------------------------------------------------------------------------
+# The trusted registry boundary, as ONE structural property
+# ---------------------------------------------------------------------------
+#
+# TRUSTED  (application-owned, in code): the registry sources, hosts, locator
+#          templates, approved identities, reviewed contracts, the builtin
+#          allowlist, the pinned CLI, and every exact pin.
+# UNTRUSTED (the registry response): the materialized file, the declared
+#          dependency fields, the ranges written into package.json, and the
+#          emitted source's imports.
+#
+# The boundary is: EVERY untrusted value is compared against a trusted table,
+# and nothing untrusted can reach argv or the manifest without that check.
+
+
+def test_no_untrusted_identity_can_reach_argv():
+    """A raw URL / path / shell fragment is never a component identity, so it
+    can never produce argv."""
+    from app.core.design_registry import build_registry_argv
+
+    for hostile in [
+        "https://evil.example/r/x",
+        "https://reactbits.dev/r/SplitText-TS-TW",  # even the CORRECT url
+        "//evil.example/r/x",
+        "file:///etc/passwd",
+        "../../etc/passwd",
+        "x;rm -rf /",
+        "x`id`",
+    ]:
+        outcome = build_registry_request(SOURCE_REACT_BITS, hostile)
+        assert outcome.ok is False, hostile
+        # No argv is produced (None request -> empty tuple): "unapproved =>
+        # nothing runs" is structural, not a caller's if-check.
+        assert not build_registry_argv(outcome.request), hostile
+
+
+def test_a_trusted_identity_with_a_hostile_declaration_is_refused():
+    """A reviewed identity does not make its DECLARED dependencies trusted."""
+    for declared in (
+        ["gsap", "npm:evil"],
+        ["gsap", "https://evil/x.tgz"],
+        ["gsap", "gsap@latest"],
+        ["gsap", "gsap@file:../x"],
+    ):
+        outcome = build_registry_request(
+            SOURCE_REACT_BITS, "SplitText", declared_dependencies=declared
+        )
+        assert outcome.ok is False, declared
+
+
+def test_a_trusted_identity_with_an_unexpected_nested_dep_is_refused():
+    for nested in (["evil-component"], ["https://evil/r/x"]):
+        outcome = build_registry_request(
+            SOURCE_REACT_BITS,
+            "SplitText",
+            declared_dependencies=["gsap", "@gsap/react"],
+            declared_registry_dependencies=nested,
+        )
+        assert outcome.ok is False, nested
+
+
+def test_the_trusted_tables_are_the_only_source_of_truth():
+    """The trusted inputs are code literals; the untrusted response is only ever
+    compared against them."""
+    import app.core.design_registry as registry
+    import app.core.design_install as install
+
+    # trusted: closed, in code
+    assert registry.REGISTRY_SOURCES == ("shadcn_builtin", "twenty_first", "react_bits")
+    assert registry.REGISTRY_HOSTS == {"twenty_first": "21st.dev", "react_bits": "reactbits.dev"}
+    assert set(registry._LOCATOR_TEMPLATES) == {"twenty_first", "react_bits"}
+    assert install.ALLOWED_SHADCN_COMPONENTS
+    assert install.PINNED_CLIS["shadcn"].is_exact()
+    for version in install.REGISTRY_INTRODUCED_PACKAGE_PINS.values():
+        assert install._EXACT_VERSION_RE.match(version)
+    # the ONLY reviewed external contract today
+    assert set(registry._REVIEWED_COMPONENT_CONTRACTS) == {("react_bits", "SplitText")}
