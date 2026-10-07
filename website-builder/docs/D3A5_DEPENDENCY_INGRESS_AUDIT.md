@@ -134,6 +134,37 @@ enforces it in BOTH directions:
   (`REASON_REGISTRY_SOURCE_IMPORT_UNREVIEWED`).
 - A component with no reviewed contract is non-installable (`REASON_CONTRACT_MISSING`).
 
+### Decision: lucide-react is REGISTRY-INTRODUCED, not pre-provisioned (Option 2)
+
+`lucide-react` is a package the pinned shadcn CLI's emitted sources import but the
+CLI does **not** install (5 of the 16 builtins: accordion, checkbox, dialog,
+select, sheet). Two designs were possible; the chosen one:
+
+**`lucide-react` remains a reviewed, application-owned, exact-pinned package that
+Hermes installs only when a reviewed builtin's emitted source requires it.**
+
+- It is **not** added to the shared starter template
+  (`templates/frontend-starter/`), and it is **not** a D2-selectable dependency
+  (`DEPENDENCY_PACKAGES`). It is a registry-introduced pin
+  (`REGISTRY_INTRODUCED_PACKAGE_PINS["lucide-react"] == "1.52.0"`).
+- Rationale:
+  1. **Boundary.** `templates/frontend-starter/` is shared infra **outside**
+     `website-builder/`; pre-provisioning there would widen this batch beyond its
+     website-only boundary and change a template other paths copy verbatim.
+  2. **Only 5 of 16 builtins need it.** Pre-provisioning would add an unused
+     dependency to *every* generated project, including the 11 that never import
+     it — a scope increase, not a narrowing.
+  3. **The starter's own source imports no lucide** (only `components.json`
+     declares `"iconLibrary": "lucide"`), so there is nothing to satisfy at
+     build time until a component that needs it is installed.
+  4. **It is already fail-closed.** Whether a project ships lucide or not, the
+     install path verifies/installs the exact pin; a project already at the pin
+     runs **no** install, and a missing one installs exactly once at `1.52.0`.
+- Proven by `tests/test_design_registry_mutation.py`:
+  `test_lucide_react_is_registry_introduced_not_d2_selectable`,
+  `test_a_project_without_lucide_gets_the_exact_pin_installed`,
+  `test_a_project_already_shipping_lucide_at_the_pin_installs_nothing`.
+
 ### Intended policy, stated explicitly (Option 1)
 
 **`package.json` direct-dependency declarations are authoritative. The

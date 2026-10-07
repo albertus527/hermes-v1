@@ -993,3 +993,70 @@ def test_an_external_install_with_every_contract_package_is_accepted(project):
     outcome = _installer(project, runner).install_external_component(_split_text_request())
 
     assert outcome.state == "installed", outcome.reason
+
+
+# ---------------------------------------------------------------------------
+# Option 2 decision: lucide-react is REGISTRY-INTRODUCED, not pre-provisioned
+# ---------------------------------------------------------------------------
+#
+# The reviewed pin table is the authority. Whether a project already ships
+# lucide-react (a starter that pre-provisioned it) or not, the install path
+# verifies/installs the EXACT application-owned pin. It is never D2-selectable
+# and never a floating dependency the starter must carry.
+
+
+def test_lucide_react_is_registry_introduced_not_d2_selectable():
+    """lucide-react is reviewed (a registry-introduced pin) but is NOT a
+    D2-selectable dependency id: it is installed only when a reviewed builtin's
+    emitted source requires it, never chosen by a design decision."""
+    from app.core.design_install import DEPENDENCY_PACKAGES
+
+    assert "lucide-react" in REGISTRY_INTRODUCED_PACKAGE_PINS
+    assert "lucide-react" not in DEPENDENCY_PACKAGES.values()
+
+
+def test_a_project_without_lucide_gets_the_exact_pin_installed(project):
+    """A project that does not ship lucide-react gets it at the exact app pin."""
+    runner = RegistryRunner(
+        dependency_writes={"dependencies": {"cn": "^0.4.0", "radix-ui": "^1.7.0"}},
+        materializes=True,
+        materialize_all_in_argv=True,
+        source_imports=("lucide-react",),
+    )
+
+    outcome, _, _ = _installer(project, runner).install_components(["accordion"])
+
+    assert outcome.state == "installed", outcome.reason
+    doc = json.loads((project / "package.json").read_text(encoding="utf-8"))
+    assert doc["dependencies"]["lucide-react"] == "1.52.0"
+    installs = [
+        c for c in runner.commands
+        if c[:2] in (["npm", "install"], ["pnpm", "add"], ["yarn", "add"])
+        and any("lucide-react" in a for a in c)
+    ]
+    assert len(installs) == 1, "the missing reviewed import is installed exactly once"
+
+
+def test_a_project_already_shipping_lucide_at_the_pin_installs_nothing(project):
+    """If the project already ships lucide-react at the exact pin, the import
+    step is a no-op -- the reviewed pin is verified, not re-installed."""
+    (project / "package.json").write_text(
+        json.dumps({"name": "site", "dependencies": {"react": "19.2.7", "lucide-react": "1.52.0"}}),
+        encoding="utf-8",
+    )
+    runner = RegistryRunner(
+        dependency_writes={"dependencies": {"cn": "^0.4.0", "radix-ui": "^1.7.0"}},
+        materializes=True,
+        materialize_all_in_argv=True,
+        source_imports=("lucide-react",),
+    )
+
+    outcome, _, _ = _installer(project, runner).install_components(["accordion"])
+
+    assert outcome.state == "installed", outcome.reason
+    installs = [
+        c for c in runner.commands
+        if c[:2] in (["npm", "install"], ["pnpm", "add"], ["yarn", "add"])
+        and any("lucide-react" in a for a in c)
+    ]
+    assert installs == [], "a project already at the exact pin needs no lucide install"
