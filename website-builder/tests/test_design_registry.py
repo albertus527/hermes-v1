@@ -33,6 +33,7 @@ from app.core.design_install import ALLOWED_SHADCN_COMPONENTS, DEPENDENCY_PACKAG
 from app.core.design_registry import (
     REGISTRY_HOSTS,
     REGISTRY_SOURCES,
+    REASON_BUILTIN_CARRIES_DEPENDENCIES,
     REASON_COMPONENT_NOT_BUILTIN,
     REASON_COMPONENT_UNKNOWN,
     REASON_DEPENDENCY_UNKNOWN,
@@ -448,3 +449,50 @@ def test_no_credential_or_path_appears_in_a_request(approved):
 
     for forbidden in ("/home/", "C:\\", "token", "secret", "api_key"):
         assert forbidden not in rendered.lower(), forbidden
+
+
+# ---------------------------------------------------------------------------
+# Builtins are NOT subject to React Bits' (or any external) reviewed contract
+# ---------------------------------------------------------------------------
+
+
+def test_a_builtin_carrying_declared_dependencies_is_refused_not_crashed():
+    """A builtin's direct dependencies are reviewed PER COMPONENT, never declared
+    by a caller. Supplying them must be a bounded refusal, not an uncaught
+    ValueError from the request constructor."""
+    outcome = build_registry_request(
+        SOURCE_SHADCN_BUILTIN,
+        "button",
+        declared_dependencies=["gsap", "@gsap/react"],
+    )
+
+    assert outcome.ok is False
+    assert outcome.request is None
+    assert outcome.reason == REASON_BUILTIN_CARRIES_DEPENDENCIES
+
+
+def test_a_clean_builtin_request_carries_no_dependencies():
+    outcome = build_registry_request(SOURCE_SHADCN_BUILTIN, "dialog")
+
+    assert outcome.ok is True
+    assert outcome.request.required_dependency_ids == ()
+    assert outcome.request.is_builtin is True
+    assert outcome.dependency_ids == ()
+
+
+def test_no_builtin_is_keyed_into_the_external_contract_table():
+    """The React Bits reviewed contract must never cover a shadcn builtin."""
+    import app.core.design_install as install
+    import app.core.design_registry as registry
+
+    contracted = {component for (_source, component) in registry._REVIEWED_COMPONENT_CONTRACTS}
+    assert contracted.isdisjoint(set(install.ALLOWED_SHADCN_COMPONENTS))
+    # And a builtin has no reviewed external contract, by source or identity.
+    for component in install.ALLOWED_SHADCN_COMPONENTS:
+        assert registry.reviewed_component_contract(SOURCE_REACT_BITS, component) is None
+        assert registry.reviewed_component_contract(SOURCE_SHADCN_BUILTIN, component) is None
+
+
+def test_a_builtin_never_resolves_to_a_react_bits_locator():
+    for component in ("button", "dialog", "card"):
+        assert resolve_registry_locator(SOURCE_REACT_BITS, component) is None

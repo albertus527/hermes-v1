@@ -447,6 +447,29 @@ MUTATIONS = [
                 "project dependency."
             )""",
     ),
+    # 12j. A builtin carrying declared dependencies must be a bounded REFUSAL,
+    #      not an uncaught ValueError (which would let a builtin be routed
+    #      through the external-contract path).
+    (
+        "a builtin carrying declared dependencies is refused, not crashed",
+        REGISTRY,
+        """        if dependency_ids:
+            logger.warning(
+                "Refusing a shadcn builtin carrying declared dependencies; builtin "
+                "dependencies are reviewed per component, not declared."
+            )
+            return RegistryRequestOutcome(
+                ok=False, request=None, reason=REASON_BUILTIN_CARRIES_DEPENDENCIES
+            )""",
+        """        if False:
+            logger.warning(
+                "Refusing a shadcn builtin carrying declared dependencies; builtin "
+                "dependencies are reviewed per component, not declared."
+            )
+            return RegistryRequestOutcome(
+                ok=False, request=None, reason=REASON_BUILTIN_CARRIES_DEPENDENCIES
+            )""",
+    ),
     # 12h. The trusted boundary must be CONSULTED by build_registry_request.
     (
         "build_registry_request consults the trusted boundary",

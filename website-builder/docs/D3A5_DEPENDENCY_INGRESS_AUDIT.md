@@ -206,6 +206,23 @@ application-owned set, exactly `REGISTRY_INTRODUCED_PACKAGE_PINS` — **not** se
 No package NAME is shared between A and B ∪ C, and no registry helper is a D2 id.
 Proven by `test_the_builtin_registry_packages_are_a_separate_application_owned_set`.
 
+### Builtins are NEVER subject to an external reviewed contract
+
+The two paths share no contract. A shadcn builtin's direct dependencies are
+reviewed **per component** (the builtin tables); an external component's are
+reviewed in its **contract**. The cross-contamination is refused structurally:
+
+- No builtin identity is keyed into `_REVIEWED_COMPONENT_CONTRACTS`, and
+  `reviewed_component_contract` returns `None` for every builtin (by source or
+  identity); `resolve_registry_locator(react_bits, <builtin>)` is `None`.
+- `build_registry_request(SOURCE_SHADCN_BUILTIN, <builtin>, declared_dependencies=[...])`
+  is a bounded **refusal** (`REASON_BUILTIN_CARRIES_DEPENDENCIES`), not an
+  uncaught `ValueError`. Supplying declared deps for a builtin is an attempt to
+  route it through the external-contract path; it is refused as a normal
+  outcome so "builtins are not subject to React Bits' reviewed contract" is a
+  property of the entry point, not of a caller remembering not to pass them.
+- A clean builtin request always carries `required_dependency_ids == ()`.
+
 ### The external registry component path
 
 An external component's direct-package allowlist is its **reviewed contract**

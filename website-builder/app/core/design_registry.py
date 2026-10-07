@@ -772,6 +772,10 @@ REASON_BOUNDARY_INCOHERENT = (
     "the application-owned trusted registry boundary is incoherent; no command "
     "was attempted"
 )
+REASON_BUILTIN_CARRIES_DEPENDENCIES = (
+    "a shadcn builtin was given declared dependencies; builtin dependencies are "
+    "reviewed per component, not declared"
+)
 
 
 def build_registry_request(
@@ -836,16 +840,32 @@ def build_registry_request(
             return RegistryRequestOutcome(
                 ok=False, request=None, reason=REASON_COMPONENT_NOT_BUILTIN
             )
+        # A builtin is NEVER subject to a reviewed external contract, and its
+        # direct dependencies are reviewed PER COMPONENT (the builtin tables),
+        # not declared by a caller. If a caller supplies declared dependency ids
+        # for a builtin, that is an attempt to route a builtin through the
+        # external-contract path -- refuse it as a bounded outcome rather than
+        # letting the constructor raise. This keeps "official shadcn builtins
+        # are not subject to React Bits' reviewed contract" a property of THIS
+        # function, not of the caller remembering not to pass dependencies.
+        if dependency_ids:
+            logger.warning(
+                "Refusing a shadcn builtin carrying declared dependencies; builtin "
+                "dependencies are reviewed per component, not declared."
+            )
+            return RegistryRequestOutcome(
+                ok=False, request=None, reason=REASON_BUILTIN_CARRIES_DEPENDENCIES
+            )
         return RegistryRequestOutcome(
             ok=True,
             request=RegistryInstallRequest(
                 source=source,
                 component_id=component_id,
                 registry_locator_id="",
-                required_dependency_ids=dependency_ids,
+                required_dependency_ids=(),
             ),
             reason=REASON_REQUEST_OK,
-            dependency_ids=dependency_ids,
+            dependency_ids=(),
         )
 
     locator = resolve_registry_locator(source, component_id)
@@ -953,6 +973,7 @@ __all__ = [
     "REGISTRY_HOSTS",
     "REGISTRY_SOURCES",
     "REASON_BOUNDARY_INCOHERENT",
+    "REASON_BUILTIN_CARRIES_DEPENDENCIES",
     "REASON_COMPONENT_NOT_BUILTIN",
     "REASON_COMPONENT_UNKNOWN",
     "REASON_DEPENDENCY_UNKNOWN",
