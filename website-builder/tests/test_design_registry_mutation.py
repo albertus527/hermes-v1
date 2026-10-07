@@ -795,3 +795,106 @@ def test_an_external_component_with_only_contract_imports_is_accepted(project):
     outcome = _installer(project, runner).install_external_component(_split_text_request())
 
     assert outcome.state == "installed", outcome.reason
+
+
+# ---------------------------------------------------------------------------
+# Removal mutation: an install must never DELETE a project dependency
+# ---------------------------------------------------------------------------
+#
+# `dependency_delta` reports what `after` CONTAINS, so a REMOVAL is invisible to
+# it. A registry install may ADD its reviewed packages; it must never remove a
+# pre-existing project dependency. These tests prove removals are caught.
+
+
+def test_removed_direct_dependencies_reports_every_removal():
+    from app.core.design_install import removed_direct_dependencies
+
+    before = {"dependencies": {"react": "19.2.7", "cn": "0.4.0"},
+              "devDependencies": {"vite": "8.2.0"}}
+    after = {"dependencies": {"cn": "0.4.0"}, "devDependencies": {}}
+
+    removed = removed_direct_dependencies(before, after)
+
+    assert removed["dependencies"] == ("react",)
+    assert removed["devDependencies"] == ("vite",)
+
+
+def test_a_removal_is_rejected_by_the_delta_guard():
+    before = {"dependencies": {"react": "19.2.7", "cn": "0.4.0"}}
+    after = {"dependencies": {"cn": "0.4.0"}}
+
+    ok, offending = registry_dependency_delta_is_acceptable(
+        before, after, allowed_packages=["cn", "radix-ui"]
+    )
+
+    assert ok is False
+    assert offending == ("react",)
+
+
+def test_an_install_that_removes_a_project_dependency_is_refused(project):
+    """The CLI adds its reviewed packages but drops a pre-existing dep."""
+    runner = RegistryRunner(
+        dependency_writes={"dependencies": {"cn": "^0.4.0", "radix-ui": "^1.7.0"}},
+        materializes=True,
+        component_name="button",
+    )
+    # Make the emulated CLI also remove `react`.
+    _orig = runner.run_command
+
+    def run_and_drop(pid, command, cwd=None, env=None, timeout=300.0):
+        result = _orig(pid, command, cwd=cwd, env=env, timeout=timeout)
+        if "add" in list(command):
+            manifest = Path(cwd) / "package.json"
+            doc = json.loads(manifest.read_text(encoding="utf-8"))
+            doc.get("dependencies", {}).pop("react", None)
+            manifest.write_text(json.dumps(doc), encoding="utf-8")
+        return result
+
+    runner.run_command = run_and_drop
+
+    outcome, _, _ = _installer(project, runner).install_components(["button"])
+
+    assert outcome.state == INSTALL_FAILED
+    assert outcome.reason == REASON_REGISTRY_DEPENDENCY_DRIFT
+    assert outcome.installed is False
+
+
+def test_an_install_that_only_adds_reviewed_packages_is_accepted(project):
+    """The no-removal path is unchanged: adding reviewed packages still passes."""
+    runner = RegistryRunner(
+        dependency_writes={"dependencies": {"cn": "^0.4.0", "radix-ui": "^1.7.0"}},
+        materializes=True,
+        component_name="button",
+    )
+
+    outcome, _, _ = _installer(project, runner).install_components(["button"])
+
+    assert outcome.state == "installed", outcome.reason
+
+
+def test_a_removal_during_normalization_is_refused(project):
+    """Normalization runs a package manager AFTER the delta check; if it drops a
+    project dependency, only the whole-operation removal check can see it."""
+    runner = RegistryRunner(
+        dependency_writes={"dependencies": {"cn": "^0.4.0"}},
+        materializes=True,
+        component_name="button",
+    )
+    _orig = runner.run_command
+
+    def run_and_drop_on_normalize(pid, command, cwd=None, env=None, timeout=300.0):
+        result = _orig(pid, command, cwd=cwd, env=env, timeout=timeout)
+        if list(command)[:2] in (["npm", "install"], ["pnpm", "add"], ["yarn", "add"]):
+            manifest = Path(cwd) / "package.json"
+            doc = json.loads(manifest.read_text(encoding="utf-8"))
+            doc.get("dependencies", {}).pop("react", None)
+            manifest.write_text(json.dumps(doc), encoding="utf-8")
+        return result
+
+    runner.run_command = run_and_drop_on_normalize
+
+    outcome, _, _ = _installer(project, runner).install_components(["button"])
+
+    assert outcome.state == INSTALL_FAILED
+    assert outcome.reason == REASON_REGISTRY_DEPENDENCY_DRIFT
+    assert outcome.installed is False

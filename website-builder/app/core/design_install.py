@@ -1006,6 +1006,28 @@ def dependency_delta(
     return delta
 
 
+def removed_direct_dependencies(
+    before: Mapping[str, Mapping[str, str]],
+    after: Mapping[str, Mapping[str, str]],
+) -> Dict[str, Tuple[str, ...]]:
+    """Direct dependencies present in ``before`` and ABSENT from ``after``.
+
+    ``dependency_delta`` only reports what ``after`` CONTAINS, so a package the
+    install silently REMOVED -- or moved out of a section entirely -- is
+    invisible to it. A registry install may only ADD its reviewed packages; it
+    must never delete a pre-existing project dependency. Returns
+    ``section -> (package, ...)`` for every removal.
+    """
+    removed: Dict[str, Tuple[str, ...]] = {}
+    for section in SNAPSHOT_SECTIONS:
+        before_block = before.get(section, {})
+        after_block = after.get(section, {})
+        gone = tuple(sorted(name for name in before_block if name not in after_block))
+        if gone:
+            removed[section] = gone
+    return removed
+
+
 def registry_dependency_delta_is_acceptable(
     before: Mapping[str, Mapping[str, str]],
     after: Mapping[str, Mapping[str, str]],
@@ -1021,6 +1043,9 @@ def registry_dependency_delta_is_acceptable(
     it appears in ``allowed_packages`` AND only in the runtime ``dependencies``
     section (a registry introducing a package into a dev/optional/peer section is
     not the reviewed shape).
+
+    A package REMOVED from a pre-existing section is also offending: a registry
+    install may add its reviewed packages, never delete a project dependency.
     """
     delta = dependency_delta(before, after)
     allowed = set(allowed_packages)
@@ -1033,6 +1058,10 @@ def registry_dependency_delta_is_acceptable(
                 # Right package, wrong section: a registry must not move a
                 # runtime helper into devDependencies/optionalDependencies.
                 offending.add(name)
+    # A removal is invisible to ``dependency_delta``; catch it here so a silent
+    # deletion of a project dependency fails the install.
+    for packages in removed_direct_dependencies(before, after).values():
+        offending.update(packages)
     return (not offending), tuple(sorted(offending))
 
 
@@ -2139,6 +2168,30 @@ class DesignDependencyInstaller:
                 rejected,
             )
 
+        # 4. Whole-operation removal check. Steps 1-3 compare the CLI's own
+        #    delta and the emitted sources, but the NORMALIZATION installs in
+        #    step 1 (and step 1b) also run a package manager, which may prune a
+        #    pre-existing project dependency. Nothing added after ``before`` may
+        #    have REMOVED a package that ``before`` declared: a registry install
+        #    adds reviewed packages, it never deletes the project's own deps.
+        if self._removal_after_install(before):
+            logger.warning(
+                "Refusing a registry install that removed a pre-existing "
+                "project dependency."
+            )
+            return (
+                InstallOutcome(
+                    dependency_id=REGISTRY_DEPENDENCY,
+                    state=INSTALL_FAILED,
+                    package=None,
+                    reason=REASON_REGISTRY_DEPENDENCY_DRIFT,
+                    receipt=imports_receipt or boundary.receipt or receipt,
+                    verified_components=(),
+                ),
+                allowed,
+                rejected,
+            )
+
         return (
             InstallOutcome(
                 dependency_id=REGISTRY_DEPENDENCY,
@@ -2151,6 +2204,19 @@ class DesignDependencyInstaller:
             allowed,
             rejected,
         )
+
+    def _removal_after_install(
+        self, before: Mapping[str, Mapping[str, str]]
+    ) -> bool:
+        """Whether any package ``before`` declared is now ABSENT.
+
+        The last line of defence for the whole operation: every prior check
+        compares ADDITIONS. A package manager run by normalization, or a CLI
+        that rewrote the manifest, could silently DROP a project dependency; that
+        is a mutation of the project's own dependency state and must fail closed.
+        """
+        after = snapshot_direct_dependencies(self.project_root)
+        return bool(removed_direct_dependencies(before, after))
 
     def _enforce_registry_source_import_boundary(
         self,
@@ -2509,6 +2575,18 @@ class DesignDependencyInstaller:
                 verified_components=(),
             )
 
+        # Whole-operation removal check: normalization installs also run a
+        # package manager, which must not drop a pre-existing project dependency.
+        if self._removal_after_install(before):
+            return InstallOutcome(
+                dependency_id=REGISTRY_DEPENDENCY,
+                state=INSTALL_FAILED,
+                package=None,
+                reason=REASON_REGISTRY_DEPENDENCY_DRIFT,
+                receipt=boundary.receipt or receipt,
+                verified_components=(),
+            )
+
         return InstallOutcome(
             dependency_id=REGISTRY_DEPENDENCY,
             state="installed",
@@ -2648,6 +2726,7 @@ __all__ = [
     "project_satisfies_dependency",
     "project_satisfies_spec",
     "registry_dependency_delta_is_acceptable",
+    "removed_direct_dependencies",
     "required_registry_packages",
     "reviewed_registry_package_pins",
     "snapshot_direct_dependencies",

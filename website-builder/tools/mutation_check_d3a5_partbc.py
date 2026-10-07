@@ -415,6 +415,38 @@ MUTATIONS = [
         ):""",
         """        if False:""",
     ),
+    # ------------------------------------------------------------------
+    # Removal mutation -- an install must never DELETE a project dependency
+    # ------------------------------------------------------------------
+    # `dependency_delta` only reports what `after` CONTAINS, so a removal is
+    # invisible to it. A registry install adds reviewed packages; it never
+    # removes a pre-existing project dependency.
+    #
+    # 10. The delta guard must include removals.
+    (
+        "a removed pre-existing dependency is refused",
+        INSTALL,
+        """    # A removal is invisible to ``dependency_delta``; catch it here so a silent
+    # deletion of a project dependency fails the install.
+    for packages in removed_direct_dependencies(before, after).values():
+        offending.update(packages)""",
+        """    pass""",
+    ),
+    # 11. The whole-operation removal check must actually run (builtin path).
+    (
+        "the whole-operation removal check runs after normalization",
+        INSTALL,
+        """        if self._removal_after_install(before):
+            logger.warning(
+                "Refusing a registry install that removed a pre-existing "
+                "project dependency."
+            )""",
+        """        if False:
+            logger.warning(
+                "Refusing a registry install that removed a pre-existing "
+                "project dependency."
+            )""",
+    ),
 ]
 
 

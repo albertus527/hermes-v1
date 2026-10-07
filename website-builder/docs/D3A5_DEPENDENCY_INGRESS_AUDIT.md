@@ -180,6 +180,22 @@ absent from the manifest.
   the four passes converge on: allowlisted identity + reviewed contract +
   manifest-delta guard + emitted-source import guard.
 
+## Fifth-pass audit (mutations: removals, not just additions)
+
+Every prior guard compared **additions** (`dependency_delta` reports what
+`after` CONTAINS). A package the install silently **REMOVED** was invisible:
+confirmed live, `install_components(["button"])` was reported `installed` while a
+pre-existing `react` dependency was dropped from `package.json`.
+
+- **Fix:** `removed_direct_dependencies(before, after)` reports every package
+  present in `before` and absent from `after`; the delta guard treats any removal
+  as offending (`REASON_REGISTRY_DEPENDENCY_DRIFT`). A whole-operation
+  `_removal_after_install(before)` check runs last on both the builtin and
+  external paths, catching a removal performed by a NORMALIZATION install (which
+  runs after the delta guard and so is not covered by it).
+- **Rule:** a registry install may ADD its reviewed packages; it must never
+  DELETE a pre-existing project dependency.
+
 ## Final dependency policy (post-repair)
 
 - **Package identity is closed and application-owned.** `DEPENDENCY_PACKAGES`
