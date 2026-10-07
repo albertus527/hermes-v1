@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import app.core.design_registry as registry
 from app.core.design_install import DEPENDENCY_PACKAGE_PINS
 from app.core.design_registry import (
+    ReviewedComponentContract,
     REASON_COMPONENT_UNKNOWN,
     REASON_CONSTRAINT_UNSATISFIED,
     REASON_CONTRACT_MISSING,
@@ -598,3 +599,78 @@ def test_the_boundary_serializes_without_untrusted_data():
 
     assert "http" not in payload and "/r/" not in payload
     assert "token" not in payload and "secret" not in payload
+
+
+def test_the_component_table_separates_builtins_from_external_contracts():
+    """The boundary type ENFORCES that a builtin is never given an external
+    reviewed contract and a builtin name is never an approved external identity
+    -- the cross-contamination the two paths exist to prevent."""
+    import dataclasses
+
+    from app.core.design_registry import (
+        SOURCE_SHADCN_BUILTIN,
+        TrustedRegistryBoundary,
+        trusted_registry_boundary,
+    )
+
+    base = trusted_registry_boundary()
+
+    def rebuild(**over):
+        fields = {f.name: getattr(base, f.name) for f in dataclasses.fields(base)}
+        fields.update(over)
+        return TrustedRegistryBoundary(**fields)
+
+    contract = ReviewedComponentContract(
+        source=SOURCE_SHADCN_BUILTIN,
+        component_id="button",
+        expected_dependency_ids=("gsap",),
+        expected_registry_dependencies=(),
+    )
+
+    # A contract keyed to the BUILTIN source is refused. Keep the approved
+    # table coherent (builtin source still empty) so the ONLY thing that can
+    # refuse this is the contract-source check, not the approved-identity check.
+    with pytest.raises(ValueError):
+        rebuild(
+            reviewed_contracts={**base.reviewed_contracts, (SOURCE_SHADCN_BUILTIN, "button"): contract},
+        )
+
+    # A contract for a component that HAPPENS to be a builtin name is refused.
+    external_contract = ReviewedComponentContract(
+        source=SOURCE_REACT_BITS,
+        component_id="button",
+        expected_dependency_ids=(),
+        expected_registry_dependencies=(),
+    )
+    with pytest.raises(ValueError):
+        rebuild(
+            approved_components={**base.approved_components, SOURCE_REACT_BITS: ("SplitText", "button")},
+            reviewed_contracts={**base.reviewed_contracts, (SOURCE_REACT_BITS, "button"): external_contract},
+        )
+
+    # A builtin NAME as an approved external identity is refused.
+    with pytest.raises(ValueError):
+        rebuild(
+            approved_components={
+                **base.approved_components,
+                SOURCE_REACT_BITS: ("SplitText", "button"),
+            },
+        )
+
+    # The builtin source must carry no approved external identities at all.
+    with pytest.raises(ValueError):
+        rebuild(
+            approved_components={**base.approved_components, SOURCE_SHADCN_BUILTIN: ("button",)},
+        )
+
+
+def test_no_builtin_name_is_an_approved_external_identity_in_the_live_tables():
+    from app.core.design_install import ALLOWED_SHADCN_COMPONENTS
+    from app.core.design_registry import _APPROVED_COMPONENTS, _REVIEWED_COMPONENT_CONTRACTS
+
+    builtin = set(ALLOWED_SHADCN_COMPONENTS)
+    for source, components in _APPROVED_COMPONENTS.items():
+        assert builtin.isdisjoint(set(components)), source
+    for (source, component_id) in _REVIEWED_COMPONENT_CONTRACTS:
+        assert source != "shadcn_builtin"
+        assert component_id not in builtin

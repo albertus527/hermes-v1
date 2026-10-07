@@ -206,6 +206,22 @@ application-owned set, exactly `REGISTRY_INTRODUCED_PACKAGE_PINS` — **not** se
 No package NAME is shared between A and B ∪ C, and no registry helper is a D2 id.
 Proven by `test_the_builtin_registry_packages_are_a_separate_application_owned_set`.
 
+### The component tables are separate at the TABLE level
+
+The trusted-boundary type now **enforces** the component-table separation, so
+cross-contamination is unrepresentable rather than merely absent:
+
+- a reviewed contract keyed to the **builtin source** (`shadcn_builtin`) →
+  refused (and, independently, subsumed by "contract without an approved
+  identity");
+- a **builtin name** appearing as an approved **external identity** → refused;
+- the **builtin source** carrying any approved external identities → refused.
+
+Live tables verified: no builtin name is in `_APPROVED_COMPONENTS` for any
+source, and no contract key names a builtin. Pinned by
+`test_the_component_table_separates_builtins_from_external_contracts` and
+`test_no_builtin_name_is_an_approved_external_identity_in_the_live_tables`.
+
 ### Builtins are NEVER subject to an external reviewed contract
 
 The two paths share no contract. A shadcn builtin's direct dependencies are

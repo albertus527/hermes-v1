@@ -447,6 +447,37 @@ MUTATIONS = [
                 "project dependency."
             )""",
     ),
+    # 12k. The component tables stay SEPARATE: a builtin name is never an
+    #      approved EXTERNAL identity (the contract-keyed-to-builtin-source case
+    #      is subsumed by the "contract without an approved identity" check).
+    (
+        "a builtin name is never an approved external identity",
+        REGISTRY,
+        """        for source, components in self.approved_components.items():
+            if source == SOURCE_SHADCN_BUILTIN:
+                if components:
+                    raise ValueError(
+                        "the builtin source must have no approved external identities"
+                    )
+                continue
+            overlap = builtin_names & set(components)
+            if overlap:
+                raise ValueError(
+                    f"a builtin name is an approved external identity: {sorted(overlap)!r}"
+                )""",
+        """        for source, components in self.approved_components.items():
+            if source == SOURCE_SHADCN_BUILTIN:
+                if components:
+                    raise ValueError(
+                        "the builtin source must have no approved external identities"
+                    )
+                continue
+            overlap = set()
+            if overlap:
+                raise ValueError(
+                    f"a builtin name is an approved external identity: {sorted(overlap)!r}"
+                )""",
+    ),
     # 12j. A builtin carrying declared dependencies must be a bounded REFUSAL,
     #      not an uncaught ValueError (which would let a builtin be routed
     #      through the external-contract path).

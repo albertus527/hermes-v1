@@ -432,6 +432,34 @@ class TrustedRegistryBoundary:
                     f"reviewed contract without an approved identity: {component_id!r}"
                 )
 
+        # The component tables are SEPARATE: the official shadcn builtins are
+        # named by the builtin allowlist and are NEVER subject to an external
+        # reviewed contract, and a builtin name is NEVER an approved external
+        # identity. This is the cross-contamination the two paths exist to
+        # prevent, enforced at the table level rather than trusted to callers.
+        builtin_names = set(self.builtin_components)
+        for (source, component_id) in self.reviewed_contracts:
+            if source == SOURCE_SHADCN_BUILTIN:
+                raise ValueError(
+                    f"a reviewed contract is keyed to the builtin source: {component_id!r}"
+                )
+            if component_id in builtin_names:
+                raise ValueError(
+                    f"a builtin component has an external reviewed contract: {component_id!r}"
+                )
+        for source, components in self.approved_components.items():
+            if source == SOURCE_SHADCN_BUILTIN:
+                if components:
+                    raise ValueError(
+                        "the builtin source must have no approved external identities"
+                    )
+                continue
+            overlap = builtin_names & set(components)
+            if overlap:
+                raise ValueError(
+                    f"a builtin name is an approved external identity: {sorted(overlap)!r}"
+                )
+
         # The builtin allowlist and its per-component rows share one key domain.
         if not self.builtin_components or len(set(self.builtin_components)) != len(
             self.builtin_components
