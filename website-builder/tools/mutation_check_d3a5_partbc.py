@@ -244,6 +244,43 @@ MUTATIONS = [
     return found""",
     ),
     # ------------------------------------------------------------------
+    # Part G -- 21st discovery is the REAL authenticated REST search
+    # ------------------------------------------------------------------
+    # No credential -> no request at all. A 401 round-trip is not a useful
+    # degradation, and the false-positive route parser must never come back.
+    (
+        "21st discovery makes no request without a credential",
+        FETCH,
+        """    if source in CREDENTIAL_REQUIRED_FOR_DISCOVERY and credential is None:
+        # No key -> no request. This is the designed bounded state, not an error.
+        return CatalogFetchResult(source=source, reason=REASON_CREDENTIAL_REQUIRED)""",
+        """    if False:
+        # No key -> no request. This is the designed bounded state, not an error.
+        return CatalogFetchResult(source=source, reason=REASON_CREDENTIAL_REQUIRED)""",
+    ),
+    # The 21st URL is the REST SEARCH endpoint, not the identity-free llms.txt.
+    (
+        "21st discovery uses the REST search endpoint",
+        FETCH,
+        """    elif source in CATALOG_SEARCH_ENDPOINTS:
+        term = query if isinstance(query, str) and query.strip() else DEFAULT_DISCOVERY_QUERY
+        term = term.strip()[:MAX_QUERY_CHARS]
+        encoded = urllib.parse.quote(term, safe="")
+        url = (
+            f"{CATALOG_SEARCH_ENDPOINTS[source]}"
+            f"?q={encoded}&scope={DISCOVERY_SCOPE}&limit={DISCOVERY_LIMIT}"
+        )""",
+        """    elif source in CATALOG_SEARCH_ENDPOINTS:
+        url = CATALOG_SEARCH_ENDPOINTS[source]""",
+    ),
+    # The search term is percent-encoded, so it cannot widen the request.
+    (
+        "the discovery query term is percent-encoded",
+        FETCH,
+        """        encoded = urllib.parse.quote(term, safe="")""",
+        """        encoded = term""",
+    ),
+    # ------------------------------------------------------------------
     # Part H -- the Impeccable degraded scan
     # ------------------------------------------------------------------
     # A degraded (regex-fallback) scan must not be treated as authoritative.

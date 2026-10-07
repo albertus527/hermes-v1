@@ -21,6 +21,8 @@ from app.core.design_catalog_fetch import (
     ALLOWED_HOSTS,
     CATALOG_ENDPOINTS,
     CATALOG_FETCH_REASONS,
+    CATALOG_SEARCH_ENDPOINTS,
+    CREDENTIAL_REQUIRED_FOR_DISCOVERY,
     MAX_RESPONSE_BYTES,
     REASON_BAD_STATUS,
     REASON_REDIRECT_REFUSED,
@@ -77,12 +79,24 @@ class RecordingTransport:
 def test_the_endpoints_are_application_owned_constants():
     """Never discovered, never overridden by a caller."""
     assert CATALOG_ENDPOINTS[SOURCE_REACT_BITS] == "https://reactbits.dev/llms.txt"
-    assert CATALOG_ENDPOINTS[SOURCE_TWENTY_FIRST].startswith("https://21st.dev/")
+    # 21st's only real surface is the authenticated REST SEARCH; its public
+    # llms.txt publishes no identity schema, so it is NOT a discovery endpoint.
+    assert SOURCE_TWENTY_FIRST not in CATALOG_ENDPOINTS
+    assert (
+        CATALOG_SEARCH_ENDPOINTS[SOURCE_TWENTY_FIRST]
+        == "https://21st.dev/api/v1/components/search"
+    )
+    assert SOURCE_TWENTY_FIRST in CREDENTIAL_REQUIRED_FOR_DISCOVERY
 
 
 @pytest.mark.parametrize("source", [SOURCE_REACT_BITS, SOURCE_TWENTY_FIRST])
-def test_every_endpoint_passes_its_own_allowlist(source):
-    assert url_is_allowed(source, CATALOG_ENDPOINTS[source]) is True
+def test_every_built_url_passes_its_own_allowlist(source):
+    """Every URL this module builds is https on the source's own host."""
+    from app.core.design_catalog_fetch import build_discovery_url
+
+    url = build_discovery_url(source)
+    assert url is not None
+    assert url_is_allowed(source, url) is True
 
 
 @pytest.mark.parametrize(
@@ -137,10 +151,15 @@ def test_the_fetch_requests_only_the_application_owned_url():
 
 
 def test_a_json_endpoint_is_passed_through_unparsed():
+    """21st's REST search returns JSON; it reaches the normalizer unparsed."""
     payload = {"components": [{"id": "blur-text", "name": "Blur Text"}]}
     transport = RecordingTransport(body=json.dumps(payload).encode("utf-8"))
 
-    result = fetch_catalog_payload(SOURCE_TWENTY_FIRST, transport=transport)
+    result = fetch_catalog_payload(
+        SOURCE_TWENTY_FIRST,
+        transport=transport,
+        credential_provider=lambda _s: "21st_sk_present",
+    )
 
     assert result.payload == payload
 
@@ -214,7 +233,11 @@ def test_an_oversized_response_is_refused():
 def test_malformed_json_is_a_degraded_result_not_an_entry():
     transport = RecordingTransport(body=b"{not json")
 
-    result = fetch_catalog_payload(SOURCE_TWENTY_FIRST, transport=transport)
+    result = fetch_catalog_payload(
+        SOURCE_TWENTY_FIRST,
+        transport=transport,
+        credential_provider=lambda _s: "21st_sk_present",
+    )
 
     assert result.reason == REASON_UNEXPECTED_ERROR
 
@@ -222,7 +245,11 @@ def test_malformed_json_is_a_degraded_result_not_an_entry():
 def test_undecodable_bytes_are_a_degraded_result():
     transport = RecordingTransport(body=b"\xff\xfe\x00binary")
 
-    result = fetch_catalog_payload(SOURCE_TWENTY_FIRST, transport=transport)
+    result = fetch_catalog_payload(
+        SOURCE_TWENTY_FIRST,
+        transport=transport,
+        credential_provider=lambda _s: "21st_sk_present",
+    )
 
     assert result.ok is False
     assert result.reason in CATALOG_FETCH_REASONS
@@ -251,12 +278,14 @@ def test_a_credential_is_sent_only_as_a_header_and_only_when_present():
     assert seen["Authorization"] == "Bearer sk-secret"
 
     seen.clear()
-    fetch_catalog_payload(
+    no_key = fetch_catalog_payload(
         SOURCE_TWENTY_FIRST,
         transport=transport,
         credential_provider=lambda _source: None,
     )
-    assert "Authorization" not in seen
+    # No credential -> no request at all (21st's search API is 401 without one).
+    assert seen == {}
+    assert no_key.reason == "this catalog needs a credential that is not configured"
 
 
 def test_the_credential_value_never_reaches_the_result():
@@ -585,3 +614,134 @@ def test_the_21st_schema_flag_is_explicitly_false():
     import app.core.design_catalog_fetch as fetch
 
     assert fetch._21ST_COMPONENT_IDENTITY_SCHEMA_VERIFIED is False
+
+
+# ---------------------------------------------------------------------------
+# Part G: 21st discovery is the REAL authenticated REST search
+# ---------------------------------------------------------------------------
+#
+# The false-positive route parser was removed; this is its REPLACEMENT. 21st's
+# only real machine surface is the authenticated REST API
+# (`GET /api/v1/components/search`), which returns HTTP 401 without a Bearer
+# key. Discovery therefore uses that endpoint, sends no request without a
+# credential, and never parses route text into identities.
+
+#: A trimmed slice of a REAL 21st search response (schema from openapi.json).
+REAL_21ST_SEARCH = {
+    "query": "hero",
+    "scope": "public",
+    "results": [
+        {"name": "Hero Section", "slug": "hero-section", "registry": "blocks",
+         "install_ref": "@someone/hero-section", "author": "someone"},
+        {"name": "Pricing Table", "slug": "pricing-table", "registry": "blocks",
+         "install_ref": "@other/pricing-table"},
+    ],
+}
+
+
+def test_21st_discovery_without_a_credential_makes_no_request():
+    """No key -> no request. A 401 round-trip is not a useful degradation."""
+    calls = []
+
+    def transport(url, headers, timeout):
+        calls.append(url)
+        return 200, b"{}"
+
+    result = fetch_catalog_payload(SOURCE_TWENTY_FIRST, transport=transport)
+
+    assert calls == [], "no request may be attempted without a credential"
+    assert result.ok is False
+    assert result.reason == "this catalog needs a credential that is not configured"
+
+
+def test_21st_discovery_with_a_credential_hits_the_search_endpoint():
+    transport = RecordingTransport(body=json.dumps(REAL_21ST_SEARCH).encode("utf-8"))
+
+    result = discover_catalog(
+        SOURCE_TWENTY_FIRST,
+        transport=transport,
+        credential_provider=lambda _s: "21st_sk_present",
+        query="hero",
+    )
+
+    url, headers, _ = transport.calls[0]
+    assert url.startswith("https://21st.dev/api/v1/components/search?")
+    assert "q=hero" in url
+    assert headers["Authorization"] == "Bearer 21st_sk_present"
+    assert result.ok is True
+    assert {e.component_id for e in result.entries} == {"hero-section", "pricing-table"}
+
+
+def test_the_21st_search_results_normalize_and_are_only_proposals():
+    """Every result is real, and none is installable (nothing is reviewed)."""
+    transport = RecordingTransport(body=json.dumps(REAL_21ST_SEARCH).encode("utf-8"))
+
+    result = discover_catalog(
+        SOURCE_TWENTY_FIRST,
+        transport=transport,
+        credential_provider=lambda _s: "21st_sk_present",
+    )
+
+    assert "hero-section" in result.installable_ids()
+    # ...and yet it is NOT installable, because review is the gate, not the catalog.
+    assert resolve_registry_locator(SOURCE_TWENTY_FIRST, "hero-section") is None
+    outcome = build_registry_request(SOURCE_TWENTY_FIRST, "hero-section")
+    assert outcome.ok is False
+
+
+def test_the_query_term_cannot_widen_the_request():
+    """A hostile term is percent-encoded into a module-owned URL."""
+    from app.core.design_catalog_fetch import build_discovery_url
+
+    url = build_discovery_url(
+        SOURCE_TWENTY_FIRST, "x&scope=team&evil=https://evil.example"
+    )
+    assert url.startswith("https://21st.dev/api/v1/components/search?q=")
+    # The injected '&scope=team' and 'https://evil' are DATA, not parameters.
+    assert "&evil=" not in url
+    assert url.count("&scope=") == 1
+    assert "scope=public" in url
+    assert "https://evil.example" not in url
+    assert url_is_allowed(SOURCE_TWENTY_FIRST, url) is True
+
+
+def test_the_query_term_is_bounded():
+    from app.core.design_catalog_fetch import MAX_QUERY_CHARS, build_discovery_url
+
+    url = build_discovery_url(SOURCE_TWENTY_FIRST, "z" * 5000)
+    # The encoded term is the bound, not the raw 5000 characters.
+    assert url.count("z") <= MAX_QUERY_CHARS
+
+
+def test_an_empty_query_uses_the_application_owned_default():
+    from app.core.design_catalog_fetch import (
+        DEFAULT_DISCOVERY_QUERY,
+        build_discovery_url,
+    )
+
+    assert f"q={DEFAULT_DISCOVERY_QUERY}" in build_discovery_url(SOURCE_TWENTY_FIRST)
+    assert f"q={DEFAULT_DISCOVERY_QUERY}" in build_discovery_url(
+        SOURCE_TWENTY_FIRST, "   "
+    )
+
+
+def test_the_21st_discovery_url_is_never_caller_supplied():
+    """No parameter is a URL; only a bounded search term."""
+    import inspect
+
+    from app.core.design_catalog_fetch import build_discovery_url, fetch_catalog_payload
+
+    for fn in (build_discovery_url, fetch_catalog_payload):
+        params = set(inspect.signature(fn).parameters)
+        for forbidden in ("url", "endpoint", "host", "locator", "href"):
+            assert forbidden not in params, (fn.__name__, forbidden)
+
+
+def test_react_bits_still_needs_no_credential():
+    """The credential gate is 21st-specific; React Bits is unchanged."""
+    transport = RecordingTransport(body=REAL_REACTBITS_INDEX.encode("utf-8"))
+
+    result = discover_catalog(SOURCE_REACT_BITS, transport=transport)
+
+    assert result.ok is True
+    assert SOURCE_REACT_BITS not in CREDENTIAL_REQUIRED_FOR_DISCOVERY

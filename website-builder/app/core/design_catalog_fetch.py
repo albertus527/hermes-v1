@@ -27,11 +27,17 @@ used.
 Verified upstream contracts
 ---------------------------
 21st.dev
-    ``llms.txt`` documents a REST API (OpenAPI at ``/openapi.json``) that "the
-    21st CLI and MCP server call", authenticated with ``Authorization: Bearer``
-    against a user-issued key from ``/mcp``. Metadata ``search`` is free;
-    component retrieval (``get_component``) is the paid tier. So discovery is
-    attempted only when a key is present, and retrieval is never attempted here.
+    The real machine surface is the authenticated REST API documented by
+    ``openapi.json`` (server ``https://21st.dev/api/v1``), the same surface the
+    ``21st`` CLI and MCP server call. Component discovery is
+    ``GET /api/v1/components/search?q=<term>``, which returns
+    ``{"results": [{slug, name, install_ref, ...}]}``. Verified live (2026-10):
+    it returns **HTTP 401 without a Bearer key**, so discovery is
+    CREDENTIAL-GATED. Its public ``llms.txt`` publishes NO component-identity
+    schema -- only route/category links -- so it is not a discovery surface at
+    all. This module therefore uses the REST search endpoint and refuses to
+    attempt a request when no key is present, rather than parsing route text
+    into fabricated identities.
 
 React Bits
     ``llms.txt`` publishes ``https://reactbits.dev/llms.txt`` as the agent-facing
@@ -68,6 +74,7 @@ import re
 import socket
 import ssl
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Tuple
@@ -116,15 +123,43 @@ CATALOG_FETCH_REASONS = frozenset(
 # Endpoints and hosts -- application-owned, CLOSED
 # ---------------------------------------------------------------------------
 
-#: Per-source, the ONE documented machine-readable discovery surface. Both were
-#: verified from upstream ``llms.txt``; neither is discovered at runtime, and
-#: neither can be overridden by a caller.
+#: Per-source, the ONE documented machine-readable discovery surface that is
+#: reachable with a plain GET and no query. React Bits publishes an
+#: unauthenticated agent index that enumerates its CLI identifiers.
 CATALOG_ENDPOINTS: Dict[str, str] = {
-    # 21st's agent-facing markdown index of the registry surface.
-    SOURCE_TWENTY_FIRST: "https://21st.dev/llms.txt",
     # React Bits' published agent index, which enumerates the CLI identifiers.
     SOURCE_REACT_BITS: "https://reactbits.dev/llms.txt",
 }
+
+#: Sources whose discovery is an authenticated REST SEARCH. The request URL is
+#: built from this module constant plus a BOUNDED, PERCENT-ENCODED query term --
+#: never from a caller-supplied URL. 21st has no "list everything" surface, so
+#: its only real discovery is search.
+CATALOG_SEARCH_ENDPOINTS: Dict[str, str] = {
+    SOURCE_TWENTY_FIRST: "https://21st.dev/api/v1/components/search",
+}
+
+#: Sources whose discovery surface requires a credential. 21st's search API
+#: returns HTTP 401 without a Bearer key, so no request is attempted without one
+#: -- the honest bounded state is CREDENTIAL-REQUIRED, not a wasted round-trip
+#: and not an empty catalog reported as a real one.
+CREDENTIAL_REQUIRED_FOR_DISCOVERY: frozenset = frozenset({SOURCE_TWENTY_FIRST})
+
+#: The scope and page size the application sends. Both are module constants, not
+#: caller input, so a request cannot widen what upstream returns. ``public`` is
+#: the community catalog; the API's own default is the caller's private scope.
+DISCOVERY_SCOPE = "public"
+DISCOVERY_LIMIT = 24
+
+#: Bound on a discovery query term. The term is inert DATA -- it is percent-
+#: encoded into the query string of a module-owned URL and can never introduce a
+#: host, a path, or a second parameter.
+MAX_QUERY_CHARS = 64
+
+#: The application-owned term used when a caller does not supply one. It is a
+#: SEARCH TERM, not an entry: every result still comes only from upstream, so
+#: this cannot fabricate a component.
+DEFAULT_DISCOVERY_QUERY = "component"
 
 #: Exact hosts permitted per source. The allowlist is checked against the
 #: PARSED host of the URL this module built, so a redirected or substituted
@@ -180,9 +215,10 @@ class CatalogFetchResult:
             )
         assert self.payload is not None  # implied by ok
 
-        # Both documented endpoints are markdown indexes. Parse the index into
-        # component documents, then hand those to the unchanged normalizer --
-        # HTTP stays in this module and normalization stays offline.
+        # A markdown index (React Bits llms.txt) is parsed into component
+        # documents first; a JSON payload (21st's search response) is passed
+        # straight to the unchanged normalizer. Either way HTTP stays in this
+        # module and normalization stays offline.
         if isinstance(self.payload, str):
             return normalize_catalog(
                 self.source, parse_markdown_catalog(self.source, self.payload)
@@ -255,12 +291,45 @@ def _default_transport(
     return int(status), body
 
 
+def build_discovery_url(source: str, query: Optional[str] = None) -> Optional[str]:
+    """The ONE request URL for ``source``, or ``None`` when it cannot be built.
+
+    For a source with a plain index endpoint the URL is the module constant. For
+    a source whose only real surface is an authenticated REST SEARCH (21st), the
+    URL is that constant plus a BOUNDED, PERCENT-ENCODED query term and the
+    application-owned ``scope``/``limit``. The term is inert data: percent
+    encoding means it can never introduce a host, a path segment, or a second
+    query parameter, and the constants mean a caller cannot widen the request.
+
+    Returns ``None`` for an unknown source, or when the built URL fails its own
+    host allowlist (a programming error that must fail closed).
+    """
+    if source in CATALOG_ENDPOINTS:
+        url = CATALOG_ENDPOINTS[source]
+    elif source in CATALOG_SEARCH_ENDPOINTS:
+        term = query if isinstance(query, str) and query.strip() else DEFAULT_DISCOVERY_QUERY
+        term = term.strip()[:MAX_QUERY_CHARS]
+        encoded = urllib.parse.quote(term, safe="")
+        url = (
+            f"{CATALOG_SEARCH_ENDPOINTS[source]}"
+            f"?q={encoded}&scope={DISCOVERY_SCOPE}&limit={DISCOVERY_LIMIT}"
+        )
+    else:
+        return None
+
+    if not url_is_allowed(source, url):
+        logger.error("A catalog endpoint failed its own host allowlist; refusing.")
+        return None
+    return url
+
+
 def fetch_catalog_payload(
     source: str,
     *,
     transport: Optional[Transport] = None,
     credential_provider: Optional[CredentialProvider] = None,
     timeout: int = FETCH_TIMEOUT_SECONDS,
+    query: Optional[str] = None,
 ) -> CatalogFetchResult:
     """Fetch ``source``'s documented catalog, bounded at every step.
 
@@ -268,20 +337,32 @@ def fetch_catalog_payload(
     result carrying a static reason, never a fabricated payload.
 
     ``transport`` is a trusted test seam. It is never channel- or
-    resource-controlled, and the URL passed to it is the module constant, so a
-    substituted transport still cannot introduce an unapproved host into a real
-    request -- the allowlist is re-checked on the way out regardless.
+    resource-controlled, and the URL passed to it is built by
+    :func:`build_discovery_url` from module constants plus an inert, encoded
+    query term -- so a substituted transport still cannot introduce an
+    unapproved host, and the allowlist is re-checked on the way out regardless.
+
+    A source whose discovery surface is authenticated (21st) is NOT requested
+    without a credential: an unauthenticated GET would only return HTTP 401, so
+    the honest bounded state is :data:`REASON_CREDENTIAL_REQUIRED` rather than a
+    wasted round-trip reported as an empty catalog.
     """
-    url = CATALOG_ENDPOINTS.get(source)
-    allowed = ALLOWED_HOSTS.get(source)
-    if url is None or not allowed:
+    if source not in ALLOWED_HOSTS:
         return CatalogFetchResult(source=source, reason=REASON_UNREACHABLE)
 
-    if not url_is_allowed(source, url):
-        # A constant that fails its own allowlist is a programming error, and
-        # must fail closed rather than "helpfully" proceeding.
-        logger.error("A catalog endpoint failed its own host allowlist; refusing.")
-        return CatalogFetchResult(source=source, reason=REASON_REDIRECT_REFUSED)
+    credential = None
+    if credential_provider is not None:
+        candidate = credential_provider(source)
+        if isinstance(candidate, str) and candidate.strip():
+            credential = candidate.strip()
+
+    if source in CREDENTIAL_REQUIRED_FOR_DISCOVERY and credential is None:
+        # No key -> no request. This is the designed bounded state, not an error.
+        return CatalogFetchResult(source=source, reason=REASON_CREDENTIAL_REQUIRED)
+
+    url = build_discovery_url(source, query)
+    if url is None:
+        return CatalogFetchResult(source=source, reason=REASON_UNREACHABLE)
 
     headers = {
         "Accept": "application/json, text/plain;q=0.9, */*;q=0.1",
@@ -289,12 +370,10 @@ def fetch_catalog_payload(
         "User-Agent": "hermes-website-builder",
     }
 
-    # 21st's REST surface requires a bearer key. Presence is the only thing that
-    # gates DISCOVERY here; the value never leaves the header.
-    if credential_provider is not None:
-        credential = credential_provider(source)
-        if isinstance(credential, str) and credential.strip():
-            headers["Authorization"] = f"Bearer {credential.strip()}"
+    # Presence is the only thing that gates DISCOVERY here; the value never
+    # leaves the header, and is never returned, logged, or stored.
+    if credential is not None:
+        headers["Authorization"] = f"Bearer {credential}"
 
     execute = transport or _default_transport
 
@@ -460,6 +539,7 @@ def discover_catalog(
     transport: Optional[Transport] = None,
     credential_provider: Optional[CredentialProvider] = None,
     timeout: int = FETCH_TIMEOUT_SECONDS,
+    query: Optional[str] = None,
 ) -> CatalogResult:
     """Discovery for ``source``, end to end and bounded.
 
@@ -468,12 +548,18 @@ def discover_catalog(
     all become a degraded :class:`CatalogResult` with zero entries, because a
     plausible-looking component that upstream never listed is the fabrication
     this whole boundary exists to prevent.
+
+    ``query`` is an optional SEARCH TERM for a source whose discovery surface is
+    a search (21st). It is inert data -- bounded and percent-encoded into a
+    module-owned URL -- and it can never widen the request. Every result still
+    comes only from upstream, so no term can fabricate an entry.
     """
     fetched = fetch_catalog_payload(
         source,
         transport=transport,
         credential_provider=credential_provider,
         timeout=timeout,
+        query=query,
     )
     return fetched.to_result()
 
@@ -482,7 +568,13 @@ __all__ = [
     "ALLOWED_HOSTS",
     "CATALOG_ENDPOINTS",
     "CATALOG_FETCH_REASONS",
+    "CATALOG_SEARCH_ENDPOINTS",
+    "CREDENTIAL_REQUIRED_FOR_DISCOVERY",
+    "DEFAULT_DISCOVERY_QUERY",
+    "DISCOVERY_LIMIT",
+    "DISCOVERY_SCOPE",
     "FETCH_TIMEOUT_SECONDS",
+    "MAX_QUERY_CHARS",
     "MAX_RESPONSE_BYTES",
     "REASON_BAD_STATUS",
     "REASON_CREDENTIAL_REQUIRED",
@@ -492,6 +584,7 @@ __all__ = [
     "REASON_UNEXPECTED_ERROR",
     "REASON_UNREACHABLE",
     "CatalogFetchResult",
+    "build_discovery_url",
     "discover_catalog",
     "fetch_catalog_payload",
     "parse_markdown_catalog",

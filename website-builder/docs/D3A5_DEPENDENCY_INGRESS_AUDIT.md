@@ -15,7 +15,7 @@ real defect or already safe.
 | 1 | npm dependency install (D2 selection) | `design_install.DesignDependencyInstaller.install_dependency` | Yes — but only via the closed `DEPENDENCY_PACKAGES` / `DEPENDENCY_PACKAGE_PINS` tables. A raw package string is unrepresentable. |
 | 2 | shadcn **builtin** component install | `install_components` → `build_registry_argv` → pinned shadcn `add <component>` | Yes. Component name is bounded by `ALLOWED_SHADCN_COMPONENTS`, **but the CLI writes npm packages (`cn`, `radix-ui`) into package.json itself.** |
 | 3 | shadcn **external** registry component install | `design_registry.build_registry_request` → `build_registry_argv` → pinned shadcn `add <locator>` | Yes. Locator is application-owned; the CLI still writes upstream-declared packages into package.json. |
-| 4 | 21st.dev / React Bits **catalog fetch** | `design_catalog_fetch.fetch_catalog_payload` | No argv. Returns catalog entities only. |
+| 4 | 21st.dev / React Bits **catalog fetch** | `design_catalog_fetch.fetch_catalog_payload` / `build_discovery_url` | No argv. Returns catalog entities only. The URL is a module constant plus an encoded search term; no URL parameter exists. |
 | 5 | 21st.dev / React Bits **catalog normalization** | `design_catalog.normalize_catalog` | No argv. Maps declared names through the registry resolver. |
 | 6 | transitions.dev recipe materialization | `design_transitions.build_add_argv` → pinned `transitions-dev add <slug>` | Yes, but only for a catalog-listed slug; writes Markdown only (verified). |
 | 7 | Impeccable critic scan | `design_critic.run_critic_scan` → `node <engine> detect --json --quiet` | Executes the skill's own Node entrypoint; fixed argv; no install. |
@@ -205,6 +205,36 @@ The **pinned official shadcn builtin registry dependencies** (B ∪ C) are their
 application-owned set, exactly `REGISTRY_INTRODUCED_PACKAGE_PINS` — **not** set A.
 No package NAME is shared between A and B ∪ C, and no registry helper is a D2 id.
 Proven by `test_the_builtin_registry_packages_are_a_separate_application_owned_set`.
+
+### 21st.dev discovery: the false positive is REPLACED, not merely muted
+
+Part G removed a false-positive parser that turned 21st's ROUTE/CATEGORY links
+(`/community/components/popular`, `/components/s/hero`) into fabricated catalog
+identities. That left 21st with a *dead* adapter: it still fetched `llms.txt`,
+which publishes NO component-identity schema, and so produced ZERO identities
+even with a credential.
+
+The replacement is the REAL machine surface, verified live (2026-10) from
+`https://21st.dev/openapi.json`:
+
+```
+GET https://21st.dev/api/v1/components/search?q=<term>&scope=public&limit=24
+  -> HTTP 401 without `Authorization: Bearer <21st_sk_...>`
+  -> 200 {"query","scope","results":[{slug,name,install_ref,...}]}
+```
+
+- **Credential-gated, honestly.** `CREDENTIAL_REQUIRED_FOR_DISCOVERY` names 21st;
+  without a key NO request is attempted (a 401 round-trip is not a useful
+  degradation). The state is `REASON_CREDENTIAL_REQUIRED`, and the capability
+  layer already reports `discovery_available=False` / `degraded=True`.
+- **The request cannot be widened.** `build_discovery_url` builds it from module
+  constants plus a BOUNDED (`MAX_QUERY_CHARS`), PERCENT-ENCODED search term --
+  there is no URL/host/locator parameter. A hostile term
+  (`x&scope=team&evil=https://evil.example`) is inert data.
+- **Results are proposals, not identities.** The JSON flows through the unchanged
+  `normalize_catalog`; nothing reviewed for 21st means nothing installable.
+- **No fabrication.** A malformed or empty search response is a degraded empty
+  result, never an invented entry.
 
 ### No unexpected package.json SECTION mutation
 

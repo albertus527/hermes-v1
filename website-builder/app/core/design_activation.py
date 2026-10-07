@@ -867,12 +867,14 @@ def activate_resource(
         return _catalog_capability(
             resource_id,
             # VERIFIED LIVE (2026-10): 21st's real machine surface is the
-            # authenticated REST API (`/api/v1/components/search` -> HTTP 401
+            # authenticated REST API (`GET /api/v1/components/search` -> HTTP 401
             # without a Bearer key), and its public `llms.txt` publishes NO
             # component-identity schema (only route/category links). So there is
             # no unauthenticated component catalog to list: discovery is
-            # credential-gated, exactly like retrieval. Reporting free discovery
-            # would repeat the exact lie this repair removes.
+            # credential-gated, exactly like retrieval. The fetch adapter uses
+            # that REST search endpoint and sends no request without a key.
+            # Reporting free discovery would repeat the exact lie this repair
+            # removes.
             metadata_without_auth=False,
             retrieval_requires_auth=True,
             credential_names=CREDENTIAL_ENV_NAMES["twenty_first"],
