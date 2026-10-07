@@ -898,3 +898,59 @@ def test_a_removal_during_normalization_is_refused(project):
     assert outcome.state == INSTALL_FAILED
     assert outcome.reason == REASON_REGISTRY_DEPENDENCY_DRIFT
     assert outcome.installed is False
+
+
+# ---------------------------------------------------------------------------
+# Boundary scope: DIRECT declarations are authoritative; the transitive tree is
+# out of scope. A lockfile that grows (as any real install does) is OBSERVED but
+# not policed; a NEW DIRECT dependency is refused. This is the intended policy.
+# ---------------------------------------------------------------------------
+
+
+def test_a_lockfile_that_only_grows_is_accepted(project):
+    """A real install grows the lockfile with transitives. That is npm's
+    territory: the guard is for new DIRECT declarations, so a lockfile change
+    alone must NOT fail the install."""
+    (project / "package-lock.json").write_text(
+        json.dumps({"lockfileVersion": 3, "packages": {}}), encoding="utf-8"
+    )
+    runner = RegistryRunner(
+        dependency_writes={"dependencies": {"cn": "^0.4.0", "radix-ui": "^1.7.0"}},
+        materializes=True,
+        component_name="button",
+    )
+    _orig = runner.run_command
+
+    def run_and_grow_lock(pid, command, cwd=None, env=None, timeout=300.0):
+        result = _orig(pid, command, cwd=cwd, env=env, timeout=timeout)
+        lock_path = Path(cwd) / "package-lock.json"
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        lock.setdefault("packages", {})["node_modules/tiny-transitive-dep"] = {"version": "9.9.9"}
+        lock_path.write_text(json.dumps(lock), encoding="utf-8")
+        return result
+
+    runner.run_command = run_and_grow_lock
+
+    outcome, _, _ = _installer(project, runner).install_components(["button"])
+
+    assert outcome.state == "installed", outcome.reason
+    lock = json.loads((project / "package-lock.json").read_text(encoding="utf-8"))
+    assert "node_modules/tiny-transitive-dep" in lock["packages"], (
+        "the transitive lockfile change is tolerated, not policed"
+    )
+
+
+def test_a_new_direct_dependency_is_refused_even_if_the_lockfile_also_grows(project):
+    """The authoritative signal is the DIRECT declaration, not the lockfile."""
+    runner = RegistryRunner(
+        dependency_writes={
+            "dependencies": {"cn": "^0.4.0", "radix-ui": "^1.7.0", "sneaky-direct-dep": "^1.0.0"}
+        },
+        materializes=True,
+        component_name="button",
+    )
+
+    outcome, _, _ = _installer(project, runner).install_components(["button"])
+
+    assert outcome.state == INSTALL_FAILED
+    assert outcome.reason == REASON_REGISTRY_DEPENDENCY_DRIFT

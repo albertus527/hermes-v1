@@ -97,6 +97,31 @@ Per the task, Hermes does **not** attempt to pin the universe of transitive npm
 dependencies. The guarded boundary is the set of dependencies introduced
 **directly** by a design registry or resource installation operation.
 
+### Intended policy, stated explicitly (Option 1)
+
+**`package.json` direct-dependency declarations are authoritative. The
+transitive tree is out of scope.**
+
+- **A lockfile that grows is OBSERVED, not policed.** Every real install grows
+  `package-lock.json` / `pnpm-lock.yaml` / `yarn.lock` with transitive packages.
+  That is the package manager's territory; a lockfile change alone must **not**
+  fail an install. Hermes reads the lockfile only to *detect the package manager*
+  (`LOCKFILES`) — never as a dependency-policy authority.
+- **A new DIRECT dependency declaration is REFUSED** unless it is in the
+  application-owned reviewed set — regardless of what the lockfile says.
+- **No full lockfile solver.** Hermes does not resolve, diff, or verify the
+  transitive graph, and does not attempt to freeze the transitive tree. The
+  guard is the set of DIRECT project-level declarations a design install causes.
+- Rationale: the VPS-proven defects were all direct-declaration defects (an
+  unreviewed package added to `package.json`, an upstream range left un-pinned,
+  a source import with no direct dependency, a removed direct dependency).
+  Policing the transitive tree would add a solver this batch explicitly refuses
+  while proving nothing about the boundary that actually matters.
+
+Proven by `tests/test_design_registry_mutation.py`:
+`test_a_lockfile_that_only_grows_is_accepted` and
+`test_a_new_direct_dependency_is_refused_even_if_the_lockfile_also_grows`.
+
 ## Second-pass audit (same class, one layer down)
 
 After the first repair, the whole design-resource ingress was re-swept for the
