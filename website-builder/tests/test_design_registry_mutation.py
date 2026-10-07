@@ -30,16 +30,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.core.design_install import (
+    ALLOWED_SHADCN_COMPONENTS,
     INSTALL_FAILED,
     REGISTRY_INTRODUCED_PACKAGE_PINS,
+    REASON_COMPONENTS_NOT_VERIFIED,
     REASON_REGISTRY_DEPENDENCY_DRIFT,
+    REASON_REGISTRY_IMPORT_UNRESOLVED,
     REASON_REGISTRY_PACKAGE_NOT_EXACT,
     SECTION_DEPENDENCIES,
     DesignDependencyInstaller,
     approved_component_dir,
     approved_external_component_dir,
     dependency_delta,
+    expand_reviewed_component_closure,
     registry_dependency_delta_is_acceptable,
+    required_registry_packages,
     reviewed_registry_package_pins,
     snapshot_direct_dependencies,
 )
@@ -86,6 +91,8 @@ class RegistryRunner:
         external_dir: bool = False,
         exitcode: int = 0,
         honor_exact: bool = True,
+        materialize_all_in_argv: bool = False,
+        install_fails_for: str | None = None,
     ):
         self.commands: List[List[str]] = []
         self._writes = dependency_writes or {}
@@ -94,6 +101,8 @@ class RegistryRunner:
         self._external_dir = external_dir
         self._exitcode = exitcode
         self._honor_exact = honor_exact
+        self._materialize_all_in_argv = materialize_all_in_argv
+        self._install_fails_for = install_fails_for
 
     def run_command(self, project_id, command, cwd=None, env=None, timeout=300.0):
         command = list(command)
@@ -104,6 +113,12 @@ class RegistryRunner:
         is_add = "add" in command and not is_install
 
         if is_install:
+            if self._install_fails_for is not None and any(
+                self._install_fails_for in arg for arg in command
+            ):
+                return subprocess.CompletedProcess(
+                    args=command, returncode=1, stdout="", stderr=""
+                )
             # Normalization install: write the EXACT spec's version.
             manifest = root / "package.json"
             doc = json.loads(manifest.read_text(encoding="utf-8"))
@@ -126,17 +141,30 @@ class RegistryRunner:
                     doc.setdefault(section, {})[name] = version
             manifest.write_text(json.dumps(doc), encoding="utf-8")
 
-            if self._materializes and self._component_name:
-                target = (
-                    approved_external_component_dir(root)
-                    if self._external_dir
-                    else approved_component_dir(root)
-                )
-                if target is not None:
-                    target.mkdir(parents=True, exist_ok=True)
-                    (target / f"{self._component_name}.tsx").write_text(
-                        "export const X = 1\n", encoding="utf-8"
+            if self._materializes:
+                if self._materialize_all_in_argv:
+                    # The real CLI materializes every component named in its
+                    # argv, so an emulation that wants to exercise the reviewed
+                    # closure has to do the same.
+                    names = [
+                        a for a in command if a in ALLOWED_SHADCN_COMPONENTS
+                    ]
+                elif self._component_name:
+                    names = [self._component_name]
+                else:
+                    names = []
+                if names:
+                    target = (
+                        approved_external_component_dir(root)
+                        if self._external_dir
+                        else approved_component_dir(root)
                     )
+                    if target is not None:
+                        target.mkdir(parents=True, exist_ok=True)
+                        for name in names:
+                            (target / f"{name}.tsx").write_text(
+                                "export const X = 1\n", encoding="utf-8"
+                            )
 
         return subprocess.CompletedProcess(
             args=command, returncode=self._exitcode, stdout="ok", stderr=""
@@ -462,3 +490,170 @@ def test_an_external_request_for_an_unknown_contract_runs_nothing(project):
 
     assert outcome.state == INSTALL_FAILED
     assert runner.commands == []
+
+
+# ---------------------------------------------------------------------------
+# Part D (built-in shadcn): the emitted SOURCE import closure
+# ---------------------------------------------------------------------------
+#
+# Live proof against shadcn@4.21.0, real starter copy: ``shadcn add dialog``
+# writes cn+radix-ui, creates ONLY dialog.tsx -- and dialog.tsx imports
+# ``lucide-react`` (never installed) and ``@/components/ui/button`` (never
+# created). ``npx tsc -b`` then fails with TS2307 for both. Same class as the
+# SplitText @gsap/react gap: a component reported ``installed`` whose build
+# cannot resolve. These tests prove the closure is now enforced.
+
+
+def test_lucide_react_is_a_reviewed_exact_pin():
+    """The icon package several builtins import is application-owned, exact."""
+    assert REGISTRY_INTRODUCED_PACKAGE_PINS["lucide-react"] == "1.52.0"
+    assert reviewed_registry_package_pins()["lucide-react"] == "1.52.0"
+
+
+def test_the_builtin_import_table_matches_the_reviewed_components():
+    from app.core.design_install import REVIEWED_BUILTIN_COMPONENT_IMPORTS
+
+    assert set(REVIEWED_BUILTIN_COMPONENT_IMPORTS) == set(ALLOWED_SHADCN_COMPONENTS)
+
+
+def test_an_import_package_without_a_pin_is_a_configuration_error():
+    """Every package the emitted source imports must have a reviewed exact pin."""
+    from app.core.design_install import REVIEWED_BUILTIN_COMPONENT_IMPORTS
+
+    pins = reviewed_registry_package_pins()
+    for component, packages in REVIEWED_BUILTIN_COMPONENT_IMPORTS.items():
+        for package in packages:
+            assert package in pins, (component, package)
+
+
+def test_the_dialog_closure_pulls_in_its_nested_button():
+    """dialog's emitted source imports @/components/ui/button, undeclared."""
+    assert expand_reviewed_component_closure(["dialog"]) == ("button", "dialog")
+    assert expand_reviewed_component_closure(["button"]) == ("button",)
+    assert expand_reviewed_component_closure([]) == ()
+
+
+def test_the_required_import_set_is_only_what_the_cli_does_not_install():
+    """lucide-react is required; cn/radix-ui are CLI-written (normalized only)."""
+    assert required_registry_packages(["dialog"]) == ("lucide-react",)
+    assert required_registry_packages(["button"]) == ()
+    assert required_registry_packages(["accordion", "checkbox"]) == ("lucide-react",)
+
+
+def test_a_lucide_builtin_install_installs_the_missing_import(project):
+    """The whole point: ``dialog`` must end up with lucide-react present EXACT."""
+    runner = RegistryRunner(
+        dependency_writes={"dependencies": {"cn": "^0.4.0", "radix-ui": "^1.7.0"}},
+        materializes=True,
+        materialize_all_in_argv=True,
+    )
+
+    outcome, installed, _ = _installer(project, runner).install_components(["dialog"])
+
+    assert outcome.state == "installed", outcome.reason
+    # The requested component AND its reviewed nested closure materialized.
+    assert installed == ("dialog",)
+    assert (project / "src/components/ui/dialog.tsx").is_file()
+    assert (project / "src/components/ui/button.tsx").is_file()
+    doc = json.loads((project / "package.json").read_text(encoding="utf-8"))
+    assert doc["dependencies"]["lucide-react"] == "1.52.0", (
+        "the emitted source's import must be installed at the exact app pin"
+    )
+    assert "^" not in doc["dependencies"]["lucide-react"]
+    # And the CLI-written helpers are still normalized to their exact pins.
+    assert doc["dependencies"]["cn"] == "0.4.0"
+    assert doc["dependencies"]["radix-ui"] == "1.7.0"
+
+
+def test_a_lucide_builtin_whose_import_install_fails_is_not_installed(project):
+    """If the exact-pin install of the required import fails, refuse."""
+    runner = RegistryRunner(
+        dependency_writes={"dependencies": {"cn": "^0.4.0", "radix-ui": "^1.7.0"}},
+        materializes=True,
+        materialize_all_in_argv=True,
+        install_fails_for="lucide-react",
+    )
+
+    outcome, _, _ = _installer(project, runner).install_components(["dialog"])
+
+    assert outcome.state == INSTALL_FAILED
+    assert outcome.reason == REASON_REGISTRY_IMPORT_UNRESOLVED
+    assert outcome.installed is False
+
+
+def test_a_nested_component_that_never_materializes_is_not_installed(project):
+    """dialog imports button; if only dialog lands, the install is incomplete."""
+    runner = RegistryRunner(
+        dependency_writes={"dependencies": {"cn": "^0.4.0", "radix-ui": "^1.7.0"}},
+        materializes=True,
+        component_name="dialog",  # ONLY dialog -- button never written
+    )
+
+    outcome, _, _ = _installer(project, runner).install_components(["dialog"])
+
+    assert outcome.state == INSTALL_FAILED
+    assert outcome.reason == REASON_COMPONENTS_NOT_VERIFIED
+
+
+def test_a_plain_builtin_needs_no_extra_import(project):
+    """A builtin whose source imports nothing beyond cn/radix-ui is unchanged."""
+    runner = RegistryRunner(
+        dependency_writes={"dependencies": {"cn": "^0.4.0", "radix-ui": "^1.7.0"}},
+        materializes=True,
+        component_name="button",
+    )
+
+    outcome, _, _ = _installer(project, runner).install_components(["button"])
+
+    assert outcome.state == "installed", outcome.reason
+    doc = json.loads((project / "package.json").read_text(encoding="utf-8"))
+    assert "lucide-react" not in doc.get("dependencies", {})
+
+
+def test_the_nested_closure_cannot_be_widened_by_upstream(project):
+    """The closure comes from the app table, not from any registry metadata.
+
+    A component with no reviewed nested entry contributes no extra argv
+    component, even if a registry started declaring one.
+    """
+    runner = RegistryRunner(
+        dependency_writes={"dependencies": {"cn": "^0.4.0"}},
+        materializes=True,
+        materialize_all_in_argv=True,
+    )
+
+    _installer(project, runner).install_components(["card"])
+
+    argv = next(c for c in runner.commands if "add" in c)
+    components = [a for a in argv if a in ALLOWED_SHADCN_COMPONENTS]
+    assert components == ["card"], "no unreviewed nested component may be added"
+
+
+def test_a_required_import_with_no_reviewed_pin_fails_closed(project, monkeypatch):
+    """Defence in depth: if a reviewed import lost its pin, refuse -- never
+    install at an upstream-suggested version.
+
+    ``required_registry_packages`` names a package; if that package is absent
+    from ``reviewed_registry_package_pins`` the install must fail BEFORE running
+    any command rather than falling back to whatever upstream declared.
+    """
+    from app.core.design_install import reviewed_registry_package_pins
+
+    original = reviewed_registry_package_pins()
+    monkeypatch.setattr(
+        "app.core.design_install.reviewed_registry_package_pins",
+        lambda: {k: v for k, v in original.items() if k != "lucide-react"},
+    )
+
+    runner = RegistryRunner(
+        dependency_writes={"dependencies": {"cn": "^0.4.0", "radix-ui": "^1.7.0"}},
+        materializes=True,
+        materialize_all_in_argv=True,
+    )
+
+    outcome, _, _ = _installer(project, runner).install_components(["dialog"])
+
+    assert outcome.state == INSTALL_FAILED
+    assert outcome.reason == REASON_REGISTRY_IMPORT_UNRESOLVED
+    # No normalization/install argv was run for the unpinned package.
+    assert not any("lucide-react" in arg for c in runner.commands for arg in c)

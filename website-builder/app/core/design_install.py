@@ -286,6 +286,13 @@ def resolve_companion_packages(dependency_id: str) -> Tuple[CompanionPackage, ..
 REGISTRY_INTRODUCED_PACKAGE_PINS: Dict[str, str] = {
     "cn": "0.4.0",
     "radix-ui": "1.7.0",
+    # The emitted builtin SOURCES import ``lucide-react`` (accordion, checkbox,
+    # dialog, select, sheet) but the pinned CLI neither declares nor installs it
+    # (verified live against shadcn@4.21.0: ``add dialog`` writes cn+radix-ui and
+    # creates only ``dialog.tsx``). The starter's own ``components.json`` already
+    # declares ``"iconLibrary": "lucide"``, so reviewing and exact-pinning the
+    # icon package is what the application intended -- not a new dependency.
+    "lucide-react": "1.52.0",
 }
 
 
@@ -328,17 +335,96 @@ REVIEWED_BUILTIN_COMPONENT_DEPENDENCIES: Dict[str, Tuple[str, ...]] = {
     "tooltip": ("cn", "radix-ui"),
 }
 
+#: For each reviewed builtin, the BARE module specifiers its EMITTED SOURCE
+#: imports that the pinned CLI does NOT install. Verified live against
+#: shadcn@4.21.0: ``add dialog`` emits ``import { XIcon } from "lucide-react"``
+#: and ``import { Button } from "@/components/ui/button"`` while the registry item
+#: declares only ``cn``/``radix-ui`` and the CLI installs only those. The starter's
+#: ``components.json`` already declares ``"iconLibrary": "lucide"``, so the icon
+#: package is reviewed and exact-pinned (``REGISTRY_INTRODUCED_PACKAGE_PINS``).
+#: A builtin whose emitted source imports a package outside this reviewed set is
+#: NOT installable: the postcondition would otherwise report ``installed`` for a
+#: component whose build cannot resolve. This is the SAME class as the external
+#: component dependency boundary, applied to the builtin source import closure.
+REVIEWED_BUILTIN_COMPONENT_IMPORTS: Dict[str, Tuple[str, ...]] = {
+    "accordion": ("lucide-react",),
+    "alert": (),
+    "badge": (),
+    "button": (),
+    "card": (),
+    "checkbox": ("lucide-react",),
+    "dialog": ("lucide-react",),
+    "input": (),
+    "label": (),
+    "select": ("lucide-react",),
+    "separator": (),
+    "sheet": ("lucide-react",),
+    "switch": (),
+    "tabs": (),
+    "textarea": (),
+    "tooltip": (),
+}
+
+#: Builtins whose emitted SOURCE imports a sibling builtin under
+#: ``@/components/ui/<name>`` that the registry item does NOT declare in
+#: ``registryDependencies``. Verified live: ``dialog.tsx`` imports
+#: ``@/components/ui/button`` but the item declares no nested registry dependency,
+#: so ``shadcn add dialog`` creates ONLY ``dialog.tsx`` and the emitted file cannot
+#: resolve. Requesting such a component must materialize its reviewed closure too.
+REVIEWED_BUILTIN_COMPONENT_NESTED: Dict[str, Tuple[str, ...]] = {
+    "dialog": ("button",),
+}
+
+
+def expand_reviewed_component_closure(components: Sequence[str]) -> Tuple[str, ...]:
+    """The requested builtins plus every REVIEWED nested builtin they require.
+
+    The closure is taken from the application-owned ``REVIEWED_BUILTIN_COMPONENT_NESTED``
+    table only -- never from upstream metadata -- so it cannot be widened by a
+    registry that starts declaring new nested components. A component whose
+    emitted source imports an unreviewed sibling is refused at the table
+    (``REVIEWED_BUILTIN_COMPONENT_IMPORTS``); this function only adds the siblings
+    the application has already reviewed.
+    """
+    resolved: set = set()
+    queue = [c for c in (components or ()) if isinstance(c, str)]
+    while queue:
+        component = queue.pop()
+        if component in resolved:
+            continue
+        resolved.add(component)
+        queue.extend(REVIEWED_BUILTIN_COMPONENT_NESTED.get(component, ()))
+    return tuple(sorted(resolved))
+
 
 def expected_registry_packages(components: Sequence[str]) -> Tuple[str, ...]:
-    """The union of reviewed direct packages for a set of builtin ``components``.
+    """Every direct package the reviewed builtins may introduce OR import.
 
-    Returns ``()`` for an empty list. An unknown component contributes nothing
-    here; callers gate on the component allowlist separately, so this only ever
-    describes the reviewed set.
+    The union of the CLI-written helpers (``cn``, ``radix-ui``) and the packages
+    the emitted SOURCE imports (``lucide-react``). This is the set the
+    post-install delta guard accepts; anything else fails closed. Returns ``()``
+    for an empty list. An unknown component contributes nothing here; callers gate
+    on the component allowlist separately, so this only ever describes the
+    reviewed set.
     """
     packages: set = set()
     for component in components or ():
         packages.update(REVIEWED_BUILTIN_COMPONENT_DEPENDENCIES.get(component, ()))
+        packages.update(REVIEWED_BUILTIN_COMPONENT_IMPORTS.get(component, ()))
+    return tuple(sorted(packages))
+
+
+def required_registry_packages(components: Sequence[str]) -> Tuple[str, ...]:
+    """Packages the builtins' emitted SOURCE requires that the CLI does NOT install.
+
+    These must be present at their exact application-owned pin after the install,
+    or the emitted component cannot build. Distinct from
+    :func:`expected_registry_packages`, which also lists packages the CLI writes
+    itself (those are normalized, not required-to-be-installed).
+    """
+    packages: set = set()
+    for component in components or ():
+        packages.update(REVIEWED_BUILTIN_COMPONENT_IMPORTS.get(component, ()))
     return tuple(sorted(packages))
 
 
@@ -506,6 +592,11 @@ REASON_REGISTRY_PACKAGE_NOT_EXACT = (
 )
 REASON_BUILTIN_COMPONENT_UNREVIEWED = (
     "the requested builtin component has no reviewed dependency contract"
+)
+REASON_REGISTRY_IMPORT_UNRESOLVED = (
+    "a component's emitted source imports a package that could not be verified "
+    "present at its exact application-owned pin; the state is not upgraded to "
+    "installed"
 )
 REASON_MANAGER_UNSUPPORTED = (
     "the project's package manager has no supported pinned one-off mechanism"
@@ -1753,6 +1844,15 @@ class DesignDependencyInstaller:
                 rejected,
             )
 
+        # Expand to the REVIEWED nested closure. Some builtins' emitted source
+        # imports a sibling builtin the registry item does not declare (live:
+        # ``dialog`` imports ``@/components/ui/button``), so requesting only
+        # ``dialog`` would materialize a file that cannot resolve. The closure is
+        # application-owned -- never taken from upstream metadata -- so a registry
+        # cannot widen it. Every requested and nested component is still gated by
+        # the allowlist above.
+        effective = expand_reviewed_component_closure(allowed)
+
         # Fail closed BEFORE any command: without an approved destination there
         # is nothing to verify against afterwards, so invoking the CLI would buy
         # an uncheckable "success".
@@ -1797,7 +1897,7 @@ class DesignDependencyInstaller:
                 rejected,
             )
 
-        argv = build_registry_argv(prefix, components=allowed)
+        argv = build_registry_argv(prefix, components=effective)
         # Snapshot BEFORE the CLI runs. The pinned CLI writes packages into
         # package.json itself, so the postcondition must compare against this
         # application-owned baseline rather than trusting a zero exit code.
@@ -1838,7 +1938,7 @@ class DesignDependencyInstaller:
         # 1. The direct-dependency delta must be inside the reviewed set, and
         #    the reviewed packages must be normalized to exact application pins.
         boundary = self._enforce_registry_dependency_boundary(
-            before, expected_registry_packages(allowed), manager
+            before, expected_registry_packages(effective), manager
         )
         if not boundary.ok:
             return (
@@ -1854,10 +1954,34 @@ class DesignDependencyInstaller:
                 rejected,
             )
 
-        # 2. Every requested component must be materialized under the approved
+        # 1b. Packages the emitted SOURCE imports but the CLI does NOT install
+        #     (live: ``lucide-react``) must be present at their exact application
+        #     pin, or the emitted component cannot build. Installed through the
+        #     SAME exact-pin mechanism as any other dependency -- never a
+        #     registry-supplied range -- and refused if a required package has no
+        #     reviewed pin.
+        imports_ok, imports_receipt = self._ensure_required_registry_imports(
+            effective, manager
+        )
+        if not imports_ok:
+            return (
+                InstallOutcome(
+                    dependency_id=REGISTRY_DEPENDENCY,
+                    state=INSTALL_FAILED,
+                    package=None,
+                    reason=REASON_REGISTRY_IMPORT_UNRESOLVED,
+                    receipt=imports_receipt or boundary.receipt or receipt,
+                    verified_components=(),
+                ),
+                allowed,
+                rejected,
+            )
+
+        # 2. Every requested component -- AND every reviewed nested component the
+        #    closure pulled in -- must be materialized under the approved
         #    directory. A partial install is not a success.
         verified = verify_components_materialized(
-            self.project_root, allowed, component_dir
+            self.project_root, effective, component_dir
         )
         if not verified:
             return (
@@ -1866,7 +1990,7 @@ class DesignDependencyInstaller:
                     state=INSTALL_FAILED,
                     package=None,
                     reason=REASON_COMPONENTS_NOT_VERIFIED,
-                    receipt=boundary.receipt or receipt,
+                    receipt=imports_receipt or boundary.receipt or receipt,
                     verified_components=(),
                 ),
                 allowed,
@@ -1879,12 +2003,72 @@ class DesignDependencyInstaller:
                 state="installed",
                 package=None,
                 reason=REASON_ALREADY_INSTALLED,
-                receipt=boundary.receipt or receipt,
+                receipt=imports_receipt or boundary.receipt or receipt,
                 verified_components=verified,
             ),
             allowed,
             rejected,
         )
+
+    def _ensure_required_registry_imports(
+        self,
+        components: Sequence[str],
+        manager: Sequence[str],
+    ) -> Tuple[bool, Optional[CommandReceipt]]:
+        """Install/verify the reviewed packages a builtin's SOURCE imports.
+
+        The pinned CLI writes ``cn``/``radix-ui`` but does NOT install
+        ``lucide-react``, which several emitted builtins import. Each such package
+        is installed through the SAME exact application-owned pin path
+        (:func:`build_registry_normalization_argv`) and then re-verified in the
+        project manifest -- never a registry range. A required package with no
+        reviewed pin fails closed rather than being installed at whatever the
+        upstream suggested.
+        """
+        required = required_registry_packages(components)
+        if not required:
+            return (True, None)
+
+        pins = reviewed_registry_package_pins()
+        if any(package not in pins for package in required):
+            logger.error(
+                "A component's emitted source requires a package with no "
+                "application-owned exact pin."
+            )
+            return (False, None)
+
+        # Already present at the exact pin? Nothing to do.
+        manifest = snapshot_direct_dependencies(self.project_root)
+        installed = manifest.get(SECTION_DEPENDENCIES, {})
+        missing = tuple(
+            package for package in required if installed.get(package) != pins[package]
+        )
+        if not missing:
+            return (True, None)
+
+        last_receipt: Optional[CommandReceipt] = None
+        for argv in build_registry_normalization_argv(manager, missing):
+            process, timed_out = self._run(argv, INSTALL_TIMEOUT_SECONDS)
+            if timed_out:
+                return (False, last_receipt)
+            if process is None or process.returncode != 0:
+                receipt = (
+                    CommandReceipt.from_process(process, cwd_label="<project>")
+                    if process is not None
+                    else None
+                )
+                return (False, receipt)
+            last_receipt = CommandReceipt.from_process(process, cwd_label="<project>")
+
+        final = snapshot_direct_dependencies(self.project_root)
+        installed = final.get(SECTION_DEPENDENCIES, {})
+        if any(installed.get(package) != pins[package] for package in required):
+            logger.error(
+                "A required component import is not at its exact "
+                "application-owned pin after normalization."
+            )
+            return (False, last_receipt)
+        return (True, last_receipt)
 
     def _enforce_registry_dependency_boundary(
         self,
@@ -2236,6 +2420,7 @@ __all__ = [
     "REASON_SHADCN_CONFIG_INVALID",
     "REASON_REGISTRY_DEPENDENCY_DRIFT",
     "REASON_REGISTRY_PACKAGE_NOT_EXACT",
+    "REASON_REGISTRY_IMPORT_UNRESOLVED",
     "REASON_BUILTIN_COMPONENT_UNREVIEWED",
     "REASON_TIMEOUT",
     "SECTION_DEPENDENCIES",
@@ -2244,6 +2429,8 @@ __all__ = [
     "REGISTRY_DEPENDENCY",
     "REGISTRY_INTRODUCED_PACKAGE_PINS",
     "REVIEWED_BUILTIN_COMPONENT_DEPENDENCIES",
+    "REVIEWED_BUILTIN_COMPONENT_IMPORTS",
+    "REVIEWED_BUILTIN_COMPONENT_NESTED",
     "SHADCN_CLI_VERSION",
     "SHADCN_CONFIG_FILENAME",
     "TERMINAL_INSTALL_STATES",
@@ -2256,6 +2443,7 @@ __all__ = [
     "approved_component_dir",
     "approved_external_component_dir",
     "dependency_delta",
+    "expand_reviewed_component_closure",
     "expected_registry_packages",
     "is_contained",
     "package_name_is_well_formed",
@@ -2263,6 +2451,7 @@ __all__ = [
     "project_satisfies_dependency",
     "project_satisfies_spec",
     "registry_dependency_delta_is_acceptable",
+    "required_registry_packages",
     "reviewed_registry_package_pins",
     "snapshot_direct_dependencies",
     "verify_external_component_materialized",

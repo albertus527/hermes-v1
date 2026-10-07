@@ -125,6 +125,38 @@ After the first repair, the whole design-resource ingress was re-swept for the
   `REVIEWED_BUILTIN_COMPONENT_DEPENDENCIES` must have identical key sets, and
   every reviewed builtin package must be exact-pinned.
 
+## Third-pass audit (built-in shadcn — the emitted-source import closure)
+
+The built-in path was audited for the **same class** as the SplitText gap: a
+component reported `installed` whose build cannot resolve its imports. Live
+against `shadcn@4.21.0` in a copy of the real starter, `shadcn add <builtin>`
+writes only the registry-declared packages, but the emitted `.tsx` imports more:
+
+| builtin | CLI writes | emitted source imports (not provided) |
+|---|---|---|
+| accordion, checkbox, select, sheet | `cn`, `radix-ui` | **`lucide-react`** |
+| **dialog** | `cn`, `radix-ui` | **`lucide-react`**, **`@/components/ui/button`** |
+
+`lucide-react` is neither declared in the registry item nor installed, and the
+starter declares it in no section; `dialog.tsx` also imports a sibling `button`
+the item does not list in `registryDependencies`, so `shadcn add dialog` creates
+only `dialog.tsx`. `npx tsc -b` on the result fails with `TS2307` for both. This
+is the **same class** as the external-component boundary, applied one layer down.
+
+- **Fix:** `REVIEWED_BUILTIN_COMPONENT_IMPORTS` records each builtin's reviewed
+  source imports; `REVIEWED_BUILTIN_COMPONENT_NESTED` records the reviewed nested
+  closure (`dialog -> button`). `install_components` expands the requested set by
+  the **application-owned** closure (never upstream metadata), installs any
+  missing required import through the same exact-pin mechanism, and verifies
+  every requested **and nested** component materialized. A required import with
+  no reviewed pin, or a failed exact-pin install, fails closed.
+- **`lucide-react` is exact-pinned at `1.52.0`** (`REGISTRY_INTRODUCED_PACKAGE_PINS`),
+  the version the starter's own `components.json` (`"iconLibrary": "lucide"`)
+  already intends. Verified: the real starter now typechecks clean (`tsc -b`
+  exit 0) after the builtin install + the exact-pin install of `lucide-react`.
+- **Coherence guards added:** the import table's key set equals
+  `ALLOWED_SHADCN_COMPONENTS`; every imported package has an exact pin.
+
 ## Final dependency policy (post-repair)
 
 - **Package identity is closed and application-owned.** `DEPENDENCY_PACKAGES`

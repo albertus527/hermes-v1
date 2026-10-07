@@ -184,10 +184,10 @@ MUTATIONS = [
         "a registry command that wrote nothing is not installed",
         INSTALL,
         """        verified = verify_components_materialized(
-            self.project_root, allowed, component_dir
+            self.project_root, effective, component_dir
         )
         if not verified:""",
-        """        verified = allowed
+        """        verified = effective
         if False:""",
     ),
     # --- 8c. The component destination is enforced, never assumed ---------

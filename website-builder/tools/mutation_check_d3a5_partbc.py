@@ -311,6 +311,66 @@ MUTATIONS = [
             )
         )""",
     ),
+    # ------------------------------------------------------------------
+    # Part D (built-in shadcn) -- the emitted SOURCE import closure
+    # ------------------------------------------------------------------
+    # Live: `add dialog` emits a file importing `lucide-react` (never installed)
+    # and `@/components/ui/button` (never created). A guard that only inspects
+    # package.json would report `installed` for a component that cannot build.
+    #
+    # 1. The required-import postcondition must actually run.
+    (
+        "a builtin's emitted-source import is installed and verified",
+        INSTALL,
+        """        imports_ok, imports_receipt = self._ensure_required_registry_imports(
+            effective, manager
+        )
+        if not imports_ok:""",
+        """        imports_ok, imports_receipt = True, None
+        if not imports_ok:""",
+    ),
+    # 2. A required import with no reviewed exact pin must fail closed.
+    (
+        "a required import with no reviewed pin fails closed",
+        INSTALL,
+        """        pins = reviewed_registry_package_pins()
+        if any(package not in pins for package in required):
+            logger.error(
+                "A component's emitted source requires a package with no "
+                "application-owned exact pin."
+            )
+            return (False, None)""",
+        """        pins = reviewed_registry_package_pins()
+        if False:
+            logger.error(
+                "A component's emitted source requires a package with no "
+                "application-owned exact pin."
+            )
+            return (False, None)""",
+    ),
+    # 3. The nested closure must be expanded, not just the requested component.
+    (
+        "the reviewed nested closure is materialized",
+        INSTALL,
+        """        effective = expand_reviewed_component_closure(allowed)""",
+        """        effective = tuple(allowed)""",
+    ),
+    # 4. The nested closure must come from the app table, not be empty forever.
+    (
+        "a builtin that imports a sibling declares it in the closure table",
+        INSTALL,
+        """REVIEWED_BUILTIN_COMPONENT_NESTED: Dict[str, Tuple[str, ...]] = {
+    "dialog": ("button",),
+}""",
+        """REVIEWED_BUILTIN_COMPONENT_NESTED: Dict[str, Tuple[str, ...]] = {}""",
+    ),
+    # 5. lucide-react must be a reviewed exact pin, not an unpinned package.
+    (
+        "the icon package the emitted sources import is exact-pinned",
+        INSTALL,
+        """    "lucide-react": "1.52.0",""",
+        """    "lucide-react": "^1.52.0",""",
+    ),
 ]
 
 
