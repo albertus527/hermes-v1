@@ -447,6 +447,21 @@ MUTATIONS = [
                 "project dependency."
             )""",
     ),
+    # 12l. The FILE delta must be checked: an extra materialized file is refused.
+    (
+        "an extra materialized file is refused",
+        INSTALL,
+        """        files_after = snapshot_component_files(component_dir)
+        unexpected_files = unreviewed_materialized_files(
+            files_before, files_after, allowed_components=effective
+        )
+        if unexpected_files:""",
+        """        files_after = snapshot_component_files(component_dir)
+        unexpected_files = unreviewed_materialized_files(
+            files_before, files_after, allowed_components=effective
+        )
+        if False:""",
+    ),
     # 12k. The component tables stay SEPARATE: a builtin name is never an
     #      approved EXTERNAL identity (the contract-keyed-to-builtin-source case
     #      is subsumed by the "contract without an approved identity" check).

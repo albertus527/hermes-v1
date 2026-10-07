@@ -206,6 +206,28 @@ application-owned set, exactly `REGISTRY_INTRODUCED_PACKAGE_PINS` — **not** se
 No package NAME is shared between A and B ∪ C, and no registry helper is a D2 id.
 Proven by `test_the_builtin_registry_packages_are_a_separate_application_owned_set`.
 
+### What an official builtin may NOT introduce
+
+An official builtin is reviewed to materialize ONLY its own
+``<component><suffix>`` file (plus a reviewed nested component's file) and to
+introduce ONLY ``cn``/``radix-ui`` (written) and ``lucide-react`` (imported), at
+exact pins. Every other vector is refused:
+
+| vector | result |
+|---|---|
+| CLI writes an unreviewed package | `REASON_REGISTRY_DEPENDENCY_DRIFT` |
+| CLI writes a reviewed package into the wrong section | `REASON_REGISTRY_DEPENDENCY_DRIFT` |
+| emitted source imports an unreviewed package | `REASON_REGISTRY_SOURCE_IMPORT_UNREVIEWED` |
+| CLI materializes an extra unreviewed FILE | `REASON_REGISTRY_FILE_UNREVIEWED` |
+| CLI removes a pre-existing project dependency | `REASON_REGISTRY_DEPENDENCY_DRIFT` |
+| normalization leaves a range instead of the exact pin | `REASON_REGISTRY_PACKAGE_NOT_EXACT` |
+| requested component outside the allowlist | rejected, not run |
+
+The FILE delta (`snapshot_component_files` + `unreviewed_materialized_files`) is
+new: previously an extra file the CLI wrote under the approved directory -- which
+could import an unreviewed package or shadow a reviewed component -- was not
+noticed. It is now refused on BOTH the builtin and external paths.
+
 ### The component tables are separate at the TABLE level
 
 The trusted-boundary type now **enforces** the component-table separation, so

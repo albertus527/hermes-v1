@@ -35,6 +35,7 @@ from app.core.design_install import (
     REGISTRY_INTRODUCED_PACKAGE_PINS,
     REASON_COMPONENTS_NOT_VERIFIED,
     REASON_REGISTRY_DEPENDENCY_DRIFT,
+    REASON_REGISTRY_FILE_UNREVIEWED,
     REASON_REGISTRY_IMPORT_UNRESOLVED,
     REASON_REGISTRY_PACKAGE_NOT_EXACT,
     REASON_REGISTRY_SOURCE_IMPORT_UNREVIEWED,
@@ -98,6 +99,7 @@ class RegistryRunner:
         materialize_all_in_argv: bool = False,
         install_fails_for: str | None = None,
         source_imports: Sequence[str] = (),
+        extra_files: Sequence[str] = (),
     ):
         self.commands: List[List[str]] = []
         self._writes = dependency_writes or {}
@@ -109,6 +111,7 @@ class RegistryRunner:
         self._materialize_all_in_argv = materialize_all_in_argv
         self._install_fails_for = install_fails_for
         self._source_imports = tuple(source_imports)
+        self._extra_files = tuple(extra_files)
 
     def run_command(self, project_id, command, cwd=None, env=None, timeout=300.0):
         command = list(command)
@@ -171,6 +174,8 @@ class RegistryRunner:
                             (target / f"{name}.tsx").write_text(
                                 self._component_source_text(), encoding="utf-8"
                             )
+                        for extra in self._extra_files:
+                            (target / extra).write_text("export const Evil = 1\n", encoding="utf-8")
 
         return subprocess.CompletedProcess(
             args=command, returncode=self._exitcode, stdout="ok", stderr=""
@@ -1121,3 +1126,68 @@ def test_a_coherent_boundary_does_not_block_a_normal_install(project):
     )
     outcome, _, _ = _installer(project, runner).install_components(["button"])
     assert outcome.state == "installed", outcome.reason
+
+
+# ---------------------------------------------------------------------------
+# An official builtin cannot introduce an UNREVIEWED FILE
+# ---------------------------------------------------------------------------
+#
+# The pinned CLI is reviewed to materialize ONLY ``<component><suffix>`` (plus a
+# reviewed nested component's file). Any OTHER file it writes under the approved
+# directory is an unreviewed artifact -- it could import an unreviewed package or
+# shadow a reviewed component -- and must fail the install.
+
+
+def test_an_extra_materialized_file_is_refused(project):
+    runner = RegistryRunner(
+        dependency_writes={"dependencies": {"cn": "^0.4.0", "radix-ui": "^1.7.0"}},
+        materializes=True,
+        component_name="button",
+        extra_files=("evil.tsx",),
+    )
+
+    outcome, _, _ = _installer(project, runner).install_components(["button"])
+
+    assert outcome.state == INSTALL_FAILED
+    assert outcome.reason == REASON_REGISTRY_FILE_UNREVIEWED
+    assert outcome.installed is False
+
+
+def test_the_reviewed_component_file_alone_is_accepted(project):
+    runner = RegistryRunner(
+        dependency_writes={"dependencies": {"cn": "^0.4.0", "radix-ui": "^1.7.0"}},
+        materializes=True,
+        component_name="button",
+    )
+    outcome, _, _ = _installer(project, runner).install_components(["button"])
+    assert outcome.state == "installed", outcome.reason
+
+
+def test_a_nested_components_file_is_not_unreviewed(project):
+    """dialog's reviewed closure includes button, so button.tsx is expected."""
+    runner = RegistryRunner(
+        dependency_writes={"dependencies": {"cn": "^0.4.0", "radix-ui": "^1.7.0"}},
+        materializes=True,
+        materialize_all_in_argv=True,
+        source_imports=("lucide-react",),
+    )
+    outcome, _, _ = _installer(project, runner).install_components(["dialog"])
+    assert outcome.state == "installed", outcome.reason
+
+
+def test_the_file_delta_primitives():
+    from app.core.design_install import (
+        snapshot_component_files,
+        unreviewed_materialized_files,
+    )
+
+    before = frozenset({"button.tsx"})
+    after = frozenset({"button.tsx", "evil.tsx", "sub/other.ts"})
+    unexpected = unreviewed_materialized_files(
+        before, after, allowed_components=["button"]
+    )
+    assert unexpected == ("evil.tsx", "sub/other.ts")
+    # The reviewed file itself is not flagged.
+    assert unreviewed_materialized_files(
+        frozenset(), frozenset({"button.tsx"}), allowed_components=["button"]
+    ) == ()

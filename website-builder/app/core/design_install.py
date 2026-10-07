@@ -718,6 +718,10 @@ REASON_REGISTRY_SOURCE_IMPORT_UNREVIEWED = (
     "a component's emitted source imports a package outside the application-owned "
     "reviewed set; the state is not upgraded to installed"
 )
+REASON_REGISTRY_FILE_UNREVIEWED = (
+    "a registry install materialized a file outside the reviewed component set; "
+    "the state is not upgraded to installed"
+)
 REASON_MANAGER_UNSUPPORTED = (
     "the project's package manager has no supported pinned one-off mechanism"
 )
@@ -1393,6 +1397,53 @@ def verify_external_component_materialized(
             continue
     return ()
 
+
+def snapshot_component_files(component_dir: Optional[Path]) -> frozenset:
+    """The relative paths of every regular file under ``component_dir``.
+
+    A ``None`` or absent directory yields the empty set. Used to compute the
+    FILE delta a registry install caused: a builtin is reviewed to materialize
+    ONLY its own ``<component><suffix>`` file (plus, for a reviewed nested
+    component, that component's file), so a NEW file the CLI writes outside that
+    closure is an unreviewed artifact and must fail the install.
+    """
+    if component_dir is None:
+        return frozenset()
+    try:
+        root = Path(component_dir)
+        if not root.is_dir():
+            return frozenset()
+        return frozenset(
+            str(path.relative_to(root))
+            for path in root.rglob("*")
+            if path.is_file()
+        )
+    except OSError:
+        return frozenset()
+
+
+def unreviewed_materialized_files(
+    before: frozenset,
+    after: frozenset,
+    *,
+    allowed_components: Sequence[str],
+    suffixes: Sequence[str] = COMPONENT_SUFFIXES,
+) -> Tuple[str, ...]:
+    """New files under the component dir that are NOT a reviewed component file.
+
+    Returns the relative paths (bounded to the approved directory) of files that
+    appeared during the install and are not ``<allowed_component><suffix>`` for a
+    reviewed component. An empty result means every new file is a reviewed
+    artifact. Only names are compared; contents are covered by the source-import
+    boundary.
+    """
+    allowed_names = {
+        f"{component}{suffix}"
+        for component in allowed_components
+        for suffix in suffixes
+    }
+    new_files = set(after) - set(before)
+    return tuple(sorted(name for name in new_files if name not in allowed_names))
 
 
 # ---------------------------------------------------------------------------
@@ -2081,6 +2132,7 @@ class DesignDependencyInstaller:
         # package.json itself, so the postcondition must compare against this
         # application-owned baseline rather than trusting a zero exit code.
         before = snapshot_direct_dependencies(self.project_root)
+        files_before = snapshot_component_files(component_dir)
         process, timed_out = self._run(argv, REGISTRY_TIMEOUT_SECONDS)
         if timed_out:
             return (
@@ -2198,7 +2250,35 @@ class DesignDependencyInstaller:
                 rejected,
             )
 
-        # 4. Whole-operation removal check. Steps 1-3 compare the CLI's own
+        # 4. FILE delta. A builtin is reviewed to materialize ONLY its own
+        #    ``<component><suffix>`` file (plus a reviewed nested component's
+        #    file). Any OTHER file the CLI writes under the approved directory is
+        #    an unreviewed artifact -- it could import an unreviewed package or
+        #    shadow a reviewed component -- so it fails the install.
+        files_after = snapshot_component_files(component_dir)
+        unexpected_files = unreviewed_materialized_files(
+            files_before, files_after, allowed_components=effective
+        )
+        if unexpected_files:
+            logger.warning(
+                "Refusing a registry install that materialized %d unreviewed "
+                "file(s) under the component directory.",
+                len(unexpected_files),
+            )
+            return (
+                InstallOutcome(
+                    dependency_id=REGISTRY_DEPENDENCY,
+                    state=INSTALL_FAILED,
+                    package=None,
+                    reason=REASON_REGISTRY_FILE_UNREVIEWED,
+                    receipt=imports_receipt or boundary.receipt or receipt,
+                    verified_components=(),
+                ),
+                allowed,
+                rejected,
+            )
+
+        # 5. Whole-operation removal check. Steps 1-4 compare the CLI's own
         #    delta and the emitted sources, but the NORMALIZATION installs in
         #    step 1 (and step 1b) also run a package manager, which may prune a
         #    pre-existing project dependency. Nothing added after ``before`` may
@@ -2557,6 +2637,7 @@ class DesignDependencyInstaller:
 
         argv = tuple(prefix) + ("add", locator, "--yes", "--overwrite")
         before = snapshot_direct_dependencies(self.project_root)
+        files_before = snapshot_component_files(component_dir)
         process, timed_out = self._run(argv, REGISTRY_TIMEOUT_SECONDS)
         if timed_out:
             return InstallOutcome(
@@ -2618,6 +2699,26 @@ class DesignDependencyInstaller:
                 state=INSTALL_FAILED,
                 package=None,
                 reason=REASON_REGISTRY_SOURCE_IMPORT_UNREVIEWED,
+                receipt=boundary.receipt or receipt,
+                verified_components=(),
+            )
+
+        # The FILE delta must be exactly the reviewed component file. An
+        # external component is reviewed to materialize ONLY ``<id><suffix>``;
+        # any other new file under the directory is an unreviewed artifact.
+        files_after = snapshot_component_files(component_dir)
+        if unreviewed_materialized_files(
+            files_before, files_after, allowed_components=(request.component_id,)
+        ):
+            logger.warning(
+                "Refusing an external registry install that materialized an "
+                "unreviewed file under the component directory."
+            )
+            return InstallOutcome(
+                dependency_id=REGISTRY_DEPENDENCY,
+                state=INSTALL_FAILED,
+                package=None,
+                reason=REASON_REGISTRY_FILE_UNREVIEWED,
                 receipt=boundary.receipt or receipt,
                 verified_components=(),
             )
@@ -2757,6 +2858,7 @@ __all__ = [
     "REASON_REGISTRY_DEPENDENCY_DRIFT",
     "REASON_REGISTRY_PACKAGE_NOT_EXACT",
     "REASON_REGISTRY_IMPORT_UNRESOLVED",
+    "REASON_REGISTRY_FILE_UNREVIEWED",
     "REASON_REGISTRY_SOURCE_IMPORT_UNREVIEWED",
     "REASON_BUILTIN_COMPONENT_UNREVIEWED",
     "REASON_TIMEOUT",
@@ -2785,6 +2887,7 @@ __all__ = [
     "dependency_delta",
     "expand_reviewed_component_closure",
     "unreviewed_imports",
+    "unreviewed_materialized_files",
     "expected_registry_packages",
     "is_contained",
     "package_name_is_well_formed",
@@ -2795,6 +2898,7 @@ __all__ = [
     "removed_direct_dependencies",
     "required_registry_packages",
     "reviewed_registry_package_pins",
+    "snapshot_component_files",
     "snapshot_direct_dependencies",
     "verify_external_component_materialized",
     "InstallReport",
