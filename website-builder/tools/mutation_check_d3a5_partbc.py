@@ -371,6 +371,50 @@ MUTATIONS = [
         """    "lucide-react": "1.52.0",""",
         """    "lucide-react": "^1.52.0",""",
     ),
+    # ------------------------------------------------------------------
+    # Emitted-SOURCE import boundary -- the INSTALLATION is untrusted
+    # ------------------------------------------------------------------
+    # A registry may materialize a file importing a package it never declared,
+    # so the manifest delta is clean. The emitted source itself must be checked.
+    #
+    # 6. The source-import boundary must actually run in install_components.
+    (
+        "the emitted-source import boundary runs after materialization",
+        INSTALL,
+        """        source_ok = self._enforce_registry_source_import_boundary(
+            effective, component_dir
+        )
+        if not source_ok:""",
+        """        source_ok = True
+        if not source_ok:""",
+    ),
+    # 7. The bare-package parser must not treat the project alias as a package.
+    (
+        "the project alias is never treated as a package import",
+        INSTALL,
+        """    if specifier.startswith(("./", "../", "/", "@/")) or specifier in (".", ".."):
+        return None""",
+        """    if specifier.startswith(("./", "../", "/")) or specifier in (".", ".."):
+        return None""",
+    ),
+    # 8. The unreviewed check must actually filter against the allow-set.
+    (
+        "only reviewed packages are accepted from an emitted source",
+        INSTALL,
+        """    allowed = set(allowed_packages)
+    return tuple(p for p in declared_imports(source) if p not in allowed)""",
+        """    allowed = set(allowed_packages)
+    return ()""",
+    ),
+    # 9. The external path must apply the source-import boundary too.
+    (
+        "the external component source import boundary runs",
+        INSTALL,
+        """        if not self._enforce_registry_source_import_boundary(
+            (request.component_id,), component_dir, extra_packages=allowed_packages
+        ):""",
+        """        if False:""",
+    ),
 ]
 
 

@@ -37,12 +37,16 @@ from app.core.design_install import (
     REASON_REGISTRY_DEPENDENCY_DRIFT,
     REASON_REGISTRY_IMPORT_UNRESOLVED,
     REASON_REGISTRY_PACKAGE_NOT_EXACT,
+    REASON_REGISTRY_SOURCE_IMPORT_UNREVIEWED,
     SECTION_DEPENDENCIES,
     DesignDependencyInstaller,
     approved_component_dir,
     approved_external_component_dir,
+    bare_package_of,
+    declared_imports,
     dependency_delta,
     expand_reviewed_component_closure,
+    unreviewed_imports,
     registry_dependency_delta_is_acceptable,
     required_registry_packages,
     reviewed_registry_package_pins,
@@ -93,6 +97,7 @@ class RegistryRunner:
         honor_exact: bool = True,
         materialize_all_in_argv: bool = False,
         install_fails_for: str | None = None,
+        source_imports: Sequence[str] = (),
     ):
         self.commands: List[List[str]] = []
         self._writes = dependency_writes or {}
@@ -103,6 +108,7 @@ class RegistryRunner:
         self._honor_exact = honor_exact
         self._materialize_all_in_argv = materialize_all_in_argv
         self._install_fails_for = install_fails_for
+        self._source_imports = tuple(source_imports)
 
     def run_command(self, project_id, command, cwd=None, env=None, timeout=300.0):
         command = list(command)
@@ -163,12 +169,24 @@ class RegistryRunner:
                         target.mkdir(parents=True, exist_ok=True)
                         for name in names:
                             (target / f"{name}.tsx").write_text(
-                                "export const X = 1\n", encoding="utf-8"
+                                self._component_source_text(), encoding="utf-8"
                             )
 
         return subprocess.CompletedProcess(
             args=command, returncode=self._exitcode, stdout="ok", stderr=""
         )
+
+    def _component_source_text(self) -> str:
+        """The emitted source, with the imports this test wants to exercise.
+
+        The default matches a real reviewed builtin (imports ``cn``/``radix-ui``
+        plus any ``source_imports`` the test asks for), so the source-import
+        boundary can be driven the way a drifted registry would drive it.
+        """
+        lines = ['import * as React from "react"', 'import { cn } from "cn"']
+        for spec in self._source_imports:
+            lines.append(f'import {{ X }} from "{spec}"')
+        return "\n".join(lines) + "\nexport const X = 1\n"
 
 
 @pytest.fixture
@@ -657,3 +675,123 @@ def test_a_required_import_with_no_reviewed_pin_fails_closed(project, monkeypatc
     assert outcome.reason == REASON_REGISTRY_IMPORT_UNRESOLVED
     # No normalization/install argv was run for the unpinned package.
     assert not any("lucide-react" in arg for c in runner.commands for arg in c)
+
+
+# ---------------------------------------------------------------------------
+# Emitted-SOURCE import boundary: the INSTALLATION is untrusted
+# ---------------------------------------------------------------------------
+#
+# The identity is reviewed; the installation is not. A registry may materialize
+# a file that imports a package it never declared, so the manifest delta guard
+# sees nothing. These tests prove the emitted source itself is checked.
+
+
+def test_bare_package_of_distinguishes_packages_from_paths():
+    assert bare_package_of("react") == "react"
+    assert bare_package_of("gsap/ScrollTrigger") == "gsap"
+    assert bare_package_of("@gsap/react") == "@gsap/react"
+    assert bare_package_of("@/components/ui/button") is None
+    assert bare_package_of("./x") is None
+    assert bare_package_of("../x") is None
+    assert bare_package_of("/abs") is None
+    assert bare_package_of("") is None
+    assert bare_package_of(None) is None
+    assert bare_package_of("@") is None
+    assert bare_package_of("@scope") is None
+
+
+def test_declared_imports_finds_every_form():
+    src = (
+        'import * as React from "react"\n'
+        'import { gsap } from "gsap"\n'
+        'import { ScrollTrigger } from "gsap/ScrollTrigger"\n'
+        'import { useGSAP } from "@gsap/react"\n'
+        'import { Button } from "@/components/ui/button"\n'
+        'import "./styles.css"\n'
+        'import "side-effect-pkg"\n'
+        'export { x } from "re-exported-pkg"\n'
+    )
+    assert declared_imports(src) == (
+        "@gsap/react", "gsap", "re-exported-pkg", "react", "side-effect-pkg",
+    )
+
+
+def test_unreviewed_imports_names_only_what_is_not_allowed():
+    src = 'import { gsap } from "gsap"\nimport { X } from "evil-lib"\n'
+    assert unreviewed_imports(src, allowed_packages=["gsap"]) == ("evil-lib",)
+    assert unreviewed_imports(src, allowed_packages=["gsap", "evil-lib"]) == ()
+
+
+def test_an_approved_builtin_whose_source_drifts_is_refused(project):
+    """button is reviewed; its emitted source importing an unreviewed package
+    must fail closed even though package.json is unchanged."""
+    runner = RegistryRunner(
+        dependency_writes={"dependencies": {"cn": "^0.4.0", "radix-ui": "^1.7.0"}},
+        materializes=True,
+        component_name="button",
+        source_imports=("brand-new-unreviewed-pkg",),
+    )
+
+    outcome, _, _ = _installer(project, runner).install_components(["button"])
+
+    assert outcome.state == INSTALL_FAILED
+    assert outcome.reason == REASON_REGISTRY_SOURCE_IMPORT_UNREVIEWED
+    assert outcome.installed is False
+
+
+def test_a_clean_builtin_source_is_accepted(project):
+    """The reviewed source (cn/radix-ui/lucide-react only) is accepted."""
+    runner = RegistryRunner(
+        dependency_writes={"dependencies": {"cn": "^0.4.0", "radix-ui": "^1.7.0"}},
+        materializes=True,
+        component_name="button",
+    )
+
+    outcome, _, _ = _installer(project, runner).install_components(["button"])
+
+    assert outcome.state == "installed", outcome.reason
+
+
+def test_a_lucide_builtin_source_that_imports_lucide_is_accepted(project):
+    """lucide-react is reviewed, so a source importing it is fine."""
+    runner = RegistryRunner(
+        dependency_writes={"dependencies": {"cn": "^0.4.0", "radix-ui": "^1.7.0"}},
+        materializes=True,
+        materialize_all_in_argv=True,
+        source_imports=("lucide-react",),
+    )
+
+    outcome, _, _ = _installer(project, runner).install_components(["dialog"])
+
+    assert outcome.state == "installed", outcome.reason
+
+
+def test_an_external_component_source_drift_is_refused(project):
+    """SplitText's contract packages are allowed; a new import is not."""
+    runner = RegistryRunner(
+        dependency_writes={"dependencies": {"gsap": "^3.15.0", "@gsap/react": "^2.1.2"}},
+        materializes=True,
+        component_name="SplitText",
+        external_dir=True,
+        source_imports=("evil-tracking-lib",),
+    )
+
+    outcome = _installer(project, runner).install_external_component(_split_text_request())
+
+    assert outcome.state == INSTALL_FAILED
+    assert outcome.reason == REASON_REGISTRY_SOURCE_IMPORT_UNREVIEWED
+
+
+def test_an_external_component_with_only_contract_imports_is_accepted(project):
+    """SplitText importing only its reviewed contract packages is accepted."""
+    runner = RegistryRunner(
+        dependency_writes={"dependencies": {"gsap": "^3.15.0", "@gsap/react": "^2.1.2"}},
+        materializes=True,
+        component_name="SplitText",
+        external_dir=True,
+        source_imports=("gsap", "@gsap/react"),
+    )
+
+    outcome = _installer(project, runner).install_external_component(_split_text_request())
+
+    assert outcome.state == "installed", outcome.reason

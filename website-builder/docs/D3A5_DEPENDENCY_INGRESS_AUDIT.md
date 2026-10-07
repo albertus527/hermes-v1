@@ -157,6 +157,29 @@ is the **same class** as the external-component boundary, applied one layer down
 - **Coherence guards added:** the import table's key set equals
   `ALLOWED_SHADCN_COMPONENTS`; every imported package has an exact pin.
 
+## Fourth-pass audit (the emitted SOURCE is untrusted, not just the identity)
+
+The component **identity** is reviewed (allowlisted); the **installation** is
+not. The registry chooses which file to materialize, and that file may import a
+package the registry never declared — so the `package.json` delta is clean and
+the earlier guards pass, yet the build cannot resolve. Confirmed live: an
+approved `button` whose emitted source added `import { Widget } from
+"brand-new-unreviewed-pkg"` was reported `installed` with `brand-new-unreviewed-pkg`
+absent from the manifest.
+
+- **Fix:** after materialization, the emitted source of every installed component
+  (builtin closure and external component) is parsed for its **bare package
+  specifiers** and each must be in the application-owned reviewed set —
+  `react`, `react-dom`, `cn`, `radix-ui`, `lucide-react`, plus, for an external
+  component, that component's reviewed contract packages. Anything else fails
+  closed (`REASON_REGISTRY_SOURCE_IMPORT_UNREVIEWED`).
+- **Bounded and total:** `bare_package_of` ignores relative paths and the `@/`
+  project alias, strips subpaths (`gsap/ScrollTrigger` → `gsap`) and preserves
+  scopes (`@gsap/react`); reads are capped at `_MAX_COMPONENT_SOURCE_CHARS`.
+- **The identity is trusted; the installation is not** — this is the boundary
+  the four passes converge on: allowlisted identity + reviewed contract +
+  manifest-delta guard + emitted-source import guard.
+
 ## Final dependency policy (post-repair)
 
 - **Package identity is closed and application-owned.** `DEPENDENCY_PACKAGES`

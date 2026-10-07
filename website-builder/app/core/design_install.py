@@ -429,6 +429,122 @@ def required_registry_packages(components: Sequence[str]) -> Tuple[str, ...]:
 
 
 # ---------------------------------------------------------------------------
+# Emitted-source import boundary -- the INSTALLATION is untrusted
+# ---------------------------------------------------------------------------
+#
+# A component IDENTITY is reviewed (``ALLOWED_SHADCN_COMPONENTS`` / a reviewed
+# external contract). Its INSTALLATION is not: the registry decides which file
+# it materializes, and that file may import a package the registry never
+# declared, the CLI never installed, and this application never reviewed. The
+# package.json delta guard cannot see this, because nothing was added to the
+# manifest -- the import is a source-level requirement. So the emitted source
+# itself is parsed and every BARE package specifier it names must be one this
+# application already provides or has reviewed. Anything else fails closed.
+
+#: Bare specifiers every emitted component may import without review: the React
+#: runtime the starter always ships.
+_ALWAYS_PROVIDED_PACKAGES: Tuple[str, ...] = ("react", "react-dom")
+
+#: A bounded read of an emitted component source. A generated component is a few
+#: kilobytes; this ceiling stops a pathological file from being slurped whole.
+_MAX_COMPONENT_SOURCE_CHARS = 400_000
+
+_IMPORT_FROM_RE = re.compile(r"""\bfrom\s*["']([^"']+)["']""")
+_SIDE_EFFECT_IMPORT_RE = re.compile(r"""\bimport\s*["']([^"']+)["']""")
+
+
+def bare_package_of(specifier: object) -> Optional[str]:
+    """The npm package a module specifier names, or ``None`` for a non-package.
+
+    ``None`` for a relative path (``./x``, ``../x``), an absolute path, or the
+    project's own alias (``@/...``). For a package, strips any subpath
+    (``gsap/ScrollTrigger`` -> ``gsap``) and preserves a scope
+    (``@gsap/react``). Bounded and total: a non-string or empty specifier is
+    ``None`` rather than an error.
+    """
+    if not isinstance(specifier, str) or not specifier:
+        return None
+    if specifier.startswith(("./", "../", "/", "@/")) or specifier in (".", ".."):
+        return None
+    parts = specifier.split("/")
+    if specifier.startswith("@"):
+        if len(parts) < 2 or not parts[0] or not parts[1]:
+            return None
+        return f"{parts[0]}/{parts[1]}"
+    return parts[0] or None
+
+
+def declared_imports(source: str) -> Tuple[str, ...]:
+    """Every BARE package specifier ``source`` imports, sorted and deduped.
+
+    Matches ``import ... from "x"``, ``export ... from "x"`` and the side-effect
+    form ``import "x"``. Relative paths and the ``@/`` project alias are not
+    packages and are ignored.
+    """
+    if not isinstance(source, str) or not source:
+        return ()
+    found: set = set()
+    for match in _IMPORT_FROM_RE.finditer(source):
+        package = bare_package_of(match.group(1))
+        if package:
+            found.add(package)
+    for match in _SIDE_EFFECT_IMPORT_RE.finditer(source):
+        package = bare_package_of(match.group(1))
+        if package:
+            found.add(package)
+    return tuple(sorted(found))
+
+
+def unreviewed_imports(
+    source: str, *, allowed_packages: Sequence[str]
+) -> Tuple[str, ...]:
+    """Bare packages ``source`` imports that are NOT in ``allowed_packages``."""
+    allowed = set(allowed_packages)
+    return tuple(p for p in declared_imports(source) if p not in allowed)
+
+
+def _reviewed_source_import_packages(*extra: str) -> Tuple[str, ...]:
+    """Every package an emitted component source may import without review.
+
+    The reviewed builtin helpers (``cn``, ``radix-ui``), the reviewed source
+    imports (``lucide-react``), the packages the starter always ships
+    (``react``, ``react-dom``), and any ``extra`` packages the caller has already
+    reviewed for this install (e.g. an external component's contract packages).
+    A package outside this set is refused.
+    """
+    packages: set = set(_ALWAYS_PROVIDED_PACKAGES)
+    packages.update(extra)
+    packages.update(REGISTRY_INTRODUCED_PACKAGE_PINS)
+    for component_packages in REVIEWED_BUILTIN_COMPONENT_DEPENDENCIES.values():
+        packages.update(component_packages)
+    for component_packages in REVIEWED_BUILTIN_COMPONENT_IMPORTS.values():
+        packages.update(component_packages)
+    return tuple(sorted(packages))
+
+
+def component_source_text(
+    project_root: Path, component_dir: Path, component: str
+) -> Optional[str]:
+    """The emitted source of ``component`` under ``component_dir``, or ``None``.
+
+    Reads the first contained regular ``<component><suffix>`` file, bounded to
+    :data:`_MAX_COMPONENT_SOURCE_CHARS`. Returns ``None`` when nothing is
+    readable -- materialization is verified separately, so an absent file is not
+    a failure here.
+    """
+    for suffix in COMPONENT_SUFFIXES:
+        candidate = Path(component_dir) / f"{component}{suffix}"
+        try:
+            if not candidate.is_file() or not is_contained(project_root, candidate):
+                continue
+            with candidate.open("r", encoding="utf-8", errors="replace") as handle:
+                return handle.read(_MAX_COMPONENT_SOURCE_CHARS)
+        except OSError:
+            continue
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Impeccable critic parser runtime -- APPLICATION-OWNED, exact-pinned
 # ---------------------------------------------------------------------------
 #
@@ -597,6 +713,10 @@ REASON_REGISTRY_IMPORT_UNRESOLVED = (
     "a component's emitted source imports a package that could not be verified "
     "present at its exact application-owned pin; the state is not upgraded to "
     "installed"
+)
+REASON_REGISTRY_SOURCE_IMPORT_UNREVIEWED = (
+    "a component's emitted source imports a package outside the application-owned "
+    "reviewed set; the state is not upgraded to installed"
 )
 REASON_MANAGER_UNSUPPORTED = (
     "the project's package manager has no supported pinned one-off mechanism"
@@ -1997,6 +2117,28 @@ class DesignDependencyInstaller:
                 rejected,
             )
 
+        # 3. The INSTALLATION is untrusted. The emitted source may import a
+        #    package the registry never declared (so the manifest delta is
+        #    clean) and the CLI never installed. Every bare package the emitted
+        #    source imports must be one this application provides or reviewed;
+        #    otherwise the build cannot resolve and the state is NOT installed.
+        source_ok = self._enforce_registry_source_import_boundary(
+            effective, component_dir
+        )
+        if not source_ok:
+            return (
+                InstallOutcome(
+                    dependency_id=REGISTRY_DEPENDENCY,
+                    state=INSTALL_FAILED,
+                    package=None,
+                    reason=REASON_REGISTRY_SOURCE_IMPORT_UNREVIEWED,
+                    receipt=imports_receipt or boundary.receipt or receipt,
+                    verified_components=(),
+                ),
+                allowed,
+                rejected,
+            )
+
         return (
             InstallOutcome(
                 dependency_id=REGISTRY_DEPENDENCY,
@@ -2009,6 +2151,41 @@ class DesignDependencyInstaller:
             allowed,
             rejected,
         )
+
+    def _enforce_registry_source_import_boundary(
+        self,
+        components: Sequence[str],
+        component_dir: Optional[Path],
+        *,
+        extra_packages: Sequence[str] = (),
+    ) -> bool:
+        """Whether every bare package the emitted sources import is reviewed.
+
+        The identity is trusted; the installation is not. ``component_dir`` is
+        the project's own reviewed destination, so the files read here are the
+        ones the CLI just wrote. Any bare package outside
+        ``_reviewed_source_import_packages()`` fails closed -- a package the
+        registry introduced only at the source level (never declared, never
+        installed) is exactly what the manifest delta guard cannot see.
+        """
+        if component_dir is None or not components:
+            return True
+        allowed = _reviewed_source_import_packages(*extra_packages)
+        for component in components:
+            source = component_source_text(self.project_root, component_dir, component)
+            if source is None:
+                # Materialization is verified separately; an unreadable file is
+                # not this boundary's failure.
+                continue
+            offending = unreviewed_imports(source, allowed_packages=allowed)
+            if offending:
+                logger.warning(
+                    "Refusing a registry component whose emitted source imports "
+                    "%d unreviewed package(s).",
+                    len(offending),
+                )
+                return False
+        return True
 
     def _ensure_required_registry_imports(
         self,
@@ -2317,6 +2494,21 @@ class DesignDependencyInstaller:
                 verified_components=(),
             )
 
+        # The INSTALLATION is untrusted: the emitted source may import a package
+        # the registry never declared and the CLI never installed. Every bare
+        # package it imports must be reviewed; otherwise the build cannot resolve.
+        if not self._enforce_registry_source_import_boundary(
+            (request.component_id,), component_dir, extra_packages=allowed_packages
+        ):
+            return InstallOutcome(
+                dependency_id=REGISTRY_DEPENDENCY,
+                state=INSTALL_FAILED,
+                package=None,
+                reason=REASON_REGISTRY_SOURCE_IMPORT_UNREVIEWED,
+                receipt=boundary.receipt or receipt,
+                verified_components=(),
+            )
+
         return InstallOutcome(
             dependency_id=REGISTRY_DEPENDENCY,
             state="installed",
@@ -2421,6 +2613,7 @@ __all__ = [
     "REASON_REGISTRY_DEPENDENCY_DRIFT",
     "REASON_REGISTRY_PACKAGE_NOT_EXACT",
     "REASON_REGISTRY_IMPORT_UNRESOLVED",
+    "REASON_REGISTRY_SOURCE_IMPORT_UNREVIEWED",
     "REASON_BUILTIN_COMPONENT_UNREVIEWED",
     "REASON_TIMEOUT",
     "SECTION_DEPENDENCIES",
@@ -2442,8 +2635,12 @@ __all__ = [
     "allowed_shadcn_components",
     "approved_component_dir",
     "approved_external_component_dir",
+    "bare_package_of",
+    "component_source_text",
+    "declared_imports",
     "dependency_delta",
     "expand_reviewed_component_closure",
+    "unreviewed_imports",
     "expected_registry_packages",
     "is_contained",
     "package_name_is_well_formed",
