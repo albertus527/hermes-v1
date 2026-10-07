@@ -200,6 +200,14 @@ MUTATIONS = [
     # ------------------------------------------------------------------
     # Parts F/G: catalog normalization (21st.dev + React Bits)
     # ------------------------------------------------------------------
+    # --- 11b. installable requires a REVIEWED locator, not just clean deps
+    #          (the false positive: 64 listed, 1 installable)
+    (
+        "installable requires an approved locator, not just clean deps",
+        CATALOG,
+        """        return self.dependencies_in_policy and self.has_approved_locator""",
+        """        return self.dependencies_in_policy""",
+    ),
     # --- 12. each source validates ids in its OWN vocabulary ------------
     (
         "a React Bits id is never valid as a 21st id",
@@ -251,14 +259,8 @@ MUTATIONS = [
     (
         "a component requiring an un-allowlisted package is not installable",
         CATALOG,
-        """    @property
-    def installable(self) -> bool:
-        \"\"\"Whether this component's requirements are entirely in policy.\"\"\"
-        return not self.unknown_dependency_ids""",
-        """    @property
-    def installable(self) -> bool:
-        \"\"\"Whether this component's requirements are entirely in policy.\"\"\"
-        return True""",
+        """        return not self.unknown_dependency_ids""",
+        """        return True""",
     ),
     # --- 16. upstream text is bounded before it is copied --------------
     (

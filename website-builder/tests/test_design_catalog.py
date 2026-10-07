@@ -188,28 +188,38 @@ def test_an_unknown_source_is_refused():
 def test_an_unknown_dependency_makes_a_component_non_installable():
     """Refusal, not allowlist widening: upstream proposes, we decide."""
     result = normalize_catalog(
-        SOURCE_TWENTY_FIRST,
-        {"components": [{"id": "risky-thing", "dependencies": ["left-pad"]}]},
+        SOURCE_REACT_BITS,
+        {"components": [{"id": "SplitText", "dependencies": ["left-pad"]}]},
     )
     entry = result.entries[0]
 
+    assert entry.dependencies_in_policy is False
     assert entry.installable is False
     assert entry.unknown_dependency_ids == ("left-pad",)
     assert result.installable_ids() == (), "no component is installable here"
 
 
-def test_installable_ids_excludes_non_installable_components():
+def test_installable_ids_requires_BOTH_policy_and_a_reviewed_locator():
+    """Installable means the application reviewed it, not merely "listed".
+
+    A component with clean dependencies but NO approved locator is a proposal,
+    not an installable thing -- the false positive this property must not repeat.
+    """
     result = normalize_catalog(
-        SOURCE_TWENTY_FIRST,
+        SOURCE_REACT_BITS,
         {
             "components": [
-                {"id": "safe-thing"},
-                {"id": "risky-thing", "dependencies": ["left-pad"]},
+                # Reviewed: an approved locator exists -> installable.
+                {"id": "SplitText"},
+                # Listed upstream, clean deps, but NOT reviewed -> not installable.
+                {"id": "BlurText"},
+                # Unreviewed AND an out-of-policy dependency -> not installable.
+                {"id": "CountUp", "dependencies": ["left-pad"]},
             ]
         },
     )
 
-    assert result.installable_ids() == ("safe-thing",)
+    assert result.installable_ids() == ("SplitText",)
 
 
 def test_the_dependency_allowlist_is_never_widened():
@@ -426,3 +436,76 @@ def test_a_non_installable_component_is_refused_even_when_approved():
 
 def test_a_shadcn_builtin_source_is_not_a_catalog_source():
     assert SOURCE_SHADCN_BUILTIN not in SOURCE_HOSTS
+
+
+# ---------------------------------------------------------------------------
+# installable means REVIEWED, not merely listed (the false positive)
+# ---------------------------------------------------------------------------
+#
+# A catalog entry is installable only when BOTH hold: its declared dependency
+# set is entirely in policy AND the application has an APPROVED canonical
+# locator for (source, component_id). Deriving installability from declared
+# dependencies alone reported every listed component as installable while only
+# the reviewed one actually was.
+
+
+def test_a_listed_but_unreviewed_component_is_not_installable():
+    """The exact false positive: clean deps, no approved locator."""
+    result = normalize_catalog(
+        SOURCE_REACT_BITS, {"components": [{"id": "BlurText"}]}
+    )
+    entry = result.entries[0]
+
+    assert entry.dependencies_in_policy is True
+    assert entry.has_approved_locator is False
+    assert entry.installable is False
+    assert result.installable_ids() == ()
+
+
+def test_a_reviewed_component_with_clean_deps_is_installable():
+    result = normalize_catalog(
+        SOURCE_REACT_BITS, {"components": [{"id": "SplitText"}]}
+    )
+    entry = result.entries[0]
+
+    assert entry.has_approved_locator is True
+    assert entry.installable is True
+    assert result.installable_ids() == ("SplitText",)
+
+
+def test_a_reviewed_component_with_an_out_of_policy_dep_is_not_installable():
+    """Review is necessary but not sufficient: dependencies must be in policy."""
+    result = normalize_catalog(
+        SOURCE_REACT_BITS,
+        {"components": [{"id": "SplitText", "dependencies": ["left-pad"]}]},
+    )
+    entry = result.entries[0]
+
+    assert entry.has_approved_locator is True
+    assert entry.dependencies_in_policy is False
+    assert entry.installable is False
+
+
+def test_installable_never_disagrees_with_the_registry():
+    """For every entry, .installable must equal what the registry would allow."""
+    from app.core.design_registry import resolve_registry_locator
+
+    for source, payload in (
+        (SOURCE_REACT_BITS, {"components": [{"id": "SplitText"}, {"id": "BlurText"}]}),
+        (SOURCE_TWENTY_FIRST, {"components": [{"id": "hero-section"}]}),
+    ):
+        for entry in normalize_catalog(source, payload).entries:
+            expected = (
+                not entry.unknown_dependency_ids
+                and resolve_registry_locator(source, entry.component_id) is not None
+            )
+            assert entry.installable is expected, entry.component_id
+
+
+def test_the_serialized_entry_reports_both_conditions():
+    result = normalize_catalog(SOURCE_REACT_BITS, {"components": [{"id": "BlurText"}]})
+    payload = result.entries[0].to_dict()
+
+    assert payload["dependencies_in_policy"] is True
+    assert payload["has_approved_locator"] is False
+    assert payload["installable"] is False

@@ -45,6 +45,7 @@ from app.core.design_registry import (
     SOURCE_REACT_BITS,
     SOURCE_TWENTY_FIRST,
     resolve_dependency_requirements,
+    resolve_registry_locator,
 )
 
 logger = logging.getLogger(__name__)
@@ -95,9 +96,32 @@ class CatalogEntry:
         return f"{self.source}:{self.component_id}"
 
     @property
-    def installable(self) -> bool:
-        """Whether this component's requirements are entirely in policy."""
+    def dependencies_in_policy(self) -> bool:
+        """Whether every declared dependency is in the closed allowlist."""
         return not self.unknown_dependency_ids
+
+    @property
+    def has_approved_locator(self) -> bool:
+        """Whether the application has a REVIEWED canonical locator for this.
+
+        The registry decides this, not the catalog: a component upstream lists
+        is installable only when this application has reviewed it.
+        """
+        return resolve_registry_locator(self.source, self.component_id) is not None
+
+    @property
+    def installable(self) -> bool:
+        """Whether THIS APPLICATION can actually install the component.
+
+        BOTH conditions are required: the declared dependency set must be
+        entirely in policy AND an approved canonical locator must exist for
+        ``(source, component_id)``. A component upstream lists but this
+        application has NOT reviewed is not installable -- claiming otherwise is
+        the false positive this property must never repeat. (Deriving
+        installability from declared dependencies alone reported every listed
+        React Bits component as installable while only the reviewed one was.)
+        """
+        return self.dependencies_in_policy and self.has_approved_locator
 
     def to_dict(self) -> Dict[str, Any]:
         """Serializable and bounded. No absolute path, no credential."""
@@ -111,6 +135,8 @@ class CatalogEntry:
             },
             "declared_dependency_ids": list(self.declared_dependency_ids),
             "unknown_dependency_ids": list(self.unknown_dependency_ids),
+            "dependencies_in_policy": self.dependencies_in_policy,
+            "has_approved_locator": self.has_approved_locator,
             "installable": self.installable,
         }
 

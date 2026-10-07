@@ -236,6 +236,22 @@ GET https://21st.dev/api/v1/components/search?q=<term>&scope=public&limit=24
 - **No fabrication.** A malformed or empty search response is a degraded empty
   result, never an invented entry.
 
+### `installable` means REVIEWED, not merely listed
+
+`CatalogEntry.installable` (and `installable_ids()`) derived installability from
+**declared dependencies alone** -- it never checked whether the application has
+an **approved canonical locator**. Confirmed live: `discover_catalog('react_bits')`
+reported **64 installable** components while exactly **1** (`SplitText`) was
+reviewed; `resolve_registry_locator` returned `None` for the other 63 and
+`build_registry_request` refused them. The module docstring claimed "nothing here
+can make an unreviewed component installable" -- the code contradicted it.
+
+Fix: `installable` now requires BOTH `dependencies_in_policy` AND
+`has_approved_locator` (resolved by the registry, the same table the install
+path uses). `to_dict()` reports both conditions separately so a consumer can see
+WHY an entry is not installable. Live result: React Bits reports exactly
+`('SplitText',)`.
+
 ### The discovery-adapter probe is PER-SOURCE
 
 Introducing the 21st REST-search endpoint split discovery into two tables

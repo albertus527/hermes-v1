@@ -337,10 +337,17 @@ def test_discovery_normalizes_through_design_catalog():
 
     assert result.ok is True
     assert result.source == SOURCE_REACT_BITS
-    assert {"BlurText", "CountUp", "ASCIIText"} <= set(result.installable_ids())
+    # Every listed id is a real entry...
+    assert {"BlurText", "CountUp", "ASCIIText"} <= {
+        e.component_id for e in result.entries
+    }
+    # ...but "installable" requires an APPROVED locator, so none of these
+    # unreviewed components is installable (only the reviewed one is).
+    assert result.installable_ids() == ()
     for entry in result.entries:
         assert entry.source == SOURCE_REACT_BITS
         assert entry.provenance_host == "reactbits.dev"
+        assert entry.dependencies_in_policy is True
 
 
 def test_a_network_failure_yields_zero_entries_and_no_fabrication():
@@ -433,8 +440,10 @@ def test_a_component_discovered_upstream_is_still_only_a_proposal():
     transport = RecordingTransport(body=REAL_REACTBITS_INDEX.encode("utf-8"))
     result = discover_catalog(SOURCE_REACT_BITS, transport=transport)
 
-    assert "BlurText" in result.installable_ids(), "upstream really lists it"
-
+    # It is a real ENTRY...
+    assert "BlurText" in {e.component_id for e in result.entries}
+    # ...but NOT installable, and the catalog agrees (no false positive).
+    assert "BlurText" not in result.installable_ids()
     assert resolve_registry_locator(SOURCE_REACT_BITS, "BlurText") is None
     outcome = build_registry_request(SOURCE_REACT_BITS, "BlurText")
     assert outcome.ok is False
@@ -487,7 +496,8 @@ def test_the_variant_is_application_owned_not_caller_supplied():
     )
     result = discover_catalog(SOURCE_REACT_BITS, transport=transport)
 
-    assert "BlurText" in result.installable_ids()
+    assert "BlurText" in {e.component_id for e in result.entries}
+    assert "BlurText" not in result.installable_ids()
     assert resolve_registry_locator(SOURCE_REACT_BITS, "BlurText") is None
 
 
@@ -682,8 +692,10 @@ def test_the_21st_search_results_normalize_and_are_only_proposals():
         credential_provider=lambda _s: "21st_sk_present",
     )
 
-    assert "hero-section" in result.installable_ids()
-    # ...and yet it is NOT installable, because review is the gate, not the catalog.
+    # It is a real ENTRY...
+    assert "hero-section" in {e.component_id for e in result.entries}
+    # ...and NOT installable, because review is the gate, not the catalog.
+    assert "hero-section" not in result.installable_ids()
     assert resolve_registry_locator(SOURCE_TWENTY_FIRST, "hero-section") is None
     outcome = build_registry_request(SOURCE_TWENTY_FIRST, "hero-section")
     assert outcome.ok is False
