@@ -221,27 +221,12 @@ MUTATIONS = [
     (
         "21st route paths never become component identities",
         FETCH,
-        """    # 21st: NO verified component-identity schema exists in the documented
-    # surface. Route paths are not identities, so nothing is extracted. This is
-    # the honest degraded result, not a fabricated catalog.
-    if not _21ST_COMPONENT_IDENTITY_SCHEMA_VERIFIED:
-        return []
-
-    return found""",
+        """    for match in _21ST_AUTHORED_COMPONENT_RE.finditer(text):
+        identity = match.group(1).strip()""",
         """    import re as _re
 
     for match in _re.finditer(r"/components/(?:s/)?([a-z0-9]+(?:-[a-z0-9]+)*)\\b", text):
-        identity = match.group(1).strip()
-        if not component_id_is_valid(source, identity):
-            continue
-        if identity in seen:
-            continue
-        seen.add(identity)
-        found.append({"id": identity, "name": identity})
-        if len(found) >= MAX_PARSED_IDS:
-            break
-
-    return found""",
+        identity = match.group(1).strip()""",
     ),
     # ------------------------------------------------------------------
     # Reserved route segments are refused at the REGISTRY (installability)
@@ -255,6 +240,19 @@ MUTATIONS = [
             raise ValueError(""",
         """        if False:
             raise ValueError(""",
+    ),
+    # ------------------------------------------------------------------
+    # The 21st identity pattern keeps the /@<author>/ ANCHOR. Dropping it for
+    # the generic /components/<slug> tail turns routes into identities.
+    (
+        "the 21st identity pattern keeps the author anchor",
+        FETCH,
+        """_21ST_AUTHORED_COMPONENT_RE = re.compile(
+    r"/@[A-Za-z0-9_.\-]+/components/([a-z0-9]+(?:-[a-z0-9]+)*)"
+)""",
+        """_21ST_AUTHORED_COMPONENT_RE = re.compile(
+    r"/components/([a-z0-9]+(?:-[a-z0-9]+)*)"
+)""",
     ),
     # ------------------------------------------------------------------
     # Part G -- 21st discovery is the REAL authenticated REST search

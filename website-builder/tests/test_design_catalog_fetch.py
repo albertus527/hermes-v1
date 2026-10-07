@@ -757,3 +757,63 @@ def test_react_bits_still_needs_no_credential():
 
     assert result.ok is True
     assert SOURCE_REACT_BITS not in CREDENTIAL_REQUIRED_FOR_DISCOVERY
+
+
+# ---------------------------------------------------------------------------
+# The 21st identity pattern is ANCHORED, never the generic /components/<slug>
+# ---------------------------------------------------------------------------
+#
+# The root cause of the route false positive: the pattern kept the generic
+# `/components/<slug>` tail and DROPPED the `/@<author>/` anchor. A component
+# page is `/@<author>/components/<slug>`; a category/highlight ROUTE is
+# `/community/components/<x>` with NO author. Without the anchor, every route
+# tail became a fabricated identity.
+
+
+def test_the_anchored_pattern_extracts_a_real_component_page():
+    from app.core.design_catalog_fetch import _21ST_AUTHORED_COMPONENT_RE
+
+    text = "https://21st.dev/@someone/components/hero-banner\n"
+    assert _21ST_AUTHORED_COMPONENT_RE.findall(text) == ["hero-banner"]
+
+
+def test_the_anchored_pattern_never_matches_a_route():
+    from app.core.design_catalog_fetch import _21ST_AUTHORED_COMPONENT_RE
+
+    for route in (
+        "https://21st.dev/community/components/s/hero\n",
+        "https://21st.dev/community/components/popular\n",
+        "https://21st.dev/community/components/newest\n",
+        "https://21st.dev/community/components/featured\n",
+        "https://21st.dev/community/components/week\n",
+    ):
+        assert _21ST_AUTHORED_COMPONENT_RE.findall(route) == [], route
+
+
+def test_the_anchored_pattern_yields_nothing_from_the_real_index():
+    """The real llms.txt is ROUTES, so the honest answer is zero identities."""
+    from app.core.design_catalog_fetch import _21ST_AUTHORED_COMPONENT_RE
+
+    assert _21ST_AUTHORED_COMPONENT_RE.findall(REAL_21ST_ROUTES) == []
+
+
+def test_the_parser_uses_the_anchored_pattern_not_the_generic_tail():
+    """A route-only index must produce zero, even if the flag is flipped."""
+    import app.core.design_catalog_fetch as fetch
+
+    # Force the extraction branch to run.
+    saved = fetch._21ST_COMPONENT_IDENTITY_SCHEMA_VERIFIED
+    try:
+        fetch._21ST_COMPONENT_IDENTITY_SCHEMA_VERIFIED = True
+        # Routes only -> the anchored pattern extracts nothing.
+        assert fetch.parse_markdown_catalog(
+            SOURCE_TWENTY_FIRST, REAL_21ST_ROUTES
+        ) == []
+        # A real authored component page -> extracted.
+        docs = fetch.parse_markdown_catalog(
+            SOURCE_TWENTY_FIRST,
+            "https://21st.dev/@someone/components/hero-banner\n",
+        )
+        assert {d["id"] for d in docs} == {"hero-banner"}
+    finally:
+        fetch._21ST_COMPONENT_IDENTITY_SCHEMA_VERIFIED = saved

@@ -236,6 +236,27 @@ GET https://21st.dev/api/v1/components/search?q=<term>&scope=public&limit=24
 - **No fabrication.** A malformed or empty search response is a degraded empty
   result, never an invented entry.
 
+### Root cause of the 21st route false positive: the ANCHOR was dropped
+
+The old pattern matched the **generic tail** `/components/<slug>` and dropped the
+`/@<author>/` anchor. A 21st component page is
+`/@<author>/components/<slug>`; a category route (`/community/components/s/<tag>`)
+and a highlight route (`/community/components/popular`) share the SAME
+`/components/<tail>` ending but have NO author. So every route tail became an
+identity -- on the real `llms.txt` the generic pattern yields **exactly**
+`featured`, `newest`, `popular`, `s`, `week`.
+
+```
+generic  /components/([a-z0-9-]+)              -> 5 fabricated identities
+anchored /@<author>/components/([a-z0-9-]+)    -> (nothing)   <- honest
+```
+
+Fix: the ONLY 21st identity pattern is now `_21ST_AUTHORED_COMPONENT_RE`, which
+keeps the `/@<author>/` anchor. The extraction branch uses it, so a route-only
+index produces zero even if the schema flag is flipped. This is the STRUCTURAL
+fix; the reserved-segment refusal (`RESERVED_COMPONENT_IDS`) remains as
+defense in depth.
+
 ### The import boundary sees EVERY module-loading form
 
 `declared_imports` is the generic scanner over UNTRUSTED emitted source, and its
