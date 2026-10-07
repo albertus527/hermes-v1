@@ -722,6 +722,10 @@ REASON_REGISTRY_FILE_UNREVIEWED = (
     "a registry install materialized a file outside the reviewed component set; "
     "the state is not upgraded to installed"
 )
+REASON_MANIFEST_SECTION_CHANGED = (
+    "a registry install changed a package.json section outside the reviewed "
+    "dependency surface; the state is not upgraded to installed"
+)
 REASON_PACKAGE_SOURCE_CHANGED = (
     "a registry install wrote or changed a package-manager config file that can "
     "redirect the package source; the state is not upgraded to installed"
@@ -1075,6 +1079,57 @@ def registry_dependency_delta_is_acceptable(
     for packages in removed_direct_dependencies(before, after).values():
         offending.update(packages)
     return (not offending), tuple(sorted(offending))
+
+
+def snapshot_manifest_sections(project_root: Path) -> Dict[str, str]:
+    """A section -> canonical-JSON snapshot of EVERY top-level ``package.json`` key.
+
+    Distinct from :func:`snapshot_direct_dependencies`, which keeps only the four
+    reviewed dependency sections. This keeps the WHOLE document so a caller can
+    detect an UNEXPECTED SECTION mutation: an install may change the dependency
+    sections (their contents are governed by the delta/removal/pin guards), but it
+    must leave every OTHER top-level section exactly as it found it. A section
+    such as ``overrides``/``resolutions`` can force a package to an arbitrary
+    version or SOURCE, so its silent appearance is a package-source redirect by
+    another name.
+
+    Values are canonicalised with ``sort_keys=True`` so key order never reads as a
+    change. An absent/unreadable manifest yields an empty snapshot.
+    """
+    document = _read_project_manifest(project_root)
+    snapshot: Dict[str, str] = {}
+    if document is None:
+        return snapshot
+    for name, value in document.items():
+        if not isinstance(name, str):
+            continue
+        try:
+            snapshot[name] = json.dumps(value, sort_keys=True, ensure_ascii=False)
+        except (TypeError, ValueError):
+            snapshot[name] = "<unserializable>"
+    return snapshot
+
+
+def changed_manifest_sections(
+    before: Mapping[str, str],
+    after: Mapping[str, str],
+    *,
+    reviewed_sections: Sequence[str] = SNAPSHOT_SECTIONS,
+) -> Tuple[str, ...]:
+    """Top-level sections that changed and are NOT part of the reviewed surface.
+
+    Returns the bounded section NAMES (never their content). The reviewed
+    dependency sections are expected to change -- the delta/removal/pin guards
+    govern their contents -- so they are excluded here. Every OTHER section is
+    frozen: an install that adds, removes, or edits one is unreviewed.
+    """
+    reviewed = set(reviewed_sections)
+    changed = [
+        name
+        for name in set(before) | set(after)
+        if name not in reviewed and before.get(name) != after.get(name)
+    ]
+    return tuple(sorted(changed))
 
 
 #: The package-manager argv that normalizes a floating range to an exact pin.
@@ -2198,6 +2253,7 @@ class DesignDependencyInstaller:
         before = snapshot_direct_dependencies(self.project_root)
         files_before = snapshot_component_files(component_dir)
         source_config_before = package_source_config_snapshot(self.project_root)
+        sections_before = snapshot_manifest_sections(self.project_root)
         process, timed_out = self._run(argv, REGISTRY_TIMEOUT_SECONDS)
         if timed_out:
             return (
@@ -2360,6 +2416,31 @@ class DesignDependencyInstaller:
                     state=INSTALL_FAILED,
                     package=None,
                     reason=REASON_PACKAGE_SOURCE_CHANGED,
+                    receipt=imports_receipt or boundary.receipt or receipt,
+                    verified_components=(),
+                ),
+                allowed,
+                rejected,
+            )
+
+        # 4c. UNEXPECTED SECTION mutation. An install may change the four reviewed
+        #     dependency sections; it must leave EVERY other top-level package.json
+        #     section exactly as it found it. `overrides`/`resolutions`/`pnpm` can
+        #     force a package to an arbitrary version or SOURCE, so their silent
+        #     appearance is a package-source redirect by another name.
+        if changed_manifest_sections(
+            sections_before, snapshot_manifest_sections(self.project_root)
+        ):
+            logger.warning(
+                "Refusing a registry install that changed a package.json section "
+                "outside the reviewed dependency surface."
+            )
+            return (
+                InstallOutcome(
+                    dependency_id=REGISTRY_DEPENDENCY,
+                    state=INSTALL_FAILED,
+                    package=None,
+                    reason=REASON_MANIFEST_SECTION_CHANGED,
                     receipt=imports_receipt or boundary.receipt or receipt,
                     verified_components=(),
                 ),
@@ -2752,6 +2833,7 @@ class DesignDependencyInstaller:
         before = snapshot_direct_dependencies(self.project_root)
         files_before = snapshot_component_files(component_dir)
         source_config_before = package_source_config_snapshot(self.project_root)
+        sections_before = snapshot_manifest_sections(self.project_root)
         process, timed_out = self._run(argv, REGISTRY_TIMEOUT_SECONDS)
         if timed_out:
             return InstallOutcome(
@@ -2852,6 +2934,25 @@ class DesignDependencyInstaller:
                 state=INSTALL_FAILED,
                 package=None,
                 reason=REASON_PACKAGE_SOURCE_CHANGED,
+                receipt=boundary.receipt or receipt,
+                verified_components=(),
+            )
+
+        # The reviewed dependency sections may change; every OTHER top-level
+        # package.json section must be exactly as it was. `overrides`/`resolutions`
+        # can force a package to an arbitrary version or SOURCE.
+        if changed_manifest_sections(
+            sections_before, snapshot_manifest_sections(self.project_root)
+        ):
+            logger.warning(
+                "Refusing an external registry install that changed a package.json "
+                "section outside the reviewed dependency surface."
+            )
+            return InstallOutcome(
+                dependency_id=REGISTRY_DEPENDENCY,
+                state=INSTALL_FAILED,
+                package=None,
+                reason=REASON_MANIFEST_SECTION_CHANGED,
                 receipt=boundary.receipt or receipt,
                 verified_components=(),
             )
@@ -2992,6 +3093,7 @@ __all__ = [
     "REASON_REGISTRY_PACKAGE_NOT_EXACT",
     "REASON_REGISTRY_IMPORT_UNRESOLVED",
     "REASON_LOCATOR_NOT_CANONICAL",
+    "REASON_MANIFEST_SECTION_CHANGED",
     "REASON_PACKAGE_SOURCE_CHANGED",
     "REASON_REGISTRY_FILE_UNREVIEWED",
     "REASON_REGISTRY_SOURCE_IMPORT_UNREVIEWED",
@@ -3034,10 +3136,12 @@ __all__ = [
     "required_registry_packages",
     "reviewed_registry_package_pins",
     "PACKAGE_SOURCE_CONFIG_FILES",
+    "changed_manifest_sections",
     "changed_package_source_configs",
     "package_source_config_snapshot",
     "snapshot_component_files",
     "snapshot_direct_dependencies",
+    "snapshot_manifest_sections",
     "verify_external_component_materialized",
     "InstallReport",
     "DesignDependencyInstaller",

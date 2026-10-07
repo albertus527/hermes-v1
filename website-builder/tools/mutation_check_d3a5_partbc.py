@@ -451,6 +451,23 @@ MUTATIONS = [
                 "project dependency."
             )""",
     ),
+    # 12p. An unexpected package.json section mutation must be refused.
+    (
+        "an unexpected package.json section mutation is refused",
+        INSTALL,
+        """        if changed_manifest_sections(
+            sections_before, snapshot_manifest_sections(self.project_root)
+        ):
+            logger.warning(
+                "Refusing a registry install that changed a package.json section "
+                "outside the reviewed dependency surface."
+            )""",
+        """        if False:
+            logger.warning(
+                "Refusing a registry install that changed a package.json section "
+                "outside the reviewed dependency surface."
+            )""",
+    ),
     # 12o. A git/file/http npm spec must never become a package identity.
     (
         "a git/file/http npm spec is refused",

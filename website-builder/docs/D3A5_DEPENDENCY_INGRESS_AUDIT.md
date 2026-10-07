@@ -206,6 +206,26 @@ application-owned set, exactly `REGISTRY_INTRODUCED_PACKAGE_PINS` — **not** se
 No package NAME is shared between A and B ∪ C, and no registry helper is a D2 id.
 Proven by `test_the_builtin_registry_packages_are_a_separate_application_owned_set`.
 
+### No unexpected package.json SECTION mutation
+
+An install may change the four reviewed dependency sections
+(`dependencies`, `devDependencies`, `optionalDependencies`,
+`peerDependencies`) -- their contents are governed by the delta, removal, and
+exact-pin guards. It must leave EVERY OTHER top-level `package.json` section
+exactly as it found it.
+
+Confirmed live gap: a CLI that wrote `overrides` / `resolutions` /
+`pnpm.overrides` / `packageManager` / an arbitrary new section was reported
+`installed`. These are package-source redirects by another name -- an `overrides`
+entry can force a package to an arbitrary version or source. The 4-section
+snapshot never saw them.
+
+Fix: `snapshot_manifest_sections` keeps a canonical-JSON image of EVERY
+top-level key; `changed_manifest_sections` returns the changed names OUTSIDE the
+reviewed sections. Any such change fails with `REASON_MANIFEST_SECTION_CHANGED`,
+on BOTH paths. Verified the real pinned CLI (`shadcn@4.21.0`) writes only
+`dependencies`, so the guard does not false-positive.
+
 ### git / file / http npm specs are refused
 
 The bounded spec parser (`parse_npm_package_spec`) accepts ONLY the approved

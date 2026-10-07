@@ -37,6 +37,7 @@ from app.core.design_install import (
     REASON_REGISTRY_DEPENDENCY_DRIFT,
     REASON_LOCATOR_NOT_CANONICAL,
     REASON_PACKAGE_SOURCE_CHANGED,
+    REASON_MANIFEST_SECTION_CHANGED,
     REASON_REGISTRY_FILE_UNREVIEWED,
     REASON_REGISTRY_IMPORT_UNRESOLVED,
     REASON_REGISTRY_PACKAGE_NOT_EXACT,
@@ -103,6 +104,7 @@ class RegistryRunner:
         source_imports: Sequence[str] = (),
         extra_files: Sequence[str] = (),
         source_config_writes: dict | None = None,
+        manifest_section_writes: dict | None = None,
     ):
         self.commands: List[List[str]] = []
         self._writes = dependency_writes or {}
@@ -116,6 +118,7 @@ class RegistryRunner:
         self._source_imports = tuple(source_imports)
         self._extra_files = tuple(extra_files)
         self._source_config_writes = source_config_writes or {}
+        self._manifest_section_writes = manifest_section_writes or {}
 
     def run_command(self, project_id, command, cwd=None, env=None, timeout=300.0):
         command = list(command)
@@ -182,6 +185,10 @@ class RegistryRunner:
                             (target / extra).write_text("export const Evil = 1\n", encoding="utf-8")
                 for name, content in self._source_config_writes.items():
                     (root / name).write_text(content, encoding="utf-8")
+                if self._manifest_section_writes:
+                    doc = json.loads((root / "package.json").read_text())
+                    doc.update(self._manifest_section_writes)
+                    (root / "package.json").write_text(json.dumps(doc))
 
         return subprocess.CompletedProcess(
             args=command, returncode=self._exitcode, stdout="ok", stderr=""
@@ -1337,3 +1344,76 @@ def test_the_package_source_config_primitives(project):
     after = package_source_config_snapshot(project)
     assert changed_package_source_configs(before, after) == (".npmrc",)
     assert changed_package_source_configs(after, after) == ()
+
+
+# ---------------------------------------------------------------------------
+# An install cannot mutate a package.json section outside the reviewed surface
+# ---------------------------------------------------------------------------
+#
+# The reviewed dependency sections may change; every OTHER top-level section
+# (`overrides`, `resolutions`, `pnpm`, `packageManager`, an arbitrary new key)
+# must be exactly as it was. `overrides`/`resolutions` can force a package to an
+# arbitrary version or SOURCE -- a package-source redirect by another name.
+
+
+def test_an_unexpected_manifest_section_is_refused(project):
+    runner = RegistryRunner(
+        dependency_writes={"dependencies": {"cn": "^0.4.0", "radix-ui": "^1.7.0"}},
+        materializes=True,
+        component_name="button",
+        manifest_section_writes={"overrides": {"evil-pkg": "https://evil.example/x.tgz"}},
+    )
+
+    outcome, _, _ = _installer(project, runner).install_components(["button"])
+
+    assert outcome.state == INSTALL_FAILED
+    assert outcome.reason == REASON_MANIFEST_SECTION_CHANGED
+    assert outcome.installed is False
+
+
+def test_a_new_arbitrary_section_is_refused(project):
+    runner = RegistryRunner(
+        dependency_writes={"dependencies": {"cn": "^0.4.0", "radix-ui": "^1.7.0"}},
+        materializes=True,
+        component_name="button",
+        manifest_section_writes={"evilConfig": {"redirect": "https://evil.example"}},
+    )
+
+    outcome, _, _ = _installer(project, runner).install_components(["button"])
+
+    assert outcome.state == INSTALL_FAILED
+    assert outcome.reason == REASON_MANIFEST_SECTION_CHANGED
+
+
+def test_changing_a_dependency_section_is_not_a_section_violation(project):
+    """The control: the CLI's own `dependencies` write is the reviewed shape."""
+    runner = RegistryRunner(
+        dependency_writes={"dependencies": {"cn": "^0.4.0", "radix-ui": "^1.7.0"}},
+        materializes=True,
+        component_name="button",
+    )
+
+    outcome, _, _ = _installer(project, runner).install_components(["button"])
+
+    assert outcome.state == "installed", outcome.reason
+
+
+def test_the_manifest_section_primitives(project):
+    from app.core.design_install import (
+        changed_manifest_sections,
+        snapshot_manifest_sections,
+    )
+
+    before = snapshot_manifest_sections(project)
+    assert "name" in before
+    # A change to a non-reviewed section is reported; a dependency-section
+    # change is not (that surface is governed by the delta/removal/pin guards).
+    import json as _json
+
+    document = _json.loads((project / "package.json").read_text())
+    document["overrides"] = {"x": "1.0.0"}
+    document.setdefault("dependencies", {})["cn"] = "0.4.0"
+    (project / "package.json").write_text(_json.dumps(document))
+    after = snapshot_manifest_sections(project)
+    assert changed_manifest_sections(before, after) == ("overrides",)
+    assert changed_manifest_sections(after, after) == ()
