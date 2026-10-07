@@ -447,6 +447,19 @@ MUTATIONS = [
                 "project dependency."
             )""",
     ),
+    # 12. The pinned CLI's DIRECT-package allowlist must be the reviewed set,
+    #     not silently widened by an extra entry.
+    (
+        "the registry-introduced package set is exactly the reviewed set",
+        INSTALL,
+        """REGISTRY_INTRODUCED_PACKAGE_PINS: Dict[str, str] = {
+    "cn": "0.4.0",
+    "radix-ui": "1.7.0",""",
+        """REGISTRY_INTRODUCED_PACKAGE_PINS: Dict[str, str] = {
+    "cn": "0.4.0",
+    "radix-ui": "1.7.0",
+    "unreviewed-extra-pkg": "9.9.9",""",
+    ),
 ]
 
 
@@ -456,7 +469,7 @@ def tests_for(relative: str) -> Tuple[str, ...]:
     if relative == REGISTRY:
         return (CONTRACT_TESTS, REGISTRY_TESTS, MUTATION_TESTS)
     if relative == INSTALL:
-        return (MUTATION_TESTS, INSTALL_TESTS, PIN_TESTS)
+        return (MUTATION_TESTS, INSTALL_TESTS, PIN_TESTS, CONTRACT_TESTS)
     if relative == FETCH:
         return (FETCH_TESTS,)
     if relative == CRITIC:

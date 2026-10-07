@@ -273,6 +273,59 @@ def test_reviewed_builtin_packages_are_all_exact_pinned():
             assert package in REGISTRY_INTRODUCED_PACKAGE_PINS, (component, package)
 
 
+def test_the_pinned_cli_introduces_exactly_two_direct_packages():
+    """The application-owned allowlist for DIRECT packages the pinned shadcn CLI
+    writes into package.json. Verified live against shadcn@4.21.0: every builtin
+    writes only ``cn`` and/or ``radix-ui``. Pinning the EXACT union means a new
+    upstream package cannot appear without a code change + re-verification."""
+    from app.core.design_install import (
+        REGISTRY_INTRODUCED_PACKAGE_PINS,
+        REVIEWED_BUILTIN_COMPONENT_DEPENDENCIES,
+    )
+
+    union = set()
+    for packages in REVIEWED_BUILTIN_COMPONENT_DEPENDENCIES.values():
+        union.update(packages)
+
+    assert union == {"cn", "radix-ui"}, union
+    for package in union:
+        assert REGISTRY_INTRODUCED_PACKAGE_PINS[package] in ("0.4.0", "1.7.0")
+
+
+def test_the_registry_introduced_pin_table_is_closed_and_exact():
+    """The closed set of every package a registry install may introduce --
+    the CLI's own writes (cn, radix-ui) plus the source imports Hermes installs
+    (lucide-react) -- each at an EXACT pin. A future entry must be reviewed and
+    pinned, never a range or a floating tag."""
+    from app.core.design_install import (
+        REGISTRY_INTRODUCED_PACKAGE_PINS,
+        REVIEWED_BUILTIN_COMPONENT_DEPENDENCIES,
+        REVIEWED_BUILTIN_COMPONENT_IMPORTS,
+        _EXACT_VERSION_RE,
+    )
+
+    assert set(REGISTRY_INTRODUCED_PACKAGE_PINS) == {
+        "cn",
+        "radix-ui",
+        "lucide-react",
+    }
+    for package, version in REGISTRY_INTRODUCED_PACKAGE_PINS.items():
+        assert _EXACT_VERSION_RE.match(version), (package, version)
+
+    cli_written = set()
+    for packages in REVIEWED_BUILTIN_COMPONENT_DEPENDENCIES.values():
+        cli_written.update(packages)
+    source_imported = set()
+    for packages in REVIEWED_BUILTIN_COMPONENT_IMPORTS.values():
+        source_imported.update(packages)
+
+    # Every reviewed direct package is covered by the pin table.
+    assert cli_written <= set(REGISTRY_INTRODUCED_PACKAGE_PINS)
+    assert source_imported <= set(REGISTRY_INTRODUCED_PACKAGE_PINS)
+    # And the pin table adds nothing beyond what is actually reviewed.
+    assert set(REGISTRY_INTRODUCED_PACKAGE_PINS) == cli_written | source_imported
+
+
 # ---------------------------------------------------------------------------
 # The version constraint is CHECKED, never installed
 # ---------------------------------------------------------------------------
