@@ -35,6 +35,8 @@ from app.core.design_activation import (
     ACTIVATION_REASONS,
     CREDENTIAL_ENV_NAMES,
     INSTALLABLE_ON_DEMAND,
+    REASON_ENGINE_DEGRADED,
+    REASON_ENGINE_FULL_QUALITY,
     REASON_ENGINE_MISSING,
     REASON_NO_LIVE_ADAPTER,
     REASON_NO_REVIEWED_COMPONENT,
@@ -224,26 +226,30 @@ def test_serialization_carries_every_axis_independently():
         assert not any(payload[axis] for axis in others), (field, payload)
 
 
-def test_free_search_and_paid_retrieval_are_separate_axes(home, monkeypatch):
-    """21st: metadata search is free, component retrieval is not.
+def test_twenty_first_discovery_is_credential_gated(home, monkeypatch):
+    """21st: BOTH its discovery and retrieval surfaces require a credential.
 
-    Both facts are true simultaneously. Forcing one state would discard the
-    other and make the capability report wrong about a working resource.
+    VERIFIED LIVE: 21st's real machine surface is the authenticated REST API
+    (`/api/v1/components/search` -> HTTP 401 without a Bearer key), and its
+    public `llms.txt` publishes no component-identity schema. So without a
+    credential there is NO discovery -- a bounded credential-required/degraded
+    state, not a free-discovery claim. The previous revision reported free
+    discovery on the strength of a public page that yields no identities.
     """
     monkeypatch.delenv("TWENTY_FIRST_API_KEY", raising=False)
     monkeypatch.delenv("TWENTYFIRST_API_KEY", raising=False)
 
     capability = _activate(_manifest_resource(TWENTY_FIRST, skill_name="x"), home)
 
-    assert capability.discovery_available is True, "free metadata search works"
-    assert capability.retrieval_available is False, "paid retrieval is gated"
+    assert capability.discovery_available is False, "discovery is credential-gated"
+    assert capability.retrieval_available is False, "retrieval is gated"
     assert capability.install_available is False
     assert capability.authentication_required is True
     assert capability.authentication_present is False
-    assert capability.degraded is False, "a designed free tier is not a degradation"
+    assert capability.degraded is True, "an unmet required credential is a degradation"
 
 
-def test_a_present_credential_enables_the_authenticated_axis(home, monkeypatch):
+def test_a_present_credential_enables_the_authenticated_axes(home, monkeypatch):
     """Presence flips exactly the axes a credential gates -- and no more.
 
     It does NOT enable INSTALL. Nothing is reviewed for 21st.dev, so its install
@@ -256,6 +262,7 @@ def test_a_present_credential_enables_the_authenticated_axis(home, monkeypatch):
     capability = _activate(_manifest_resource(TWENTY_FIRST, skill_name="x"), home)
 
     assert capability.authentication_present is True
+    assert capability.discovery_available is True, "a present credential restores discovery"
     assert capability.retrieval_available is True
     assert capability.install_available is False, (
         "no 21st component is reviewed, so install must not be claimed"
@@ -499,11 +506,23 @@ def _impeccable_resource() -> DesignResource:
     )
 
 
-def _provision_impeccable(home: Path, *, with_engine: bool, system="linux", machine="x86_64"):
+def _provision_impeccable(
+    home: Path,
+    *,
+    with_engine: bool,
+    with_parser_runtime: bool = False,
+    system="linux",
+    machine="x86_64",
+):
     """Provision the REAL verified layout: SKILL.md, reference, scripts/detect.mjs.
 
     ``system``/``machine`` are accepted and ignored: the shipped detector is a
     cross-platform Node ESM entrypoint, so there is no per-platform artifact.
+
+    ``with_parser_runtime`` additionally creates the four parser module
+    directories under the skill's ``node_modules``, which is what the full
+    static-HTML engine needs. Without it the engine runs DEGRADED, so a test that
+    wants a full-quality critic must ask for it.
     """
     del system, machine
     _make_skill(
@@ -517,6 +536,12 @@ def _provision_impeccable(home: Path, *, with_engine: bool, system="linux", mach
         engine = home / "skills" / "impeccable" / relative
         engine.parent.mkdir(parents=True, exist_ok=True)
         engine.write_text("// node entrypoint", encoding="utf-8")
+    if with_parser_runtime:
+        from app.core.design_activation import PARSER_RUNTIME_PACKAGES
+
+        modules = home / "skills" / "impeccable" / "node_modules"
+        for package in PARSER_RUNTIME_PACKAGES:
+            (modules / package).mkdir(parents=True, exist_ok=True)
 
 
 def test_critic_needs_the_stable_artifacts(home):
@@ -550,16 +575,38 @@ def test_critic_needs_the_current_platform_engine(home):
 
 
 def test_critic_is_available_only_when_both_verify(home):
-    _provision_impeccable(home, with_engine=True)
+    """Engine + parser runtime => full-quality critic."""
+    _provision_impeccable(home, with_engine=True, with_parser_runtime=True)
 
     capability = _activate(_impeccable_resource(), home)
 
     assert capability.critic_available is True
+    assert capability.critic_degraded is False
     assert capability.locally_provisioned is True
     assert capability.install_available is False, (
         "Impeccable is a reviewer, never something installed into a project"
     )
     assert REASON_ENGINE_VERIFIED in capability.reasons
+    assert REASON_ENGINE_FULL_QUALITY in capability.reasons
+
+
+def test_an_engine_without_the_parser_runtime_is_degraded(home):
+    """The VPS-found defect: the engine runs but the scan is an undercount.
+
+    ``detect.mjs`` prints ``DEGRADED - HTML parser modules unavailable`` and
+    falls back to regex when ``htmlparser2``/``css-select``/``css-tree``/
+    ``domutils`` are absent. The critic is CALLABLE, but a clean result is NOT
+    authoritative -- so ``critic_available=True`` with ``critic_degraded=True``.
+    """
+    _provision_impeccable(home, with_engine=True, with_parser_runtime=False)
+
+    capability = _activate(_impeccable_resource(), home)
+
+    assert capability.critic_available is True, "the critic can still be invoked"
+    assert capability.critic_degraded is True, "but its scan is not authoritative"
+    assert capability.degraded is True
+    assert REASON_ENGINE_DEGRADED in capability.reasons
+    assert REASON_ENGINE_FULL_QUALITY not in capability.reasons
 
 
 def test_a_missing_engine_never_downloads(home, monkeypatch):

@@ -81,21 +81,39 @@ MUTATIONS = [
         """    return _format_locator(source, component_id)""",
     ),
     # --- 3. approval is required ------------------------------------------
+        # The pre-repair external path had NO approval enforcement and NO
+        # reviewed-contract check: any well-formed component identity resolved
+        # (or fabricated) a locator and produced an install request. This
+        # mutation restores exactly that path -- both the locator approval check
+        # AND the contract check are bypassed, so the unreviewed-component and
+        # contract tests go red together. It is deliberately a TWO-guard
+        # mutation: the two checks are defence-in-depth for the same property,
+        # and removing only one leaves the other to catch the case (which is
+        # what the contract-missing mutation in partbc.py proves independently).
     (
-        "an unreviewed component has no locator",
+        "an unreviewed component is refused before any locator is used",
         REGISTRY,
         """    locator = resolve_registry_locator(source, component_id)
     if locator is None:
         return RegistryRequestOutcome(
             ok=False, request=None, reason=REASON_COMPONENT_UNKNOWN
         )""",
-        """    locator = resolve_registry_locator(source, component_id) or (
+        """    # MUTATED: pre-repair behaviour -- fabricate a locator for any identity
+    # and return the request immediately, bypassing approval AND the contract.
+    locator = resolve_registry_locator(source, component_id) or (
         f"https://{REGISTRY_HOSTS.get(source, 'evil.example')}/r/{component_id}"
     )
-    if locator is None:
-        return RegistryRequestOutcome(
-            ok=False, request=None, reason=REASON_COMPONENT_UNKNOWN
-        )""",
+    return RegistryRequestOutcome(
+        ok=True,
+        request=RegistryInstallRequest(
+            source=source,
+            component_id=component_id,
+            registry_locator_id=locator,
+            required_dependency_ids=dependency_ids,
+        ),
+        reason=REASON_REQUEST_OK,
+        dependency_ids=dependency_ids,
+    )""",
     ),
     # --- 4. a URL is never a component identity ---------------------------
     (

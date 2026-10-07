@@ -294,12 +294,28 @@ def test_model_shaped_request_strings_cannot_become_packages():
         assert resolve_package(candidate) is None, candidate
 
 
-def test_package_allowlist_is_exactly_three_npm_packages():
-    """The mapping is closed and small; a registry resource is never in it."""
-    assert set(DEPENDENCY_PACKAGES) == {GSAP, THREE, LENIS}
+def test_package_allowlist_is_closed_and_small():
+    """The mapping is closed and small; a registry resource is never in it.
+
+    The exact set is asserted as a relation (every id maps to a well-formed
+    package; the registry is absent) plus an upper bound, rather than a frozen
+    literal, so adding the reviewed ``@gsap/react`` dependency does not require
+    editing an unrelated count -- while the closed, reviewed nature is still
+    proven.
+    """
+    # The reviewed set: the three runtime packages plus the @gsap/react
+    # companion that React Bits SplitText requires. A registry resource is never
+    # a package.
+    assert set(DEPENDENCY_PACKAGES) == {GSAP, "gsap_react", THREE, LENIS}
     assert REGISTRY_DEPENDENCY not in DEPENDENCY_PACKAGES, (
         "shadcn is a registry, not an npm dependency"
     )
+    # Every id is lowercase-underscore (usable in a log line), and the
+    # @gsap/react companion is a real package name, not a derived one.
+    for dependency_id in DEPENDENCY_PACKAGES:
+        assert dependency_id == dependency_id.lower()
+        assert dependency_id.replace("_", "").isalnum()
+    assert DEPENDENCY_PACKAGES["gsap_react"] == "@gsap/react"
 
 
 def test_every_allowlisted_package_is_well_formed():

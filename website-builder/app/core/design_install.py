@@ -95,8 +95,17 @@ TERMINAL_INSTALL_STATES: Tuple[str, ...] = ("installed", INSTALL_FAILED)
 #: package strings this module can ever produce. Nothing here is derived from a
 #: resource, a model, a prompt, or Design DNA, which is what makes
 #: "resource text cannot choose package names" an implementation fact.
+#:
+#: ``gsap_react`` is the ``@gsap/react`` companion that the reviewed React Bits
+#: ``SplitText`` component imports (``useGSAP``). It is a FIRST-CLASS
+#: application-owned dependency, not a transitive detail: SplitText cannot
+#: compile without it, so a registry install that materialized the component
+#: while leaving ``@gsap/react`` un-pinned would ship a broken build. It is
+#: deliberately NOT derived from a ``@gsap/*`` naming rule -- it is a reviewed
+#: row, exactly like ``@types/three``.
 DEPENDENCY_PACKAGES: Dict[str, str] = {
     "gsap": "gsap",
+    "gsap_react": "@gsap/react",
     "three": "three",
     "lenis": "lenis",
 }
@@ -169,8 +178,15 @@ def _runtime_spec(dependency_id: str) -> PackageSpec:
 #: ``DEPENDENCY_PACKAGES`` answers "which package", these answer "which
 #: version", and a caller that wants an installable spec must consult
 #: :func:`required_package_specs` rather than pairing the maps by hand.
+#:
+#: ``gsap_react`` is pinned to ``2.1.2`` -- the current stable release, verified
+#: live against the npm registry (``npm view @gsap/react version``). Its
+#: ``peerDependencies`` are ``gsap: ^3.12.5`` and ``react: >=17``; the app-owned
+#: ``gsap`` pin (3.15.0) satisfies the first, and the starter ships React 19.2.7,
+#: which satisfies the second. See :data:`REVIEWED_REGISTRY_COMPONENTS`.
 DEPENDENCY_PACKAGE_PINS: Dict[str, str] = {
     "gsap": "3.15.0",
+    "gsap_react": "2.1.2",
     "three": "0.186.1",
     "lenis": "1.3.26",
 }
@@ -244,6 +260,124 @@ def resolve_companion_packages(dependency_id: str) -> Tuple[CompanionPackage, ..
     if not isinstance(dependency_id, str):
         return ()
     return DEPENDENCY_COMPANION_PACKAGES.get(dependency_id, ())
+
+
+# ---------------------------------------------------------------------------
+# Packages the pinned shadcn CLI introduces -- APPLICATION-OWNED, exact-pinned
+# ---------------------------------------------------------------------------
+#
+# The pinned shadcn CLI is a black box that WRITES npm packages directly into a
+# project's package.json. Live probe of shadcn@4.21.0: adding the builtin
+# `button` writes ``cn@^0.4.0`` and ``radix-ui@^1.7.0``; adding the external
+# React Bits `SplitText` writes ``gsap@^3.15.0`` and ``@gsap/react@^2.1.2``.
+# Those are DIRECT project dependencies introduced by a design install, so they
+# are inside the boundary this batch guards.
+#
+# They are deliberately NOT added to :data:`DEPENDENCY_PACKAGES`: that table maps
+# D2-selectable resource ids, and these are toolchain-introduced packages with no
+# manifest resource. Keeping them separate stops the D2 selection surface from
+# widening just because the registry needs a helper package.
+#
+# Every entry is an EXACT application-owned pin, verified live. The registry's own
+# range (``^0.4.0``) is only a starting point: it is normalized to the pin below
+# after the CLI runs.
+
+#: package -> exact application-owned pin, for packages the registry introduces.
+REGISTRY_INTRODUCED_PACKAGE_PINS: Dict[str, str] = {
+    "cn": "0.4.0",
+    "radix-ui": "1.7.0",
+}
+
+
+def reviewed_registry_package_pins() -> Dict[str, str]:
+    """Every package a registry install may introduce, at its exact pin.
+
+    The union of the toolchain-introduced helpers (``cn``, ``radix-ui``) and the
+    allowlisted dependencies an external component may declare (``gsap``,
+    ``@gsap/react``, ...). Used to normalize whatever the CLI wrote back to an
+    exact application-owned version. A package absent from this map has no
+    reviewed pin and cannot be normalized -- the boundary refuses it first.
+    """
+    pins: Dict[str, str] = dict(REGISTRY_INTRODUCED_PACKAGE_PINS)
+    for dependency_id, package in DEPENDENCY_PACKAGES.items():
+        pin = DEPENDENCY_PACKAGE_PINS.get(dependency_id)
+        if pin is not None:
+            pins[package] = pin
+    return pins
+
+#: For each reviewed shadcn BUILTIN component, the DIRECT packages the pinned CLI
+#: adds to ``dependencies``. Verified live against shadcn@4.21.0 by adding each
+#: component to a clean project and diffing package.json. A component absent from
+#: this table has no reviewed dependency contract and must not be installed.
+REVIEWED_BUILTIN_COMPONENT_DEPENDENCIES: Dict[str, Tuple[str, ...]] = {
+    "accordion": ("cn", "radix-ui"),
+    "alert": ("cn",),
+    "badge": ("cn", "radix-ui"),
+    "button": ("cn", "radix-ui"),
+    "card": ("cn",),
+    "checkbox": ("cn", "radix-ui"),
+    "dialog": ("cn", "radix-ui"),
+    "input": ("cn",),
+    "label": ("cn", "radix-ui"),
+    "select": ("cn", "radix-ui"),
+    "separator": ("cn", "radix-ui"),
+    "sheet": ("cn", "radix-ui"),
+    "switch": ("cn", "radix-ui"),
+    "tabs": ("cn", "radix-ui"),
+    "textarea": ("cn",),
+    "tooltip": ("cn", "radix-ui"),
+}
+
+
+def expected_registry_packages(components: Sequence[str]) -> Tuple[str, ...]:
+    """The union of reviewed direct packages for a set of builtin ``components``.
+
+    Returns ``()`` for an empty list. An unknown component contributes nothing
+    here; callers gate on the component allowlist separately, so this only ever
+    describes the reviewed set.
+    """
+    packages: set = set()
+    for component in components or ():
+        packages.update(REVIEWED_BUILTIN_COMPONENT_DEPENDENCIES.get(component, ()))
+    return tuple(sorted(packages))
+
+
+# ---------------------------------------------------------------------------
+# Impeccable critic parser runtime -- APPLICATION-OWNED, exact-pinned
+# ---------------------------------------------------------------------------
+#
+# The Impeccable skill-v4.1.0 ``detect.mjs`` runs the FULL static HTML/CSS engine
+# only when four npm parser modules are importable; without them it prints
+# ``DEGRADED - HTML parser modules unavailable`` and falls back to regex, which
+# is an UNDERCOUNT, not a clean bill of health.
+#
+# The universal artifact ships NO ``package.json`` (verified: 2698 zip entries,
+# zero ``package.json``/lockfile), so the parser modules are not bundled. They
+# must be provisioned explicitly. Versions below are the upstream ``skill-v4.1.0``
+# ``package.json`` ``dependencies`` (verified live), pinned EXACT:
+#
+#     css-select ^7.0.0  -> 7.0.0
+#     css-tree   ^3.2.1  -> 3.2.1
+#     domutils   ^4.0.2  -> 4.0.2
+#     htmlparser2 ^12.0.0 -> 12.0.0
+#
+# These are provisioned ONLY during explicit Hermes design-profile setup, NEVER
+# during an arbitrary website build. They are deliberately NOT in
+# ``DEPENDENCY_PACKAGES`` (that table is the D2 project-on-demand surface), so
+# no project build can pull them in.
+
+#: The four parser modules the full static-HTML engine imports, exactly pinned.
+IMPECCABLE_PARSER_PACKAGE_PINS: Dict[str, str] = {
+    "css-select": "7.0.0",
+    "css-tree": "3.2.1",
+    "domutils": "4.0.2",
+    "htmlparser2": "12.0.0",
+}
+
+
+def impeccable_parser_package_pins() -> Tuple[Tuple[str, str], ...]:
+    """The exact ``(package, version)`` pins for the Impeccable parser runtime."""
+    return tuple(sorted(IMPECCABLE_PARSER_PACKAGE_PINS.items()))
 
 
 def required_package_specs(dependency_id: str) -> Tuple[PackageSpec, ...]:
@@ -361,6 +495,17 @@ REASON_COMPONENTS_NOT_VERIFIED = (
 REASON_SHADCN_CONFIG_INVALID = (
     "the project has no valid application-owned shadcn configuration, so the "
     "component destination is unknown; no command was attempted"
+)
+REASON_REGISTRY_DEPENDENCY_DRIFT = (
+    "the registry install introduced a direct package dependency outside the "
+    "application-owned reviewed set; the state is not upgraded to installed"
+)
+REASON_REGISTRY_PACKAGE_NOT_EXACT = (
+    "a registry-introduced package could not be normalized to its exact "
+    "application-owned pin; the state is not upgraded to installed"
+)
+REASON_BUILTIN_COMPONENT_UNREVIEWED = (
+    "the requested builtin component has no reviewed dependency contract"
 )
 REASON_MANAGER_UNSUPPORTED = (
     "the project's package manager has no supported pinned one-off mechanism"
@@ -480,6 +625,20 @@ class InstallOutcome:
         }
 
 
+@dataclass(frozen=True)
+class _RegistryBoundaryResult:
+    """Internal outcome of the registry dependency-boundary check.
+
+    Private: this is not part of the module's public contract. It carries only a
+    static ``reason`` and an optional receipt -- never the offending package
+    names, which stay internal so no untrusted string can reach a public reason.
+    """
+
+    ok: bool
+    reason: str = ""
+    receipt: Optional[CommandReceipt] = None
+
+
 # ---------------------------------------------------------------------------
 # Verification -- what "installed" actually means
 # ---------------------------------------------------------------------------
@@ -566,6 +725,133 @@ def project_satisfies_dependency(project_root: Path, dependency_id: str) -> bool
     if not specs:
         return False
     return all(project_satisfies_spec(project_root, spec) for spec in specs)
+
+
+# ---------------------------------------------------------------------------
+# Direct-dependency snapshot / delta -- the registry boundary
+# ---------------------------------------------------------------------------
+#
+# The pinned shadcn CLI writes packages into package.json itself, so "the CLI
+# exited 0" says nothing about WHICH packages it introduced. These helpers make
+# the DIRECT dependency delta observable and comparable against an
+# application-owned reviewed set. They deliberately do NOT model the full
+# transitive tree (npm's territory): only the direct project-level declarations a
+# design install causes.
+
+#: Every dependency section a snapshot covers. Wider than the two this module
+#: writes, because the guard must notice a package smuggled into
+#: ``optionalDependencies`` or ``peerDependencies`` by a registry.
+SNAPSHOT_SECTIONS: Tuple[str, ...] = (
+    "dependencies",
+    "devDependencies",
+    "optionalDependencies",
+    "peerDependencies",
+)
+
+
+def snapshot_direct_dependencies(project_root: Path) -> Dict[str, Dict[str, str]]:
+    """A section -> {package: declared} snapshot of the project's direct deps.
+
+    A missing or unreadable manifest yields an empty snapshot, so a delta
+    computed against it is the whole manifest -- the conservative direction.
+    """
+    document = _read_project_manifest(project_root)
+    snapshot: Dict[str, Dict[str, str]] = {section: {} for section in SNAPSHOT_SECTIONS}
+    if document is None:
+        return snapshot
+    for section in SNAPSHOT_SECTIONS:
+        block = document.get(section)
+        if isinstance(block, Mapping):
+            snapshot[section] = {
+                str(name): str(version)
+                for name, version in block.items()
+                if isinstance(name, str) and isinstance(version, str)
+            }
+    return snapshot
+
+
+def dependency_delta(
+    before: Mapping[str, Mapping[str, str]],
+    after: Mapping[str, Mapping[str, str]],
+) -> Dict[str, Dict[str, str]]:
+    """The packages present in ``after`` that are new or changed vs ``before``.
+
+    Returns ``section -> {package: new_version}``. A package that moved sections
+    (added to a section it was not in before) counts as a delta in the new
+    section, which is how a runtime package smuggled into ``devDependencies``
+    becomes visible.
+    """
+    delta: Dict[str, Dict[str, str]] = {}
+    for section in SNAPSHOT_SECTIONS:
+        before_block = before.get(section, {})
+        after_block = after.get(section, {})
+        changed = {
+            name: version
+            for name, version in after_block.items()
+            if before_block.get(name) != version
+        }
+        if changed:
+            delta[section] = changed
+    return delta
+
+
+def registry_dependency_delta_is_acceptable(
+    before: Mapping[str, Mapping[str, str]],
+    after: Mapping[str, Mapping[str, str]],
+    *,
+    allowed_packages: Sequence[str],
+) -> Tuple[bool, Tuple[str, ...]]:
+    """Whether a registry install's direct-dependency delta is inside policy.
+
+    Returns ``(ok, offending_packages)``. ``offending_packages`` names only
+    packages OUTSIDE the reviewed set -- never a raw upstream string, and never
+    more than the offending names -- so a caller can log a bounded, actionable
+    reason without echoing untrusted metadata. A package is acceptable only when
+    it appears in ``allowed_packages`` AND only in the runtime ``dependencies``
+    section (a registry introducing a package into a dev/optional/peer section is
+    not the reviewed shape).
+    """
+    delta = dependency_delta(before, after)
+    allowed = set(allowed_packages)
+    offending: set = set()
+    for section, packages in delta.items():
+        for name in packages:
+            if name not in allowed:
+                offending.add(name)
+            elif section != SECTION_DEPENDENCIES:
+                # Right package, wrong section: a registry must not move a
+                # runtime helper into devDependencies/optionalDependencies.
+                offending.add(name)
+    return (not offending), tuple(sorted(offending))
+
+
+#: The package-manager argv that normalizes a floating range to an exact pin.
+#: The registry writes ``cn@^0.4.0``; this rewrites it to ``cn@0.4.0`` with the
+#: manager's own ``--save-exact`` so the final manifest matches the
+#: application-owned pin. Reuses the SAME manager-specific shape as
+#: :func:`_runtime_install_argv`, so there is one place that knows how to pin.
+def build_registry_normalization_argv(
+    manager: Sequence[str], packages: Sequence[str]
+) -> Tuple[Tuple[str, ...], ...]:
+    """One exact-pin install command per registry-introduced ``package``.
+
+    Returns a tuple of argv lists, each installing one package at its
+    application-owned pin with ``--save-exact``. A package with no reviewed pin
+    yields NO command for it (the caller refuses on the pin table separately), so
+    an unknown package cannot be normalized into existence.
+    """
+    commands: list = []
+    for package in packages:
+        pin = reviewed_registry_package_pins().get(package)
+        if pin is None:
+            continue
+        commands.append(
+            _runtime_install_argv(
+                tuple(manager),
+                PackageSpec(package=package, version=pin),
+            )
+        )
+    return tuple(commands)
 
 
 def is_contained(root: Path, candidate: Path) -> bool:
@@ -708,6 +994,34 @@ def approved_component_dir(project_root: Path) -> Optional[Path]:
     approve) and once as a *location* (resolves inside the project, with no
     symlinked segment escaping it). Only then is it usable.
     """
+    return _approved_alias_dir(project_root, "ui")
+
+
+def approved_external_component_dir(project_root: Path) -> Optional[Path]:
+    """The approved destination for an EXTERNAL registry component.
+
+    shadcn writes a remote ``registry-item`` under ``aliases.components`` (not
+    ``aliases.ui``). Verified live: adding
+    ``https://reactbits.dev/r/SplitText-TS-TW`` to the starter writes
+    ``src/components/SplitText.tsx``. So an external component's destination is a
+    DIFFERENT reviewed alias from the builtin one, and verifying it against
+    ``aliases.ui`` would fail closed on a correct install (or, worse, pass on the
+    wrong directory).
+
+    Same fail-closed contract as :func:`approved_component_dir`: an unapproved
+    config yields ``None`` and the caller runs nothing.
+    """
+    return _approved_alias_dir(project_root, "components")
+
+
+def _approved_alias_dir(project_root: Path, alias_key: str) -> Optional[Path]:
+    """Resolve a reviewed ``aliases.<alias_key>`` directory inside the project.
+
+    Shared by the builtin (``ui``) and external (``components``) destinations so
+    the containment rule exists in exactly one place. ``utils`` is still required
+    present because the shadcn schema requires it and every emitted component
+    imports it.
+    """
     document = _read_shadcn_config(project_root)
     if document is None:
         return None
@@ -730,13 +1044,13 @@ def approved_component_dir(project_root: Path) -> Optional[Path]:
     # `utils` is required by the shadcn schema and is the import every emitted
     # component depends on, so its absence means the config cannot produce a
     # compiling project.
-    if not _alias_is_approved(aliases.get("ui")) or not _alias_is_approved(
+    if not _alias_is_approved(aliases.get(alias_key)) or not _alias_is_approved(
         aliases.get("utils")
     ):
         return None
 
-    ui_alias = str(aliases["ui"])
-    relative = PurePosixPath(ui_alias[len(_APPROVED_ALIAS_PREFIX):])
+    alias = str(aliases[alias_key])
+    relative = PurePosixPath(alias[len(_APPROVED_ALIAS_PREFIX):])
     root = Path(project_root)
     # The alias is bound against the SOURCE root, because that is what the
     # starter's `@/*` mapping points at. Joining against the project root would
@@ -807,6 +1121,37 @@ def _component_is_materialized(
     except OSError:
         return False
     return is_contained(project_root, candidate)
+
+
+def verify_external_component_materialized(
+    project_root: Path, component_id: str, component_dir: Optional[Path]
+) -> Tuple[str, ...]:
+    """Whether an external component materialized under the approved directory.
+
+    Same all-or-nothing contract as :func:`verify_components_materialized`, but
+    the component identity is a REVIEWED external component (PascalCase, e.g.
+    ``SplitText``) rather than a shadcn builtin, so the ``ALLOWED_SHADCN_COMPONENTS``
+    membership check does not apply. The identity is validated as a well-formed
+    component id, and the file must be ``<component_id><suffix>`` -- a contained
+    regular file inside the project. Returns ``(component_id,)`` or ``()``.
+    """
+    if component_dir is None or not component_id:
+        return ()
+    # Reuse the registry module's identity rule so a URL fragment can never be
+    # verified as a materialized file. Imported lazily to avoid an import cycle
+    # (design_registry imports design_install).
+    from app.core.design_registry import component_id_is_well_formed
+
+    if not component_id_is_well_formed(component_id):
+        return ()
+    for suffix in COMPONENT_SUFFIXES:
+        candidate = Path(component_dir) / f"{component_id}{suffix}"
+        try:
+            if candidate.is_file() and is_contained(project_root, candidate):
+                return (component_id,)
+        except OSError:
+            continue
+    return ()
 
 
 
@@ -1453,6 +1798,10 @@ class DesignDependencyInstaller:
             )
 
         argv = build_registry_argv(prefix, components=allowed)
+        # Snapshot BEFORE the CLI runs. The pinned CLI writes packages into
+        # package.json itself, so the postcondition must compare against this
+        # application-owned baseline rather than trusting a zero exit code.
+        before = snapshot_direct_dependencies(self.project_root)
         process, timed_out = self._run(argv, REGISTRY_TIMEOUT_SECONDS)
         if timed_out:
             return (
@@ -1485,6 +1834,28 @@ class DesignDependencyInstaller:
 
         # The command succeeded. That is NOT yet an installed claim.
         receipt = CommandReceipt.from_process(process, cwd_label="<project>")
+
+        # 1. The direct-dependency delta must be inside the reviewed set, and
+        #    the reviewed packages must be normalized to exact application pins.
+        boundary = self._enforce_registry_dependency_boundary(
+            before, expected_registry_packages(allowed), manager
+        )
+        if not boundary.ok:
+            return (
+                InstallOutcome(
+                    dependency_id=REGISTRY_DEPENDENCY,
+                    state=INSTALL_FAILED,
+                    package=None,
+                    reason=boundary.reason,
+                    receipt=boundary.receipt or receipt,
+                    verified_components=(),
+                ),
+                allowed,
+                rejected,
+            )
+
+        # 2. Every requested component must be materialized under the approved
+        #    directory. A partial install is not a success.
         verified = verify_components_materialized(
             self.project_root, allowed, component_dir
         )
@@ -1495,7 +1866,7 @@ class DesignDependencyInstaller:
                     state=INSTALL_FAILED,
                     package=None,
                     reason=REASON_COMPONENTS_NOT_VERIFIED,
-                    receipt=receipt,
+                    receipt=boundary.receipt or receipt,
                     verified_components=(),
                 ),
                 allowed,
@@ -1508,11 +1879,253 @@ class DesignDependencyInstaller:
                 state="installed",
                 package=None,
                 reason=REASON_ALREADY_INSTALLED,
-                receipt=receipt,
+                receipt=boundary.receipt or receipt,
                 verified_components=verified,
             ),
             allowed,
             rejected,
+        )
+
+    def _enforce_registry_dependency_boundary(
+        self,
+        before: Mapping[str, Mapping[str, str]],
+        allowed_packages: Sequence[str],
+        manager: Sequence[str],
+    ) -> "_RegistryBoundaryResult":
+        """Verify the CLI's direct-dependency delta, then normalize to exact pins.
+
+        This is the guard that makes "the CLI succeeded" insufficient. It:
+
+        1. snapshots the manifest AFTER the CLI,
+        2. computes the DIRECT dependency delta (all four sections),
+        3. refuses any package outside ``allowed_packages`` or in a non-runtime
+           section,
+        4. normalizes the reviewed packages that actually appeared to their exact
+           application-owned pins (the CLI writes ranges; Hermes installs exact),
+        5. re-verifies the final manifest holds the exact pins.
+
+        It never echoes an untrusted package name into a reason; the offending
+        names stay in the bounded internal tuple.
+        """
+        after = snapshot_direct_dependencies(self.project_root)
+        acceptable, offending = registry_dependency_delta_is_acceptable(
+            before, after, allowed_packages=allowed_packages
+        )
+        if not acceptable:
+            logger.warning(
+                "Refusing a registry install that introduced %d unreviewed "
+                "direct dependency(ies).",
+                len(offending),
+            )
+            return _RegistryBoundaryResult(
+                ok=False, reason=REASON_REGISTRY_DEPENDENCY_DRIFT
+            )
+
+        delta = dependency_delta(before, after)
+        introduced = tuple(sorted(delta.get(SECTION_DEPENDENCIES, {})))
+        if not introduced:
+            # Nothing changed in the runtime set: no normalization needed.
+            return _RegistryBoundaryResult(ok=True)
+
+        # A package that appeared must have a reviewed exact pin. A reviewed
+        # package with no pin is a configuration error, not a pass.
+        pins = reviewed_registry_package_pins()
+        missing_pin = [
+            package for package in introduced if package not in pins
+        ]
+        if missing_pin:
+            logger.error(
+                "A registry-introduced package has no application-owned exact pin."
+            )
+            return _RegistryBoundaryResult(
+                ok=False, reason=REASON_REGISTRY_PACKAGE_NOT_EXACT
+            )
+
+        # Already exact? Then nothing to normalize.
+        already_exact = all(
+            after.get(SECTION_DEPENDENCIES, {}).get(package) == pins[package]
+            for package in introduced
+        )
+        if already_exact:
+            return _RegistryBoundaryResult(ok=True)
+
+        last_receipt: Optional[CommandReceipt] = None
+        for argv in build_registry_normalization_argv(manager, introduced):
+            normalize_process, normalize_timed_out = self._run(
+                argv, INSTALL_TIMEOUT_SECONDS
+            )
+            if normalize_timed_out:
+                return _RegistryBoundaryResult(
+                    ok=False, reason=REASON_TIMEOUT
+                )
+            if normalize_process is None or normalize_process.returncode != 0:
+                receipt = (
+                    CommandReceipt.from_process(
+                        normalize_process, cwd_label="<project>"
+                    )
+                    if normalize_process is not None
+                    else None
+                )
+                return _RegistryBoundaryResult(
+                    ok=False, reason=REASON_INSTALL_FAILED, receipt=receipt
+                )
+            last_receipt = CommandReceipt.from_process(
+                normalize_process, cwd_label="<project>"
+            )
+
+        # Re-verify: the final manifest must hold the EXACT application pins.
+        final = snapshot_direct_dependencies(self.project_root)
+        for package in introduced:
+            if final.get(SECTION_DEPENDENCIES, {}).get(package) != pins[package]:
+                logger.error(
+                    "A registry-introduced package is not at its exact "
+                    "application-owned pin after normalization."
+                )
+                return _RegistryBoundaryResult(
+                    ok=False,
+                    reason=REASON_REGISTRY_PACKAGE_NOT_EXACT,
+                    receipt=last_receipt,
+                )
+        return _RegistryBoundaryResult(ok=True, receipt=last_receipt)
+
+    # -- external registry components -----------------------------------
+
+    def install_external_component(self, request) -> InstallOutcome:
+        """Install ONE reviewed external registry component, bounded at every step.
+
+        ``request`` is a :class:`app.core.design_registry.RegistryInstallRequest`.
+        The locator inside it is application-owned (never a caller URL), and the
+        reviewed contract's expected dependency set is what the post-install
+        manifest delta is checked against -- so a registry that silently adds a
+        package makes this FAIL rather than installing it.
+
+        The architecture is the safe one this batch requires:
+
+            snapshot direct deps
+            -> pinned shadcn `add <locator>`
+            -> verify the direct-dependency delta is the reviewed set
+            -> normalize any registry-introduced range to an exact app pin
+            -> verify the component materialized under ``aliases.components``
+
+        A refused/absent request produces NO command.
+        """
+        if request is None or getattr(request, "is_builtin", True):
+            return InstallOutcome(
+                dependency_id=REGISTRY_DEPENDENCY,
+                state=INSTALL_FAILED,
+                package=None,
+                reason=REASON_COMPONENT_NOT_ALLOWED,
+            )
+
+        locator = getattr(request, "registry_locator_id", "")
+        if not locator:
+            return InstallOutcome(
+                dependency_id=REGISTRY_DEPENDENCY,
+                state=INSTALL_FAILED,
+                package=None,
+                reason=REASON_COMPONENT_NOT_ALLOWED,
+            )
+
+        component_dir = approved_external_component_dir(self.project_root)
+        if component_dir is None:
+            return InstallOutcome(
+                dependency_id=REGISTRY_DEPENDENCY,
+                state=INSTALL_FAILED,
+                package=None,
+                reason=REASON_SHADCN_CONFIG_INVALID,
+            )
+
+        manager = detect_package_manager(self.project_root)
+        if manager is None:
+            return InstallOutcome(
+                dependency_id=REGISTRY_DEPENDENCY,
+                state=INSTALL_FAILED,
+                package=None,
+                reason=REASON_NO_PACKAGE_MANAGER,
+            )
+
+        prefix = registry_invocation_prefix(
+            manager, project_root=self.project_root, version=SHADCN_CLI_VERSION
+        )
+        if prefix is None:
+            return InstallOutcome(
+                dependency_id=REGISTRY_DEPENDENCY,
+                state=INSTALL_FAILED,
+                package=None,
+                reason=REASON_MANAGER_UNSUPPORTED,
+            )
+
+        # The reviewed packages this component may introduce, mapped from the
+        # contract's application-owned dependency ids to their exact packages.
+        allowed_packages = tuple(
+            sorted(
+                DEPENDENCY_PACKAGES[dependency_id]
+                for dependency_id in getattr(
+                    request, "required_dependency_ids", ()
+                )
+                if dependency_id in DEPENDENCY_PACKAGES
+            )
+        )
+
+        argv = tuple(prefix) + ("add", locator, "--yes", "--overwrite")
+        before = snapshot_direct_dependencies(self.project_root)
+        process, timed_out = self._run(argv, REGISTRY_TIMEOUT_SECONDS)
+        if timed_out:
+            return InstallOutcome(
+                dependency_id=REGISTRY_DEPENDENCY,
+                state=INSTALL_FAILED,
+                package=None,
+                reason=REASON_TIMEOUT,
+            )
+        if process is None or process.returncode != 0:
+            receipt = (
+                CommandReceipt.from_process(process, cwd_label="<project>")
+                if process is not None
+                else None
+            )
+            return InstallOutcome(
+                dependency_id=REGISTRY_DEPENDENCY,
+                state=INSTALL_FAILED,
+                package=None,
+                reason=REASON_INSTALL_FAILED,
+                receipt=receipt,
+            )
+
+        receipt = CommandReceipt.from_process(process, cwd_label="<project>")
+
+        boundary = self._enforce_registry_dependency_boundary(
+            before, allowed_packages, manager
+        )
+        if not boundary.ok:
+            return InstallOutcome(
+                dependency_id=REGISTRY_DEPENDENCY,
+                state=INSTALL_FAILED,
+                package=None,
+                reason=boundary.reason,
+                receipt=boundary.receipt or receipt,
+                verified_components=(),
+            )
+
+        verified = verify_external_component_materialized(
+            self.project_root, request.component_id, component_dir
+        )
+        if not verified:
+            return InstallOutcome(
+                dependency_id=REGISTRY_DEPENDENCY,
+                state=INSTALL_FAILED,
+                package=None,
+                reason=REASON_COMPONENTS_NOT_VERIFIED,
+                receipt=boundary.receipt or receipt,
+                verified_components=(),
+            )
+
+        return InstallOutcome(
+            dependency_id=REGISTRY_DEPENDENCY,
+            state="installed",
+            package=None,
+            reason=REASON_ALREADY_INSTALLED,
+            receipt=boundary.receipt or receipt,
+            verified_components=verified,
         )
 
     # -- plan execution --------------------------------------------------
@@ -1607,10 +2220,16 @@ __all__ = [
     "REASON_PIN_NOT_EXACT",
     "REASON_PROJECT_INVALID",
     "REASON_SHADCN_CONFIG_INVALID",
+    "REASON_REGISTRY_DEPENDENCY_DRIFT",
+    "REASON_REGISTRY_PACKAGE_NOT_EXACT",
+    "REASON_BUILTIN_COMPONENT_UNREVIEWED",
     "REASON_TIMEOUT",
     "SECTION_DEPENDENCIES",
     "SECTION_DEV_DEPENDENCIES",
+    "SNAPSHOT_SECTIONS",
     "REGISTRY_DEPENDENCY",
+    "REGISTRY_INTRODUCED_PACKAGE_PINS",
+    "REVIEWED_BUILTIN_COMPONENT_DEPENDENCIES",
     "SHADCN_CLI_VERSION",
     "SHADCN_CONFIG_FILENAME",
     "TERMINAL_INSTALL_STATES",
@@ -1621,11 +2240,18 @@ __all__ = [
     "allowlisted_dependencies",
     "allowed_shadcn_components",
     "approved_component_dir",
+    "approved_external_component_dir",
+    "dependency_delta",
+    "expected_registry_packages",
     "is_contained",
     "package_name_is_well_formed",
     "project_declares_dependency",
     "project_satisfies_dependency",
     "project_satisfies_spec",
+    "registry_dependency_delta_is_acceptable",
+    "reviewed_registry_package_pins",
+    "snapshot_direct_dependencies",
+    "verify_external_component_materialized",
     "InstallReport",
     "DesignDependencyInstaller",
     "LOCKFILES",
@@ -1636,6 +2262,7 @@ __all__ = [
     "build_install_argv",
     "build_pinned_cli_prefix",
     "build_registry_argv",
+    "build_registry_normalization_argv",
     "detect_package_manager",
     "filter_allowed_components",
     "pinned_cli",

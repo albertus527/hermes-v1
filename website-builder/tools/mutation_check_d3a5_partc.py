@@ -74,13 +74,15 @@ MUTATIONS = [
             "critic_available": _one == "critic",""",
     ),
     # --- 2. free metadata search is not gated by the credential ----------
+        # A source whose catalog is listable without a credential (React Bits)
+        # must report discovery even with NO credential present. Gating discovery
+        # on `auth_present` would make a working free catalog report itself
+        # absent.
     (
         "free metadata search stays available without a credential",
         ACTIVATION,
-        """    discovery = adapter_exists and metadata_without_auth""",
-        """    discovery = adapter_exists and metadata_without_auth and (
-        not auth_required or auth_present
-    )""",
+        """    discovery = adapter_exists and (metadata_without_auth or auth_present)""",
+        """    discovery = adapter_exists and metadata_without_auth and auth_present""",
     ),
     # --- 3. a designed free tier is not a degradation --------------------
     (
@@ -159,6 +161,9 @@ MUTATIONS = [
             failures.append(resource_id)""",
     ),
     # --- 8. the engine is verified before the critic is claimed ----------
+        # The full-quality return is only reachable when `engine_quality` is
+        # "full". A mutation that claims the critic on any OTHER quality makes
+        # the "full-quality critic" test fail.
     (
         "a critic requires a verified engine binary",
         ACTIVATION,
@@ -166,24 +171,32 @@ MUTATIONS = [
         resource_id=resource_id,
         discovery_available=True,
         retrieval_available=True,
-        critic_available=True,""",
+        critic_available=True,
+        critic_degraded=False,""",
         """    return ResourceActivationCapability(
         resource_id=resource_id,
         discovery_available=True,
         retrieval_available=True,
-        critic_available=not engine_verified,""",
+        critic_available=quality != "full",
+        critic_degraded=False,""",
     ),
     # --- 9. a missing engine never triggers a download ------------------
+        # The engine-resolution guard is now `engine_quality(...) == "missing"`.
+        # Removing it must not fall through to a download.
     (
         "a missing engine degrades honestly instead of downloading",
         ACTIVATION,
-        """    if not engine_verified:
+        """    quality = engine_quality(skill_root)
+
+    if quality == "missing":
         return ResourceActivationCapability(
             resource_id=resource_id,
             discovery_available=True,
             retrieval_available=False,
             locally_provisioned=True,""",
-        """    if not engine_verified:
+        """    quality = engine_quality(skill_root)
+
+    if quality == "missing":
         import urllib.request
 
         urllib.request.urlopen(f"https://example.invalid/{resource_id}")

@@ -549,3 +549,152 @@ def test_an_inexact_pin_runs_no_command(project, monkeypatch):
     assert outcome.state == INSTALL_FAILED
     assert outcome.reason == REASON_PIN_NOT_EXACT
     assert runner.commands == [], "a non-exact pin must mean no command at all"
+
+
+# ---------------------------------------------------------------------------
+# Part E: GSAP / Three / Lenis + companions -- structural coherence
+# ---------------------------------------------------------------------------
+#
+# A future edit must not be able to add a package without its pin, or a pin
+# without its package. These tests assert the RELATION between the maps, so a
+# pin bump is fine but a missing pin, an orphan pin, a colliding companion, or a
+# wrong section fails loudly.
+
+
+def test_package_and_pin_maps_have_identical_key_domains():
+    """No package without a pin; no pin without a package."""
+    assert set(DEPENDENCY_PACKAGES) == set(DEPENDENCY_PACKAGE_PINS)
+
+
+def test_every_pin_is_exact():
+    for dependency_id, version in DEPENDENCY_PACKAGE_PINS.items():
+        assert PackageSpec("x", version).is_exact(), (dependency_id, version)
+
+
+def test_every_runtime_package_lands_in_dependencies():
+    """A runtime package is a runtime declaration, never a dev one."""
+    for dependency_id in DEPENDENCY_PACKAGES:
+        specs = required_package_specs(dependency_id)
+        runtime = specs[0]
+        assert runtime.package == DEPENDENCY_PACKAGES[dependency_id]
+        assert runtime.dependency_section == SECTION_DEPENDENCIES, dependency_id
+
+
+def test_every_type_companion_lands_in_devdependencies():
+    """A type-only companion must not ship to production."""
+    for dependency_id, companions in DEPENDENCY_COMPANION_PACKAGES.items():
+        for companion in companions:
+            assert companion.dependency_section == SECTION_DEV_DEPENDENCIES, (
+                dependency_id,
+                companion.package,
+            )
+
+
+def test_a_companion_cannot_collide_with_a_runtime_package():
+    """A companion name may not also be an allowlisted runtime package."""
+    runtime_packages = set(DEPENDENCY_PACKAGES.values())
+    for dependency_id, companions in DEPENDENCY_COMPANION_PACKAGES.items():
+        for companion in companions:
+            assert companion.package not in runtime_packages, (
+                dependency_id,
+                companion.package,
+            )
+
+
+def test_every_companion_has_an_exact_pin():
+    for dependency_id, companions in DEPENDENCY_COMPANION_PACKAGES.items():
+        for companion in companions:
+            assert companion.to_spec().is_exact(), (dependency_id, companion.package)
+
+
+def test_every_companion_belongs_to_a_known_dependency():
+    """A companion row for an unknown dependency would never be installed."""
+    for dependency_id in DEPENDENCY_COMPANION_PACKAGES:
+        assert dependency_id in DEPENDENCY_PACKAGES, dependency_id
+
+
+def test_project_satisfies_dependency_requires_all_companions(project):
+    """The conjunctive postcondition: runtime alone is never enough."""
+    # three's runtime alone:
+    _declare(project, THREE, DEPENDENCY_PACKAGE_PINS[THREE], SECTION_DEPENDENCIES)
+    assert project_satisfies_dependency(project, THREE) is False
+
+    # add the companion exactly:
+    companion = DEPENDENCY_COMPANION_PACKAGES[THREE][0]
+    _declare(
+        project,
+        companion.package,
+        companion.version,
+        SECTION_DEV_DEPENDENCIES,
+    )
+    assert project_satisfies_dependency(project, THREE) is True
+
+
+def test_no_registry_constraint_can_override_an_exact_pin():
+    """A registry-declared range never becomes the installed version."""
+    from app.core.design_registry import (
+        dependency_specs_are_satisfied,
+        resolve_reviewed_dependency_specs,
+    )
+
+    # The live SplitText declaration.
+    declared = ["gsap@^3.13.0", "@gsap/react@^2.1.2"]
+
+    # The pins the app owns satisfy the constraints...
+    assert dependency_specs_are_satisfied(declared) is True
+    # ...and the spec's version is retained as a CONSTRAINT only.
+    resolved = dict(resolve_reviewed_dependency_specs(declared))
+    assert resolved["gsap"] == "^3.13.0"
+    # The exact pin is what installs, not the constraint.
+    assert DEPENDENCY_PACKAGE_PINS["gsap"] == "3.15.0"
+    assert DEPENDENCY_PACKAGE_PINS["gsap_react"] == "2.1.2"
+
+
+def test_gsap_and_lenis_have_no_companion_but_gsap_react_is_its_own_runtime():
+    """The reviewed @gsap/react is a runtime dependency, not a companion."""
+    assert resolve_companion_packages(GSAP) == ()
+    assert resolve_companion_packages(LENIS) == ()
+    # @gsap/react is its own allowlisted runtime id.
+    assert DEPENDENCY_PACKAGES["gsap_react"] == "@gsap/react"
+    assert required_package_specs("gsap_react")[0].dependency_section == (
+        SECTION_DEPENDENCIES
+    )
+
+
+# ---------------------------------------------------------------------------
+# Part H: the Impeccable parser runtime pins
+# ---------------------------------------------------------------------------
+
+
+def test_impeccable_parser_pins_are_exact():
+    """The four parser modules are exactly pinned, never ranged."""
+    from app.core.design_install import (
+        IMPECCABLE_PARSER_PACKAGE_PINS,
+        impeccable_parser_package_pins,
+    )
+
+    assert set(IMPECCABLE_PARSER_PACKAGE_PINS) == {
+        "htmlparser2",
+        "css-select",
+        "css-tree",
+        "domutils",
+    }
+    for package, version in impeccable_parser_package_pins():
+        assert PackageSpec(package, version).is_exact(), (package, version)
+
+
+def test_impeccable_parser_pins_are_not_project_dependencies():
+    """They are provisioned at profile setup, never pulled into a build."""
+    from app.core.design_install import IMPECCABLE_PARSER_PACKAGE_PINS
+
+    runtime_packages = set(DEPENDENCY_PACKAGES.values())
+    for package in IMPECCABLE_PARSER_PACKAGE_PINS:
+        assert package not in runtime_packages, package
+
+
+def test_impeccable_parser_pins_match_the_activation_runtime_list():
+    """The pin table and the capability check must name the SAME modules."""
+    from app.core.design_activation import PARSER_RUNTIME_PACKAGES
+    from app.core.design_install import IMPECCABLE_PARSER_PACKAGE_PINS
+
+    assert set(IMPECCABLE_PARSER_PACKAGE_PINS) == set(PARSER_RUNTIME_PACKAGES)

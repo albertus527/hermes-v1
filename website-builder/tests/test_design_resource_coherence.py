@@ -51,8 +51,13 @@ from app.core.design_retrieval import _RESOURCE_ADAPTER_IDS
 #: The five resources D3a.5 exists to activate.
 ACTIVATED = ("refero", "twenty_first", "react_bits", "transitions_dev", "impeccable")
 
-#: Of those, the ones reachable with no provisioning at all.
-ON_DEMAND = ("twenty_first", "react_bits", "transitions_dev")
+#: Of those, the ones reachable with no provisioning AND no credential.
+#:
+#: 21st is deliberately NOT here: its real machine surface is authenticated
+#: (verified live -- HTTP 401 without a Bearer key) and its public llms.txt
+#: publishes no component-identity schema, so it needs a credential. Its
+#: credential-gated state is asserted separately below.
+ON_DEMAND = ("react_bits", "transitions_dev")
 
 #: Those that need the skill provisioned into the profile first.
 PROFILE_SKILL = ("refero", "impeccable")
@@ -98,15 +103,28 @@ def _provision(hermes_home: Path, manifest, resource_id: str) -> Path:
 
 
 def _provision_impeccable(
-    hermes_home: Path, manifest, *, system: str, machine: str, with_engine: bool = True
+    hermes_home: Path,
+    manifest,
+    *,
+    system: str,
+    machine: str,
+    with_engine: bool = True,
+    with_parser_runtime: bool = True,
 ) -> Path:
     """Provision Impeccable's skill plus its cross-platform Node engine.
 
     ``system``/``machine`` are accepted and ignored: the shipped detector is the
     same Node ESM entrypoint on every platform, so there is no per-OS artifact.
+
+    ``with_parser_runtime`` defaults True here so the helper produces a
+    FULL-QUALITY critic (engine + parser runtime). A test that wants the degraded
+    state passes ``with_parser_runtime=False``.
     """
     del system, machine
-    from app.core.design_activation import engine_relative_paths
+    from app.core.design_activation import (
+        PARSER_RUNTIME_PACKAGES,
+        engine_relative_paths,
+    )
 
     home = _provision(hermes_home, manifest, "impeccable")
     if with_engine:
@@ -114,6 +132,10 @@ def _provision_impeccable(
             engine = home / "skills" / "impeccable" / relative
             engine.parent.mkdir(parents=True, exist_ok=True)
             engine.write_text("// node entrypoint\n", encoding="utf-8")
+    if with_engine and with_parser_runtime:
+        modules = home / "skills" / "impeccable" / "node_modules"
+        for package in PARSER_RUNTIME_PACKAGES:
+            (modules / package).mkdir(parents=True, exist_ok=True)
     return home
 
 
@@ -243,15 +265,22 @@ def test_the_free_refero_baseline_needs_no_credential(manifest, tmp_path):
     assert capability.degraded is False
 
 
-def test_twenty_first_reports_free_discovery_without_claiming_retrieval(
-    manifest, tmp_path
-):
-    """The case that made one boolean impossible."""
+def test_twenty_first_is_credential_gated_not_free_discovery(manifest, tmp_path):
+    """21st's discovery AND retrieval both require a credential.
+
+    VERIFIED LIVE: the real machine surface is authenticated (HTTP 401 without a
+    Bearer key) and the public index publishes no component-identity schema. So
+    with no credential there is no discovery -- a bounded credential-required,
+    degraded state. A present credential restores discovery but never install
+    (nothing is reviewed for 21st).
+    """
     capability = _activate(tmp_path, manifest).capabilities["twenty_first"]
 
-    assert capability.discovery_available is True
+    assert capability.discovery_available is False
     assert capability.retrieval_available is False
-    assert capability.usable is True
+    assert capability.authentication_required is True
+    assert capability.degraded is True
+    assert capability.usable is False
 
 
 def test_twenty_first_records_a_present_credential_as_presence_only(

@@ -588,3 +588,66 @@ def test_the_guard_is_never_synthesized_into_a_recipe():
 def test_detect_handles_non_string_input():
     assert detect_reduced_motion_guard(None) is False
     assert detect_reduced_motion_guard(7) is False
+
+
+# ---------------------------------------------------------------------------
+# Part I: .md-only materialization + no dependency mutation
+# ---------------------------------------------------------------------------
+
+
+def test_md_only_materialization_is_accepted(project):
+    """The REAL upstream contract: `add <slug>` writes ONLY the Markdown."""
+    _materialize(project, "card-resize")
+
+    verified = verify_recipe_materialized(
+        project, "card-resize", approved_recipes_dir(project)
+    )
+
+    assert verified == ("card-resize.md",)
+    # No .css is required or synthesized.
+    assert not (project / RECIPES_DIRNAME / "card-resize.css").exists()
+
+
+def test_a_missing_css_companion_is_never_a_failure(project):
+    """The old defect: requiring a .css that upstream never writes."""
+    _materialize(project, "fade-in")
+
+    assert verify_recipe_materialized(
+        project, "fade-in", approved_recipes_dir(project)
+    ) == ("fade-in.md",)
+
+
+def test_the_transitions_argv_never_carries_a_package_install():
+    """A transitions invocation is `add <slug>`; it installs no npm package."""
+    from app.core.design_transitions import build_add_argv, normalize_recipe_catalog
+    from app.core.design_install import build_pinned_cli_prefix
+
+    catalog = normalize_recipe_catalog(
+        [{"slug": "card-resize", "name": "Card resize", "tier": "free"}]
+    )
+    prefix = build_pinned_cli_prefix(
+        ("npm",), "transitions_dev", Path(".")
+    )
+    argv = build_add_argv(prefix, "card-resize", catalog)
+
+    assert argv is not None
+    assert "install" not in argv
+    assert "add" in argv
+    # No npm package spec (name@version) appears as an install target.
+    assert not any(part.startswith(("transitions-dev@",)) and part != "transitions-dev@0.3.0" for part in argv)
+
+
+def test_transitions_materialization_does_not_touch_package_json(project):
+    """Verifying a recipe is a filesystem check, not a manifest mutation."""
+    import json
+
+    (project / "package.json").write_text(
+        json.dumps({"name": "site", "dependencies": {"react": "19.2.7"}}),
+        encoding="utf-8",
+    )
+    before = (project / "package.json").read_text(encoding="utf-8")
+
+    _materialize(project, "card-resize")
+    verify_recipe_materialized(project, "card-resize", approved_recipes_dir(project))
+
+    assert (project / "package.json").read_text(encoding="utf-8") == before

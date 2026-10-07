@@ -47,9 +47,15 @@ from typing import Dict, Mapping, Optional, Sequence, Tuple
 
 from app.core.design_install import (
     ALLOWED_SHADCN_COMPONENTS,
+    DEPENDENCY_PACKAGE_PINS,
     DEPENDENCY_PACKAGES,
     INSTALL_FAILED,
     REASON_COMPONENT_NOT_ALLOWED,
+)
+from app.core.design_npm_spec import (
+    REJECTED_SPEC_LABEL,
+    constraint_is_satisfied,
+    parse_npm_package_spec,
 )
 
 logger = logging.getLogger(__name__)
@@ -87,36 +93,120 @@ REGISTRY_HOSTS: Dict[str, str] = {
 # manager: each is mapped to an allowlisted dependency id, and an id this
 # application does not own makes the whole component non-installable.
 
-#: Canonical package name -> dependency id. Only these three exist because only
-#: these three are in ``DEPENDENCY_PACKAGES``.
+#: Canonical package name -> dependency id. Only these exist because only these
+#: are in ``DEPENDENCY_PACKAGES``.
 PACKAGE_TO_DEPENDENCY_ID: Dict[str, str] = {
     package: dependency_id
     for dependency_id, package in DEPENDENCY_PACKAGES.items()
 }
 
 
+#: The static label recorded for a dependency SPEC that FAILED the bounded
+#: grammar -- a hostile/unsupported form (git URL, `file:`, dist-tag, malformed
+#: scoped name, non-string). The raw value is NEVER echoed; this label stands in
+#: its place. A spec that PARSES but is merely not allowlisted is different: its
+#: package name is grammar-validated, bounded data (e.g. ``left-pad``) and is
+#: safe to cite so an operator can see WHAT was refused.
+UNRESOLVED_DEPENDENCY_LABEL = REJECTED_SPEC_LABEL
+
+
 def resolve_dependency_requirements(
     declared: Sequence[str],
 ) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
-    """Map declared package names to dependency ids.
+    """Map declared npm dependency SPECS to allowlisted dependency ids.
 
     Returns ``(known, unknown)``. A non-empty ``unknown`` means the component
     cannot be installed: it wants something this application does not own, and
     the only safe response is refusal rather than adding a row to the allowlist
     because a remote catalog asked.
+
+    **The declared value is an npm package SPEC, not a bare name.** Upstream
+    declares ``gsap@^3.13.0`` and ``@gsap/react@^2.1.2``; the previous
+    implementation mapped the whole string through a name lookup, so a versioned
+    declaration never matched and the requirement was silently lost. Each spec is
+    now parsed by :func:`parse_npm_package_spec`, and the parsed package identity
+    is what is mapped -- the declared constraint is returned separately by
+    :func:`resolve_reviewed_dependency_specs` so it can be checked against the
+    application-owned pin.
+
+    Two DIFFERENT unknowns are recorded, because they are different operational
+    facts:
+
+    * a spec that FAILS the bounded grammar (a hostile form) records the static
+      :data:`UNRESOLVED_DEPENDENCY_LABEL` -- the raw string is never echoed;
+    * a spec that PARSES but whose package is not allowlisted records its
+      grammar-validated package NAME (``left-pad``), which is bounded data, so a
+      refusal is explicable to whoever hits it.
+
+    Neither is ever forwarded to a package manager.
     """
     known: list[str] = []
     unknown: list[str] = []
-    for name in declared:
-        if not isinstance(name, str):
-            unknown.append("<non-string>")
+    for spec in declared:
+        parsed = parse_npm_package_spec(spec)
+        if parsed is None:
+            # A non-string, a hostile npm spec, or a malformed scoped name. The
+            # raw value is not echoed; the static label is what is recorded.
+            unknown.append(UNRESOLVED_DEPENDENCY_LABEL)
             continue
-        dependency_id = PACKAGE_TO_DEPENDENCY_ID.get(name.strip())
+        dependency_id = PACKAGE_TO_DEPENDENCY_ID.get(parsed.package_name)
         if dependency_id is None:
-            unknown.append(name.strip())
+            # Grammar-valid but unreviewed: cite the validated package name, not
+            # the raw spec, so the reason stays bounded and free of a version
+            # range or any embedded text.
+            unknown.append(parsed.package_name)
         else:
             known.append(dependency_id)
     return tuple(sorted(set(known))), tuple(sorted(set(unknown)))
+
+
+def resolve_reviewed_dependency_specs(
+    declared: Sequence[str],
+) -> Tuple[Tuple[str, str], ...]:
+    """``(dependency_id, declared_constraint)`` for every parseable, allowlisted spec.
+
+    The constraint is retained so :func:`dependency_specs_are_satisfied` can prove
+    the application-owned exact pin is inside the range upstream declared. A spec
+    that does not parse, or whose package is not allowlisted, is omitted -- the
+    caller's ``unknown`` from :func:`resolve_dependency_requirements` is what
+    refuses the component, and this function never invents a mapping for it.
+    """
+    resolved: list[Tuple[str, str]] = []
+    for spec in declared:
+        parsed = parse_npm_package_spec(spec)
+        if parsed is None:
+            continue
+        dependency_id = PACKAGE_TO_DEPENDENCY_ID.get(parsed.package_name)
+        if dependency_id is None:
+            continue
+        resolved.append((dependency_id, parsed.declared_constraint))
+    return tuple(resolved)
+
+
+def dependency_specs_are_satisfied(declared: Sequence[str]) -> bool:
+    """Whether EVERY declared spec's constraint is met by the application's pin.
+
+    This is the "the exact pin satisfies the reviewed upstream constraint" check.
+    A bare name imposes no constraint and is trivially satisfied; a ranged spec
+    must be satisfied by :data:`DEPENDENCY_PACKAGE_PINS`. An unparseable or
+    un-allowlisted spec is NOT satisfied here (the caller refuses the component on
+    the ``unknown`` list too), so this never returns a false pass.
+    """
+    for spec in declared:
+        parsed = parse_npm_package_spec(spec)
+        if parsed is None:
+            return False
+        dependency_id = PACKAGE_TO_DEPENDENCY_ID.get(parsed.package_name)
+        if dependency_id is None:
+            return False
+        pin = DEPENDENCY_PACKAGE_PINS.get(dependency_id)
+        if pin is None:
+            return False
+        if parsed.declared_constraint and not constraint_is_satisfied(
+            parsed.declared_constraint, pin
+        ):
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -160,13 +250,112 @@ REACT_BITS_VARIANT = "TS-TW"
 #: Exactly ONE React Bits component is reviewed so far, ``SplitText``. Its
 #: canonical locator ``https://reactbits.dev/r/SplitText-TS-TW`` was probed and
 #: confirmed to serve a real shadcn ``registry-item`` document whose declared
-#: dependencies are ``gsap`` and ``@gsap/react``. Both are in the closed
-#: dependency allowlist, which is why this component -- and only reviewed
-#: components like it -- is installable.
-_APPROVED_COMPONENTS: Dict[str, frozenset] = {
-    SOURCE_TWENTY_FIRST: frozenset(),
-    SOURCE_REACT_BITS: frozenset({"SplitText"}),
+#: dependencies are ``gsap@^3.13.0`` and ``@gsap/react@^2.1.2``.
+#:
+#: This mapping is DERIVED from :data:`_REVIEWED_COMPONENT_CONTRACTS` below, so
+#: the two can never drift: a component is an approved identity here if and only
+#: if it has a reviewed dependency contract. ``resolve_registry_locator`` reads
+#: THIS table (so a monkeypatch that approves an identity is honoured), while
+#: :func:`build_registry_request` additionally requires the contract.
+
+
+# ---------------------------------------------------------------------------
+# The reviewed component dependency CONTRACT -- application-owned, authoritative
+# ---------------------------------------------------------------------------
+#
+# The catalog is a PROPOSAL. The registry response is UNTRUSTED. This table is
+# the authority: a component is installable only when the live registry metadata
+# matches, EXACTLY, what a human reviewed here.
+#
+# Why a contract and not just "map the declared names through the allowlist":
+# a name allowlist cannot tell "gsap" (correct) from "gsap + some-new-package"
+# (drift). Upstream can silently add a dependency to a component we already
+# approved; without an expected SET there is nothing to compare against and the
+# new package would be installed as though it were reviewed. The contract closes
+# that: the declared dependency SET must equal ``expected_dependency_ids`` and
+# the declared ``registryDependencies`` must equal
+# ``expected_registry_dependencies``, or the component becomes non-installable
+# until the change is reviewed and the contract is updated.
+
+
+@dataclass(frozen=True)
+class ReviewedComponentContract:
+    """What a human reviewed for ONE component, and nothing more.
+
+    ``expected_dependency_ids`` are application-owned dependency ids (keys into
+    :data:`app.core.design_install.DEPENDENCY_PACKAGES`), NOT raw upstream
+    strings: the mapping from ``gsap@^3.13.0`` to the ``gsap`` id is the
+    review, and it lives in code. ``expected_registry_dependencies`` is the set
+    of NESTED registry components the component may pull in; an empty tuple means
+    "this component must declare no nested registry component", which is the
+    reviewed fact for SplitText (its live ``registryDependencies`` is ``[]``).
+    """
+
+    source: str
+    component_id: str
+    expected_dependency_ids: Tuple[str, ...] = ()
+    expected_registry_dependencies: Tuple[str, ...] = ()
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "source": self.source,
+            "component_id": self.component_id,
+            "expected_dependency_ids": list(self.expected_dependency_ids),
+            "expected_registry_dependencies": list(
+                self.expected_registry_dependencies
+            ),
+        }
+
+
+#: The reviewed contracts, keyed by ``(source, component_id)``. Application-owned
+#: and closed: a component absent here has NO reviewed contract and is therefore
+#: not installable.
+#:
+#: ``SplitText`` (React Bits, ``TS-TW``) declares exactly two direct
+#: dependencies -- ``gsap@^3.13.0`` and ``@gsap/react@^2.1.2`` -- and no nested
+#: registry components. Verified live at
+#: ``https://reactbits.dev/r/SplitText-TS-TW``. The application pins both as
+#: exact application-owned versions; the upstream ranges are only CHECKED, never
+#: installed.
+_REVIEWED_COMPONENT_CONTRACTS: Dict[Tuple[str, str], ReviewedComponentContract] = {
+    (SOURCE_REACT_BITS, "SplitText"): ReviewedComponentContract(
+        source=SOURCE_REACT_BITS,
+        component_id="SplitText",
+        expected_dependency_ids=("gsap", "gsap_react"),
+        expected_registry_dependencies=(),
+    ),
 }
+
+
+def _approved_components_from_contracts() -> Dict[str, frozenset]:
+    """Derive the approved-identity table from the reviewed contracts.
+
+    The single source of truth is :data:`_REVIEWED_COMPONENT_CONTRACTS`; the
+    identity allowlist is a projection of it. That makes "approved but no
+    contract" and "contract but not approved" both unrepresentable.
+    """
+    approved: Dict[str, frozenset] = {source: frozenset() for source in REGISTRY_SOURCES}
+    for (source, component_id) in _REVIEWED_COMPONENT_CONTRACTS:
+        approved[source] = approved.get(source, frozenset()) | {component_id}
+    return approved
+
+
+_APPROVED_COMPONENTS: Dict[str, frozenset] = _approved_components_from_contracts()
+
+
+def reviewed_component_contract(
+    source: str, component_id: str
+) -> Optional[ReviewedComponentContract]:
+    """The reviewed contract for ``(source, component_id)``, or ``None``.
+
+    A ``None`` means the component has no application-owned dependency contract,
+    which :func:`build_registry_request` treats as non-installable. Returning
+    ``None`` rather than a permissive default is deliberate: a missing contract
+    must never be read as "no constraints".
+    """
+    if not isinstance(source, str) or not isinstance(component_id, str):
+        return None
+    return _REVIEWED_COMPONENT_CONTRACTS.get((source, component_id))
 
 #: Component identities are PascalCase (React Bits' own convention, e.g.
 #: ``SplitText``) or kebab/lowercase slugs. Anything containing a path
@@ -365,21 +554,43 @@ REASON_DEPENDENCY_UNKNOWN = (
     "the component requires a dependency outside the closed allowlist"
 )
 REASON_COMPONENT_NOT_BUILTIN = "the component is not an approved shadcn builtin"
+REASON_CONTRACT_MISSING = (
+    "the component has no application-owned reviewed dependency contract"
+)
+REASON_DEPENDENCY_CONTRACT_MISMATCH = (
+    "the component's declared dependencies do not match its reviewed contract"
+)
+REASON_REGISTRY_DEPENDENCY_MISMATCH = (
+    "the component declares nested registry dependencies outside its reviewed "
+    "contract"
+)
+REASON_CONSTRAINT_UNSATISFIED = (
+    "the application-owned pin does not satisfy the component's declared "
+    "version constraint"
+)
 
 
 def build_registry_request(
-    source: str, component_id: str, *, declared_dependencies: Sequence[str] = ()
+    source: str,
+    component_id: str,
+    *,
+    declared_dependencies: Sequence[str] = (),
+    declared_registry_dependencies: Sequence[str] = (),
 ) -> RegistryRequestOutcome:
     """Turn ``(source, component_id)`` into a validated install request.
 
     The single entry point. It is deliberately the ONLY place that assembles a
     :class:`RegistryInstallRequest`, so the checks below cannot be skipped by a
     caller constructing one directly -- the constructor re-verifies them, and
-    this function is what maps external dependency NAMES to allowlisted ids.
+    this function is what maps external dependency SPECS to allowlisted ids.
 
-    ``declared_dependencies`` arrives from upstream metadata and is therefore
-    untrusted: an unknown name refuses the whole component rather than being
-    added to the allowlist.
+    ``declared_dependencies`` and ``declared_registry_dependencies`` arrive from
+    upstream metadata and are therefore untrusted. For a BUILTIN, the dependency
+    specs must all be allowlisted. For an EXTERNAL component, the declared sets
+    must match the component's application-owned reviewed contract EXACTLY --
+    the catalog proposes, the contract decides. A mismatch (a missing, extra,
+    unknown, or unexpected nested dependency) refuses the whole component rather
+    than shipping a partial requirement set.
     """
     if not isinstance(source, str) or source not in REGISTRY_SOURCES:
         return RegistryRequestOutcome(ok=False, request=None, reason=REASON_SOURCE_UNKNOWN)
@@ -423,6 +634,51 @@ def build_registry_request(
             ok=False, request=None, reason=REASON_COMPONENT_UNKNOWN
         )
 
+    # The contract is authoritative. A reviewed-locator component with no
+    # contract is NOT installable -- absence of a contract is never read as
+    # "no constraints".
+    contract = reviewed_component_contract(source, component_id)
+    if contract is None:
+        return RegistryRequestOutcome(
+            ok=False, request=None, reason=REASON_CONTRACT_MISSING
+        )
+
+    # The declared dependency id SET must equal the reviewed set. A subset
+    # (missing) and a superset (extra/new) are both drift and both refused.
+    if set(dependency_ids) != set(contract.expected_dependency_ids):
+        logger.warning(
+            "Refusing a registry component whose declared dependencies do not "
+            "match its reviewed contract."
+        )
+        return RegistryRequestOutcome(
+            ok=False, request=None, reason=REASON_DEPENDENCY_CONTRACT_MISMATCH
+        )
+
+    # Nested registry dependencies must equal the reviewed set (empty for
+    # SplitText). An unexpected nested component fails closed.
+    declared_registry = _normalize_registry_dependencies(
+        declared_registry_dependencies
+    )
+    if set(declared_registry) != set(contract.expected_registry_dependencies):
+        logger.warning(
+            "Refusing a registry component declaring nested registry "
+            "dependencies outside its reviewed contract."
+        )
+        return RegistryRequestOutcome(
+            ok=False, request=None, reason=REASON_REGISTRY_DEPENDENCY_MISMATCH
+        )
+
+    # Every declared version constraint must be satisfied by the
+    # application-owned exact pin. The constraint is CHECKED, never installed.
+    if not dependency_specs_are_satisfied(declared_dependencies):
+        logger.warning(
+            "Refusing a registry component whose declared constraint is not "
+            "satisfied by the application-owned pin."
+        )
+        return RegistryRequestOutcome(
+            ok=False, request=None, reason=REASON_CONSTRAINT_UNSATISFIED
+        )
+
     return RegistryRequestOutcome(
         ok=True,
         request=RegistryInstallRequest(
@@ -434,6 +690,24 @@ def build_registry_request(
         reason=REASON_REQUEST_OK,
         dependency_ids=dependency_ids,
     )
+
+
+def _normalize_registry_dependencies(declared: Sequence[str]) -> Tuple[str, ...]:
+    """Grammar-validate nested ``registryDependencies``, dropping nothing silently.
+
+    Upstream may express a nested registry dependency as a bare name, a
+    ``@scope/name``, or a URL. Only a bare component identity (the same shape a
+    reviewed component id has) is meaningful here; anything else is preserved
+    verbatim so the contract comparison fails closed rather than being normalized
+    into agreement.
+    """
+    normalized: list[str] = []
+    for entry in declared or ():
+        if isinstance(entry, str) and component_id_is_well_formed(entry):
+            normalized.append(entry)
+        else:
+            normalized.append(REJECTED_SPEC_LABEL)
+    return tuple(sorted(set(normalized)))
 
 
 def build_registry_argv(request: Optional[RegistryInstallRequest]) -> Tuple[str, ...]:

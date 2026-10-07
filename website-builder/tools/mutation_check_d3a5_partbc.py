@@ -1,0 +1,363 @@
+"""Mutation driver for the D3a.5 dependency-boundary repair.
+
+Same discipline as the other D3a.5 drivers: revert ONE guard at a time on a
+THROWAWAY COPY and prove the focused tests go red. The real working tree is never
+edited.
+
+This driver covers the NEW class of bug this repair closes -- a design registry
+or resource introducing a DIRECT package dependency Hermes did not review:
+
+  Part F -- the bounded npm spec parser
+    * parser-echoes-raw          -> a hostile spec becomes a package identity
+    * parser-accepts-tag         -> `latest`/`next` become installable
+    * parser-accepts-empty-at    -> `gsap@` (npm's `latest`) slips through
+    * constraint-always-true     -> an unsatisfiable range is accepted
+
+  Part B -- the reviewed component contract
+    * contract-ignored           -> upstream can add a package undetected
+    * registry-deps-ignored      -> an unexpected nested component is installed
+    * contract-missing-permits   -> a component with no contract is installable
+
+  Part C -- the registry dependency boundary
+    * delta-not-verified         -> the CLI's packages are trusted blindly
+    * wrong-section-accepted     -> a runtime package lands in devDependencies
+    * range-not-normalized       -> a floating range survives to package.json
+
+  Part G -- 21st route false positives
+    * routes-become-identities   -> /components/popular becomes a component
+
+  Part H -- the Impeccable degraded scan
+    * degraded-treated-as-clean  -> a regex-fallback scan certifies a design
+
+Run:  python tools/mutation_check_d3a5_partbc.py
+"""
+
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Tuple
+
+ROOT = Path(__file__).resolve().parents[1]
+IGNORED = shutil.ignore_patterns("__pycache__", "*.pyc", ".git", ".venv", "venv")
+
+NPM_SPEC = "app/core/design_npm_spec.py"
+REGISTRY = "app/core/design_registry.py"
+INSTALL = "app/core/design_install.py"
+FETCH = "app/core/design_catalog_fetch.py"
+CRITIC = "app/core/design_critic.py"
+
+NPM_SPEC_TESTS = "tests/test_design_npm_spec.py"
+REGISTRY_TESTS = "tests/test_design_registry.py"
+CONTRACT_TESTS = "tests/test_design_registry_contract.py"
+MUTATION_TESTS = "tests/test_design_registry_mutation.py"
+INSTALL_TESTS = "tests/test_design_install.py"
+PIN_TESTS = "tests/test_design_dependency_pins.py"
+FETCH_TESTS = "tests/test_design_catalog_fetch.py"
+CRITIC_TESTS = "tests/test_design_critic.py"
+
+MUTATIONS = [
+    # ------------------------------------------------------------------
+    # Part F -- the bounded npm spec parser
+    # ------------------------------------------------------------------
+    # A parser that echoes its input would make an arbitrary string a package
+    # identity -- the exact class this batch forbids.
+    (
+        "the spec parser never echoes an unparsed spec",
+        NPM_SPEC,
+        """    name, constraint, had_separator = _split_name_and_constraint(text)
+    if not name or not _PACKAGE_NAME_RE.match(name):
+        return None
+    if had_separator and not constraint:
+        # `gsap@` is npm's spelling for the floating `latest` tag.
+        return None
+    if constraint and not _CONSTRAINT_RE.match(constraint):
+        return None
+    return NpmPackageSpec(package_name=name, declared_constraint=constraint)""",
+        """    name, constraint, had_separator = _split_name_and_constraint(text)
+    return NpmPackageSpec(package_name=text, declared_constraint="")""",
+    ),
+    # A dist-tag like `latest` must not become an installable version.
+    (
+        "a dist-tag is not a valid constraint",
+        NPM_SPEC,
+        """    if constraint and not _CONSTRAINT_RE.match(constraint):
+        return None""",
+        """    if False:
+        return None""",
+    ),
+    # `gsap@` is npm's spelling for `latest`; it must fail closed.
+    (
+        "an empty constraint after an explicit @ is refused",
+        NPM_SPEC,
+        """    if had_separator and not constraint:
+        # `gsap@` is npm's spelling for the floating `latest` tag.
+        return None""",
+        """    if False:
+        return None""",
+    ),
+    # A constraint the pin cannot satisfy must not be accepted.
+    (
+        "the constraint check can fail",
+        NPM_SPEC,
+        """    if not isinstance(constraint, str) or not constraint.strip():
+        return False
+    if not _CONSTRAINT_RE.match(constraint.strip()):
+        return False""",
+        """    return True
+    if not isinstance(constraint, str) or not constraint.strip():
+        return False
+    if not _CONSTRAINT_RE.match(constraint.strip()):
+        return False""",
+    ),
+    # ------------------------------------------------------------------
+    # Part B -- the reviewed component contract
+    # ------------------------------------------------------------------
+    # Without the contract-set check, upstream can ADD a package and it installs.
+    (
+        "the declared dependency set must match the reviewed contract",
+        REGISTRY,
+        """    if set(dependency_ids) != set(contract.expected_dependency_ids):
+        logger.warning(
+            "Refusing a registry component whose declared dependencies do not "
+            "match its reviewed contract."
+        )
+        return RegistryRequestOutcome(
+            ok=False, request=None, reason=REASON_DEPENDENCY_CONTRACT_MISMATCH
+        )""",
+        """    if False:
+        return RegistryRequestOutcome(
+            ok=False, request=None, reason=REASON_DEPENDENCY_CONTRACT_MISMATCH
+        )""",
+    ),
+    # An unexpected nested registry dependency must fail closed.
+    (
+        "unexpected nested registry dependencies are refused",
+        REGISTRY,
+        """    if set(declared_registry) != set(contract.expected_registry_dependencies):
+        logger.warning(
+            "Refusing a registry component declaring nested registry "
+            "dependencies outside its reviewed contract."
+        )
+        return RegistryRequestOutcome(
+            ok=False, request=None, reason=REASON_REGISTRY_DEPENDENCY_MISMATCH
+        )""",
+        """    if False:
+        return RegistryRequestOutcome(
+            ok=False, request=None, reason=REASON_REGISTRY_DEPENDENCY_MISMATCH
+        )""",
+    ),
+    # A component with no contract must NOT be installable.
+    (
+        "a component with no reviewed contract is not installable",
+        REGISTRY,
+        """    contract = reviewed_component_contract(source, component_id)
+    if contract is None:
+        return RegistryRequestOutcome(
+            ok=False, request=None, reason=REASON_CONTRACT_MISSING
+        )""",
+        """    contract = reviewed_component_contract(source, component_id)
+    if contract is None:
+        return RegistryRequestOutcome(
+            ok=True,
+            request=RegistryInstallRequest(
+                source=source,
+                component_id=component_id,
+                registry_locator_id=locator,
+                required_dependency_ids=dependency_ids,
+            ),
+            reason=REASON_REQUEST_OK,
+            dependency_ids=dependency_ids,
+        )""",
+    ),
+    # ------------------------------------------------------------------
+    # Part C -- the registry dependency boundary
+    # ------------------------------------------------------------------
+    # Trusting the CLI's packages blindly is the whole defect.
+    (
+        "the registry direct-dependency delta is verified",
+        INSTALL,
+        """        after = snapshot_direct_dependencies(self.project_root)
+        acceptable, offending = registry_dependency_delta_is_acceptable(
+            before, after, allowed_packages=allowed_packages
+        )
+        if not acceptable:""",
+        """        after = snapshot_direct_dependencies(self.project_root)
+        acceptable, offending = True, ()
+        if not acceptable:""",
+    ),
+    # A reviewed package in the wrong SECTION must be refused.
+    (
+        "a registry package in a non-runtime section is refused",
+        INSTALL,
+        """            if name not in allowed:
+                offending.add(name)
+            elif section != SECTION_DEPENDENCIES:
+                # Right package, wrong section: a registry must not move a
+                # runtime helper into devDependencies/optionalDependencies.
+                offending.add(name)""",
+        """            if name not in allowed:
+                offending.add(name)""",
+    ),
+    # A floating range must be normalized to the exact application pin.
+    (
+        "a registry-introduced range is normalized to an exact pin",
+        INSTALL,
+        """        already_exact = all(
+            after.get(SECTION_DEPENDENCIES, {}).get(package) == pins[package]
+            for package in introduced
+        )
+        if already_exact:
+            return _RegistryBoundaryResult(ok=True)""",
+        """        already_exact = True
+        if already_exact:
+            return _RegistryBoundaryResult(ok=True)""",
+    ),
+    # ------------------------------------------------------------------
+    # Part G -- 21st route false positives
+    # ------------------------------------------------------------------
+    # Reintroducing the route regex fabricates component identities.
+    (
+        "21st route paths never become component identities",
+        FETCH,
+        """    # 21st: NO verified component-identity schema exists in the documented
+    # surface. Route paths are not identities, so nothing is extracted. This is
+    # the honest degraded result, not a fabricated catalog.
+    if not _21ST_COMPONENT_IDENTITY_SCHEMA_VERIFIED:
+        return []
+
+    return found""",
+        """    import re as _re
+
+    for match in _re.finditer(r"/components/([a-z0-9]+(?:-[a-z0-9]+)*)\\b", text):
+        identity = match.group(1).strip()
+        if not component_id_is_valid(source, identity):
+            continue
+        if identity in seen:
+            continue
+        seen.add(identity)
+        found.append({"id": identity, "name": identity})
+        if len(found) >= MAX_PARSED_IDS:
+            break
+
+    return found""",
+    ),
+    # ------------------------------------------------------------------
+    # Part H -- the Impeccable degraded scan
+    # ------------------------------------------------------------------
+    # A degraded (regex-fallback) scan must not be treated as authoritative.
+    (
+        "a degraded engine scan is not authoritative",
+        CRITIC,
+        """    stderr = getattr(completed, "stderr", "") or ""
+    if DEGRADED_MARKER in stderr:""",
+        """    stderr = getattr(completed, "stderr", "") or ""
+    if False:""",
+    ),
+]
+
+
+def tests_for(relative: str) -> Tuple[str, ...]:
+    if relative == NPM_SPEC:
+        return (NPM_SPEC_TESTS,)
+    if relative == REGISTRY:
+        return (CONTRACT_TESTS, REGISTRY_TESTS, MUTATION_TESTS)
+    if relative == INSTALL:
+        return (MUTATION_TESTS, INSTALL_TESTS, PIN_TESTS)
+    if relative == FETCH:
+        return (FETCH_TESTS,)
+    if relative == CRITIC:
+        return (CRITIC_TESTS,)
+    return (NPM_SPEC_TESTS,)
+
+
+def run_tests(cwd, test_files):
+    if isinstance(test_files, str):
+        test_files = (test_files,)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            *test_files,
+            "-q",
+            "--no-header",
+            "-p",
+            "no:cacheprovider",
+        ],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+    )
+    lines = [line for line in result.stdout.strip().splitlines() if line.strip()]
+    return result.returncode, lines[-1] if lines else result.stderr.strip()[-140:]
+
+
+def main():
+    for label, path in (
+        ("Part F", NPM_SPEC_TESTS),
+        ("Part B", CONTRACT_TESTS),
+        ("Part C", MUTATION_TESTS),
+        ("Parts E/K", PIN_TESTS),
+        ("Part G", FETCH_TESTS),
+        ("Part H", CRITIC_TESTS),
+    ):
+        code, tail = run_tests(ROOT, path)
+        print(f"{label} baseline: exit={code} {tail}")
+        if code != 0:
+            return 1
+
+    print()
+    unproven = []
+    for label, relative, present, replacement in MUTATIONS:
+        target = ROOT / relative
+        original = target.read_text(encoding="utf-8")
+
+        if present not in original:
+            print(f"[ANCHOR-MISS] {label}")
+            unproven.append(f"{label}: anchor not found in {relative}")
+            continue
+
+        mutated = original.replace(present, replacement, 1)
+        if mutated == original:
+            print(f"[ANCHOR-MISS] {label} (replacement was a no-op)")
+            unproven.append(f"{label}: mutation changed nothing")
+            continue
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # The copy MUST be named `website-builder`: test_design_install.py
+            # resolves the shipped manifest as `parents[2]/website-builder/config`,
+            # so a differently-named tree makes those tests error at setup
+            # (environmental), which would masquerade as a mutation kill.
+            work = Path(tmp) / "website-builder"
+            shutil.copytree(ROOT, work, ignore=IGNORED)
+            destination = work / relative
+            if not destination.resolve().is_relative_to(work.resolve()):
+                print(f"[ABORT]      {label} -- target escapes the temp tree")
+                return 1
+            destination.write_text(mutated, encoding="utf-8")
+
+            code, tail = run_tests(work, tests_for(relative))
+            if code == 0:
+                print(f"[SURVIVED]   {label} -- tests still pass without this guard")
+                unproven.append(f"{label}: tests still pass without this guard")
+            elif "no tests ran" in tail or " errors in " in tail:
+                print(f"[INVALID]    {label} -- {tail}")
+                unproven.append(f"{label}: mutation invalidated collection ({tail})")
+            else:
+                print(f"[KILLED]     {label} -- {tail}")
+
+    print()
+    if unproven:
+        print(f"{len(unproven)} guard(s) unproven:")
+        for item in unproven:
+            print("  -", item)
+        return 1
+
+    print(f"all {len(MUTATIONS)} guards killed by the focused tests")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

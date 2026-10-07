@@ -420,14 +420,23 @@ def test_the_reviewed_component_resolves_to_its_canonical_locator():
 
 
 def test_a_reviewed_component_builds_a_typed_install_request():
+    """The reviewed SplitText contract, declared as the LIVE registry does.
+
+    The live document declares ``gsap@^3.13.0`` and ``@gsap/react@^2.1.2``. The
+    contract requires BOTH ids, so a request declaring only ``gsap`` is refused
+    (a separate test). This exercises the matching path.
+    """
     outcome = build_registry_request(
-        SOURCE_REACT_BITS, "SplitText", declared_dependencies=["gsap"]
+        SOURCE_REACT_BITS,
+        "SplitText",
+        declared_dependencies=["gsap@^3.13.0", "@gsap/react@^2.1.2"],
+        declared_registry_dependencies=[],
     )
 
     assert outcome.ok is True
     assert outcome.request.source == SOURCE_REACT_BITS
     assert outcome.request.component_id == "SplitText"
-    assert outcome.request.required_dependency_ids == ("gsap",)
+    assert outcome.request.required_dependency_ids == ("gsap", "gsap_react")
 
 
 def test_the_locator_host_and_source_match_is_enforced():
@@ -516,3 +525,63 @@ def test_live_smoke_is_documented_rather_than_executed():
     """This module never touches the network; the live path is opt-in."""
     transport = RecordingTransport(body=REAL_REACTBITS_INDEX.encode("utf-8"))
     assert discover_catalog(SOURCE_REACT_BITS, transport=transport).ok is True
+
+
+# ---------------------------------------------------------------------------
+# Part G: 21st route paths are NOT component identities
+# ---------------------------------------------------------------------------
+#
+# The VPS-found false positive: a parser that extracted ``/components/<x>`` from
+# the raw text turned 21st's ROUTE/CATEGORY links into fabricated catalog
+# identities. The real 21st surface is authenticated (HTTP 401 without a Bearer
+# key) and its public llms.txt publishes no component-identity schema.
+
+#: A trimmed slice of the REAL 21st llms.txt category/highlight routes -- the
+#: exact paths the old regex turned into fake identities.
+REAL_21ST_ROUTES = """# 21st (https://21st.dev)
+
+## Component categories
+- [Hero Sections](https://21st.dev/community/components/s/hero): landing page hero components
+- [Cards](https://21st.dev/community/components/s/card): card layouts
+- [Buttons](https://21st.dev/community/components/s/button): buttons
+
+## Community highlights
+- [Popular Components](https://21st.dev/community/components/popular): most used
+- [Latest Components](https://21st.dev/community/components/newest): newest
+- [Featured Components](https://21st.dev/community/components/featured): picks
+- [Weekly Best](https://21st.dev/community/components/week): top of the week
+"""
+
+
+def test_21st_route_paths_do_not_become_component_identities():
+    """NONE of the category/highlight routes may be a catalog identity."""
+    docs = parse_markdown_catalog(SOURCE_TWENTY_FIRST, REAL_21ST_ROUTES)
+
+    ids = {d["id"] for d in docs}
+    for forbidden in ("s", "popular", "newest", "featured", "week", "hero", "card", "button"):
+        assert forbidden not in ids, forbidden
+
+
+def test_a_21st_200_with_routes_only_yields_zero_entries():
+    """A network success with no identity schema is an EMPTY result, not a pass."""
+    transport = RecordingTransport(body=REAL_21ST_ROUTES.encode("utf-8"))
+
+    result = discover_catalog(SOURCE_TWENTY_FIRST, transport=transport)
+
+    assert result.entries == ()
+    assert result.ok is False, "no identities parsed must not be reported as ok"
+    assert result.warnings
+
+
+def test_the_react_bits_cli_marker_still_parses():
+    """The regression must not break the source that DOES publish a schema."""
+    docs = parse_markdown_catalog(SOURCE_REACT_BITS, REAL_REACTBITS_INDEX)
+
+    assert {d["id"] for d in docs} == {"ASCIIText", "BlurText", "CountUp"}
+
+
+def test_the_21st_schema_flag_is_explicitly_false():
+    """The verified fact: no unauthenticated 21st identity schema exists."""
+    import app.core.design_catalog_fetch as fetch
+
+    assert fetch._21ST_COMPONENT_IDENTITY_SCHEMA_VERIFIED is False

@@ -114,6 +114,18 @@ resources:
     # application-owned version/ref with a verified artifact digest. A build never
     # clones, downloads, or updates it. An absent skill is `unavailable_optional`
     # -- a degraded status that is never a startup failure.
+    #
+    # PARSER RUNTIME (Part H). The universal artifact ships NO `package.json`,
+    # so the detector's full static HTML/CSS engine is only available when four
+    # npm parser modules are provisioned into the skill's own `node_modules`
+    # (`htmlparser2 12.0.0`, `css-select 7.0.0`, `css-tree 3.2.1`,
+    # `domutils 4.0.2` -- the upstream skill-v4.1.0 `package.json` pins,
+    # application-owned in `design_install.IMPECCABLE_PARSER_PACKAGE_PINS`).
+    # They are provisioned ONLY during explicit profile setup, NEVER during a
+    # website build. Without them the engine prints
+    # `DEGRADED - HTML parser modules unavailable` and regex-falls-back; the
+    # capability report then sets `critic_degraded=True` and `authoritative=False`
+    # so a degraded clean scan is never treated as a pass.
     data_entries:
       - SKILL.md
       - reference/critique.md

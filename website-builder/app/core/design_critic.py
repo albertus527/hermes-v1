@@ -105,7 +105,16 @@ CRITIC_REASONS = (
     "output_unexpected",
     "output_empty",
     "truncated",
+    "parser_runtime_unavailable",
 )
+
+
+#: The exact marker the shipped ``detect.mjs`` writes to STDERR when the parser
+#: modules are missing and it falls back to regex. Verified in the skill-v4.1.0
+#: artifact (``detector/engines/static-html/detect-html.mjs``). Detecting it is
+#: what lets a caller tell a full-quality scan from an undercount -- a degraded
+#: clean result must never be read as authoritative.
+DEGRADED_MARKER = "DEGRADED - HTML parser modules unavailable"
 
 
 @dataclass(frozen=True)
@@ -116,11 +125,24 @@ class CriticOutcome:
     findings: Tuple[CriticFinding, ...] = ()
     truncated: bool = False
     reasons: Tuple[str, ...] = ()
+    #: True when the engine ran but reported its DEGRADED (regex-fallback) path,
+    #: so the findings are an UNDERCOUNT and a clean result is NOT authoritative.
+    #: Distinct from ``ok``: the scan succeeded, but at reduced quality.
+    degraded: bool = False
 
     def __post_init__(self) -> None:
         for reason in self.reasons:
             if reason not in CRITIC_REASONS:
                 raise ValueError(f"unknown critic reason: {reason!r}")
+
+    @property
+    def authoritative(self) -> bool:
+        """Whether a clean result may be trusted as full-quality.
+
+        False whenever the engine degraded, because a degraded clean scan is an
+        undercount, not a pass.
+        """
+        return self.ok and not self.degraded
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -128,6 +150,8 @@ class CriticOutcome:
             "findings": [finding.to_dict() for finding in self.findings],
             "truncated": self.truncated,
             "reasons": list(self.reasons),
+            "degraded": self.degraded,
+            "authoritative": self.authoritative,
         }
 
 
@@ -339,15 +363,41 @@ def run_critic_scan(
         logger.warning("Impeccable critic could not be executed: %s", type(error).__name__)
         return CriticOutcome(ok=False, reasons=("engine_not_executable",))
 
-    return parse_critic_output(
+    outcome = parse_critic_output(
         getattr(completed, "stdout", "") or "", getattr(completed, "returncode", 1)
     )
+
+    # The engine writes its DEGRADED notice to STDERR. When it does, the scan ran
+    # at reduced quality: the findings are an undercount, so a clean result is
+    # NOT authoritative. This is reported, never silently swallowed.
+    stderr = getattr(completed, "stderr", "") or ""
+    if DEGRADED_MARKER in stderr:
+        reasons = tuple(sorted(set(outcome.reasons) | {"parser_runtime_unavailable"}))
+        return CriticOutcome(
+            ok=outcome.ok,
+            findings=outcome.findings,
+            truncated=outcome.truncated,
+            reasons=reasons,
+            degraded=True,
+        )
+    return outcome
+
+
+def scan_is_authoritative(outcome: CriticOutcome) -> bool:
+    """Whether ``outcome`` is a full-quality, authoritative result.
+
+    A degraded scan is NOT authoritative even when ``ok``: its clean result is an
+    undercount. This is the single predicate a caller should gate "treat the
+    critic as having certified this design" on.
+    """
+    return outcome.authoritative
 
 
 __all__ = [
     "CRITIC_ARGV_SUFFIX",
     "CRITIC_ENGINE_ARGV_SUFFIX",
     "CRITIC_REASONS",
+    "DEGRADED_MARKER",
     "EXIT_CLEAN",
     "EXIT_FINDINGS",
     "EXIT_SCAN_FAILED",
@@ -359,4 +409,5 @@ __all__ = [
     "parse_critic_output",
     "resolve_engine_path",
     "run_critic_scan",
+    "scan_is_authoritative",
 ]

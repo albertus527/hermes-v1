@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.core.design_critic import (
     CRITIC_ARGV_SUFFIX,
     CRITIC_REASONS,
+    DEGRADED_MARKER,
     EXIT_CLEAN,
     EXIT_FINDINGS,
     EXIT_SCAN_FAILED,
@@ -37,6 +38,7 @@ from app.core.design_critic import (
     parse_critic_output,
     resolve_engine_path,
     run_critic_scan,
+    scan_is_authoritative,
 )
 from app.core.design_install import is_contained
 
@@ -96,14 +98,17 @@ REAL_FINDINGS = {
 class RecordingRunner:
     """Stands in for ``subprocess.run``; records argv, returns a canned result."""
 
-    def __init__(self, stdout="", returncode=0):
+    def __init__(self, stdout="", returncode=0, stderr=""):
         self.calls = []
         self.stdout = stdout
         self.returncode = returncode
+        self.stderr = stderr
 
     def __call__(self, argv, **kwargs):
         self.calls.append((tuple(argv), kwargs))
-        return SimpleNamespace(stdout=self.stdout, returncode=self.returncode, stderr="")
+        return SimpleNamespace(
+            stdout=self.stdout, returncode=self.returncode, stderr=self.stderr
+        )
 
     @property
     def argv(self):
@@ -652,3 +657,91 @@ def test_alias_keys_are_tolerated_for_the_same_concept():
     assert "m" in outcome.finding
     assert outcome.severity == "critical"
     assert outcome.suggested_action == "do it"
+
+
+# ---------------------------------------------------------------------------
+# Part H: the DEGRADED (regex-fallback) scan is not authoritative
+# ---------------------------------------------------------------------------
+#
+# The VPS-found defect: without the four parser modules the engine prints
+# ``DEGRADED - HTML parser modules unavailable`` to STDERR and falls back to
+# regex, which is an UNDERCOUNT. A clean result there must never be read as a
+# pass. These tests prove the degraded state is detected and reported.
+
+
+def test_a_degraded_scan_is_detected_from_stderr(tmp_path):
+    """The engine ran but degraded => ok, but NOT authoritative."""
+    runner = RecordingRunner(
+        stdout="[]", returncode=EXIT_CLEAN, stderr=DEGRADED_MARKER
+    )
+
+    outcome = run_critic_scan(
+        tmp_path / "detect.mjs", node_executable=NODE, runner=runner
+    )
+
+    assert outcome.ok is True, "the scan still succeeded"
+    assert outcome.degraded is True, "but it ran the degraded path"
+    assert outcome.authoritative is False
+    assert "parser_runtime_unavailable" in outcome.reasons
+
+
+def test_a_full_quality_scan_is_authoritative(tmp_path):
+    """No degraded marker => a clean scan is authoritative."""
+    runner = RecordingRunner(stdout="[]", returncode=EXIT_CLEAN, stderr="")
+
+    outcome = run_critic_scan(
+        tmp_path / "detect.mjs", node_executable=NODE, runner=runner
+    )
+
+    assert outcome.ok is True
+    assert outcome.degraded is False
+    assert outcome.authoritative is True
+
+
+def test_a_degraded_scan_with_findings_is_still_degraded(tmp_path):
+    """Findings do not make a degraded scan authoritative."""
+    runner = RecordingRunner(
+        stdout=json.dumps(REAL_FINDING_ARRAY),
+        returncode=EXIT_FINDINGS,
+        stderr=DEGRADED_MARKER,
+    )
+
+    outcome = run_critic_scan(
+        tmp_path / "detect.mjs", node_executable=NODE, runner=runner
+    )
+
+    assert outcome.degraded is True
+    assert outcome.authoritative is False
+    assert len(outcome.findings) == 2
+
+
+def test_scan_is_authoritative_matches_the_outcome_property():
+    assert scan_is_authoritative(CriticOutcome(ok=True, degraded=False)) is True
+    assert scan_is_authoritative(CriticOutcome(ok=True, degraded=True)) is False
+    assert scan_is_authoritative(CriticOutcome(ok=False)) is False
+
+
+def test_the_degraded_marker_matches_the_shipped_engine_text():
+    """The marker is the exact string the shipped detect.mjs writes."""
+    assert DEGRADED_MARKER == "DEGRADED - HTML parser modules unavailable"
+
+
+def test_the_degraded_flag_is_serialized():
+    payload = CriticOutcome(ok=True, degraded=True).to_dict()
+
+    assert payload["degraded"] is True
+    assert payload["authoritative"] is False
+
+
+def test_a_real_non_empty_finding_reports_every_real_field():
+    """Part H item 5: a REAL finding reads real fields, not just []."""
+    outcome = parse_critic_output(json.dumps(REAL_FINDING_ARRAY), EXIT_FINDINGS)
+
+    assert len(outcome.findings) == 2
+    first = outcome.findings[0]
+    # antipattern -> rule_id; description; severity; category; snippet -> evidence
+    assert first.rule_id == "text-on-surface"
+    assert first.category == "contrast"
+    assert first.severity == "warning"
+    assert "3.9:1" in first.finding
+    assert first.evidence == "color: #8a8f98 on #ffffff"

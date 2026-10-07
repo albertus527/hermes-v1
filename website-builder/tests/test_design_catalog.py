@@ -364,20 +364,30 @@ def test_a_catalog_entry_alone_cannot_become_an_install_request():
 
 
 def test_an_approved_component_flows_through_the_registry_boundary():
-    """The full path: catalog entry -> approved locator -> typed request."""
+    """The full path: catalog entry -> approved locator + contract -> typed request."""
     import app.core.design_registry as registry
 
     result = normalize_catalog(SOURCE_TWENTY_FIRST, TWENTY_FIRST_PAYLOAD)
     entry = result.entries[0]
 
+    # Approval now requires an identity AND a reviewed contract. The catalog
+    # entry declares no dependencies here, so the contract expects none.
     registry._APPROVED_COMPONENTS[SOURCE_TWENTY_FIRST] = frozenset(
         {entry.component_id}
+    )
+    registry._REVIEWED_COMPONENT_CONTRACTS[
+        (SOURCE_TWENTY_FIRST, entry.component_id)
+    ] = registry.ReviewedComponentContract(
+        source=SOURCE_TWENTY_FIRST,
+        component_id=entry.component_id,
+        expected_dependency_ids=tuple(entry.declared_dependency_ids),
+        expected_registry_dependencies=(),
     )
     try:
         outcome = build_registry_request(
             entry.source,
             entry.component_id,
-            declared_dependencies=list(entry.unknown_dependency_ids),
+            declared_dependencies=list(entry.declared_dependency_ids),
         )
         assert outcome.ok is True
         assert outcome.request.registry_locator_id.startswith("https://21st.dev/")
@@ -388,6 +398,9 @@ def test_an_approved_component_flows_through_the_registry_boundary():
         ) == outcome.request.registry_locator_id
     finally:
         registry._APPROVED_COMPONENTS[SOURCE_TWENTY_FIRST] = frozenset()
+        registry._REVIEWED_COMPONENT_CONTRACTS.pop(
+            (SOURCE_TWENTY_FIRST, entry.component_id), None
+        )
 
 
 def test_a_non_installable_component_is_refused_even_when_approved():

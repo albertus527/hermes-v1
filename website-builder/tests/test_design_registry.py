@@ -77,6 +77,11 @@ def approved(monkeypatch):
     the monkeypatch fixture restores -- lets the suite exercise the approved
     path without the production allowlist being pre-populated with names no
     human has reviewed.
+
+    An approved IDENTITY is no longer sufficient on its own: the reviewed
+    dependency CONTRACT is also required, because a name allowlist cannot detect
+    an added/removed dependency. So this fixture installs BOTH -- a matching
+    contract whose expected dependencies are the ones the tests declare.
     """
     import app.core.design_registry as registry
 
@@ -86,6 +91,24 @@ def approved(monkeypatch):
         {
             SOURCE_TWENTY_FIRST: frozenset({APPROVED_21ST}),
             SOURCE_REACT_BITS: frozenset({APPROVED_REACT_BITS}),
+        },
+    )
+    monkeypatch.setattr(
+        registry,
+        "_REVIEWED_COMPONENT_CONTRACTS",
+        {
+            (SOURCE_TWENTY_FIRST, APPROVED_21ST): registry.ReviewedComponentContract(
+                source=SOURCE_TWENTY_FIRST,
+                component_id=APPROVED_21ST,
+                expected_dependency_ids=(),
+                expected_registry_dependencies=(),
+            ),
+            (SOURCE_REACT_BITS, APPROVED_REACT_BITS): registry.ReviewedComponentContract(
+                source=SOURCE_REACT_BITS,
+                component_id=APPROVED_REACT_BITS,
+                expected_dependency_ids=(),
+                expected_registry_dependencies=(),
+            ),
         },
     )
     return registry

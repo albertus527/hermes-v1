@@ -376,12 +376,29 @@ def _decode_payload(body: bytes) -> Optional[Any]:
 
 
 #: The marker upstream uses for the CLI-installable identifier, then a
-#: backticked token. Verified in reactbits.dev/llms.txt.
+#: backticked token. Verified in reactbits.dev/llms.txt, where it is the ONLY
+#: documented identity surface.
 _CLI_MARKER = re.compile(r"CLI:\s*`([A-Za-z0-9][A-Za-z0-9_-]*)`")
 
-#: 21st documents install ids as slash paths (e.g. ``/@author/components/slug``)
-#: and lowercase slugs; the identity is the trailing slug.
-_21ST_SLUG = re.compile(r"/components/([a-z0-9]+(?:-[a-z0-9]+)*)\b")
+#: 21st documents component PAGES as ``/@author/components/<slug>`` and CATEGORY
+#: pages as ``/community/components/s/<tag>``, ``/community/components/popular``,
+#: ``/newest``, ``/featured``, ``/week``. Those are ROUTES, not component
+#: identities: the ``/components/<x>`` segment names a page path, and the bare
+#: highlight slugs (``popular``, ``newest``, ``featured``, ``week``) and the
+#: single-letter category prefix (``s`` in ``/components/s/hero``) are NOT
+#: installable component ids.
+#:
+#: The previous revision extracted ``/components/([a-z0-9-]+)`` from the raw
+#: text, which turned every one of those routes into a fabricated catalog
+#: identity. That is the false-positive this repair removes.
+#:
+#: Verified live (2026-10): 21st's ``llms.txt`` publishes NO machine-readable
+#: component-identity schema. Its real machine surface is the authenticated REST
+#: API (``/api/v1/components/search``), which returns HTTP 401 without a Bearer
+#: key. So there is NO unauthenticated official component catalog to parse, and
+#: this parser correctly produces ZERO identities from the documentation index
+#: rather than inventing them from route text.
+_21ST_COMPONENT_IDENTITY_SCHEMA_VERIFIED = False
 
 #: Upper bound on how many component lines one index may contribute. Upstream
 #: lists hundreds; the normalizer applies its own budget, and this keeps the
@@ -395,6 +412,12 @@ def parse_markdown_catalog(source: str, text: str) -> Any:
     Returns ``[]`` (a well-formed but empty listing) rather than raising on
     anything unrecognized: an index this application cannot read is a degraded
     empty result, never a fabricated entry.
+
+    Only a VERIFIED identity marker is accepted. React Bits publishes one
+    (``CLI: `X` ``); 21st publishes NONE in its documentation index, so its
+    routes (``/components/popular``, ``/components/s/hero``, ...) yield zero
+    identities instead of fabricated ones. A 200 response whose body carries no
+    recognized identity schema is therefore an EMPTY result, not a success.
     """
     from app.core.design_catalog import component_id_is_valid
 
@@ -408,7 +431,8 @@ def parse_markdown_catalog(source: str, text: str) -> Any:
     seen = set()
 
     if source == SOURCE_REACT_BITS:
-        # React Bits documents PascalCase CLI identifiers.
+        # React Bits documents PascalCase CLI identifiers behind an explicit
+        # `CLI:` marker. That marker IS the verified schema.
         for match in _CLI_MARKER.finditer(text):
             identity = match.group(1).strip()
             if not component_id_is_valid(source, identity):
@@ -421,17 +445,11 @@ def parse_markdown_catalog(source: str, text: str) -> Any:
                 break
         return found
 
-    # 21st: component slugs appear in documented `/components/<slug>` paths.
-    for match in _21ST_SLUG.finditer(text):
-        identity = match.group(1).strip()
-        if not component_id_is_valid(source, identity):
-            continue
-        if identity in seen:
-            continue
-        seen.add(identity)
-        found.append({"id": identity, "name": identity})
-        if len(found) >= MAX_PARSED_IDS:
-            break
+    # 21st: NO verified component-identity schema exists in the documented
+    # surface. Route paths are not identities, so nothing is extracted. This is
+    # the honest degraded result, not a fabricated catalog.
+    if not _21ST_COMPONENT_IDENTITY_SCHEMA_VERIFIED:
+        return []
 
     return found
 

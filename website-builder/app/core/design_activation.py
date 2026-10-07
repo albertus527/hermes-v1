@@ -139,6 +139,14 @@ REASON_ENGINE_VERIFIED = (
 REASON_ENGINE_MISSING = (
     "the provisioned skill has no detector engine; no download is attempted"
 )
+REASON_ENGINE_DEGRADED = (
+    "the detector engine is present but its parser runtime is unavailable; the "
+    "scan is degraded and NOT an authoritative clean"
+)
+REASON_ENGINE_FULL_QUALITY = (
+    "the detector engine and its parser runtime are present; the scan is "
+    "full-quality"
+)
 
 #: Exhaustive. A reason outside this set is a bug, and callers switch on these
 #: strings; a new spelling would be a new, unhandled state.
@@ -157,6 +165,8 @@ ACTIVATION_REASONS: frozenset = frozenset(
         REASON_CLI_PINNED,
         REASON_ENGINE_VERIFIED,
         REASON_ENGINE_MISSING,
+        REASON_ENGINE_DEGRADED,
+        REASON_ENGINE_FULL_QUALITY,
     }
 )
 
@@ -233,6 +243,65 @@ def resolve_engine_path(skill_root: Path) -> Optional[Path]:
     return root / ENGINE_ENTRYPOINTS[0]
 
 
+#: The directory inside the skill where the parser runtime is provisioned. The
+#: modules are resolved by Node's normal ``node_modules`` lookup from the skill
+#: scripts, so they live at ``<skill>/node_modules``. Provisioning writes them
+#: there; a build never does.
+PARSER_RUNTIME_DIRNAME = "node_modules"
+
+#: The parser modules the full static-HTML engine imports, verified against the
+#: shipped ``detect-html.mjs`` (``import('htmlparser2')`` etc.). Mirrors
+#: ``design_install.IMPECCABLE_PARSER_PACKAGE_PINS`` by package name; kept as a
+#: tuple here so this module does not import the install layer at load time.
+PARSER_RUNTIME_PACKAGES: Tuple[str, ...] = (
+    "htmlparser2",
+    "css-select",
+    "css-tree",
+    "domutils",
+)
+
+
+def parser_runtime_is_provisioned(skill_root: Path) -> bool:
+    """Whether every parser module is present under the skill's ``node_modules``.
+
+    Presence is checked as a directory per package (``node_modules/<pkg>``); the
+    module itself is a ``.mjs``/``.js`` inside it, but a package directory that
+    exists is what Node's resolver needs to resolve the bare import. A missing
+    directory means the engine would print DEGRADED and fall back to regex, so
+    this is the difference between a full-quality scan and an undercount.
+
+    Offline and pure: filesystem inspection only, no import, no execution.
+    """
+    modules_dir = Path(skill_root) / PARSER_RUNTIME_DIRNAME
+    try:
+        if not modules_dir.is_dir():
+            return False
+    except OSError:
+        return False
+    for package in PARSER_RUNTIME_PACKAGES:
+        try:
+            if not (modules_dir / package).is_dir():
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def engine_quality(skill_root: Path) -> str:
+    """``"full"`` | ``"degraded"`` | ``"missing"`` for the engine at ``skill_root``.
+
+    ``missing`` -- the entrypoints themselves are absent.
+    ``degraded`` -- the engine exists but the parser runtime does not, so a scan
+    is an undercount and a clean result is NOT authoritative.
+    ``full`` -- engine AND parser runtime present; a scan is full-quality.
+    """
+    if resolve_engine_path(skill_root) is None:
+        return "missing"
+    if not parser_runtime_is_provisioned(skill_root):
+        return "degraded"
+    return "full"
+
+
 # ---------------------------------------------------------------------------
 # Credential PRESENCE -- never a credential value
 # ---------------------------------------------------------------------------
@@ -304,6 +373,12 @@ class ResourceActivationCapability:
     retrieval_available: bool = False
     install_available: bool = False
     critic_available: bool = False
+    #: The critic can be INVOKED and its findings parsed, but it is running the
+    #: DEGRADED (regex-fallback) path, so its findings are an UNDERCOUNT and a
+    #: clean result is NOT authoritative. Distinct from ``critic_available``:
+    #: a degraded critic is callable but must never be treated as a full-quality
+    #: pass. Impeccable sets this when the parser runtime is absent.
+    critic_degraded: bool = False
     authentication_required: bool = False
     #: An OPTIONAL, separately-gated enhancement is unmet. Distinct from
     #: `authentication_required`: that one says the capability being reported is
@@ -344,6 +419,7 @@ class ResourceActivationCapability:
             "retrieval_available": self.retrieval_available,
             "install_available": self.install_available,
             "critic_available": self.critic_available,
+            "critic_degraded": self.critic_degraded,
             "authentication_required": self.authentication_required,
             "authentication_optional": self.authentication_optional,
             "authentication_present": self.authentication_present,
@@ -547,14 +623,19 @@ def _catalog_capability(
 ) -> ResourceActivationCapability:
     """A remote catalog resource (21st, React Bits).
 
-    21st splits its surface: metadata ``search`` is free while component
-    retrieval is paid. So ``discovery_available`` can be ``True`` while
-    ``retrieval_available`` is ``False`` -- two true facts about one resource,
-    which is exactly why the model is multi-dimensional rather than an enum.
+    ``metadata_without_auth`` states whether the catalog can be LISTED with no
+    credential. It must be the truth about the PRODUCTION adapter, not the
+    marketing tier: 21st's real machine surface is an authenticated REST API
+    (verified live -- ``/api/v1/components/search`` returns HTTP 401 without a
+    Bearer key) and its public ``llms.txt`` publishes no component-identity
+    schema, so 21st's discovery is credential-gated. React Bits publishes an
+    unauthenticated agent index with an explicit ``CLI:`` marker, so its
+    discovery needs no credential.
 
-    React Bits has no credential, so both its metadata and its registry are
-    reachable locally-declared; its ``install_available`` is still governed by
-    D2 selection, so it reports the capability's existence, not an install.
+    Discovery therefore follows the credential WHENEVER the mechanism requires
+    one: a resource whose only real surface is authenticated must NOT report
+    ``discovery_available=True`` on the strength of a public page that yields no
+    identities. The honest state is a bounded credential-required/degraded one.
     """
     auth_required = retrieval_requires_auth
     auth_present = credential_present(credential_names) if credential_names else False
@@ -577,7 +658,11 @@ def _catalog_capability(
         # An install capability with nothing reviewed is not a capability.
         reasons.append(REASON_NO_REVIEWED_COMPONENT)
 
-    discovery = adapter_exists and metadata_without_auth
+    # Discovery is available when the adapter exists AND either the catalog is
+    # listable without a credential OR a credential is present. A credentialed
+    # mechanism with no credential is a bounded credential-required state, NOT a
+    # free-discovery claim.
+    discovery = adapter_exists and (metadata_without_auth or auth_present)
     install = install_available and reviewed_components > 0
 
     return ResourceActivationCapability(
@@ -592,8 +677,9 @@ def _catalog_capability(
         authentication_required=auth_required,
         authentication_present=auth_present,
         locally_provisioned=False,
-        # Free metadata working is the designed state; a MISSING adapter is
-        # a genuine reduction in what this build can do.
+        # Free metadata working is the designed state; a MISSING adapter OR an
+        # unmet required credential is a genuine reduction in what this build
+        # can do.
         degraded=not discovery,
         reasons=_dedupe(reasons),
     )
@@ -658,9 +744,9 @@ def _impeccable_capability(
         return _absent(resource_id, [REASON_SKILL_ARTIFACTS_MISSING])
 
     skill_root = design_profile_skills_dir(hermes_home) / str(resource.skill_name)
-    engine_verified = resolve_engine_path(skill_root) is not None
+    quality = engine_quality(skill_root)
 
-    if not engine_verified:
+    if quality == "missing":
         return ResourceActivationCapability(
             resource_id=resource_id,
             discovery_available=True,
@@ -671,18 +757,47 @@ def _impeccable_capability(
             ),
         )
 
+    if quality == "degraded":
+        # The engine runs, but its parser runtime is absent, so the detector
+        # prints DEGRADED and falls back to regex -- an UNDERCOUNT. The critic
+        # is CALLABLE, so `critic_available=True`, but `critic_degraded=True`
+        # marks it as NOT authoritative: a clean result here must never be
+        # treated as a full-quality pass.
+        return ResourceActivationCapability(
+            resource_id=resource_id,
+            discovery_available=True,
+            retrieval_available=True,
+            critic_available=True,
+            critic_degraded=True,
+            install_available=False,
+            authentication_required=False,
+            authentication_present=False,
+            locally_provisioned=True,
+            degraded=True,
+            reasons=_dedupe(
+                [REASON_LOCALLY_PROVISIONED, REASON_ENGINE_DEGRADED]
+            ),
+        )
+
     return ResourceActivationCapability(
         resource_id=resource_id,
         discovery_available=True,
         retrieval_available=True,
         critic_available=True,
+        critic_degraded=False,
         # Impeccable is a reviewer, never something to install into a project.
         install_available=False,
         authentication_required=False,
         authentication_present=False,
         locally_provisioned=True,
         degraded=False,
-        reasons=_dedupe([REASON_LOCALLY_PROVISIONED, REASON_ENGINE_VERIFIED]),
+        reasons=_dedupe(
+            [
+                REASON_LOCALLY_PROVISIONED,
+                REASON_ENGINE_VERIFIED,
+                REASON_ENGINE_FULL_QUALITY,
+            ]
+        ),
     )
 
 
@@ -751,11 +866,14 @@ def activate_resource(
     if resource_id == "twenty_first":
         return _catalog_capability(
             resource_id,
-            # Upstream: `search` is metadata-only and free; `get_component` is
-            # paid. The free REST surface still requires a Bearer key, so
-            # discovery here is credential-gated exactly like retrieval --
-            # the upstream product is free, this application is not.
-            metadata_without_auth=True,
+            # VERIFIED LIVE (2026-10): 21st's real machine surface is the
+            # authenticated REST API (`/api/v1/components/search` -> HTTP 401
+            # without a Bearer key), and its public `llms.txt` publishes NO
+            # component-identity schema (only route/category links). So there is
+            # no unauthenticated component catalog to list: discovery is
+            # credential-gated, exactly like retrieval. Reporting free discovery
+            # would repeat the exact lie this repair removes.
+            metadata_without_auth=False,
             retrieval_requires_auth=True,
             credential_names=CREDENTIAL_ENV_NAMES["twenty_first"],
             install_available=True,
@@ -844,12 +962,16 @@ __all__ = [
         "CREDENTIAL_ENV_NAMES",
         "ENGINE_ENTRYPOINTS",
         "INSTALLABLE_ON_DEMAND",
+        "PARSER_RUNTIME_DIRNAME",
+        "PARSER_RUNTIME_PACKAGES",
         "DesignActivationReport",
         "ResourceActivationCapability",
         "activate_design_resources",
         "activate_resource",
         "credential_present",
+        "engine_quality",
         "engine_relative_paths",
+        "parser_runtime_is_provisioned",
         "resolve_engine_path",
         "verify_local_skill",
 ]
