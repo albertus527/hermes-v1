@@ -338,6 +338,31 @@ def test_a_request_cannot_carry_a_non_allowlisted_dependency(approved):
         )
 
 
+def test_a_builtin_request_cannot_carry_dependency_ids_at_all():
+    """A builtin's direct dependencies are reviewed per component in
+    ``REVIEWED_BUILTIN_COMPONENT_DEPENDENCIES`` (plus emitted-source imports);
+    the request carries none. Accepting ids here would let a caller assert a
+    dependency contract for a builtin the reviewed table never declared."""
+    # Allowlisted ids are refused too: the shape itself is wrong for a builtin.
+    for deps in (("gsap",), ("gsap", "three"), ("gsap_react",)):
+        with pytest.raises(ValueError):
+            RegistryInstallRequest(
+                source=SOURCE_SHADCN_BUILTIN,
+                component_id="button",
+                registry_locator_id="",
+                required_dependency_ids=deps,
+            )
+    # And the empty-tuple shape the application actually produces is accepted.
+    request = RegistryInstallRequest(
+        source=SOURCE_SHADCN_BUILTIN,
+        component_id="button",
+        registry_locator_id="",
+        required_dependency_ids=(),
+    )
+    assert request.required_dependency_ids == ()
+    assert request.is_builtin is True
+
+
 def test_a_builtin_request_cannot_carry_a_non_allowlisted_dependency():
     """The allowlist check is load-bearing for the BUILTIN path.
 

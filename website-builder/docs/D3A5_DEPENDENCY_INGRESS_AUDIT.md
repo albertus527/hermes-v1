@@ -97,6 +97,25 @@ Per the task, Hermes does **not** attempt to pin the universe of transitive npm
 dependencies. The guarded boundary is the set of dependencies introduced
 **directly** by a design registry or resource installation operation.
 
+### The shadcn builtin registry path
+
+`SOURCE_SHADCN_BUILTIN` is a **local, named** registry path, deliberately disjoint
+from the external URL path:
+
+- It has **no host** (absent from `REGISTRY_HOSTS`) and **no locator template**
+  (absent from `_LOCATOR_TEMPLATES`); `resolve_registry_locator` returns `None`
+  for it, and `_APPROVED_COMPONENTS[shadcn_builtin]` is **empty**.
+- A builtin is requested by **name** against the 16-name allowlist; its argv is
+  `shadcn add <name> --yes --overwrite` — **no URL ever reaches argv**.
+- A builtin `RegistryInstallRequest` must carry **no locator** and **no
+  dependency ids**: its direct packages are reviewed per component in
+  `REVIEWED_BUILTIN_COMPONENT_DEPENDENCIES` (plus emitted-source imports in
+  `REVIEWED_BUILTIN_COMPONENT_IMPORTS`). A directly-constructed request supplying
+  ids — allowlisted or not — is refused, so a caller cannot assert a dependency
+  contract the reviewed table never declared.
+- `install_external_component` refuses a builtin request outright (no command),
+  so the two paths cannot be crossed in either direction.
+
 ### Intended policy, stated explicitly (Option 1)
 
 **`package.json` direct-dependency declarations are authoritative. The

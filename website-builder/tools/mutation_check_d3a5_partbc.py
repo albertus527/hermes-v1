@@ -447,6 +447,22 @@ MUTATIONS = [
                 "project dependency."
             )""",
     ),
+    # 12b. A builtin request must not carry dependency ids at all.
+    (
+        "a builtin request cannot carry dependency ids",
+        REGISTRY,
+        """            if self.required_dependency_ids and all(
+                dependency_id in DEPENDENCY_PACKAGES
+                for dependency_id in self.required_dependency_ids
+            ):
+                raise ValueError(
+                    "a shadcn builtin request must not carry required dependency ids"
+                )""",
+        """            if False:
+                raise ValueError(
+                    "a shadcn builtin request must not carry required dependency ids"
+                )""",
+    ),
     # 12. The pinned CLI's DIRECT-package allowlist must be the reviewed set,
     #     not silently widened by an extra entry.
     (

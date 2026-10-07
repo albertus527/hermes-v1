@@ -499,6 +499,23 @@ class RegistryInstallRequest:
                 raise ValueError(
                     f"component is not an approved shadcn builtin: {self.component_id!r}"
                 )
+            # A builtin's direct dependencies are reviewed per component in
+            # ``REVIEWED_BUILTIN_COMPONENT_DEPENDENCIES`` (plus its emitted-source
+            # imports); the request carries no dependency ids. A directly
+            # constructed builtin request supplying some is not a shape the
+            # application produces, and accepting it would let a caller assert a
+            # dependency contract for a builtin that the reviewed table never
+            # declared. Refuse it rather than ignore it. This is deliberately
+            # scoped to ids the allowlist gate BELOW would accept, so that gate
+            # stays the single guard for an unknown id and this one is the single
+            # guard for a known id on a builtin.
+            if self.required_dependency_ids and all(
+                dependency_id in DEPENDENCY_PACKAGES
+                for dependency_id in self.required_dependency_ids
+            ):
+                raise ValueError(
+                    "a shadcn builtin request must not carry required dependency ids"
+                )
         else:
             if not isinstance(self.registry_locator_id, str) or not self.registry_locator_id:
                 raise ValueError("an external registry request requires a locator")
