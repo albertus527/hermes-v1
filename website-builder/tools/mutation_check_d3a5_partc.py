@@ -545,6 +545,17 @@ MUTATIONS = [
         """    if status == 429:
         return REASON_BAD_STATUS""",
     ),
+    # --- 25. the doc does not claim a socket ban the suite does not have
+    # The default suite is offline (no non-loopback network) but the
+    # port-allocation tests bind LOOPBACK sockets, so a blanket "bans sockets"
+    # claim is false. Reintroduce the stale wording; the coherence doc-integrity
+    # test must fail.
+    (
+        "the doc does not claim a socket ban the suite lacks",
+        AUDIT_DOC,
+        "The default suite is **offline** (no non-loopback network), enforced by",
+        "The suite bans sockets (`socket.socket.connect`, `create_connection`), enforced by",
+    ),
 ]
 
 

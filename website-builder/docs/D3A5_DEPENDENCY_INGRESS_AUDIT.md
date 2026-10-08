@@ -655,7 +655,7 @@ whose stated purpose is catching DRIFT between layers. The assertions:
 * every installable on-demand resource has the mechanism its axis claims.
 
 These run in the partc driver (`RUN_TESTS`), so the `21st is credential-gated`
-mutation now kills 7 tests rather than 3 -- the drift cannot return without the
+mutation now kills 8 tests rather than 3 -- the drift cannot return without the
 coherence regression going red.
 
 ### A configured credential must actually REACH the request
@@ -1955,7 +1955,7 @@ What it proves, in three blocks:
    excluded, not silently run.
 2. **Every mutation driver kills all its guards, at the PINNED count.** A driver
    prints "all N guards killed", which stays true if a mutation is DELETED -- so
-   the runner pins each N externally (`parta 16`, `partbc 73`, `partc 37`,
+   the runner pins each N externally (`parta 16`, `partbc 73`, `partc 38`,
    `partd 36`, `parti 18`). A dropped guard makes the count mismatch and the
    proof FAIL. The three legacy D0/D1/D2-D3a drivers are reported for the record
    (separate work; their host-masked kills are a documented artifact).
@@ -1973,15 +1973,41 @@ what turns the driver's honest self-report into a checkable claim -- the same
 built on.
 
 **Observed on the qualification host (2026-10):** `13/13 checks passed`,
-`VERDICT: PASS` -- suite `3570 passed, 2 skipped, 4 deselected` (offline),
-drivers `16 / 73 / 35 / 36 / 18` and legacy `9 / 33 / 25`, guardrails all green.
+`VERDICT: PASS` -- suite `3604 passed, 2 skipped, 4 deselected` (offline),
+drivers `16 / 73 / 38 / 36 / 18` and legacy `9 / 33 / 25`, guardrails all green.
 (13 = 1 suite + 5 D3a.5 drivers + 3 legacy drivers + 4 guardrails.)
+
+### A stale-claim sweep of the batch diff
+
+Reviewing the batch's own `git diff` for comments/docs whose claims no longer
+match the code found three stale claims, all in the audit doc:
+
+- **A "socket ban" that does not exist** — the doc claimed the suite bans
+  sockets outright (three places). FALSE. No conftest patches `socket`; the
+  offline guard (`tests/test_suite_offline.py`) allows **loopback**, and the
+  port-allocation tests legitimately bind `127.0.0.1:0`. The honest property is
+  "offline — no non-loopback network".
+- **Part M's observed tally** said `partc 35` / suite `3570` — stale after partc
+  grew and the suite passed 3604. Corrected to `partc 38` / `3604`.
+- **"the `21st is credential-gated` mutation now kills 7 tests"** — the real
+  count is **8** (measured: `8 failed`). Corrected.
+
+Each correction is pinned: `tests/test_design_resource_coherence.py` now asserts
+the doc contains `drivers \`16 / 73 / 38 / 36 / 18\`` and does NOT contain the
+socket-ban wording, and `partc` guard #25 reintroduces the stale socket claim to
+prove that assertion is load-bearing (2 failed).
+
+**The lesson, once more:** a number written into prose is a claim like any other,
+and it drifts the moment the code it describes moves. Every count the doc states
+that is derivable offline is now either pinned by a test or measured from the
+artifact (the final-proof runner pins the driver counts from outside).
 
 ## Part L — manual LIVE smokes (run AFTER the unit suite)
 
-The unit suite is socket-free by construction, so every claim that has a LIVE
-dimension is proven here by hand against the real upstreams / the real pinned CLI.
-Run these **after** `pytest tests/` is green, never instead of it.
+The default suite is offline (no non-loopback network) by construction, so every
+claim that has a LIVE dimension is proven here by hand against the real upstreams
+/ the real pinned CLI. Run these **after** `pytest tests/` is green, never
+instead of it.
 
 **Order matters:** the unit suite proves the logic offline; these smokes prove the
 same logic still holds against reality. A smoke that passes offline too is not a
@@ -2423,8 +2449,9 @@ is defined but never collected is not a test.
 ### The default suite is OFFLINE -- and a real violation was found + fixed
 
 **Constraint: normal `pytest` must never depend on the internet.** The suite is
-supposed to be socket-free, and the live smokes are documented rather than run
-for exactly that reason. Auditing it found one real violation:
+supposed to be offline (no non-loopback network), and the live smokes are
+documented rather than run for exactly that reason. Auditing it found one real
+violation:
 
 `tests/test_starter_toolchain.py` ran the **real `npm ci`** (four command
 assertions), which resolves every package from the npm registry. It was gated
@@ -2457,10 +2484,15 @@ other socket users bind **loopback** (the port-allocation tests).
 
 ### Why these are manual, not in the suite
 
-The suite bans sockets (`socket.socket.connect`, `create_connection`,
-`getaddrinfo`) and does not shell out to `npm`. A live smoke therefore cannot be a
-unit test without weakening that ban. The doc records the COMMANDS and the
-OBSERVED outputs; the suite separately pins the offline behaviour
+The default suite is **offline** (no non-loopback network), enforced by
+`tests/test_suite_offline.py`, which fails if any non-integration test resolves
+or runs a network CLI (`npm`/`npx`/`pnpm`/`yarn`/`pip`/`curl`/`wget`/`gh`) or
+calls a network entry point against a non-loopback host. It is NOT a socket
+*ban*: the port-allocation tests legitimately bind **loopback** sockets
+(`127.0.0.1:0`), and the guard deliberately allows loopback. A live smoke needs a
+real non-loopback call, so it cannot be a unit test without an
+`@pytest.mark.integration` mark. The doc records the COMMANDS and the OBSERVED
+outputs; the suite separately pins the offline behaviour
 (`test_live_smoke_is_documented_rather_than_executed`) and the fact that every
 symbol these commands import still exists.
 

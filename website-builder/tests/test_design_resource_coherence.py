@@ -593,11 +593,11 @@ def test_every_installable_on_demand_resource_has_a_real_mechanism():
 # Part L: the manual LIVE smokes must stay runnable
 # ---------------------------------------------------------------------------
 # The audit doc records manual live smokes (Part L). They are NOT run in this
-# suite -- the suite is socket-free -- but the COMMANDS must keep naming real
-# symbols and the real CLI pin, or a reader following the doc would hit an
-# ImportError or an unpinned CLI. This guard is the doc's anti-rot check: it
-# resolves every symbol the documented commands import, and pins the CLI version
-# the documented `npm exec` lines hard-code.
+# suite -- the default suite is offline (no non-loopback network) -- but the
+# COMMANDS must keep naming real symbols and the real CLI pin, or a reader
+# following the doc would hit an ImportError or an unpinned CLI. This guard is
+# the doc's anti-rot check: it resolves every symbol the documented commands
+# import, and pins the CLI version the documented `npm exec` lines hard-code.
 
 
 #: The audit doc that records the manual live smokes.
@@ -965,9 +965,37 @@ def test_the_doc_has_the_final_proof_part_m_section():
     assert "d3a5_final_proof.py" in text
     assert "VERDICT" in text
     # The pinned counts must be the real ones (a dropped guard changes a count).
-    assert "`parta 16`, `partbc 73`, `partc 37`" in text
+    assert "`parta 16`, `partbc 73`, `partc 38`" in text
     # The observed tally must be the real one (13 = 1 suite + 8 drivers + 4 rails).
     assert "`13/13 checks passed`" in text
+    # The observed driver tally must match the pinned counts too -- this is the
+    # line that went stale when partc grew to 38 and the suite to 3604.
+    assert "drivers `16 / 73 / 38 / 36 / 18`" in text
+
+
+def test_the_doc_does_not_claim_a_socket_ban_the_suite_does_not_have():
+    """The doc must NOT claim the suite 'bans sockets' -- it does not.
+
+    The suite is offline (no non-loopback network), enforced by
+    ``tests/test_suite_offline.py``. But the port-allocation tests bind loopback
+    sockets (``127.0.0.1:0``) and the guard deliberately allows loopback, so a
+    blanket 'bans sockets' claim is false. Pin the honest wording.
+    """
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    assert "The suite bans sockets" not in text
+    assert "socket-free by construction" not in text
+    # The honest phrasing must be present instead.
+    assert "no non-loopback network" in text
+    assert "loopback" in text
+
+
+def test_the_doc_records_the_stale_claim_sweep():
+    """The sweep section must exist and record what it corrected."""
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    assert "### A stale-claim sweep of the batch diff" in text
+    assert "three stale claims" in text
 
 
 def test_the_doc_has_the_source_review_bullets_part_n_section():
