@@ -236,6 +236,23 @@ GET https://21st.dev/api/v1/components/search?q=<term>&scope=public&limit=24
 - **No fabrication.** A malformed or empty search response is a degraded empty
   result, never an invented entry.
 
+### The artifact contract: `required: transitions/<slug>.md`, `optional: (none)`
+
+The optional half is EMPTY, and that is the verified upstream truth:
+
+* `RECIPE_OPTIONAL_SUFFIXES = ()`; `RECIPE_SUFFIXES = (".md",)`.
+* The real `transitions-dev@0.3.0` tarball ships only `free/<slug>.md`; `add`
+  writes exactly one file. So no companion is part of the artifact.
+* A stray `.css` beside the Markdown is IGNORED by the default verifier, not
+  counted (verified: `.md` + `.css` -> `('card-resize.md',)`).
+* The `optional_suffixes` parameter is reachable ONLY by explicit injection, and
+  exists so a future genuinely-shipped companion can be added WITHOUT
+  reintroducing a requirement. It is not dead: passing `(".css",)` accepts a
+  present companion and is exercised by tests.
+
+The empty set is load-bearing, not incidental: making it `(".css",)` fails 2
+tests, and a mutation guard pins that.
+
 ### Transitions materialization is exactly `transitions/<slug>.md`
 
 Re-verified against the REAL `transitions-dev@0.3.0` package (downloaded from the

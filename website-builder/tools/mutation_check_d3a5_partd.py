@@ -370,6 +370,15 @@ MUTATIONS = [
         return None
     return tuple(cli_prefix) + ("add", slug)""",
     ),
+    # --- 20a. the optional suffix set is EMPTY (upstream emits none) -----
+        # A non-empty optional set would make a companion part of the artifact.
+        # Upstream emits only the Markdown, so the set must stay empty.
+    (
+        "the recipe optional suffix set is empty",
+        TRANSITIONS,
+        """RECIPE_OPTIONAL_SUFFIXES: Tuple[str, ...] = ()""",
+        """RECIPE_OPTIONAL_SUFFIXES: Tuple[str, ...] = (".css",)""",
+    ),
     # --- 20b. the verifier's docstring matches the suffix table ---------
         # The docstring once claimed a .css is "accepted if and only if upstream
         # emitted one", which reads as "a present .css IS accepted". The table is
