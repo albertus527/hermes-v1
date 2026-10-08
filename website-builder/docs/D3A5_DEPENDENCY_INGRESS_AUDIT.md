@@ -360,6 +360,28 @@ A test pins the reviewed surface as EXACTLY the four sections, so no section can
 be silently added or lost. A mutation guard proves that dropping
 ``peerDependencies`` fails the suite (the delta classification changes).
 
+### The comparison identifies a REMOVED direct package
+
+The before/after comparison identifies a removed direct package via
+``removed_direct_dependencies`` -- necessary because ``dependency_delta`` only
+reports what ``after`` CONTAINS, so a silent deletion is invisible to it. Verified
+across every dimension:
+
+| case | identified as |
+|---|---|
+| package removed, section remains | ``removed=('dependencies', 'cn')`` |
+| package removed, its reviewed section disappears | ``removed=(...)`` (a non-empty section always names its packages) |
+| a package MOVED between sections | BOTH ``removed`` (original section) and ``added`` (new section) |
+| a removal of a REVIEWED package | ``removed`` -- allowed to ADD a reviewed package is not allowed to REMOVE one |
+| a version change | ``changed``, NOT ``removed`` |
+| a correctly-placed reviewed addition | neither bucket |
+
+**Honest boundary (out of scope, not a defect):** an *empty* reviewed section
+(``devDependencies: {}``) disappearing is not reported -- it has **no package to
+name**, so it is not a dependency mutation. No package can be hidden this way: a
+section WITH packages always names them, and a move to another section is caught
+by both buckets.
+
 ### The comparison identifies an ADDED package as an addition, not a re-pin
 
 The before/after comparison must identify **an added direct package**. It did, but

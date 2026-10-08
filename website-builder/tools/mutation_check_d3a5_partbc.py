@@ -356,6 +356,18 @@ MUTATIONS = [
             (changed if was_present else added).append((section, name))""",
         """            added.append((section, name))""",
     ),
+    # If removals stop being computed, a deleted project dependency survives an
+    # 'installed' claim -- the comparison no longer identifies a removed package.
+    (
+        "the comparison identifies a removed direct package",
+        INSTALL,
+        """    removals = sorted(
+        (section, name)
+        for section, names in removed_direct_dependencies(before.direct, after.direct).items()
+        for name in names
+    )""",
+        """    removals = []""",
+    ),
     # If install_dependency stops verifying the delta, a lifecycle-script-added
     # extra dependency survives an 'installed' claim.
     (

@@ -658,3 +658,86 @@ def test_a_refusal_may_name_only_a_changed_entry():
 
     assert verdict.ok is False
     assert verdict.changed == (("dependencies", "x"),)
+
+
+# ---------------------------------------------------------------------------
+# "Before/after comparison must identify: removed direct package"
+# ---------------------------------------------------------------------------
+# The verdict must identify a REMOVED direct package AS a removal -- distinct
+# from a version change (which is `changed`) and from an addition (which is
+# `added`). A package moved between sections is BOTH a removal (from its original
+# section) and an addition (to the new one).
+
+
+def test_a_removed_package_is_identified_as_removed(tmp_path):
+    v = _verdict(
+        tmp_path,
+        {"name": "p", "dependencies": {"react": "19.3.0", "cn": "0.4.0"}},
+        {"name": "p", "dependencies": {"react": "19.3.0"}},
+    )
+
+    assert v.removed == (("dependencies", "cn"),)
+    assert v.added == ()
+    assert v.changed == ()
+
+
+def test_a_version_change_is_not_a_removal(tmp_path):
+    v = _verdict(
+        tmp_path,
+        {"name": "p", "dependencies": {"react": "19.3.0"}},
+        {"name": "p", "dependencies": {"react": "19.4.0"}},
+    )
+
+    assert v.removed == ()
+    assert v.changed == (("dependencies", "react"),)
+
+
+@pytest.mark.parametrize("section", [
+    "dependencies", "devDependencies", "optionalDependencies", "peerDependencies"
+])
+def test_a_removal_is_identified_in_every_reviewed_section(tmp_path, section):
+    v = _verdict(
+        tmp_path,
+        {"name": "p", section: {"x": "1.0.0"}},
+        {"name": "p", section: {}},
+    )
+
+    assert v.removed == ((section, "x"),)
+    assert v.ok is False
+
+
+def test_a_moved_package_is_a_removal_and_an_addition(tmp_path):
+    v = _verdict(
+        tmp_path,
+        {"name": "p", "dependencies": {"cn": "0.4.0"}},
+        {"name": "p", "devDependencies": {"cn": "0.4.0"}},
+    )
+
+    assert v.removed == (("dependencies", "cn"),)
+    assert v.added == (("devDependencies", "cn"),)
+
+
+def test_removing_a_reviewed_package_is_still_a_removal(tmp_path):
+    """Allowed to ADD a reviewed package is not allowed to REMOVE one."""
+    v = _verdict(
+        tmp_path,
+        {"name": "p", "dependencies": {"cn": "0.4.0"}},
+        {"name": "p", "dependencies": {}},
+        allowed=("cn",),
+    )
+
+    assert v.removed == (("dependencies", "cn"),)
+    assert v.ok is False
+
+
+def test_a_removed_only_verdict_serializes_the_removed_bucket(tmp_path):
+    v = _verdict(
+        tmp_path,
+        {"name": "p", "dependencies": {"cn": "0.4.0"}},
+        {"name": "p", "dependencies": {}},
+    )
+
+    document = v.to_dict()
+    assert document["removed"] == [["dependencies", "cn"]]
+    assert document["added"] == []
+    assert document["changed"] == []
