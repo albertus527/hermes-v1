@@ -9,9 +9,9 @@ wrong outcome:
 
   * enum-collapse                 -> a resource with two true capabilities is
                                      forced to report one, discarding a truth
-  * free-search-gated             -> 21st reports NO discovery while its free
-                                     metadata search demonstrably works
-  * auth-gates-everything         -> a designed free tier is reported as a
+  * uncredentialed-catalog-gated  -> React Bits reports NO discovery while its
+                                     open (no-credential) catalog works
+  * auth-gates-everything         -> a designed open baseline is reported as a
                                      degradation, training operators to ignore
                                      real ones
   * credential-value-leaks        -> a secret reaches the capability report
@@ -72,6 +72,15 @@ MUTATIONS = [
             "retrieval_available": _one == "retrieval",
             "install_available": _one == "install",
             "critic_available": _one == "critic",""",
+    ),
+    # --- 1a. the MANIFEST comment must not claim a free 21st tier ---------
+    # The resource manifest is the contract; its comment must agree with the
+    # verified REST surface (audit question 9: docs vs executable policy).
+    (
+        "the manifest comment does not claim a free 21st tier",
+        "config/design_resources.yaml",
+        """    # D3a.5 (verified live 2026-10): 21st's ONLY machine surface is the""",
+        """    # D3a.5: metadata SEARCH is real and works with no credential (the free""",
     ),
     # --- 1b. the 21st capability is credential-gated on BOTH axes ---------
     # The module docstring once claimed a free 21st search surface; the verified

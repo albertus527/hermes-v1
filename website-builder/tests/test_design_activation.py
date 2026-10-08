@@ -869,3 +869,21 @@ def test_the_adapter_is_registered_as_credential_required_for_21st():
     assert fetch.CATALOG_SEARCH_ENDPOINTS[SOURCE_TWENTY_FIRST].endswith(
         "/api/v1/components/search"
     )
+
+
+def test_the_manifest_comment_does_not_claim_a_free_21st_tier():
+    """The manifest is the resource contract; its comment must not contradict
+    the verified REST surface (audit question 9: docs vs executable policy)."""
+    import app.core.design_resources as resources
+
+    source = Path(resources.__file__).read_text(encoding="utf-8")
+    # The manifest YAML is a sibling of the module's package.
+    manifest = Path(resources.__file__).resolve().parents[2] / "config" / "design_resources.yaml"
+    text = manifest.read_text(encoding="utf-8")
+    for banned in (
+        "metadata SEARCH is real and works with no credential",
+        "works with no credential (the free",
+    ):
+        assert banned not in text, banned
+    # And it must state the verified fact.
+    assert "NO free tier" in text or "credential" in text

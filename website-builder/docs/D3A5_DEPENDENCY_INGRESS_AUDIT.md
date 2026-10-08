@@ -236,6 +236,22 @@ GET https://21st.dev/api/v1/components/search?q=<term>&scope=public&limit=24
 - **No fabrication.** A malformed or empty search response is a degraded empty
   result, never an invented entry.
 
+### The "free metadata search tier" claim is gone from EVERY surface
+
+The earlier review's finding (21st's metadata search is NOT free) had been
+corrected in the module docstring and two tests, but a full sweep found it still
+live in two more places:
+
+- `config/design_resources.yaml` (the resource manifest): "metadata SEARCH is
+  real and works with no credential (the free tier)". This is the CONTRACT the
+  manifest asserts, and it contradicted the verified REST surface.
+- `tools/mutation_check_d3a5_partc.py` header: "free-search-gated -> 21st
+  reports NO discovery while its free metadata search demonstrably works".
+
+Both were corrected to the verified truth (21st has NO free tier; both axes are
+credential-gated). A test now asserts the manifest comment does not claim a free
+21st tier, and a guard proves that assertion is load-bearing.
+
 ### Bearer credential: handling verified, and a leak vector closed
 
 Re-verified the credential end to end:

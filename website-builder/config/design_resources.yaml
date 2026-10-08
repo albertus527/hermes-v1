@@ -160,11 +160,14 @@ resources:
   twenty_first:
     kind: reference
     required: false
-    # D3a.5: metadata SEARCH is real and works with no credential (the free
-    # tier), while component RETRIEVAL needs an account. The activation report
-    # carries both axes separately -- discovery_available vs retrieval_available
-    # -- so the resource is no longer a single boolean that must lie about one
-    # of them.
+    # D3a.5 (verified live 2026-10): 21st's ONLY machine surface is the
+    # authenticated REST API (`GET /api/v1/components/search` -> HTTP 401
+    # without a Bearer key), and its public llms.txt publishes NO
+    # component-identity schema. So there is NO free tier: BOTH discovery and
+    # retrieval require a credential. The activation report still carries both
+    # axes separately (discovery_available vs retrieval_available), because a
+    # resource whose two surfaces differ (React Bits) needs both; for 21st both
+    # are credential-gated.
     resolution: on_demand_registry
     adapter: twenty_first
 
