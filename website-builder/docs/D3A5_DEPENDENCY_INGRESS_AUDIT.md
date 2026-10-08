@@ -1424,19 +1424,36 @@ pre-existing `react` dependency was dropped from `package.json`.
   scan is `critic_available=True, critic_degraded=True, authoritative=False` —
   a clean result there is never authoritative.
 
-## Manual VPS smoke commands
+## Part L — manual LIVE smokes (run AFTER the unit suite)
+
+The unit suite is socket-free by construction, so every claim that has a LIVE
+dimension is proven here by hand against the real upstreams / the real pinned CLI.
+Run these **after** `pytest tests/` is green, never instead of it.
+
+**Order matters:** the unit suite proves the logic offline; these smokes prove the
+same logic still holds against reality. A smoke that passes offline too is not a
+smoke — each live smoke below was checked to FAIL when its upstream is removed.
+
+### L.1 — offline unit suite first
 
 ```bash
-# 1. SplitText resolves to the reviewed contract.
+cd website-builder && source .venv/bin/activate
+python -m pytest tests/ -q          # 3505 passed, 2 skipped
+```
+
+### L.2 — the live smokes
+
+```bash
+# 1. SplitText resolves to the reviewed contract (local).
 python -c "from app.core.design_registry import build_registry_request as b; \
   o=b('react_bits','SplitText',declared_dependencies=['gsap@^3.13.0','@gsap/react@^2.1.2']); \
   print(o.ok, o.request.required_dependency_ids)"
 
-# 2. React Bits catalog discovery (live).
+# 2. React Bits catalog discovery (LIVE HTTP).
 python -c "from app.core.design_catalog_fetch import discover_catalog as d; \
   r=d('react_bits'); print(r.ok, 'SplitText' in r.installable_ids())"
 
-# 3. 21st is credential-gated (no free discovery).
+# 3. 21st is credential-gated (LIVE HTTP -> 401, no free discovery).
 python -c "from app.core.design_activation import activate_resource as a; \
   from app.core.design_resources import load_design_resource_manifest as m; \
   c=a(__import__('pathlib').Path('/tmp'), m().get('twenty_first'), system='Linux', machine='x86_64'); \
@@ -1444,5 +1461,54 @@ python -c "from app.core.design_activation import activate_resource as a; \
 
 # 4. Impeccable engine quality (full / degraded / missing).
 python -c "from app.core.design_activation import engine_quality as q; \
-  from pathlib import Path; print(q(Path.home()/'.hermes'/'skills'/'impeccable')))"
+  from pathlib import Path; print(q(Path.home()/'.hermes'/'skills'/'impeccable'))"
+
+# 5. transitions-dev list (LIVE pinned CLI; no account).
+npm exec --yes --package=transitions-dev@0.3.0 -- transitions-dev list
+
+# 6. transitions-dev add card-resize, in a DISPOSABLE dir (LIVE pinned CLI).
+mkdir -p /tmp/partL && cd /tmp/partL && echo '{"name":"p","version":"1.0.0"}' > package.json
+npm exec --yes --package=transitions-dev@0.3.0 -- transitions-dev add card-resize
+ls transitions/ && git diff --no-index package.json package.json   # unchanged
 ```
+
+### L.3 — observed on the qualification host (2026-10)
+
+| # | smoke | observed |
+|---|---|---|
+| 1 | SplitText contract | `True ('gsap', 'gsap_react')` |
+| 2 | React Bits discovery (live) | `ok=True`, `SplitText` present |
+| 3 | 21st credential gate | `discovery_available=False`, `authentication_required=True`, `degraded=True`; with `API_KEY_21ST` set → `discovery_available=True`, `degraded=False` |
+| 4 | Impeccable engine quality | `missing` on a host with no provisioned skill |
+| 5 | transitions-dev list | exit 0, 32 free recipes incl. `card-resize` |
+| 6 | transitions-dev add | exit 0, `✓ Added Card resize → transitions/card-resize.md`; creates ONLY `transitions/card-resize.md`; `package.json` byte-identical (no dependency delta) |
+
+**Live-ness proven, not assumed.** Smoke 2 returns `ok=False` with the socket
+layer disabled and `ok=True` with it — it is a real live smoke, not a fake one.
+Smoke 3 flips `discovery_available` False→True when a credential is configured,
+so it is testing the gate, not a constant.
+
+### L.4 — the reusable delta verifier against a real CLI artifact
+
+After smoke 6, the delta verifier must still accept the real artifact and refuse an
+injected extra dependency:
+
+```bash
+python -c "import sys; from pathlib import Path; sys.path.insert(0, '.'); \
+  from app.core.design_install import snapshot_direct_dependency_state as s, verify_direct_dependency_delta as v; \
+  root = Path('/tmp/partL'); before = s(root); \
+  import json; d = json.loads((root/'package.json').read_text()); \
+  d.setdefault('dependencies', {})['evil-lifecycle'] = '9.9.9'; \
+  (root/'package.json').write_text(json.dumps(d)); \
+  r = v(before, s(root), allowed_additions=()); print(r.ok, r.added)"
+# -> False (('dependencies', 'evil-lifecycle'),)
+```
+
+### Why these are manual, not in the suite
+
+The suite bans sockets (`socket.socket.connect`, `create_connection`,
+`getaddrinfo`) and does not shell out to `npm`. A live smoke therefore cannot be a
+unit test without weakening that ban. The doc records the COMMANDS and the
+OBSERVED outputs; the suite separately pins the offline behaviour
+(`test_live_smoke_is_documented_rather_than_executed`).
+

@@ -587,3 +587,83 @@ def test_every_installable_on_demand_resource_has_a_real_mechanism():
             continue
         argv = build_install_argv(("npm", "install"), dependency_id)
         assert argv, dependency_id
+
+
+# ---------------------------------------------------------------------------
+# Part L: the manual LIVE smokes must stay runnable
+# ---------------------------------------------------------------------------
+# The audit doc records manual live smokes (Part L). They are NOT run in this
+# suite -- the suite is socket-free -- but the COMMANDS must keep naming real
+# symbols and the real CLI pin, or a reader following the doc would hit an
+# ImportError or an unpinned CLI. This guard is the doc's anti-rot check: it
+# resolves every symbol the documented commands import, and pins the CLI version
+# the documented `npm exec` lines hard-code.
+
+
+#: The audit doc that records the manual live smokes.
+LIVE_SMOKE_DOC = (
+    Path(__file__).resolve().parents[1] / "docs" / "D3A5_DEPENDENCY_INGRESS_AUDIT.md"
+)
+
+
+def test_the_live_smoke_doc_exists_and_has_the_part_l_section():
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    assert "Part L" in text
+    assert "manual LIVE smokes" in text
+    # the ordering requirement is the whole point of Part L
+    assert "AFTER the unit suite" in text or "after the unit" in text.lower()
+
+
+def test_every_symbol_the_documented_smokes_import_exists():
+    """Each `from app.core... import ...` the doc's commands use must resolve."""
+    import importlib
+    import re
+
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+    # Join shell line-continuations, then find import statements. A name list
+    # ends at a `;`, a quote, or the end of the joined text.
+    joined = text.replace("\\\n", " ").replace("\n", " ")
+    pattern = re.compile(r"from\s+(app\.core\.[\w.]+)\s+import\s+([\w,\s]+?)\s*(?:;|\"|$)")
+
+    def _clean(raw: str) -> list:
+        # strip `as <alias>` from each name and drop empties
+        out = []
+        for chunk in raw.split(","):
+            name = chunk.strip().split(" as ")[0].strip()
+            if name:
+                out.append(name)
+        return out
+
+    pairs = [(m.group(1), _clean(m.group(2))) for m in pattern.finditer(joined)]
+
+    assert pairs, "the doc must document at least one app.core import"
+    for module, names in pairs:
+        resolved = importlib.import_module(module)
+        for name in names:
+            assert hasattr(resolved, name), f"{module} has no {name}"
+
+
+def test_the_documented_cli_pin_matches_the_application_pin():
+    """The doc hard-codes `transitions-dev@0.3.0`; it must match PINNED_CLIS."""
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+    pinned = PINNED_CLIS["transitions_dev"]
+
+    assert f"{pinned.package}@{pinned.version}" in text
+    # and the binary the doc invokes is the pinned binary
+    assert f"-- {pinned.binary} list" in text
+    assert f"-- {pinned.binary} add" in text
+
+
+def test_the_documented_delta_verifier_symbols_exist():
+    """The L.4 command imports the reusable verifier -- it must exist."""
+    from app.core.design_install import (
+        snapshot_direct_dependency_state,
+        verify_direct_dependency_delta,
+    )
+
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+    assert "snapshot_direct_dependency_state" in text
+    assert "verify_direct_dependency_delta" in text
+    assert callable(snapshot_direct_dependency_state)
+    assert callable(verify_direct_dependency_delta)

@@ -43,6 +43,10 @@ COHERENCE_TESTS = "tests/test_design_resource_coherence.py"
 RUN_TESTS = (ACTIVATION_TESTS, COHERENCE_TESTS)
 ACTIVATION = "app/core/design_activation.py"
 RESOURCES = "app/core/design_resources.py"
+#: The audit doc records the manual LIVE smokes (Part L). The doc-rot guard in
+#: the coherence suite resolves every symbol those commands import, so mutating
+#: the doc to name a bogus symbol must fail the suite.
+AUDIT_DOC = "docs/D3A5_DEPENDENCY_INGRESS_AUDIT.md"
 
 MUTATIONS = [
     # --- 1. the model is multi-dimensional, not an enum -------------------
@@ -361,6 +365,16 @@ MUTATIONS = [
         degraded=True,
         reasons=(),
     )""",
+    ),
+    # --- 15. Part L: the documented LIVE smokes stay runnable -------------
+    # The doc records manual smoke commands. If a command names a symbol that no
+    # longer exists, a reader following the doc hits an ImportError -- so the
+    # doc-rot guard must fail. Mutate a documented import to a bogus name.
+    (
+        "the documented live smokes name real symbols",
+        AUDIT_DOC,
+        "from app.core.design_catalog_fetch import discover_catalog as d",
+        "from app.core.design_catalog_fetch import discover_catalog_renamed as d",
     ),
 ]
 
