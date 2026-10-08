@@ -866,3 +866,21 @@ def test_the_documented_disposable_starter_command_states_the_refusal_is_load_be
 
     assert "the refusal is load-bearing" in text
     assert "TS2307" in text
+
+
+def test_the_documented_final_exact_state_command_is_present():
+    """The command proves a PRE-EXISTING floating range is normalized to the pin."""
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    assert "verify the FINAL package.json exact direct-dependency state" in text
+    assert 'doc["dependencies"]["cn"] = "^0.4.0"' in text
+    assert "final cn: 0.4.0" in text
+
+
+def test_the_documented_final_exact_state_command_states_the_governed_set_rule():
+    """The doc must name the property, not just show the command."""
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    assert "governed" in text
+    assert "not just the CLI's delta" in text
+

@@ -207,15 +207,28 @@ MUTATIONS = [
     (
         "a registry-introduced range is normalized to an exact pin",
         INSTALL,
-        """        already_exact = all(
-            after.get(SECTION_DEPENDENCIES, {}).get(package) == pins[package]
-            for package in introduced
+        """        to_pin = tuple(
+            package
+            for package in governed
+            if after_runtime.get(package) != pins[package]
         )
-        if already_exact:
+        if not to_pin:
             return _RegistryBoundaryResult(ok=True)""",
-        """        already_exact = True
-        if already_exact:
+        """        to_pin = ()
+        if not to_pin:
             return _RegistryBoundaryResult(ok=True)""",
+    ),
+    # The exactness check must cover EVERY governed package, not just the ones
+    # the CLI's delta named. A reviewed package the project ALREADY declares at a
+    # floating range is unchanged by the CLI (so not in the delta) yet must still
+    # be pinned. Reverting to the delta-only set reintroduces the gap.
+    (
+        "the exactness check covers governed packages, not just the delta",
+        INSTALL,
+        """        governed = tuple(
+            sorted(package for package in allowed_packages if package in after_runtime)
+        )""",
+        """        governed = introduced""",
     ),
     # ------------------------------------------------------------------
     # Part G -- 21st route false positives

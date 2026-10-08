@@ -3104,9 +3104,6 @@ class DesignDependencyInstaller:
 
         delta = dependency_delta(before, after)
         introduced = tuple(sorted(delta.get(SECTION_DEPENDENCIES, {})))
-        if not introduced:
-            # Nothing changed in the runtime set: no normalization needed.
-            return _RegistryBoundaryResult(ok=True)
 
         # A package that appeared must have a reviewed exact pin. A reviewed
         # package with no pin is a configuration error, not a pass.
@@ -3122,16 +3119,51 @@ class DesignDependencyInstaller:
                 ok=False, reason=REASON_REGISTRY_PACKAGE_NOT_EXACT
             )
 
-        # Already exact? Then nothing to normalize.
-        already_exact = all(
-            after.get(SECTION_DEPENDENCIES, {}).get(package) == pins[package]
-            for package in introduced
+        # The reviewed packages this operation GOVERNS: everything it is allowed
+        # to touch. The DELTA only names what the CLI CHANGED; a governed package
+        # the project ALREADY declared at a floating range is unchanged by the
+        # CLI, so it never appears in the delta. Verifying only the delta let such
+        # a range survive an ``installed`` claim, contradicting this function's
+        # own "the final manifest must hold the EXACT application pins".
+        # Verified live: a project declaring ``cn@^0.4.0`` and installing ``card``
+        # was reported ``installed`` with ``cn`` still ``^0.4.0``.
+        after_runtime = after.get(SECTION_DEPENDENCIES, {})
+        governed = tuple(
+            sorted(package for package in allowed_packages if package in after_runtime)
         )
-        if already_exact:
+        if any(package not in pins for package in governed):
+            logger.error("A governed package has no application-owned exact pin.")
+            return _RegistryBoundaryResult(
+                ok=False, reason=REASON_REGISTRY_PACKAGE_NOT_EXACT
+            )
+
+        # A governed package belongs in the RUNTIME section; one the project
+        # already declares in a non-runtime section is the same "wrong section"
+        # violation the delta guard refuses, just not caused by this CLI run.
+        for section in SNAPSHOT_SECTIONS:
+            if section == SECTION_DEPENDENCIES:
+                continue
+            if any(package in after.get(section, {}) for package in allowed_packages):
+                logger.warning(
+                    "Refusing a registry install whose governed package sits in a "
+                    "non-runtime dependency section."
+                )
+                return _RegistryBoundaryResult(
+                    ok=False, reason=REASON_REGISTRY_DEPENDENCY_DRIFT
+                )
+
+        # The governed packages that are not yet at their exact pin. An empty
+        # delta no longer short-circuits: a pre-existing range must be pinned too.
+        to_pin = tuple(
+            package
+            for package in governed
+            if after_runtime.get(package) != pins[package]
+        )
+        if not to_pin:
             return _RegistryBoundaryResult(ok=True)
 
         last_receipt: Optional[CommandReceipt] = None
-        for argv in build_registry_normalization_argv(manager, introduced):
+        for argv in build_registry_normalization_argv(manager, to_pin):
             normalize_process, normalize_timed_out = self._run(
                 argv, INSTALL_TIMEOUT_SECONDS
             )
@@ -3154,12 +3186,13 @@ class DesignDependencyInstaller:
                 normalize_process, cwd_label="<project>"
             )
 
-        # Re-verify: the final manifest must hold the EXACT application pins.
+        # Re-verify: the final manifest must hold the EXACT application pins for
+        # EVERY governed package -- not just the ones the delta named.
         final = snapshot_direct_dependencies(self.project_root)
-        for package in introduced:
+        for package in governed:
             if final.get(SECTION_DEPENDENCIES, {}).get(package) != pins[package]:
                 logger.error(
-                    "A registry-introduced package is not at its exact "
+                    "A governed package is not at its exact "
                     "application-owned pin after normalization."
                 )
                 return _RegistryBoundaryResult(

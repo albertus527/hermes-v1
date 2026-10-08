@@ -432,6 +432,16 @@ MUTATIONS = [
         "from app.core.design_catalog_fetch import discover_catalog as d",
         "from app.core.design_catalog_fetch import discover_catalog_renamed as d",
     ),
+    # --- 17. the documented FINAL exact-state command names the governed rule
+    # The command's whole point is that the guard reasons over the GOVERNED set,
+    # not just the CLI's delta. If the doc drops that, the reader cannot tell a
+    # surviving range from a normalized pin. Mutate the doc's stated rule.
+    (
+        "the documented final exact-state command states the governed-set rule",
+        AUDIT_DOC,
+        "over the **governed** set, not just the CLI's delta",
+        "over the introduced set",
+    ),
 ]
 
 

@@ -1395,6 +1395,32 @@ pre-existing `react` dependency was dropped from `package.json`.
 - **Rule:** a registry install may ADD its reviewed packages; it must never
   DELETE a pre-existing project dependency.
 
+## Sixth-pass audit (the final manifest's EXACT state, not just the delta)
+
+The exactness re-verify ran over `introduced` — the packages the CLI's **delta**
+named. But the DELTA only names what the CLI **CHANGED**. A reviewed package the
+project **already declares at a floating range**, where the CLI writes the *same*
+value, produces **no delta** — so it was never normalized and never re-verified,
+while the boundary's own comment claimed *"the final manifest must hold the EXACT
+application pins."* Same defect class as every prior pass: a guard whose scope is
+narrower than the property it names.
+
+- **Reproduced live:** a starter declaring `cn@^0.4.0` (exactly what the pinned
+  CLI writes) + `install_components(["card"])` → `state=installed`, `cn` still
+  `^0.4.0`. The external path showed the mirror (`gsap@^3.15.0` pre-declared →
+  `installed` with a range).
+- **Fix:** the guard now reasons over the **governed** set — every
+  `allowed_packages` entry present in the runtime section — not just the delta.
+  The set is normalized to its exact pins and **re-verified for every governed
+  package**. A governed package found in a **non-runtime** section (e.g.
+  `cn` in `devDependencies`) is refused as the same wrong-section violation the
+  delta guard catches, just not caused by this CLI run.
+- **No false positive:** all 16 builtin dependency tables were re-verified
+  against the **real** `shadcn@4.21.0` (`cli == table` for every one), and the
+  four named sections' governed packages are all in `reviewed_registry_package_pins`.
+- **Rule:** the manifest the install **leaves behind** must hold the exact pins
+  for every package the install **governs** — whether the CLI touched it or not.
+
 ## Final dependency policy (post-repair)
 
 - **Package identity is closed and application-owned.** `DEPENDENCY_PACKAGES`
@@ -2002,6 +2028,59 @@ not ceremony — without it the disposable starter would not build.
 **Why disposable.** `install_external_component` writes real files and runs `npm
 install`; the whole batch's rule is that a build never mutates a live project. The
 disposable copy makes the smoke safe to run repeatedly and safe to discard.
+
+### VPS command: verify the FINAL package.json exact direct-dependency state
+
+The install must leave the manifest at the **exact** application pins for every
+package it governs — whether the CLI touched it or not. The subtle case is a
+reviewed package the project **already declares at a floating range**: the CLI
+writes the *same* value, so no delta appears. Run this to prove the range is
+still normalized.
+
+```bash
+cd website-builder && source .venv/bin/activate
+APP="$(pwd)"
+
+# A disposable copy with a PRE-EXISTING floating range for a governed package.
+WORK="$(mktemp -d)" && cp -r ../templates/frontend-starter "$WORK/project"
+cd "$WORK/project" && rm -rf node_modules dist
+python - <<'PY'
+import json
+from pathlib import Path
+doc = json.loads(Path("package.json").read_text())
+doc["dependencies"]["cn"] = "^0.4.0"   # the exact range the pinned CLI writes
+Path("package.json").write_text(json.dumps(doc, indent=2))
+print("before cn:", doc["dependencies"]["cn"])
+PY
+
+python - "$APP" <<'PY'
+import sys, subprocess
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from app.core.design_install import DesignDependencyInstaller
+
+class Runner:
+    def __init__(self): self.calls = []
+    def run_command(self, project_id, command, cwd=None, env=None, timeout=300.0):
+        self.calls.append(list(command))
+        return subprocess.run(list(command), cwd=cwd, capture_output=True,
+                              text=True, timeout=timeout, shell=False)
+
+outcome, installed, _ = DesignDependencyInstaller(
+    Runner(), "p", Path(".")).install_components(["card"])
+import json
+final = json.loads(Path("package.json").read_text())
+print("state:", outcome.state, "| final cn:", final["dependencies"]["cn"])
+PY
+# expect: state: installed | final cn: 0.4.0   (the range is normalized to the pin)
+```
+
+**Observed on the qualification host (2026-10):** with `cn` pre-declared at
+`^0.4.0`, the builtin `card` install reports `installed` and the final `cn` is
+**`0.4.0`** (the exact pin) — the normalization runs because the guard reasons
+over the **governed** set, not just the CLI's delta. Before the sixth-pass fix
+this printed `final cn: ^0.4.0` (a surviving range) while still claiming
+`installed`.
 
 ### Why these are manual, not in the suite
 

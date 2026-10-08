@@ -381,6 +381,107 @@ def test_a_builtin_install_with_no_dependency_change_is_accepted(project):
 
 
 # ---------------------------------------------------------------------------
+# The final manifest must hold the EXACT pins for every GOVERNED package, not
+# just the ones the CLI's delta named.
+#
+# The DELTA only names what the CLI CHANGED. A reviewed package the project
+# ALREADY declares at a floating range is unchanged by the CLI, so it never
+# appears in the delta -- and verifying only the delta let such a range survive
+# an ``installed`` claim, contradicting the boundary's own "the final manifest
+# must hold the EXACT application pins". Live proof: a project declaring
+# ``cn@^0.4.0`` and installing ``card`` was reported ``installed`` with ``cn``
+# still ``^0.4.0``.
+# ---------------------------------------------------------------------------
+
+
+def test_a_pre_existing_reviewed_range_is_normalized_on_the_builtin_path(project):
+    """``cn`` already declared as ``^0.4.0``; the CLI writes the same value, so
+    there is NO delta. The final manifest must still hold ``0.4.0``."""
+    doc = json.loads((project / "package.json").read_text(encoding="utf-8"))
+    doc["dependencies"]["cn"] = "^0.4.0"
+    (project / "package.json").write_text(json.dumps(doc), encoding="utf-8")
+
+    runner = RegistryRunner(
+        dependency_writes={}, materializes=True, component_name="card"
+    )
+
+    outcome, _, _ = _installer(project, runner).install_components(["card"])
+
+    assert outcome.state == "installed", outcome.reason
+    final = json.loads((project / "package.json").read_text(encoding="utf-8"))
+    assert final["dependencies"]["cn"] == "0.4.0", (
+        "a pre-existing reviewed range must be normalized to the exact pin"
+    )
+    # And the normalization actually ran, rather than the value being rewritten.
+    installs = [
+        c for c in runner.commands
+        if c[:2] in (["npm", "install"], ["pnpm", "add"], ["yarn", "add"])
+        and any("cn" in a for a in c)
+    ]
+    assert len(installs) == 1, "the surviving range is normalized exactly once"
+
+
+def test_a_pre_existing_reviewed_range_is_normalized_on_the_external_path(project):
+    """The mirror case for the external path: ``gsap`` pre-declared at the range
+    the CLI writes, so no delta appears."""
+    doc = json.loads((project / "package.json").read_text(encoding="utf-8"))
+    doc["dependencies"]["gsap"] = "^3.15.0"
+    doc["dependencies"]["@gsap/react"] = "^2.1.2"
+    (project / "package.json").write_text(json.dumps(doc), encoding="utf-8")
+
+    runner = RegistryRunner(
+        dependency_writes={}, materializes=True, component_name="SplitText",
+        external_dir=True,
+    )
+
+    outcome = _installer(project, runner).install_external_component(_split_text_request())
+
+    assert outcome.state == "installed", outcome.reason
+    final = json.loads((project / "package.json").read_text(encoding="utf-8"))
+    assert final["dependencies"]["gsap"] == "3.15.0"
+    assert final["dependencies"]["@gsap/react"] == "2.1.2"
+
+
+def test_a_pre_existing_governed_package_in_the_wrong_section_is_refused(project):
+    """A governed package the project already declares in a NON-runtime section
+    is the same wrong-section violation the delta guard refuses -- the CLI just
+    did not cause it."""
+    doc = json.loads((project / "package.json").read_text(encoding="utf-8"))
+    doc.setdefault("devDependencies", {})["cn"] = "^0.4.0"
+    (project / "package.json").write_text(json.dumps(doc), encoding="utf-8")
+
+    runner = RegistryRunner(
+        dependency_writes={}, materializes=True, component_name="card"
+    )
+
+    outcome, _, _ = _installer(project, runner).install_components(["card"])
+
+    assert outcome.state == INSTALL_FAILED
+    assert outcome.reason == REASON_REGISTRY_DEPENDENCY_DRIFT
+
+
+def test_an_already_exact_governed_package_needs_no_normalization(project):
+    """The no-op half: a governed package already at its exact pin runs nothing."""
+    doc = json.loads((project / "package.json").read_text(encoding="utf-8"))
+    doc["dependencies"]["cn"] = "0.4.0"
+    (project / "package.json").write_text(json.dumps(doc), encoding="utf-8")
+
+    runner = RegistryRunner(
+        dependency_writes={}, materializes=True, component_name="card"
+    )
+
+    outcome, _, _ = _installer(project, runner).install_components(["card"])
+
+    assert outcome.state == "installed", outcome.reason
+    installs = [
+        c for c in runner.commands
+        if c[:2] in (["npm", "install"], ["pnpm", "add"], ["yarn", "add"])
+        and any("cn" in a for a in c)
+    ]
+    assert installs == [], "a governed package already at the exact pin runs nothing"
+
+
+# ---------------------------------------------------------------------------
 # End to end: the external registry path
 # ---------------------------------------------------------------------------
 
