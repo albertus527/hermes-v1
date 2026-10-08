@@ -441,9 +441,26 @@ def required_registry_packages(components: Sequence[str]) -> Tuple[str, ...]:
 # itself is parsed and every BARE package specifier it names must be one this
 # application already provides or has reviewed. Anything else fails closed.
 
-#: Bare specifiers every emitted component may import without review: the React
-#: runtime the starter always ships.
-_ALWAYS_PROVIDED_PACKAGES: Tuple[str, ...] = ("react", "react-dom")
+#: Bare specifiers every emitted component may import without review: the
+#: packages the starter ALWAYS ships. The starter's ``dependencies`` are copied
+#: verbatim into every generated project, so a reviewed component's emitted
+#: source may import any of them without review -- they are present by
+#: construction.
+#:
+#: This set must EQUAL the starter's runtime ``dependencies``. Verified live
+#: against the real pinned ``shadcn@4.21.0``: the emitted source of every
+#: reviewed builtin imports only ``cn`` / ``lucide-react`` / ``radix-ui`` /
+#: ``react`` / ``class-variance-authority`` -- and the last of those is a starter
+#: runtime dependency. Omitting it refused 5 of the 16 reviewed builtins
+#: (``alert``/``badge``/``button``/``tabs`` and ``dialog`` via its nested
+#: ``button``) for importing a package the project already had. A test pins this
+#: tuple to ``templates/frontend-starter/package.json``'s ``dependencies`` so the
+#: two cannot drift.
+_ALWAYS_PROVIDED_PACKAGES: Tuple[str, ...] = (
+    "class-variance-authority",
+    "react",
+    "react-dom",
+)
 
 #: A bounded read of an emitted component source. A generated component is a few
 #: kilobytes; this ceiling stops a pathological file from being slurped whole.

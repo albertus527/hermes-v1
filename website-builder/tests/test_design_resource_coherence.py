@@ -884,3 +884,22 @@ def test_the_documented_final_exact_state_command_states_the_governed_set_rule()
     assert "governed" in text
     assert "not just the CLI's delta" in text
 
+
+def test_the_documented_typecheck_command_is_present():
+    """The command typechecks a disposable project after a reviewed install."""
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    assert "`typecheck` a generated project after a reviewed install" in text
+    assert "npm run typecheck" in text
+    assert '"typecheck": "tsc -b"' in text
+
+
+def test_the_documented_typecheck_command_states_the_starter_dep_fix():
+    """The doc must record the class-variance-authority false-refusal defect."""
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    assert "class-variance-authority" in text
+    assert "5 of the 16" in text
+    assert "was absent from the always-provided set" in text
+
+

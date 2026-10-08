@@ -442,6 +442,16 @@ MUTATIONS = [
         "over the **governed** set, not just the CLI's delta",
         "over the introduced set",
     ),
+    # --- 18. the documented typecheck command records the starter-dep fix
+    # The command's value is that it installs the builtins whose source imports a
+    # starter runtime dependency. If the doc drops the defect it fixed, a reader
+    # cannot tell why those components were previously refused.
+    (
+        "the documented typecheck command records the starter-dep false-refusal fix",
+        AUDIT_DOC,
+        "was absent from the always-provided set",
+        "was absent from the reviewed set",
+    ),
 ]
 
 

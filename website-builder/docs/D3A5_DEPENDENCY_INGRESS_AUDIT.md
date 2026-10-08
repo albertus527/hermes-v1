@@ -985,6 +985,17 @@ false-refusals (every import is `cn`/`lucide-react`/`radix-ui`/`react`/
 `class-variance-authority`). Residual over-matching (a `from "x"` inside a
 comment or string literal) is fail-CLOSED, and no reviewed source contains one.
 
+**The "always provided" set must EQUAL the starter's runtime dependencies.**
+This claim was FALSE until the typecheck pass: `class-variance-authority` --
+which the starter ships as a direct dependency and which `alert`/`badge`/
+`button`/`tabs` (and `dialog`, via its nested `button`) import in their emitted
+source -- was missing from `_ALWAYS_PROVIDED_PACKAGES` (then only
+`react`/`react-dom`). Live against the pinned `shadcn@4.21.0`, **5 of the 16
+reviewed builtins were REFUSED** for importing a package the project already had
+(`a component's emitted source imports a package outside the application-owned
+reviewed set`). Fixed by making the set exactly the starter's `dependencies`;
+a test pins the two together so they cannot drift.
+
 ### The FILE boundary is project-wide, not component-dir-only
 
 The file-delta guard (step 4) snapshots only the APPROVED COMPONENT DIRECTORY,
@@ -2081,6 +2092,53 @@ PY
 over the **governed** set, not just the CLI's delta. Before the sixth-pass fix
 this printed `final cn: ^0.4.0` (a surviving range) while still claiming
 `installed`.
+
+### VPS command: `typecheck` a generated project after a reviewed install
+
+`typecheck` is the starter's own script (`"typecheck": "tsc -b"`). It is one of
+the three cheap checks that gate a real build (`npm ci` / `npm run build` /
+`npm run typecheck`). Run it on a disposable copy after installing the reviewed
+components — including the ones whose emitted source imports a starter runtime
+dependency (`class-variance-authority`), which the reviewed set must accept.
+
+```bash
+cd website-builder && source .venv/bin/activate
+APP="$(pwd)"
+
+WORK="$(mktemp -d)" && cp -r ../templates/frontend-starter "$WORK/project"
+cd "$WORK/project" && rm -rf node_modules dist && npm ci --no-audit --no-fund
+
+# Install the reviewed builtins whose source imports class-variance-authority.
+python - "$APP" <<'PY'
+import sys, subprocess
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from app.core.design_install import DesignDependencyInstaller
+
+class Runner:
+    def __init__(self): self.calls = []
+    def run_command(self, project_id, command, cwd=None, env=None, timeout=300.0):
+        self.calls.append(list(command))
+        return subprocess.run(list(command), cwd=cwd, capture_output=True,
+                              text=True, timeout=timeout, shell=False)
+
+for comp in ("card", "button", "dialog", "tabs"):
+    outcome, _, _ = DesignDependencyInstaller(
+        Runner(), "p", Path(".")).install_components([comp])
+    print(f"{comp}: {outcome.state}")
+PY
+
+npm run typecheck     # tsc -b -- must exit 0
+```
+
+**Observed on the qualification host (2026-10):** `card`/`button`/`dialog`/`tabs`
+all report `installed`, and `npm run typecheck` exits **0**. `tsc -b` was proven
+load-bearing: injecting a type error into `src/App.tsx` makes it exit non-zero,
+and re-running does **not** hide the error behind the incremental `tsbuildinfo`
+cache (build mode re-checks changed inputs). Before the fix this command refused
+`button`/`dialog`/`tabs`/`alert`/`badge` (`…emitted source imports a package
+outside the application-owned reviewed set`) because `class-variance-authority`
+was absent from the always-provided set.
 
 ### Why these are manual, not in the suite
 

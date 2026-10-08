@@ -752,6 +752,19 @@ MUTATIONS = [
         """    allowed = set(allowed_packages)
     return ()""",
     ),
+    # 8b. The "always provided" set must equal the starter's runtime deps.
+    # Omitting a package the starter ships falsely REFUSES the reviewed builtins
+    # that import it (live: class-variance-authority -> 5 of 16 refused).
+    (
+        "the always-provided set equals the starter runtime dependencies",
+        INSTALL,
+        """_ALWAYS_PROVIDED_PACKAGES: Tuple[str, ...] = (
+    "class-variance-authority",
+    "react",
+    "react-dom",
+)""",
+        """_ALWAYS_PROVIDED_PACKAGES: Tuple[str, ...] = ("react", "react-dom")""",
+    ),
     # 9. The external path must apply the source-import boundary too.
     (
         "the external component source import boundary runs",

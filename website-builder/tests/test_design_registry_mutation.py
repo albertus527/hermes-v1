@@ -45,6 +45,8 @@ from app.core.design_install import (
     REASON_REGISTRY_SOURCE_IMPORT_UNREVIEWED,
     SECTION_DEPENDENCIES,
     DesignDependencyInstaller,
+    _ALWAYS_PROVIDED_PACKAGES,
+    _reviewed_source_import_packages,
     approved_component_dir,
     approved_external_component_dir,
     bare_package_of,
@@ -850,6 +852,84 @@ def test_unreviewed_imports_names_only_what_is_not_allowed():
     src = 'import { gsap } from "gsap"\nimport { X } from "evil-lib"\n'
     assert unreviewed_imports(src, allowed_packages=["gsap"]) == ("evil-lib",)
     assert unreviewed_imports(src, allowed_packages=["gsap", "evil-lib"]) == ()
+
+
+# ---------------------------------------------------------------------------
+# The "always provided" set must EQUAL the starter's runtime dependencies.
+#
+# A generated project is a verbatim copy of ``templates/frontend-starter``, so
+# every package in the starter's ``dependencies`` is present BY CONSTRUCTION and
+# a reviewed component's emitted source may import it without review. Omitting
+# one falsely REFUSES the reviewed builtins that import it: live against the
+# pinned shadcn@4.21.0, ``class-variance-authority`` was missing and 5 of the 16
+# reviewed builtins (alert/badge/button/tabs + dialog via nested button) were
+# refused for importing a package the project already shipped.
+# ---------------------------------------------------------------------------
+
+
+def test_always_provided_packages_equal_the_starter_runtime_dependencies():
+    """The two tables cannot drift: every starter ``dependencies`` key is
+    importable without review, and nothing else is claimed as provided."""
+    starter = json.loads(
+        (
+            Path(__file__).resolve().parents[2]
+            / "templates"
+            / "frontend-starter"
+            / "package.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert set(_ALWAYS_PROVIDED_PACKAGES) == set(starter["dependencies"]), (
+        "the always-provided set must equal the starter's runtime dependencies"
+    )
+
+
+def test_a_reviewed_builtin_may_import_a_starter_runtime_dependency(project):
+    """``button``'s REAL emitted source imports ``class-variance-authority``, a
+    starter runtime dependency. That must be accepted, not refused."""
+    runner = RegistryRunner(
+        dependency_writes={"dependencies": {"cn": "^0.4.0", "radix-ui": "^1.7.0"}},
+        materializes=True,
+        component_name="button",
+        source_imports=("class-variance-authority",),
+    )
+
+    outcome, _, _ = _installer(project, runner).install_components(["button"])
+
+    assert outcome.state == "installed", outcome.reason
+
+
+def test_every_reviewed_builtin_source_is_accepted():
+    """The union of every REAL builtin's bare imports is inside the reviewed set.
+
+    The real imports were captured live from the pinned CLI: no reviewed builtin
+    may be refused for a package it actually imports."""
+    real_imports = {
+        "accordion": ("cn", "lucide-react", "radix-ui", "react"),
+        "alert": ("class-variance-authority", "cn", "react"),
+        "badge": ("class-variance-authority", "cn", "radix-ui", "react"),
+        "button": ("class-variance-authority", "cn", "radix-ui", "react"),
+        "card": ("cn", "react"),
+        "checkbox": ("cn", "lucide-react", "radix-ui", "react"),
+        "dialog": ("cn", "lucide-react", "radix-ui", "react"),
+        "input": ("cn", "react"),
+        "label": ("cn", "radix-ui", "react"),
+        "select": ("cn", "lucide-react", "radix-ui", "react"),
+        "separator": ("cn", "radix-ui", "react"),
+        "sheet": ("cn", "lucide-react", "radix-ui", "react"),
+        "switch": ("cn", "radix-ui", "react"),
+        "tabs": ("class-variance-authority", "cn", "radix-ui", "react"),
+        "textarea": ("cn", "react"),
+        "tooltip": ("cn", "radix-ui", "react"),
+    }
+    assert set(real_imports) == set(ALLOWED_SHADCN_COMPONENTS)
+    reviewed = set(_reviewed_source_import_packages())
+    for component in sorted(ALLOWED_SHADCN_COMPONENTS):
+        for sibling in expand_reviewed_component_closure([component]):
+            for package in real_imports[sibling]:
+                assert package in reviewed, (
+                    f"{component} -> {sibling} imports {package}, "
+                    "which the reviewed set refuses"
+                )
 
 
 def test_an_approved_builtin_whose_source_drifts_is_refused(project):
