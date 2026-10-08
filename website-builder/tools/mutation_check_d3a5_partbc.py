@@ -261,8 +261,10 @@ MUTATIONS = [
     (
         "the reusable delta verifier refuses an unreviewed addition",
         INSTALL,
-        """        if allowed.get(name) != section""",
-        """        if False""",
+        """            if allowed.get(name) == section:
+                continue""",
+        """            if True:
+                continue""",
     ),
     # If the section check is dropped, an overrides/packageManager mutation passes.
     (
@@ -343,6 +345,16 @@ MUTATIONS = [
     "devDependencies",
     "optionalDependencies",
 )""",
+    ),
+    # If the added/changed split is removed, a version change of an existing
+    # package is reported as an ADDITION -- so the comparison can no longer
+    # identify "an added direct package" as its own finding.
+    (
+        "the comparison tells an addition from a version change",
+        INSTALL,
+        """            was_present = name in before.direct.get(section, {})
+            (changed if was_present else added).append((section, name))""",
+        """            added.append((section, name))""",
     ),
     # If install_dependency stops verifying the delta, a lifecycle-script-added
     # extra dependency survives an 'installed' claim.

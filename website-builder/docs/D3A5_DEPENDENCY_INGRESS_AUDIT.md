@@ -360,6 +360,26 @@ A test pins the reviewed surface as EXACTLY the four sections, so no section can
 be silently added or lost. A mutation guard proves that dropping
 ``peerDependencies`` fails the suite (the delta classification changes).
 
+### The comparison identifies an ADDED package as an addition, not a re-pin
+
+The before/after comparison must identify **an added direct package**. It did, but
+the field was named ``added`` while holding BOTH a genuinely new package AND a
+version change of an existing one -- ``dependency_delta`` reports a package when
+``before[name] != after[name]``, so the two landed in the same bucket and a
+consumer could not tell "a new package appeared" from "an existing package was
+re-pinned". That is the same class as the rest of this batch: a name narrower than
+the property it reports.
+
+Fix: the verdict now carries ``added`` (genuinely NEW -- absent from ``before``)
+and ``changed`` (already present, version moved) as SEPARATE fields, and
+``to_dict`` emits both. Both are still offending, so ``ok`` is unchanged; the split
+is about IDENTITY, not policy. The ``ok``/payload binding covers ``changed`` too.
+
+```
+added:   [["dependencies", "evil"]]    <- a new package
+changed: [["dependencies", "react"]]   <- 19.3.0 -> 19.4.0
+```
+
 ### The verifier is WIRED into every operation allowed to mutate the manifest
 
 Auditing which operations may mutate a generated project's `package.json` found

@@ -574,3 +574,87 @@ def test_the_reviewed_surface_is_exactly_the_four_dependency_sections():
         "optionalDependencies",
         "peerDependencies",
     )
+
+
+# ---------------------------------------------------------------------------
+# "Before/after comparison must identify: added direct package"
+# ---------------------------------------------------------------------------
+# The verdict must identify an ADDED direct package AS an addition -- not conflate
+# it with a version change of an existing package. `added` holds only genuinely
+# NEW packages; an already-present package whose version moved is `changed`. Both
+# are still offending (ok=False), so the split is about IDENTITY, not policy.
+
+
+def test_an_added_package_is_identified_as_added_not_changed(tmp_path):
+    v = _verdict(
+        tmp_path,
+        {"name": "p", "dependencies": {"react": "19.3.0"}},
+        {"name": "p", "dependencies": {"react": "19.3.0", "evil": "1.0.0"}},
+    )
+
+    assert v.added == (("dependencies", "evil"),)
+    assert v.changed == ()
+
+
+def test_a_version_change_is_identified_as_changed_not_added(tmp_path):
+    v = _verdict(
+        tmp_path,
+        {"name": "p", "dependencies": {"react": "19.3.0"}},
+        {"name": "p", "dependencies": {"react": "19.4.0"}},
+    )
+
+    assert v.added == ()
+    assert v.changed == (("dependencies", "react"),)
+
+
+def test_an_addition_and_a_change_are_kept_in_separate_buckets(tmp_path):
+    v = _verdict(
+        tmp_path,
+        {"name": "p", "dependencies": {"react": "19.3.0"}},
+        {"name": "p", "dependencies": {"react": "19.4.0", "evil": "1.0.0"}},
+    )
+
+    assert v.added == (("dependencies", "evil"),)
+    assert v.changed == (("dependencies", "react"),)
+    assert v.ok is False
+
+
+def test_a_reviewed_addition_is_in_neither_bucket(tmp_path):
+    """A correctly-placed reviewed package is not an offending addition."""
+    v = _verdict(
+        tmp_path,
+        {"name": "p", "dependencies": {}},
+        {"name": "p", "dependencies": {"cn": "0.4.0"}},
+        allowed=("cn",),
+    )
+
+    assert v.ok is True
+    assert v.added == ()
+    assert v.changed == ()
+
+
+def test_a_changed_only_verdict_serializes_both_buckets(tmp_path):
+    v = _verdict(
+        tmp_path,
+        {"name": "p", "dependencies": {"react": "19.3.0"}},
+        {"name": "p", "dependencies": {"react": "19.4.0"}},
+    )
+
+    document = v.to_dict()
+    assert document["added"] == []
+    assert document["changed"] == [["dependencies", "react"]]
+
+
+def test_the_ok_binding_covers_the_changed_bucket():
+    """An ok verdict may not carry a `changed` entry either."""
+    with pytest.raises(ValueError):
+        DirectDependencyDeltaVerdict(ok=True, changed=(("dependencies", "x"),))
+
+
+def test_a_refusal_may_name_only_a_changed_entry():
+    verdict = DirectDependencyDeltaVerdict(
+        ok=False, changed=(("dependencies", "x"),), reason="r"
+    )
+
+    assert verdict.ok is False
+    assert verdict.changed == (("dependencies", "x"),)

@@ -1220,9 +1220,14 @@ class DirectDependencyDeltaVerdict:
     """
 
     ok: bool
-    #: ``(section, package)`` pairs added or changed OUTSIDE policy -- a package
-    #: not in the reviewed set, or a reviewed package in a non-runtime section.
+    #: ``(section, package)`` pairs that are genuinely NEW -- absent from the
+    #: ``before`` snapshot -- and outside policy. A version CHANGE is NOT here:
+    #: it is a different finding and is reported by ``changed``.
     added: Tuple[Tuple[str, str], ...] = ()
+    #: ``(section, package)`` pairs that were ALREADY present but whose VERSION
+    #: changed, outside policy. Kept distinct from ``added`` so a consumer can
+    #: tell "a new package appeared" from "an existing package was re-pinned".
+    changed: Tuple[Tuple[str, str], ...] = ()
     #: ``(section, package)`` pairs present before and ABSENT after -- a project
     #: dependency the operation deleted.
     removed: Tuple[Tuple[str, str], ...] = ()
@@ -1235,7 +1240,9 @@ class DirectDependencyDeltaVerdict:
     truncated: bool = False
 
     def __post_init__(self) -> None:
-        offending = bool(self.added or self.removed or self.sections_changed)
+        offending = bool(
+            self.added or self.changed or self.removed or self.sections_changed
+        )
         if self.ok and offending:
             raise ValueError("an ok dependency-delta verdict must carry no offending delta")
         if not self.ok and not offending:
@@ -1248,6 +1255,7 @@ class DirectDependencyDeltaVerdict:
         return {
             "ok": self.ok,
             "added": [list(pair) for pair in self.added],
+            "changed": [list(pair) for pair in self.changed],
             "removed": [list(pair) for pair in self.removed],
             "sections_changed": list(self.sections_changed),
             "reason": self.reason,
@@ -1266,9 +1274,12 @@ def verify_direct_dependency_delta(
     The ONE reusable check, composing the existing primitives so an operation does
     not re-derive them:
 
-    * additions/changes -- :func:`dependency_delta` filtered by the reviewed set
-      and each package's allowed SECTION (a runtime package smuggled into
+    * ADDED packages -- :func:`dependency_delta` filtered by the reviewed set and
+      each package's allowed SECTION (a runtime package smuggled into
       devDependencies is not the reviewed shape);
+    * CHANGED packages -- an already-present package whose VERSION moved, kept
+      distinct from an addition so the verdict identifies "an added direct
+      package" as its own finding rather than conflating it with a re-pin;
     * removals -- :func:`removed_direct_dependencies`, because a delta only
       reports what ``after`` CONTAINS and is blind to a silent deletion;
     * unexpected sections -- :func:`changed_manifest_sections`, so a section
@@ -1300,12 +1311,20 @@ def verify_direct_dependency_delta(
     else:
         allowed = {str(name): SECTION_DEPENDENCIES for name in allowed_additions}
 
-    additions = sorted(
-        (section, name)
-        for section, packages in dependency_delta(before.direct, after.direct).items()
-        for name in packages
-        if allowed.get(name) != section
-    )
+    # A package is ADDED when it is absent from `before`; it is CHANGED when it
+    # was already present but its version differs. Splitting the two is what lets
+    # the comparison identify "an added direct package" as a distinct finding --
+    # a single `dependency_delta` bucket conflates them.
+    added: List[Tuple[str, str]] = []
+    changed: List[Tuple[str, str]] = []
+    for section, packages in dependency_delta(before.direct, after.direct).items():
+        for name in packages:
+            if allowed.get(name) == section:
+                continue
+            was_present = name in before.direct.get(section, {})
+            (changed if was_present else added).append((section, name))
+    additions = sorted(added)
+    changes = sorted(changed)
     removals = sorted(
         (section, name)
         for section, names in removed_direct_dependencies(before.direct, after.direct).items()
@@ -1315,10 +1334,11 @@ def verify_direct_dependency_delta(
 
     truncated = (
         len(additions) > _MAX_DELTA_NAMES
+        or len(changes) > _MAX_DELTA_NAMES
         or len(removals) > _MAX_DELTA_NAMES
         or len(sections) > _MAX_DELTA_NAMES
     )
-    ok = not (additions or removals or sections)
+    ok = not (additions or changes or removals or sections)
 
     reason: Optional[str] = None
     if not ok:
@@ -1333,6 +1353,7 @@ def verify_direct_dependency_delta(
     return DirectDependencyDeltaVerdict(
         ok=ok,
         added=tuple(additions[:_MAX_DELTA_NAMES]),
+        changed=tuple(changes[:_MAX_DELTA_NAMES]),
         removed=tuple(removals[:_MAX_DELTA_NAMES]),
         sections_changed=tuple(sections[:_MAX_DELTA_NAMES]),
         reason=reason,
