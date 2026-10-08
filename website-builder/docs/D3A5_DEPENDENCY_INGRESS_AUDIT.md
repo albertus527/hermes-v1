@@ -236,6 +236,30 @@ GET https://21st.dev/api/v1/components/search?q=<term>&scope=public&limit=24
 - **No fabrication.** A malformed or empty search response is a degraded empty
   result, never an invented entry.
 
+### The D3a.5 mutation drivers: a KILL is a FAILED test, not an exit code
+
+While pinning the reduced-motion guard, a defect in the D3a.5 drivers themselves
+surfaced. Each driver mutates a guard and checks the focused tests go RED, then
+reports `[KILLED]`. But "red" has two causes:
+
+```
+1 failed, 38 passed in 0.74s   -> a real FAILURE   -> the guard is load-bearing
+1 error in 0.24s               -> collection error -> the tests NEVER RAN
+```
+
+The drivers matched only the PLURAL `" errors in "`, while pytest prints
+`"1 error in"` (SINGULAR) for one collection error. So a mutation that merely
+broke collection -- tests never executed -- was reported `[KILLED]`. That is a
+**false kill**, and it would weaken every "N/N guards killed" claim.
+
+Fix: a KILL is keyed on pytest's summary token **`"failed"`**. Anything else
+(a collection error, singular or plural, or "no tests ran") is `[INVALID]` and
+recorded as unproven. Applied to all five D3a.5 drivers; a regression test
+(`tests/test_mutation_driver_classification.py`) pins the rule.
+
+Scope note: the older D0/D1/D2 drivers are separate work and were NOT touched.
+(That scope decision is deliberate and unchanged.)
+
 ### The guard string: `@media (prefers-reduced-motion: reduce)` — scope pinned
 
 The detector handles the canonical selector and every realistic spelling of it

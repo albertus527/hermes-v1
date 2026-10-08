@@ -409,20 +409,17 @@ def main():
             if code == 0:
                 print(f"[SURVIVED]   {label} -- tests still pass without this guard")
                 unproven.append(f"{label}: tests still pass without this guard")
-            elif "no tests ran" in tail:
-                # A collection failure must never count as a kill: it proves
-                # the tests did not execute, which invalidates the mutation
-                # rather than demonstrating the guard is load-bearing.
-                print(f"[INVALID]    {label} -- {tail}")
-                unproven.append(f"{label}: mutation invalidated collection ({tail})")
-            elif " errors in " in tail:
-                # A nonzero ERROR count means collection did not fully
-                # succeed. The baseline is verified to have zero, so any
-                # errors here were introduced by the mutation itself.
-                print(f"[INVALID]    {label} -- collection errors: {tail}")
-                unproven.append(f"{label}: mutation introduced collection errors ({tail})")
-            else:
+            elif "failed" in tail:
+                # A real FAILED test is the ONLY outcome that proves a guard is
+                # load-bearing. pytest's summary line is the discriminator.
                 print(f"[KILLED]     {label} -- {tail}")
+            else:
+                # No test produced a pass/fail outcome: a collection error
+                # (pytest prints "1 error in" SINGULAR or "N errors in" plural)
+                # or "no tests ran". The mutation proved NOTHING, so it must not
+                # count as a kill.
+                print(f"[INVALID]    {label} -- {tail}")
+                unproven.append(f"{label}: mutation produced no test outcome ({tail})")
 
     print()
     if unproven:
