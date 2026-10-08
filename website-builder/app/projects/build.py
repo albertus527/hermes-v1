@@ -59,6 +59,23 @@ PROTECTED_TOOLCHAIN_FILES = (
     "vite.config.ts",
 )
 
+#: Config filenames a tool auto-discovers with PRECEDENCE, where the starter
+#: ships only the one in ``PROTECTED_TOOLCHAIN_FILES``. Vite resolves
+#: ``DEFAULT_CONFIG_FILES`` in order -- ``vite.config.js``, ``.mjs``, ``.ts``,
+#: ``.cjs``, ``.mts``, ``.cts`` -- so a FRONTEND-created ``vite.config.js``
+#: SHADOWS the platform-owned ``vite.config.ts`` and a by-name hash guard never
+#: sees it. Reproduced live: planting ``vite.config.js`` with a different
+#: ``build.outDir`` made ``npm run build`` write there while
+#: ``_verify_toolchain_untouched`` reported ``None`` (untouched). These must be
+#: ABSENT -- the platform owns exactly one config per resolver.
+FORBIDDEN_TOOLCHAIN_FILES = (
+    "vite.config.js",
+    "vite.config.mjs",
+    "vite.config.cjs",
+    "vite.config.mts",
+    "vite.config.cts",
+)
+
 # Phase-7 compile repair: after initial FRONTEND generation, a single targeted
 # FRONTEND repair attempt may run when the fixed cheap checks fail for a
 # deterministic source/code-level reason. Exactly one attempt, never a second.
@@ -334,9 +351,23 @@ def _capture_toolchain_hashes(workspace: Path) -> Dict[str, str]:
 
 
 def _verify_toolchain_untouched(workspace: Path, expected_hashes: Dict[str, str]) -> Optional[str]:
-    """Verify that protected toolchain identity files have not been modified or deleted.
+    """Verify protected toolchain identity files are unchanged AND complete.
 
-    Returns the filename of the first modified/missing file, or None if all match.
+    Two independent dimensions:
+
+    1. **Present protected files are unchanged.** Every captured file must still
+       exist and hash the same, else ``missing:<name>`` / ``modified:<name>``.
+    2. **A protected file that was ABSENT at capture must not APPEAR, and no
+       shadowing config may exist.** The captured dict only names files present
+       at capture, so an absent-at-capture protected file was previously
+       unverified -- and, more sharply, a tool that auto-discovers a config by
+       PRECEDENCE (Vite: ``vite.config.js`` > ``.mjs`` > ``.ts`` > …) would let a
+       FRONTEND-created ``vite.config.js`` SHADOW the protected
+       ``vite.config.ts``. Reproduced live: the shadow config's ``outDir`` was
+       honored while the by-name guard reported untouched.
+
+    Returns the first offending filename (``appeared:<name>`` / ``forbidden:`` /
+    ``missing:`` / ``modified:``), or None if everything matches.
     """
     for filename, expected in expected_hashes.items():
         target = workspace / filename
@@ -344,6 +375,17 @@ def _verify_toolchain_untouched(workspace: Path, expected_hashes: Dict[str, str]
             return f"missing:{filename}"
         if _file_sha256(target) != expected:
             return f"modified:{filename}"
+
+    # A protected file that did not exist at capture must not have been created.
+    for filename in PROTECTED_TOOLCHAIN_FILES:
+        if filename not in expected_hashes and (workspace / filename).is_file():
+            return f"appeared:{filename}"
+
+    # A shadowing config the resolver would prefer must never exist.
+    for filename in FORBIDDEN_TOOLCHAIN_FILES:
+        if (workspace / filename).is_file():
+            return f"forbidden:{filename}"
+
     return None
 
 

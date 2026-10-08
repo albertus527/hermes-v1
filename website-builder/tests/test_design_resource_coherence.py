@@ -903,3 +903,21 @@ def test_the_documented_typecheck_command_states_the_starter_dep_fix():
     assert "was absent from the always-provided set" in text
 
 
+def test_the_documented_build_command_is_present():
+    """The command builds a disposable project after a reviewed install."""
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    assert "`build` a generated project after a reviewed install" in text
+    assert '"build": "tsc -b && vite build"' in text
+    assert "npm run build" in text
+
+
+def test_the_documented_build_command_states_the_shadow_config_fix():
+    """The doc must record the vite.config shadowing defect and its fix."""
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    assert "shadow" in text.lower()
+    assert "FORBIDDEN_TOOLCHAIN_FILES" in text
+    assert "TOOLCHAIN_MUTATION_REJECTED" in text
+
+

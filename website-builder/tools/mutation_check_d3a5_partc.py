@@ -452,6 +452,15 @@ MUTATIONS = [
         "was absent from the always-provided set",
         "was absent from the reviewed set",
     ),
+    # --- 19. the documented build command records the shadow-config fix
+    # The build's toolchain guard must reject a shadowing config. If the doc
+    # drops that, a reader cannot tell the guard is broader than a by-name hash.
+    (
+        "the documented build command records the shadow-config fix",
+        AUDIT_DOC,
+        "FORBIDDEN_TOOLCHAIN_FILES",
+        "the toolchain file list",
+    ),
 ]
 
 

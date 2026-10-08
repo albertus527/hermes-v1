@@ -32,6 +32,12 @@ from app.core.contracts import OperationResult
 from app.core.lifecycle import ProjectLifecycle
 from app.core.state import ProjectStateStore
 from app.projects.build import FrontendBuilder, BuildResult
+from app.projects.build import (
+    FORBIDDEN_TOOLCHAIN_FILES,
+    PROTECTED_TOOLCHAIN_FILES,
+    _capture_toolchain_hashes,
+    _verify_toolchain_untouched,
+)
 from app.qa.orchestrator import QAResult
 from app.sandbox.runner import ProjectRunner
 
@@ -1095,6 +1101,121 @@ class TestToolchainProtectionInitialBuild(unittest.TestCase):
         self.assertEqual(result.error, "TOOLCHAIN_MUTATION_REJECTED")
         state = self.store.load("proj-mutate-fail")
         self.assertIn("TOOLCHAIN_MUTATION_REJECTED", state.failure["error"])
+
+
+# ---------------------------------------------------------------------------
+# The toolchain guard must also reject a SHADOWING config, not just a mutated
+# protected file.
+#
+# Vite resolves its config by PRECEDENCE -- ``DEFAULT_CONFIG_FILES`` is
+# [vite.config.js, .mjs, .ts, .cjs, .mts, .cts] -- and the starter ships only
+# ``vite.config.ts``. A by-name hash guard therefore never saw a
+# FRONTEND-created ``vite.config.js``, which SHADOWS the platform-owned config.
+# Reproduced live: the shadow config's ``build.outDir`` was honored while the
+# guard reported untouched. Same class as every other repair in this batch: a
+# guard whose scope is narrower than the property it names.
+# ---------------------------------------------------------------------------
+
+
+class TestToolchainShadowConfigRejected(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.starter = Path(self.tmpdir) / "starter"
+        self.starter.mkdir(parents=True)
+        for name in PROTECTED_TOOLCHAIN_FILES:
+            (self.starter / name).write_text("starter\n", encoding="utf-8")
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_the_real_starter_ships_no_forbidden_config(self):
+        """No false positive: the platform-owned starter has none of these."""
+        from app.projects.build import _STARTER_PATH
+
+        for name in FORBIDDEN_TOOLCHAIN_FILES:
+            self.assertFalse(
+                (_STARTER_PATH / name).exists(),
+                f"the starter must not ship the shadowing config {name}",
+            )
+
+    def test_every_forbidden_config_is_rejected(self):
+        """Each shadowing filename is caught, with a named reason."""
+        for name in FORBIDDEN_TOOLCHAIN_FILES:
+            with self.subTest(name=name):
+                work = Path(self.tmpdir) / f"work-{name}"
+                import shutil
+
+                shutil.copytree(self.starter, work)
+                hashes = _capture_toolchain_hashes(work)
+                (work / name).write_text("export default {}\n", encoding="utf-8")
+                self.assertEqual(
+                    _verify_toolchain_untouched(work, hashes), f"forbidden:{name}"
+                )
+
+    def test_a_shadowing_vite_config_fails_the_build(self):
+        """End to end: FRONTEND planting vite.config.js fails with the
+        deterministic toolchain-policy code, never a generic success."""
+        starter = Path(self.tmpdir) / "starter-e2e"
+        (starter / "src").mkdir(parents=True)
+        (starter / ".nvmrc").write_text("26.5.0\n", encoding="utf-8")
+        (starter / "package.json").write_text(
+            json.dumps({"name": "starter", "scripts": {"build": "echo build"}}),
+            encoding="utf-8",
+        )
+        (starter / "src" / "App.tsx").write_text("// placeholder\n", encoding="utf-8")
+
+        workspace_root = Path(self.tmpdir) / "ws-e2e"
+        store = ProjectStateStore(Path(self.tmpdir) / "state-e2e")
+        runner = ProjectRunner(workspace_root, store)
+        adapter = MagicMock()
+
+        def plant_shadow(**kwargs):
+            (kwargs["workspace"] / "vite.config.js").write_text(
+                "export default { build: { outDir: 'evil' } }\n", encoding="utf-8"
+            )
+            return {"success": True, "design_dna": {"version": 1}}
+
+        adapter.frontend_build.side_effect = plant_shadow
+        builder = FrontendBuilder(
+            runner, store, hermes_adapter=adapter, starter_path=starter
+        )
+        _queue_project(store, "proj-shadow")
+        result = builder.build(
+            "proj-shadow", {"name": "N", "what": "barbershop", "why": "booking"}
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error, "TOOLCHAIN_MUTATION_REJECTED")
+        state = store.load("proj-shadow")
+        self.assertIsNotNone(state)
+        assert state is not None
+        self.assertIn("vite.config.js", state.failure["error"])
+
+    def test_an_absent_at_capture_protected_file_appearing_is_rejected(self):
+        """A protected file ABSENT at capture was previously unverified; if
+        FRONTEND creates it, the guard must reject it."""
+        work = Path(self.tmpdir) / "work-appear"
+        import shutil
+
+        shutil.copytree(self.starter, work)
+        (work / "tsconfig.node.json").unlink()
+        hashes = _capture_toolchain_hashes(work)
+        self.assertNotIn("tsconfig.node.json", hashes)
+        (work / "tsconfig.node.json").write_text("created\n", encoding="utf-8")
+        self.assertEqual(
+            _verify_toolchain_untouched(work, hashes),
+            "appeared:tsconfig.node.json",
+        )
+
+    def test_the_untouched_starter_is_still_accepted(self):
+        """The control: an unmodified starter reports untouched."""
+        self.assertIsNone(
+            _verify_toolchain_untouched(
+                self.starter, _capture_toolchain_hashes(self.starter)
+            )
+        )
 
 
 # ---------------------------------------------------------------------------

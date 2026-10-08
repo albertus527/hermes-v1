@@ -2140,6 +2140,71 @@ cache (build mode re-checks changed inputs). Before the fix this command refused
 outside the application-owned reviewed set`) because `class-variance-authority`
 was absent from the always-provided set.
 
+### VPS command: `build` a generated project after a reviewed install
+
+`build` is the starter's `"build": "tsc -b && vite build"` — typecheck, then
+bundle. Run it on a disposable copy after installing the reviewed components,
+and confirm `dist/` is produced. The build is only meaningful if the installed
+components are **actually bundled**: Vite tree-shakes an unimported component
+away, so import them before building.
+
+```bash
+cd website-builder && source .venv/bin/activate
+APP="$(pwd)"
+
+WORK="$(mktemp -d)" && cp -r ../templates/frontend-starter "$WORK/project"
+cd "$WORK/project" && rm -rf node_modules dist && npm ci --no-audit --no-fund
+
+# Install EVERY reviewed builtin + the reviewed external component.
+python - "$APP" <<'PY'
+import sys, subprocess
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from app.core.design_install import DesignDependencyInstaller, ALLOWED_SHADCN_COMPONENTS
+from app.core.design_registry import RegistryInstallRequest, resolve_registry_locator
+
+class Runner:
+    def __init__(self): self.calls = []
+    def run_command(self, project_id, command, cwd=None, env=None, timeout=300.0):
+        self.calls.append(list(command))
+        return subprocess.run(list(command), cwd=cwd, capture_output=True,
+                              text=True, timeout=timeout, shell=False)
+
+o, installed, rejected = DesignDependencyInstaller(
+    Runner(), "p", Path(".")).install_components(sorted(ALLOWED_SHADCN_COMPONENTS))
+print("builtins:", o.state, len(installed), "rejected:", rejected)
+req = RegistryInstallRequest(source="react_bits", component_id="SplitText",
+    registry_locator_id=resolve_registry_locator("react_bits", "SplitText"),
+    required_dependency_ids=("gsap", "gsap_react"))
+o2 = DesignDependencyInstaller(Runner(), "p", Path(".")).install_external_component(req)
+print("SplitText:", o2.state)
+PY
+
+npm run build     # tsc -b && vite build -- must exit 0
+ls dist/assets/   # dist/ must be produced
+```
+
+**Observed on the qualification host (2026-10):** all 16 reviewed builtins +
+`SplitText` install (`installed`), `npm run build` exits **0**, and `dist/`
+contains `index.html` + `dist/assets/index-*.{js,css}`.
+
+**The build is load-bearing.** Vite tree-shakes an unimported component: with the
+components installed but not imported the bundle is `193.07 kB` and contains
+**none** of their code; importing them (via `src/App.tsx`) makes the build report
+**2026 modules transformed** and the bundle grow to `312.25 kB` with the
+component code present. So a green build only proves the installed components
+compile when they are actually reachable — which is what a real generated site
+does.
+
+**Toolchain shadow-config guard (fixed in this pass).** Vite resolves its config
+by PRECEDENCE (`vite.config.js` → `.mjs` → `.ts` → …) and the starter ships only
+`vite.config.ts`. A FRONTEND-created `vite.config.js` therefore **shadows** the
+platform-owned config: reproduced live, planting one with a different
+`build.outDir` made `npm run build` write to `evil-dist` while the by-name hash
+guard reported *untouched*. The build's toolchain guard now also rejects any
+`FORBIDDEN_TOOLCHAIN_FILES` (`vite.config.{js,mjs,cjs,mts,cts}`) and any
+protected file that APPEARS after capture — `TOOLCHAIN_MUTATION_REJECTED`.
+
 ### Why these are manual, not in the suite
 
 The suite bans sockets (`socket.socket.connect`, `create_connection`,

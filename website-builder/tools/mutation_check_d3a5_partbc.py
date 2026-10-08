@@ -47,6 +47,7 @@ REGISTRY = "app/core/design_registry.py"
 INSTALL = "app/core/design_install.py"
 FETCH = "app/core/design_catalog_fetch.py"
 CRITIC = "app/core/design_critic.py"
+BUILD = "app/projects/build.py"
 
 NPM_SPEC_TESTS = "tests/test_design_npm_spec.py"
 REGISTRY_TESTS = "tests/test_design_registry.py"
@@ -59,6 +60,7 @@ DELTA_VERIFIER_TESTS = "tests/test_design_dependency_delta_verifier.py"
 PIN_TESTS = "tests/test_design_dependency_pins.py"
 FETCH_TESTS = "tests/test_design_catalog_fetch.py"
 CRITIC_TESTS = "tests/test_design_critic.py"
+BUILD_TESTS = "tests/test_build.py"
 
 MUTATIONS = [
     # ------------------------------------------------------------------
@@ -765,6 +767,20 @@ MUTATIONS = [
 )""",
         """_ALWAYS_PROVIDED_PACKAGES: Tuple[str, ...] = ("react", "react-dom")""",
     ),
+    # 8c. The toolchain guard must reject a SHADOWING config, not just a mutated
+    # protected file. Vite resolves its config by PRECEDENCE, so a FRONTEND-added
+    # vite.config.js shadows the protected vite.config.ts. Dropping the check
+    # reintroduces the shadow bypass.
+    (
+        "the toolchain guard rejects a shadowing config",
+        BUILD,
+        """    # A shadowing config the resolver would prefer must never exist.
+    for filename in FORBIDDEN_TOOLCHAIN_FILES:
+        if (workspace / filename).is_file():
+            return f"forbidden:{filename}"
+""",
+        "",
+    ),
     # 9. The external path must apply the source-import boundary too.
     (
         "the external component source import boundary runs",
@@ -1132,6 +1148,8 @@ def tests_for(relative: str) -> Tuple[str, ...]:
         return (FETCH_TESTS,)
     if relative == CRITIC:
         return (CRITIC_TESTS,)
+    if relative == BUILD:
+        return (BUILD_TESTS,)
     return (NPM_SPEC_TESTS,)
 
 
@@ -1165,6 +1183,7 @@ def main():
         ("Parts E/K", PIN_TESTS),
         ("Part G", FETCH_TESTS),
         ("Part H", CRITIC_TESTS),
+        ("build", BUILD_TESTS),
     ):
         code, tail = run_tests(ROOT, path)
         print(f"{label} baseline: exit={code} {tail}")
