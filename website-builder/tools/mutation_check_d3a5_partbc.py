@@ -229,6 +229,25 @@ MUTATIONS = [
         identity = match.group(1).strip()""",
     ),
     # ------------------------------------------------------------------
+    # The adapter uses the AUTHORITATIVE interface + its documented auth
+    # ------------------------------------------------------------------
+    # auth.md: "REST v1 reads Authorization: Bearer ... only and answers 401 to
+    # x-api-key." Switching the header would break against the real API.
+    (
+        "the adapter sends Authorization: Bearer, not x-api-key",
+        FETCH,
+        """        headers["Authorization"] = f"Bearer {credential}"
+""",
+        """        headers["x-api-key"] = credential
+""",
+    ),
+    (
+        "the search endpoint is under the designated api/v1 base",
+        FETCH,
+        """    SOURCE_TWENTY_FIRST: "https://21st.dev/api/v1/components/search",""",
+        """    SOURCE_TWENTY_FIRST: "https://21st.dev/components/search",""",
+    ),
+    # ------------------------------------------------------------------
     # The fetch NEVER raises for an upstream problem (incl. HTTPException)
     # ------------------------------------------------------------------
     (

@@ -236,6 +236,35 @@ GET https://21st.dev/api/v1/components/search?q=<term>&scope=public&limit=24
 - **No fabrication.** A malformed or empty search response is a degraded empty
   result, never an invented entry.
 
+### The interface we call is the AUTHORITATIVE one (21st says so)
+
+21st publishes several machine-readable surfaces. Which one is authoritative is
+not a guess -- 21st's own ARD manifest says so:
+
+```
+/.well-known/ard.json
+  entries:
+    identifier  urn:air:21st.dev:api:rest-v1
+    type        application/vnd.oai.openapi+json;version=3.0
+    url         https://21st.dev/openapi.json
+```
+
+Exactly **one** API entry exists (`urn:air:21st.dev:api:rest-v1`) -- there is no
+v2 or rival API. Its RFC 9727 catalog (`/.well-known/api-catalog`) anchors that
+service at `https://21st.dev/api/v1`, and our search endpoint
+(`.../api/v1/components/search`) sits under that base. So the surface our
+adapter calls **is** the authoritative one, by 21st's own designation.
+
+The same manifests pin the auth method. `auth.md` (the ARD-designated agent auth
+doc) says:
+
+> "Send an API key as a Bearer token on every request; that header works on both
+>  MCP endpoints and on REST v1... REST v1 reads `Authorization: Bearer ...`
+>  only and answers `401` to `x-api-key`."
+
+Our adapter sends `Authorization: Bearer <key>` and never `x-api-key` -- the one
+the REST surface reads. Both facts are now pinned by tests + guards.
+
 ### The official machine-readable interface is still the one we call
 
 Re-verified that our adapter uses 21st's OWN documented machine-readable

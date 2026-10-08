@@ -970,3 +970,41 @@ def test_an_http_exception_does_not_leak_the_bearer_value():
     blob = json.dumps({"reason": result.reason, "payload": result.payload}, default=str)
     assert secret not in blob
     assert "Authorization" not in blob
+
+
+# ---------------------------------------------------------------------------
+# The adapter targets the AUTHORITATIVE interface, with its documented auth
+# ---------------------------------------------------------------------------
+#
+# 21st's ARD manifest (/.well-known/ard.json) names exactly ONE REST API:
+#   urn:air:21st.dev:api:rest-v1 -> https://21st.dev/openapi.json
+# and its RFC 9727 catalog anchors that service at https://21st.dev/api/v1.
+# auth.md says: "REST v1 reads `Authorization: Bearer ...` only and answers
+# 401 to `x-api-key`." So the header choice is load-bearing.
+
+
+def test_the_search_endpoint_is_under_the_designated_api_base():
+    from app.core.design_catalog_fetch import CATALOG_SEARCH_ENDPOINTS
+    from app.core.design_registry import SOURCE_TWENTY_FIRST
+
+    assert CATALOG_SEARCH_ENDPOINTS[SOURCE_TWENTY_FIRST].startswith(
+        "https://21st.dev/api/v1/"
+    )
+
+
+def test_the_adapter_sends_bearer_not_x_api_key():
+    """REST v1 answers 401 to x-api-key; Authorization: Bearer is the one."""
+    seen = {}
+
+    def transport(url, headers, timeout):
+        seen.update(headers)
+        return 200, b'{"results":[{"slug":"x"}]}'
+
+    fetch_catalog_payload(
+        SOURCE_TWENTY_FIRST,
+        transport=transport,
+        credential_provider=lambda _s: "21st_sk_present",
+    )
+
+    assert seen.get("Authorization") == "Bearer 21st_sk_present"
+    assert "x-api-key" not in {k.lower() for k in seen}
