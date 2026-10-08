@@ -709,3 +709,42 @@ def test_the_live_smoke_doc_does_not_hard_code_a_test_count():
     text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
     # no `# <N> passed, <N> skipped` comment beside the pytest line
     assert not re.search(r"pytest tests/ -q\s+#\s*\d+ passed", text)
+
+
+def test_the_documented_21st_discovery_command_is_present_and_exact():
+    """The VPS command for 21st real discovery must document the real surface.
+
+    The credential requirement is load-bearing: 21st's only machine surface is the
+    authenticated REST search. The documented command must name it, and must not
+    reintroduce the "free tier" claim the batch removed.
+    """
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    assert "21st REAL discovery" in text
+    assert "/api/v1/components/search" in text
+    # the real credential names, not invented ones
+    assert "API_KEY_21ST" in text
+    assert "TWENTYFIRST_TOKEN" in text
+    # the removed false claim must not come back
+    assert "free tier" not in text.lower() or "no free tier" in text.lower()
+
+
+def test_the_documented_discovery_never_echoes_the_credential():
+    """The documented command prints presence, never the value."""
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    # presence is printed; the value is only ever put in a header
+    assert "credential_present" in text
+    assert "Authorization: Bearer" in text
+    # no documented command interpolates the secret into a print
+    for line in text.splitlines():
+        if "print(" in line and "$API_KEY_21ST" in line:
+            raise AssertionError(f"a documented print echoes the secret: {line!r}")
+
+
+def test_the_documented_discovery_states_the_proposal_not_install_rule():
+    """A discovered component is a proposal; only review makes it installable."""
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    assert "PROPOSAL, not an install" in text
+    assert "approved_registry_components" in text

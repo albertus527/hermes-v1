@@ -366,6 +366,15 @@ MUTATIONS = [
         reasons=(),
     )""",
     ),
+    # --- 14b. the documented 21st discovery names the real authenticated surface
+    # If the doc stops naming the credential requirement / the real endpoint, a
+    # reader following it would try an unauthenticated call that can only 401.
+    (
+        "the documented 21st discovery names the credential requirement",
+        AUDIT_DOC,
+        "21st REAL discovery, with a credential when required",
+        "21st discovery (free, no credential needed)",
+    ),
     # --- 15. Part L: the documented no-delta proof must be able to FAIL -----
     # The doc must not document a self-comparison as the "unchanged" proof:
     # `git diff --no-index package.json package.json` compares a file to itself,

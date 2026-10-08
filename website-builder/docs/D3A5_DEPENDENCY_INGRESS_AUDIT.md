@@ -1475,6 +1475,72 @@ undercount, not a pass. Only the `full` row may be read as a certification.
 `authoritative=True` — certifying a project it never opened. Fixed by the fixed
 `.` target; pinned by tests and a mutation guard (see the audit's Part I notes).
 
+### VPS command: 21st REAL discovery, with a credential when required
+
+21st's only machine surface is the authenticated REST search
+(`GET https://21st.dev/api/v1/components/search`), so discovery **requires a
+credential**. The adapter reads the credential itself from the same env names the
+capability layer checks, so no caller wiring is needed — but the VALUE only ever
+goes into an `Authorization: Bearer …` header.
+
+```bash
+cd website-builder && source .venv/bin/activate
+
+# 1. Which env names are recognised, and is one configured?  (no value printed)
+python -c "from app.core.design_resources import CREDENTIAL_ENV_NAMES as N; \
+  from app.core.design_activation import credential_present; \
+  print('names:', N['twenty_first']); \
+  print('present:', credential_present(N['twenty_first']))"
+
+# 2. Configure the credential (one of the official names). Value never echoed.
+export API_KEY_21ST='21st_sk_...'          # or TWENTYFIRST_TOKEN
+
+# 3. REAL discovery against the live REST search. `query` is inert data.
+python -c "from app.core.design_catalog_fetch import discover_catalog as d; \
+  r = d('twenty_first', query='button'); \
+  print('ok=%s entries=%d' % (r.ok, len(r.entries))); \
+  print('warnings:', r.warnings); \
+  print('ids:', [e.component_id for e in r.entries][:10])"
+
+# 4. Confirm capability and execution AGREE (both keyed on the same credential).
+python -c "from pathlib import Path; from app.core.design_activation import activate_resource; \
+  from app.core.design_resources import load_design_resource_manifest as m; \
+  from app.core.design_catalog_fetch import discover_catalog as d; \
+  c = activate_resource(Path('/tmp'), m().get('twenty_first'), system='Linux', machine='x86_64'); \
+  r = d('twenty_first'); \
+  print('cap.discovery=%s cap.auth_present=%s | exec ok=%s' % (c.discovery_available, c.authentication_present, r.ok))"
+
+# 5. Cross-check the raw endpoint (the same surface, by hand).
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -H "Authorization: Bearer $API_KEY_21ST" \
+  'https://21st.dev/api/v1/components/search?q=button&scope=public&limit=3'
+```
+
+**Observed on the qualification host (2026-10):**
+
+| credential | `credential_present` | `cap.discovery` | exec `ok` | exec warning |
+|---|---|---|---|---|
+| none | False | False | False | `this catalog needs a credential that is not configured` |
+| set (invalid/placeholder) | True | True | False | `the catalog rejected the configured credential` |
+| set (valid) | True | True | **True** | — (entries returned) |
+
+The live endpoint confirms the header is what matters:
+
+| request | response |
+|---|---|
+| no `Authorization` | `401 {"error":"unauthorized", ...}` |
+| `Authorization: Bearer <invalid>` | `401 {"error":"invalid_api_key", ...}` — upstream PARSED the key |
+| `x-api-key: <invalid>` | `401 {"error":"unauthorized", ...}` — ignored; REST v1 reads `Authorization` only |
+
+**No credential → no request.** The adapter returns `REASON_CREDENTIAL_REQUIRED`
+without a round-trip (verified: the transport is never called), so an absent key
+is a bounded state, not a wasted 401.
+
+**A discovered component is a PROPOSAL, not an install.** `approved_registry_components('twenty_first')`
+is `()` — nothing is reviewed for 21st, so a discovered id is never installable.
+Discovery proves a component EXISTS; only a reviewed contract makes it installable.
+
+
 
 ## Part L — manual LIVE smokes (run AFTER the unit suite)
 
