@@ -46,7 +46,12 @@ HYGIENE_TESTS = "tests/test_suite_hygiene.py"
 #: Suite offline guard: no default-suite test may reach the network. Carried
 #: here so the guard is proven.
 OFFLINE_TESTS = "tests/test_suite_offline.py"
-RUN_TESTS = (ACTIVATION_TESTS, COHERENCE_TESTS, HYGIENE_TESTS, OFFLINE_TESTS)
+#: Part M: the FINAL PROOF runner's own self-checks (pins match the drivers).
+FINAL_PROOF_TESTS = "tests/test_final_proof_runner.py"
+#: The runner itself (mutated by guard #23 to prove the pin cross-check).
+FINAL_PROOF_RUNNER = "tools/d3a5_final_proof.py"
+RUN_TESTS = (ACTIVATION_TESTS, COHERENCE_TESTS, HYGIENE_TESTS, OFFLINE_TESTS,
+             FINAL_PROOF_TESTS)
 ACTIVATION = "app/core/design_activation.py"
 RESOURCES = "app/core/design_resources.py"
 #: The audit doc records the manual LIVE smokes (Part L). The doc-rot guard in
@@ -499,6 +504,17 @@ MUTATIONS = [
             offenders.append((node.name, node.lineno))""",
         """        if False:
             offenders.append((node.name, node.lineno))""",
+    ),
+    # --- 23. the FINAL PROOF runner's pinned counts are cross-checked
+    # "all N guards killed" is self-referential: delete a mutation and the
+    # sentence stays true. The runner pins N externally; if the pin drifts from
+    # the driver's real count, the proof must FAIL. Mutate a pin to a wrong
+    # number; the self-check test must catch it.
+    (
+        "the final-proof runner pins match the drivers",
+        FINAL_PROOF_RUNNER,
+        '''    ("mutation_check_d3a5_parta.py", 16),''',
+        '''    ("mutation_check_d3a5_parta.py", 99),''',
     ),
 ]
 

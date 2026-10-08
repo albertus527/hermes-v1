@@ -1873,6 +1873,48 @@ a proven guard.
 
 
 
+## Part M — FINAL PROOF (one command, one verdict)
+
+The acceptance gate. `tools/d3a5_final_proof.py` runs the whole D3a.5 battery and
+prints a single PASS/FAIL. It is the one command to run before declaring the
+batch done.
+
+```bash
+cd website-builder && source .venv/bin/activate
+python tools/d3a5_final_proof.py
+```
+
+What it proves, in three blocks:
+
+1. **The default suite is GREEN while the internet is unreachable.** The suite
+   runs with NON-LOOPBACK network blocked at the Python level
+   (`socket.connect`/`getaddrinfo`/`urlopen`), so one run establishes both
+   "green" AND "offline". It also asserts exactly **4 deselected** -- the four
+   network-needing `test_starter_toolchain.py` command assertions, which must be
+   excluded, not silently run.
+2. **Every mutation driver kills all its guards, at the PINNED count.** A driver
+   prints "all N guards killed", which stays true if a mutation is DELETED -- so
+   the runner pins each N externally (`parta 16`, `partbc 73`, `partc 35`,
+   `partd 36`, `parti 18`). A dropped guard makes the count mismatch and the
+   proof FAIL. The three legacy D0/D1/D2-D3a drivers are reported for the record
+   (separate work; their host-masked kills are a documented artifact).
+3. **The guardrails hold:** branch `web-design`; `feature/website` byte-identical
+   to its baseline (`868ed00e3`); no D3b artifact; working tree clean.
+
+Exit code is 0 iff every check passes. The runner mutates nothing (each driver
+copies the tree to a temp dir; the runner only reads), so it is safe to run
+against the real working tree.
+
+**Why the counts are pinned.** `"all N guards killed"` is self-referential: delete
+a mutation and the sentence is still true. An external expectation per driver is
+what turns the driver's honest self-report into a checkable claim -- the same
+"enforcement must be as strong as the property it names" rule the whole batch is
+built on.
+
+**Observed on the qualification host (2026-10):** `14/14 checks passed`,
+`VERDICT: PASS` -- suite `3565 passed, 2 skipped, 4 deselected` (offline),
+drivers `16 / 73 / 35 / 36 / 18` and legacy `9 / 33 / 25`, guardrails all green.
+
 ## Part L — manual LIVE smokes (run AFTER the unit suite)
 
 The unit suite is socket-free by construction, so every claim that has a LIVE

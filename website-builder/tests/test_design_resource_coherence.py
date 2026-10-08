@@ -957,3 +957,14 @@ def test_the_doc_records_the_offline_suite_constraint():
     assert "@pytest.mark.integration" in text
 
 
+def test_the_doc_has_the_final_proof_part_m_section():
+    """Part M must document the one-command acceptance gate."""
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    assert "## Part M — FINAL PROOF" in text
+    assert "d3a5_final_proof.py" in text
+    assert "VERDICT" in text
+    # The pinned counts must be the real ones (a dropped guard changes a count).
+    assert "`parta 16`, `partbc 73`, `partc 35`" in text
+
+
