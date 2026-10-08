@@ -236,6 +236,25 @@ GET https://21st.dev/api/v1/components/search?q=<term>&scope=public&limit=24
 - **No fabrication.** A malformed or empty search response is a degraded empty
   result, never an invented entry.
 
+### The official machine-readable interface is still the one we call
+
+Re-verified that our adapter uses 21st's OWN documented machine-readable
+discovery surface, and that it is still live:
+
+- `GET https://21st.dev/api/v1/components/search` -> **401** without a key (live).
+- 21st's RFC 9727 API catalog (`/.well-known/api-catalog`) names exactly this:
+  `anchor: https://21st.dev/api/v1` -> `service-desc: https://21st.dev/openapi.json`.
+- `openapi.json` is byte-identical to the copy the adapter was written against
+  (sha256 `ea4a86354995ba2a`), so no drift.
+
+While re-reading 21st's OWN agent skill
+(`/.well-known/skills/21st-cli-use/SKILL.md`), a real mismatch surfaced: it
+documents the credential env vars as **`TWENTYFIRST_TOKEN` / `API_KEY_21ST`**,
+while our `CREDENTIAL_ENV_NAMES["twenty_first"]` recognised only
+`TWENTY_FIRST_API_KEY` / `TWENTYFIRST_API_KEY` -- **no overlap**. A user who
+followed upstream's docs got a FALSE NEGATIVE (reported unconfigured). Fixed by
+adding the two official names (keeping the old ones for compatibility).
+
 ### The free-tier claim is SURFACE-SCOPED, not absolute
 
 Removing the "free metadata search" claim over-corrected: the code then said

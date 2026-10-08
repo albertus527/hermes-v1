@@ -73,6 +73,23 @@ MUTATIONS = [
             "install_available": _one == "install",
             "critic_available": _one == "critic",""",
     ),
+    # --- 0a. the official credential env names are recognised ------------
+    # 21st's own skill documents TWENTYFIRST_TOKEN / API_KEY_21ST. Dropping them
+    # makes a user who follows upstream's docs a false negative.
+    (
+        "the officially documented 21st credential names are recognised",
+        ACTIVATION,
+        """    "twenty_first": (
+        "TWENTYFIRST_TOKEN",
+        "API_KEY_21ST",
+        "TWENTY_FIRST_API_KEY",
+        "TWENTYFIRST_API_KEY",
+    ),""",
+        """    "twenty_first": (
+        "TWENTY_FIRST_API_KEY",
+        "TWENTYFIRST_API_KEY",
+    ),""",
+    ),
     # --- 0b. the free-tier claim is SURFACE-SCOPED, not absolute ----------
     # 21st DOES advertise a free allowance (Web/CLI/MCP); the REST surface this
     # application calls is credential-gated. "no free tier" absolutely would be

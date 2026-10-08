@@ -900,3 +900,50 @@ def test_the_free_tier_claim_is_surface_specific_not_absolute():
     assert "There is no free tier to report" not in source
     # The accurate, surface-scoped statement is present.
     assert "surface" in source.lower()
+
+
+# ---------------------------------------------------------------------------
+# The credential env names include the ones 21st's OWN docs document
+# ---------------------------------------------------------------------------
+#
+# 21st's agent skill (21st.dev/.well-known/skills/21st-cli-use/SKILL.md) says:
+#   "Pass via `--api-key <key>` or the `TWENTYFIRST_TOKEN` / `API_KEY_21ST` env
+#    var."
+# A user who follows upstream's docs must be recognised, not reported as
+# unconfigured.
+
+
+@pytest.mark.parametrize(
+    "name", ["TWENTYFIRST_TOKEN", "API_KEY_21ST", "TWENTY_FIRST_API_KEY", "TWENTYFIRST_API_KEY"]
+)
+def test_every_documented_21st_credential_name_is_recognised(monkeypatch, name):
+    from app.core.design_activation import CREDENTIAL_ENV_NAMES, credential_present
+
+    for other in CREDENTIAL_ENV_NAMES["twenty_first"]:
+        monkeypatch.delenv(other, raising=False)
+    monkeypatch.setenv(name, "21st_sk_present")
+
+    assert credential_present(CREDENTIAL_ENV_NAMES["twenty_first"]) is True
+
+
+def test_the_official_21st_names_are_in_the_table():
+    """The two names upstream documents must be present."""
+    from app.core.design_activation import CREDENTIAL_ENV_NAMES
+
+    names = set(CREDENTIAL_ENV_NAMES["twenty_first"])
+    assert "TWENTYFIRST_TOKEN" in names
+    assert "API_KEY_21ST" in names
+
+
+def test_a_user_following_upstream_docs_gets_discovery(home, monkeypatch):
+    """End to end: only the official names set -> discovery is available."""
+    from app.core.design_activation import CREDENTIAL_ENV_NAMES
+
+    for name in CREDENTIAL_ENV_NAMES["twenty_first"]:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("API_KEY_21ST", "21st_sk_present")
+
+    capability = _activate(_manifest_resource(TWENTY_FIRST, skill_name="x"), home)
+
+    assert capability.authentication_present is True
+    assert capability.discovery_available is True
