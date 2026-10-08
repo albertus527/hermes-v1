@@ -43,7 +43,10 @@ COHERENCE_TESTS = "tests/test_design_resource_coherence.py"
 #: Suite hygiene: no test file may define the same test name twice (a duplicate
 #: silently shadows every earlier body). Carried here so the guard is proven.
 HYGIENE_TESTS = "tests/test_suite_hygiene.py"
-RUN_TESTS = (ACTIVATION_TESTS, COHERENCE_TESTS, HYGIENE_TESTS)
+#: Suite offline guard: no default-suite test may reach the network. Carried
+#: here so the guard is proven.
+OFFLINE_TESTS = "tests/test_suite_offline.py"
+RUN_TESTS = (ACTIVATION_TESTS, COHERENCE_TESTS, HYGIENE_TESTS, OFFLINE_TESTS)
 ACTIVATION = "app/core/design_activation.py"
 RESOURCES = "app/core/design_resources.py"
 #: The audit doc records the manual LIVE smokes (Part L). The doc-rot guard in
@@ -484,6 +487,18 @@ MUTATIONS = [
         seen[name] = seen.get(name, 0) + 1
     return sorted(name for name, count in seen.items() if count > 1)""",
         """    return []""",
+    ),
+    # --- 22. the offline guard actually detects a network-reaching test
+    # If the scanner never reports an offender, a test that shells out to npm
+    # would slip back into the default suite. Mutate the reachability check so
+    # it never fires; the self-proof test must fail.
+    (
+        "the offline guard actually detects a network-reaching test",
+        OFFLINE_TESTS,
+        """        if reaches(node, set()):
+            offenders.append((node.name, node.lineno))""",
+        """        if False:
+            offenders.append((node.name, node.lineno))""",
     ),
 ]
 

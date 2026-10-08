@@ -2316,6 +2316,41 @@ may define the same `test_*` name twice** -- with a self-proof that the scanner
 actually flags a planted duplicate (so the guard cannot be vacuous). A test that
 is defined but never collected is not a test.
 
+### The default suite is OFFLINE -- and a real violation was found + fixed
+
+**Constraint: normal `pytest` must never depend on the internet.** The suite is
+supposed to be socket-free, and the live smokes are documented rather than run
+for exactly that reason. Auditing it found one real violation:
+
+`tests/test_starter_toolchain.py` ran the **real `npm ci`** (four command
+assertions), which resolves every package from the npm registry. It was gated
+only on `npm` being installed, so it ran by DEFAULT -- and a warm local npm cache
+silently hid the dependency until a cold host ran it. Proven: `npm ci` with an
+empty cache fails with `ENOTCACHED` (it must fetch `vite-8.2.0.tgz` from
+`registry.npmjs.org`). The file's own comment even called `npm ci` *"the slow,
+network-touching step"* while leaving it unmarked.
+
+**Fix:** the four command assertions now carry `@pytest.mark.integration` (the
+repo's own marker; `addopts = "-m 'not integration'"` deselects them from a
+normal run). The ten static assertions above them -- manifest, lockfile,
+tsconfig, `.nvmrc` -- still run offline and are what kill the regression, so the
+default run loses no coverage of the pin; the command assertions exist to prove
+the real toolchain builds, and are runnable with `-m integration`.
+
+**Guard:** `tests/test_suite_offline.py` pins the general property -- no
+non-integration test may resolve or run a network CLI (`npm`/`npx`/`pnpm`/`yarn`/
+`pip`/`curl`/`wget`/`gh`), or call a network entry point against a non-loopback
+host. It is AST-based and **follows module-level helpers** (the offender hid one
+hop away: the test called `_run`, and `_run` invoked `NPM`), recognises an
+`@pytest.mark.integration` alias, and does NOT flag a test that *blocks* the
+network (`monkeypatch.setattr(urllib.request, "urlopen", boom)` is a call to
+`setattr`, not `urlopen`). Verified load-bearing: removing the markers makes it
+fail.
+
+The rest of the suite was audited and is offline: every `git` subprocess uses a
+local `file://` mirror, `push_github` raises before any network, and the only
+other socket users bind **loopback** (the port-allocation tests).
+
 ### Why these are manual, not in the suite
 
 The suite bans sockets (`socket.socket.connect`, `create_connection`,

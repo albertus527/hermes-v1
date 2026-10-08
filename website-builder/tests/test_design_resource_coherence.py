@@ -948,3 +948,12 @@ def test_the_doc_records_the_linux_containment_family_and_shadowed_tests():
     assert "test_suite_hygiene.py" in text
 
 
+def test_the_doc_records_the_offline_suite_constraint():
+    """The doc must record that the default suite is offline + the npm fix."""
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    assert "must never depend on the internet" in text
+    assert "test_suite_offline.py" in text
+    assert "@pytest.mark.integration" in text
+
+

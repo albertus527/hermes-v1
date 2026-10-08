@@ -224,9 +224,19 @@ def test_app_side_project_keeps_its_dom_lib():
 # ---------------------------------------------------------------------------
 # The real toolchain, on a copy of the real starter
 # ---------------------------------------------------------------------------
+#
+# `npm ci` resolves every package from the npm registry, so these four command
+# assertions need the INTERNET and are marked `integration` -- normal `pytest`
+# must never depend on the network (the repo's `addopts = "-m 'not integration'"`
+# deselects them). The ten static assertions above (manifest, lockfile, tsconfig,
+# .nvmrc) still run offline and are what kill the regression; these command
+# assertions exist to prove the real toolchain builds, not to be the mutation
+# killer, so excluding them from the default run costs no coverage of the pin.
 
 NPM = shutil.which("npm")
 requires_npm = pytest.mark.skipif(NPM is None, reason="npm is not installed")
+#: The command assertions that install from the registry.
+requires_network = pytest.mark.integration
 
 COMMAND_TIMEOUT = 900
 
@@ -277,6 +287,7 @@ def installed_starter(tmp_path_factory) -> Path:
 
 
 @requires_npm
+@requires_network
 def test_npm_ci_installs_the_pinned_node_types_into_the_project(
     installed_starter,
 ):
@@ -295,6 +306,7 @@ def test_npm_ci_installs_the_pinned_node_types_into_the_project(
 
 
 @requires_npm
+@requires_network
 def test_starter_typecheck_succeeds(installed_starter):
     """`npm run typecheck` (``tsc -b``) accepts both TypeScript projects."""
     result = _run(installed_starter, "run", "typecheck")
@@ -302,6 +314,7 @@ def test_starter_typecheck_succeeds(installed_starter):
 
 
 @requires_npm
+@requires_network
 def test_starter_build_succeeds(installed_starter):
     """`npm run build` (``tsc -b && vite build``) produces the dist artifact."""
     result = _run(installed_starter, "run", "build")
@@ -310,6 +323,7 @@ def test_starter_build_succeeds(installed_starter):
 
 
 @requires_npm
+@requires_network
 def test_starter_build_runs_after_a_clean_typecheck(installed_starter):
     """A clean tree builds — no cached ``.tsbuildinfo`` short-circuit.
 
