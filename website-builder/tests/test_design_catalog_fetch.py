@@ -830,3 +830,87 @@ def test_a_failed_fetch_still_carries_no_payload():
         CatalogFetchResult(
             source=SOURCE_TWENTY_FIRST, payload={"x": 1}, reason=REASON_UNREACHABLE
         )
+
+
+# ---------------------------------------------------------------------------
+# The failure vocabulary matches the DOCUMENTED contract (200 / 401 / 429)
+# ---------------------------------------------------------------------------
+#
+# 21st's search contract documents three responses: 200, 401 (unauthorized) and
+# 429 (rate limited). Each has a different remedy, so each is a distinct bounded
+# reason -- not one generic "unusable status".
+
+
+def test_a_401_is_named_as_a_rejected_credential():
+    from app.core.design_catalog_fetch import REASON_AUTH_REJECTED
+
+    r = fetch_catalog_payload(
+        SOURCE_TWENTY_FIRST,
+        transport=RecordingTransport(status=401),
+        credential_provider=lambda _s: "21st_sk_invalid",
+    )
+
+    assert r.ok is False
+    assert r.reason == REASON_AUTH_REJECTED
+    assert r.degraded is True
+
+
+def test_a_429_is_named_as_rate_limiting():
+    from app.core.design_catalog_fetch import REASON_RATE_LIMITED
+
+    r = fetch_catalog_payload(
+        SOURCE_TWENTY_FIRST,
+        transport=RecordingTransport(status=429),
+        credential_provider=lambda _s: "21st_sk_present",
+    )
+
+    assert r.ok is False
+    assert r.reason == REASON_RATE_LIMITED
+
+
+def test_401_and_429_are_distinguishable():
+    """A bad key and a rate limit have different remedies, so different reasons."""
+    a = fetch_catalog_payload(
+        SOURCE_TWENTY_FIRST, transport=RecordingTransport(status=401),
+        credential_provider=lambda _s: "k",
+    )
+    b = fetch_catalog_payload(
+        SOURCE_TWENTY_FIRST, transport=RecordingTransport(status=429),
+        credential_provider=lambda _s: "k",
+    )
+
+    assert a.reason != b.reason
+
+
+@pytest.mark.parametrize("status", [403, 404, 500, 502, 503])
+def test_other_statuses_use_the_generic_bounded_reason(status):
+    from app.core.design_catalog_fetch import REASON_BAD_STATUS
+
+    r = fetch_catalog_payload(
+        SOURCE_TWENTY_FIRST, transport=RecordingTransport(status=status),
+        credential_provider=lambda _s: "k",
+    )
+
+    assert r.reason == REASON_BAD_STATUS
+
+
+def test_a_status_code_never_becomes_a_reason_string():
+    """The reason vocabulary stays static: no digits, no URL."""
+    from app.core.design_catalog_fetch import _reason_for_status
+
+    for status in (301, 302, 400, 401, 403, 404, 418, 429, 500, 503):
+        reason = _reason_for_status(status)
+        assert str(status) not in reason, status
+        assert "://" not in reason
+        assert reason in CATALOG_FETCH_REASONS
+
+
+def test_the_reason_set_still_covers_the_documented_contract():
+    """200 -> ok; 401 and 429 each have a NAMED member of the closed set."""
+    from app.core.design_catalog_fetch import (
+        REASON_AUTH_REJECTED,
+        REASON_RATE_LIMITED,
+    )
+
+    assert REASON_AUTH_REJECTED in CATALOG_FETCH_REASONS
+    assert REASON_RATE_LIMITED in CATALOG_FETCH_REASONS

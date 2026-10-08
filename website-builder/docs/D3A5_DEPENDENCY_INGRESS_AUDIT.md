@@ -236,6 +236,35 @@ GET https://21st.dev/api/v1/components/search?q=<term>&scope=public&limit=24
 - **No fabrication.** A malformed or empty search response is a degraded empty
   result, never an invented entry.
 
+### The failure vocabulary matches the DOCUMENTED contract (200 / 401 / 429)
+
+Re-verified the 21st discovery/search contract against a FRESH fetch of
+``https://21st.dev/openapi.json`` (byte-identical to the earlier copy, so no
+drift):
+
+```
+server   : https://21st.dev/api/v1
+endpoint : GET /components/search   (summary: "Search components")
+params   : q (required), scope in {team,mine,public} default team, limit 1..50 default 25
+200 body : {"query","scope","results":[ComponentSearchResult]}
+codes    : 200, 401, 429
+auth     : ApiKeyAuth, bearer 21st_sk_...
+```
+
+Live probes: unauthenticated -> 401; bogus bearer -> 401 ``invalid_api_key``.
+
+The contract documents **401** and **429** distinctly, but the adapter collapsed
+every non-200 into one generic `REASON_BAD_STATUS` -- so a bad/expired key and a
+rate limit were indistinguishable, and neither was named. Fix: `_reason_for_status`
+maps 3xx -> redirect, **401 -> `REASON_AUTH_REJECTED`**, **429 ->
+`REASON_RATE_LIMITED`**, anything else -> the generic reason. Both new reasons are
+members of the closed set; a status code still never becomes a reason string.
+
+Verified end-to-end against the documented codes: 200 -> ok; 401 -> auth
+rejected; 429 -> rate limited; 403/404/500 -> generic. The adapter matches the
+contract field for field (server URL, required `q`, `scope=public` within the
+enum, `limit=24` within 1..50, container key `results`, bearer auth).
+
 ### A success flag is bound to its payload at CONSTRUCTION
 
 The `ok` fix was one instance of a general defect: a "success" flag whose

@@ -229,6 +229,25 @@ MUTATIONS = [
         identity = match.group(1).strip()""",
     ),
     # ------------------------------------------------------------------
+    # The failure vocabulary matches the DOCUMENTED contract (401 / 429)
+    # ------------------------------------------------------------------
+    (
+        "a 401 is named as a rejected credential",
+        FETCH,
+        """    if status == 401:
+        return REASON_AUTH_REJECTED""",
+        """    if False:
+        return REASON_AUTH_REJECTED""",
+    ),
+    (
+        "a 429 is named as rate limiting",
+        FETCH,
+        """    if status == 429:
+        return REASON_RATE_LIMITED""",
+        """    if False:
+        return REASON_RATE_LIMITED""",
+    ),
+    # ------------------------------------------------------------------
     # A success flag is bound to its payload at CONSTRUCTION
     # ------------------------------------------------------------------
     # ok means "an installable request was produced" -> it must carry a request.

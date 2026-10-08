@@ -103,6 +103,16 @@ REASON_TIMEOUT = "the official catalog endpoint did not respond in time"
 REASON_TOO_LARGE = "the official catalog response exceeded the size bound"
 REASON_REDIRECT_REFUSED = "the official catalog endpoint redirected; refusing to follow"
 REASON_BAD_STATUS = "the official catalog endpoint returned an unusable status"
+#: The contract documents HTTP 401 distinctly from any other non-200. A key can
+#: be PRESENT but INVALID/expired (verified live: a bogus bearer returns
+#: ``401 invalid_api_key``), so a present credential is not a working one. Named
+#: separately so an operator can tell a bad key from a rate limit or a real
+#: outage.
+REASON_AUTH_REJECTED = "the catalog rejected the configured credential"
+#: The contract documents HTTP 429 (rate limited) as its own response. A rate
+#: limit is transient and actionable ("retry later"), which is a different
+#: remedy from an invalid key or an unusable status, so it is named separately.
+REASON_RATE_LIMITED = "the official catalog rate-limited the request"
 REASON_CREDENTIAL_REQUIRED = "this catalog needs a credential that is not configured"
 REASON_UNEXPECTED_ERROR = "the official catalog could not be read"
 
@@ -113,6 +123,8 @@ CATALOG_FETCH_REASONS = frozenset(
         REASON_TOO_LARGE,
         REASON_REDIRECT_REFUSED,
         REASON_BAD_STATUS,
+        REASON_AUTH_REJECTED,
+        REASON_RATE_LIMITED,
         REASON_CREDENTIAL_REQUIRED,
         REASON_UNEXPECTED_ERROR,
     }
@@ -388,12 +400,9 @@ def fetch_catalog_payload(
     try:
         status, body = execute(url, headers, timeout)
     except urllib.error.HTTPError as error:
-        if 300 <= int(getattr(error, "code", 0) or 0) < 400:
-            return CatalogFetchResult(
-                source=source, reason=REASON_REDIRECT_REFUSED, degraded=True
-            )
+        code = int(getattr(error, "code", 0) or 0)
         return CatalogFetchResult(
-            source=source, reason=REASON_BAD_STATUS, degraded=True
+            source=source, reason=_reason_for_status(code), degraded=True
         )
     except (socket.timeout, TimeoutError):
         return CatalogFetchResult(source=source, reason=REASON_TIMEOUT, degraded=True)
@@ -412,13 +421,9 @@ def fetch_catalog_payload(
         )
 
     status = int(status)
-    if 300 <= status < 400:
-        return CatalogFetchResult(
-            source=source, reason=REASON_REDIRECT_REFUSED, degraded=True
-        )
     if status != 200:
         return CatalogFetchResult(
-            source=source, reason=REASON_BAD_STATUS, degraded=True
+            source=source, reason=_reason_for_status(status), degraded=True
         )
     if len(body) > MAX_RESPONSE_BYTES:
         return CatalogFetchResult(
@@ -432,6 +437,26 @@ def fetch_catalog_payload(
         )
 
     return CatalogFetchResult(source=source, payload=payload)
+
+
+def _reason_for_status(status: int) -> str:
+    """The bounded reason for a non-200 HTTP status, per the documented contract.
+
+    The 21st search contract documents three responses: 200, **401**, and
+    **429**. 401 means the credential was rejected (present but invalid or
+    expired -- verified live: a bogus bearer returns ``401 invalid_api_key``);
+    429 means the caller was rate-limited. Both are named separately from the
+    generic unusable-status case, because each has a DIFFERENT remedy. Any other
+    status, and every redirect, is the generic bounded reason. A status code
+    never becomes a reason string.
+    """
+    if 300 <= status < 400:
+        return REASON_REDIRECT_REFUSED
+    if status == 401:
+        return REASON_AUTH_REJECTED
+    if status == 429:
+        return REASON_RATE_LIMITED
+    return REASON_BAD_STATUS
 
 
 def _decode_payload(body: bytes) -> Optional[Any]:
@@ -616,7 +641,9 @@ __all__ = [
     "FETCH_TIMEOUT_SECONDS",
     "MAX_QUERY_CHARS",
     "MAX_RESPONSE_BYTES",
+    "REASON_AUTH_REJECTED",
     "REASON_BAD_STATUS",
+    "REASON_RATE_LIMITED",
     "REASON_CREDENTIAL_REQUIRED",
     "REASON_REDIRECT_REFUSED",
     "REASON_TIMEOUT",
