@@ -261,7 +261,7 @@ MUTATIONS = [
     (
         "the reusable delta verifier refuses an unreviewed addition",
         INSTALL,
-        """        if name not in allowed or section != SECTION_DEPENDENCIES""",
+        """        if allowed.get(name) != section""",
         """        if False""",
     ),
     # If the section check is dropped, an overrides/packageManager mutation passes.
@@ -270,6 +270,22 @@ MUTATIONS = [
         INSTALL,
         """    sections = changed_manifest_sections(before.sections, after.sections)""",
         """    sections = ()""",
+    ),
+    # If install_dependency stops verifying the delta, a lifecycle-script-added
+    # extra dependency survives an 'installed' claim.
+    (
+        "install_dependency verifies its manifest delta",
+        INSTALL,
+        """        verdict = verify_direct_dependency_delta(
+            state_before,
+            snapshot_direct_dependency_state(self.project_root),
+            allowed_additions=allowed_additions,
+        )""",
+        """        verdict = verify_direct_dependency_delta(
+            state_before,
+            snapshot_direct_dependency_state(self.project_root),
+            allowed_additions=allowed_additions,
+        ) if False else type("V", (), {"ok": True, "reason": None})()""",
     ),
     # If the ok/payload binding is removed, an ok verdict can carry a delta.
     (

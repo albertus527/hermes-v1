@@ -1255,7 +1255,7 @@ def verify_direct_dependency_delta(
     before: DirectDependencySnapshot,
     after: DirectDependencySnapshot,
     *,
-    allowed_packages: Sequence[str] = (),
+    allowed_additions: "Mapping[str, str] | Sequence[str]" = (),
 ) -> DirectDependencyDeltaVerdict:
     """Verify an operation's direct-dependency delta against policy.
 
@@ -1263,29 +1263,44 @@ def verify_direct_dependency_delta(
     not re-derive them:
 
     * additions/changes -- :func:`dependency_delta` filtered by the reviewed set
-      and the runtime section (a reviewed package in a dev/optional/peer section
-      is not the reviewed shape);
+      and each package's allowed SECTION (a runtime package smuggled into
+      devDependencies is not the reviewed shape);
     * removals -- :func:`removed_direct_dependencies`, because a delta only
       reports what ``after`` CONTAINS and is blind to a silent deletion;
     * unexpected sections -- :func:`changed_manifest_sections`, so a section
       outside the reviewed surface (``overrides``, ``packageManager``, ...) that
       can redirect a package version or SOURCE fails closed.
 
-    ``allowed_packages`` is the application-owned reviewed set. An EMPTY set means
-    nothing may be added: the conservative default, so a caller that forgets to
-    pass the reviewed set cannot accidentally accept an addition.
+    ``allowed_additions`` is the application-owned reviewed set, expressed as the
+    (package, section) pairs the operation may ADD. Two forms are accepted:
+
+    * a ``Mapping`` -- ``package -> the ONE section it may be added to``. This is
+      the general form: ``install_dependency`` legitimately adds ``three`` to
+      ``dependencies`` and ``@types/three`` to ``devDependencies``, so a
+      single-section rule would either accept a wrong placement or refuse a
+      correct one;
+    * a ``Sequence`` -- every named package may be added to ``dependencies`` only
+      (the registry shape, where the reviewed helpers are all runtime).
+
+    An EMPTY set means nothing may be added: the conservative default, so a caller
+    that forgets to pass the reviewed set cannot accidentally accept an addition.
 
     Returns a bounded :class:`DirectDependencyDeltaVerdict`. A refusal names the
-    FIRST offending dimension in the order the install path checks (sections, then
+    FIRST offending dimension in the order the install paths check (sections, then
     the dependency delta) so the reason is the most actionable one.
     """
-    allowed = set(allowed_packages)
+    if isinstance(allowed_additions, Mapping):
+        allowed: Dict[str, str] = {
+            str(name): str(section) for name, section in allowed_additions.items()
+        }
+    else:
+        allowed = {str(name): SECTION_DEPENDENCIES for name in allowed_additions}
 
     additions = sorted(
         (section, name)
         for section, packages in dependency_delta(before.direct, after.direct).items()
         for name in packages
-        if name not in allowed or section != SECTION_DEPENDENCIES
+        if allowed.get(name) != section
     )
     removals = sorted(
         (section, name)
@@ -2330,6 +2345,14 @@ class DesignDependencyInstaller:
 
         receipts: List[CommandReceipt] = []
 
+        # Snapshot the direct-dependency state BEFORE any command. ``npm install``
+        # runs the package's own lifecycle scripts -- UNTRUSTED upstream code --
+        # so a command that exits 0 may still have added an extra direct
+        # dependency, removed one, or changed a section outside the reviewed
+        # surface. The postcondition below verifies the REQUIRED specs EXIST; this
+        # snapshot is what lets the operation also verify nothing ELSE moved.
+        state_before = snapshot_direct_dependency_state(self.project_root)
+
         process, timed_out = self._run(
             build_install_argv(manager, dependency_id), INSTALL_TIMEOUT_SECONDS
         )
@@ -2403,6 +2426,38 @@ class DesignDependencyInstaller:
                 state=INSTALL_FAILED,
                 package=package,
                 reason=_incomplete_reason(dependency_id, self.project_root),
+                receipt=receipt,
+                verified_in_manifest=False,
+            )
+
+        # The REQUIRED specs are present. Now verify nothing ELSE moved: the
+        # install may add ONLY this dependency's reviewed packages, each into its
+        # own section, and may not remove or relocate anything or change a section
+        # outside the reviewed surface. ``install_dependency``'s packages come from
+        # the application-owned spec table, so the allowed set is exactly the
+        # specs -- package -> the ONE section each belongs in.
+        allowed_additions = {
+            spec.package: spec.dependency_section
+            for spec in required_package_specs(dependency_id)
+        }
+        verdict = verify_direct_dependency_delta(
+            state_before,
+            snapshot_direct_dependency_state(self.project_root),
+            allowed_additions=allowed_additions,
+        )
+        if not verdict.ok:
+            logger.warning(
+                "Refusing a dependency install whose manifest delta is outside "
+                "the reviewed set: %s",
+                verdict.to_dict(),
+            )
+            return InstallOutcome(
+                dependency_id=dependency_id,
+                state=INSTALL_FAILED,
+                package=package,
+                # `ok=False` is bound to a non-None reason at construction, so
+                # this is a fact of the verdict type, not a fallback.
+                reason=verdict.reason or REASON_NOT_VERIFIED,
                 receipt=receipt,
                 verified_in_manifest=False,
             )

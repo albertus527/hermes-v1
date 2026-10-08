@@ -236,6 +236,38 @@ GET https://21st.dev/api/v1/components/search?q=<term>&scope=public&limit=24
 - **No fabrication.** A malformed or empty search response is a degraded empty
   result, never an invented entry.
 
+### The verifier is WIRED into every operation allowed to mutate the manifest
+
+Auditing which operations may mutate a generated project's `package.json` found
+**three** that run a package manager, but only **two** verified a delta:
+
+| operation | runs a package manager | verified a delta |
+|---|---|---|
+| `install_components` (shadcn builtin) | yes | yes |
+| `install_external_component` (registry) | yes | yes |
+| **`install_dependency` (D2 npm)** | yes | **NO** |
+
+`install_dependency` ran `npm install <pkg>@<ver> --save-exact` (which runs the
+package's own **lifecycle scripts** -- untrusted upstream code) and then verified
+only that the REQUIRED spec was PRESENT. That postcondition is blind to an EXTRA
+dependency, a removal, or a section change. Reproduced end-to-end: a runner that
+adds an extra direct dependency alongside the requested one still reported
+`installed`.
+
+**This is a real dependency mutation**, so the guardrail's condition is met and the
+fix belongs here.
+
+Fix: `install_dependency` now captures `snapshot_direct_dependency_state` BEFORE
+any command and calls `verify_direct_dependency_delta` AFTER the postcondition
+passes, with the allowed set derived from the application-owned spec table
+(`package -> the ONE section each belongs in`, so `three` -> `dependencies` and
+`@types/three` -> `devDependencies` are both accepted while a wrong placement is
+refused). A non-ok verdict returns `INSTALL_FAILED` with the verdict's reason.
+
+Verified: an extra dependency, a removed project dependency, and an unexpected
+section are all refused; a clean `gsap` install and a two-section `three` install
+still report `installed` (no false positive).
+
 ### A reusable bounded direct-dependency snapshot/diff verifier
 
 New: one reusable check an operation can wrap around ANY mutation, instead of each

@@ -45,6 +45,8 @@ from app.core.design_install import (
     REASON_COMPANION_NOT_VERIFIED,
     REASON_COMPONENTS_NOT_VERIFIED,
     REASON_MANAGER_UNSUPPORTED,
+    REASON_MANIFEST_SECTION_CHANGED,
+    REASON_REGISTRY_DEPENDENCY_DRIFT,
     REASON_SHADCN_CONFIG_INVALID,
     SHADCN_CLI_VERSION,
     TERMINAL_INSTALL_STATES,
@@ -149,7 +151,12 @@ class RecordingRunner:
                     for arg in command:
                         if "@" not in arg or arg.startswith("-"):
                             continue
-                        name, _, version = arg.partition("@")
+                        # rpartition, not partition: a scoped name like
+                        # "@types/three" contains its own "@", so splitting at
+                        # the FIRST one yields an empty package name and writes
+                        # nothing -- which made a two-section install look like a
+                        # failed companion.
+                        name, _, version = arg.rpartition("@")
                         if name not in pinned_names:
                             continue
                         document.setdefault(section, {})[name] = version
@@ -1157,3 +1164,89 @@ def test_an_installed_outcome_with_component_verification_is_fine():
         verified_components=("button",),
     )
     assert outcome.installed is True
+
+
+# ---------------------------------------------------------------------------
+# install_dependency: the manifest delta is verified, not just the required spec
+# ---------------------------------------------------------------------------
+# `npm install` runs the package's own lifecycle scripts -- UNTRUSTED upstream
+# code -- so a command that exits 0 can still have added an extra direct
+# dependency. The postcondition alone (`project_satisfies_dependency`) only
+# checks the REQUIRED specs EXIST; it is blind to an EXTRA one. These tests pin
+# the delta guard that closes that gap.
+
+
+class _ManifestMutatingRunner(RecordingRunner):
+    """A runner that installs the requested package AND smuggles an extra one."""
+
+    def __init__(self, *, extra: dict | None = None, drop: str | None = None, **kw):
+        super().__init__(**kw)
+        self._extra = extra or {}
+        self._drop = drop
+
+    def run_command(self, project_id, command, cwd=None, env=None, timeout=300.0):
+        result = super().run_command(project_id, command, cwd, env, timeout)
+        if command[:2] in (["npm", "install"], ["pnpm", "add"], ["yarn", "add"]):
+            path = Path(cwd) / "package.json"
+            document = json.loads(path.read_text(encoding="utf-8"))
+            for section, packages in self._extra.items():
+                document.setdefault(section, {}).update(packages)
+            if self._drop:
+                for section in ("dependencies", "devDependencies"):
+                    document.get(section, {}).pop(self._drop, None)
+            path.write_text(json.dumps(document), encoding="utf-8")
+        return result
+
+
+def test_an_extra_direct_dependency_from_an_install_is_refused(project):
+    """A lifecycle script adds an unreviewed package -> not 'installed'."""
+    runner = _ManifestMutatingRunner(extra={"dependencies": {"evil-lifecycle": "9.9.9"}})
+
+    outcome = _installer(project, runner).install_dependency(GSAP)
+
+    assert outcome.state == INSTALL_FAILED
+    assert outcome.installed is False
+    assert outcome.reason == REASON_REGISTRY_DEPENDENCY_DRIFT
+
+
+def test_a_removed_project_dependency_from_an_install_is_refused(project):
+    """The install silently drops the project's own `react` -> not 'installed'."""
+    runner = _ManifestMutatingRunner(drop="react")
+
+    outcome = _installer(project, runner).install_dependency(GSAP)
+
+    assert outcome.state == INSTALL_FAILED
+    assert outcome.installed is False
+
+
+def test_an_unexpected_section_from_an_install_is_refused(project):
+    """The install adds an `overrides` section -> not 'installed'."""
+    runner = _ManifestMutatingRunner(extra={"overrides": {"evil": "https://evil/x.tgz"}})
+
+    outcome = _installer(project, runner).install_dependency(GSAP)
+
+    assert outcome.state == INSTALL_FAILED
+    assert outcome.installed is False
+    assert outcome.reason == REASON_MANIFEST_SECTION_CHANGED
+
+
+def test_a_clean_install_still_reports_installed(project):
+    """The delta guard adds no false positive: the reviewed install is accepted."""
+    runner = RecordingRunner()
+
+    outcome = _installer(project, runner).install_dependency(GSAP)
+
+    assert outcome.state == "installed"
+    assert outcome.installed is True
+
+
+def test_a_two_section_install_is_accepted(project):
+    """`three` legitimately adds to dependencies AND devDependencies."""
+    runner = RecordingRunner()
+
+    outcome = _installer(project, runner).install_dependency(THREE)
+
+    assert outcome.state == "installed"
+    document = json.loads((project / "package.json").read_text())
+    assert "three" in document.get("dependencies", {})
+    assert "@types/three" in document.get("devDependencies", {})
