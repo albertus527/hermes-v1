@@ -1652,6 +1652,74 @@ python -c "from app.core.design_catalog_fetch import ( \
 defect class as an unscanned "authoritative" verdict. Each bound here was checked
 at its EDGE (exactly at, and one past) rather than trusted from the constant.
 
+### VPS command: fetch the `SplitText-TS-TW` registry JSON
+
+The canonical locator is `https://reactbits.dev/r/SplitText-TS-TW`. **The app
+never fetches this JSON** — `design_registry` imports no HTTP client; the pinned
+shadcn CLI fetches it during `add`. The app's defence is therefore **post-hoc**:
+it snapshots before, runs the CLI, and verifies the delta. This command fetches
+the JSON **by hand** to confirm what the CLI is about to act on.
+
+```bash
+cd website-builder && source .venv/bin/activate
+
+# 1. Fetch the registry JSON (the exact locator the app authorizes).
+python -c "import json, urllib.request; \
+  req = urllib.request.Request('https://reactbits.dev/r/SplitText-TS-TW', \
+    headers={'User-Agent': 'shadcn', 'Accept': 'application/json'}); \
+  doc = json.load(urllib.request.urlopen(req, timeout=30)); \
+  print('name                :', doc['name']); \
+  print('type                :', doc['type']); \
+  print('dependencies        :', doc.get('dependencies')); \
+  print('registryDependencies:', doc.get('registryDependencies')); \
+  print('files               :', [f['path'] for f in doc.get('files', [])])"
+
+# 2. The variant suffix is LOAD-BEARING: the bare name is NOT a registry item.
+python -c "import urllib.request; \
+  b = urllib.request.urlopen(urllib.request.Request('https://reactbits.dev/r/SplitText', \
+        headers={'User-Agent':'shadcn'}), timeout=30).read().decode(); \
+  print('bare /r/SplitText is JSON?', b.strip()[:1] in '[{', '(', len(b), 'bytes)')"
+# -> False: it is the marketing HTML page. /r/<C>-TS-TW is the registry item.
+```
+
+**Observed on the qualification host (2026-10):**
+
+| field | value |
+|---|---|
+| `$schema` | `https://ui.shadcn.com/schema/registry-item.json` |
+| `name` | `SplitText-TS-TW` |
+| `type` | `registry:component` |
+| `dependencies` | `['gsap@^3.13.0', '@gsap/react@^2.1.2']` |
+| `registryDependencies` | `[]` |
+| `files` | `['SplitText/SplitText.tsx']` |
+| bare `/r/SplitText` | HTTP 200 but **HTML**, not JSON — the `-TS-TW` suffix is required |
+
+**Who fetches what.** The app does NOT read this JSON. The **pinned shadcn CLI**
+does, during `shadcn add https://reactbits.dev/r/SplitText-TS-TW`. The app's
+defence runs AFTER the CLI and is post-hoc, in four independent checks:
+
+1. **direct packages** — the delta is compared against the reviewed contract
+   (`gsap`, `@gsap/react`), both directions (`REASON_REGISTRY_DEPENDENCY_DRIFT`
+   for an extra, `REASON_REGISTRY_PACKAGE_NOT_EXACT` for a missing one);
+2. **nested registry components** — `expected_registry_dependencies` is `()`, and
+   a materialized file that is not `<allowed><suffix>` is refused
+   (`unreviewed_materialized_files`; verified: an unexpected `button.tsx` alongside
+   `SplitText.tsx` is caught);
+3. **emitted-source imports** — every bare package specifier in the materialized
+   source must be in the reviewed set (`REASON_REGISTRY_SOURCE_IMPORT_UNREVIEWED`);
+4. **manifest sections + removals** — a section outside the reviewed surface, or a
+   removed dependency, is refused.
+
+**Division of labour, stated honestly.** The app trusts the CLI to fetch and write;
+it does not trust the CLI's *result*. That is why the post-hoc delta is the real
+boundary, and why `build_registry_request(declared_dependencies=...)` — which
+checks the upstream metadata *before* the CLI runs — is a **caller-supplied seam**
+(the CLI is the production fetcher). No production caller drives the external path
+today; it is reachable via the public `install_external_component` API and covered
+by `tests/test_design_registry_mutation.py`, but it is not yet wired into
+`execute_selection`, which routes only the builtin component list.
+
+
 
 
 

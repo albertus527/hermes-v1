@@ -393,6 +393,15 @@ MUTATIONS = [
         "print('--- size bound is ENFORCED (not just declared) ---')",
         "print('--- size bound (declared) ---')",
     ),
+    # --- 14e. the documented registry-JSON command states who fetches what
+    # If the doc implies the APP fetches the registry JSON, a reader would look
+    # for an HTTP client that does not exist -- the real boundary is post-hoc.
+    (
+        "the documented registry JSON command states who fetches",
+        AUDIT_DOC,
+        "**Who fetches what.** The app does NOT read this JSON.",
+        "**Who fetches what.** The app reads this JSON.",
+    ),
     # --- 15. Part L: the documented no-delta proof must be able to FAIL -----
     # The doc must not document a self-comparison as the "unchanged" proof:
     # `git diff --no-index package.json package.json` compares a file to itself,

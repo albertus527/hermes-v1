@@ -797,3 +797,36 @@ def test_the_documented_fetch_layer_command_uses_the_real_transport():
 
     assert "_default_transport" in text
     assert "no injection" in text.lower()
+
+
+def test_the_documented_registry_json_command_is_present():
+    """The command fetches the exact locator the app authorizes."""
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    assert "fetch the `SplitText-TS-TW` registry JSON" in text
+    assert "https://reactbits.dev/r/SplitText-TS-TW" in text
+    assert "registryDependencies" in text
+
+
+def test_the_documented_registry_json_command_states_who_fetches_what():
+    """The app does NOT fetch the JSON; the pinned CLI does. Stated, not implied."""
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    assert "The app does NOT read this JSON" in text
+    assert "post-hoc" in text
+
+
+def test_the_documented_registry_json_command_notes_the_variant_suffix_is_required():
+    """The bare /r/SplitText is HTML; the -TS-TW variant is the registry item."""
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    assert "-TS-TW suffix is required" in text or "suffix is required" in text
+    assert "bare `/r/SplitText`" in text or "bare /r/SplitText" in text
+
+
+def test_the_documented_registry_json_command_states_the_external_path_is_not_wired():
+    """Honest boundary: the external path is reachable but not yet in execute_selection."""
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    assert "execute_selection" in text
+    assert "not yet wired" in text
