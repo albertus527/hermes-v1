@@ -236,6 +236,20 @@ GET https://21st.dev/api/v1/components/search?q=<term>&scope=public&limit=24
 - **No fabrication.** A malformed or empty search response is a degraded empty
   result, never an invented entry.
 
+### The REST/OpenAPI surface: no endpoint is unauthenticated
+
+The whole OpenAPI surface was enumerated (33 operations). The spec declares
+``security: [{"ApiKeyAuth": []}]`` GLOBALLY and no operation overrides it, so
+**every** endpoint requires a Bearer key -- including ``GET /components/search``,
+whose 401 was confirmed live. There is no unauthenticated surface.
+
+Re-verified the doc/code coherence for that fact (audit question 9, applied to
+the 21st surface): the module docstring had claimed "21st.dev's metadata search
+may work with no credential while authenticated component retrieval requires
+one", and two tests repeated "free search". All were corrected to the verified
+truth -- 21st is credential-gated on BOTH axes. A guard now fails if the false
+claim returns to the module.
+
 ### The failure vocabulary matches the DOCUMENTED contract (200 / 401 / 429)
 
 Re-verified the 21st discovery/search contract against a FRESH fetch of

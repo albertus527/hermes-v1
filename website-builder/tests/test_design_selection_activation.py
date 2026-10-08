@@ -107,10 +107,12 @@ def test_an_activation_usable_resource_is_reachable():
 
 
 def test_discovery_alone_makes_a_resource_reachable():
-    """21st.dev: free search works with no credential, retrieval does not.
+    """A resource whose ONLY usable axis is discovery still counts as reachable.
 
     The single D0 boolean forced a choice between discarding a true capability
     and claiming an unauthenticated one. Discovery-only must count as reachable.
+    (This is the axis shape, not a claim about 21st: 21st's discovery AND
+    retrieval both require a credential -- no free tier.)
     """
     report = _activation(_act(discovery_available=True, retrieval_available=False))
 

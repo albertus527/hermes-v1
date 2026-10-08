@@ -9,7 +9,7 @@ The properties under test are BEHAVIOUR CONTRACTS:
 
     * capability resolution opens no socket and starts no process
     * a resource reports SEVERAL simultaneous capabilities, not one enum state
-      (21st: free metadata discovery while authenticated retrieval is absent)
+      (21st: BOTH discovery and retrieval require a credential -- no free tier)
     * credential PRESENCE is never confused with credential VALUE
     * a declared-but-unactivated resource cannot acquire capability
     * an optional absent resource never fails the report
@@ -810,3 +810,62 @@ def test_a_missing_discover_function_is_absent_for_every_source(monkeypatch):
     monkeypatch.setattr(fetch, "discover_catalog", None, raising=False)
     assert _has_live_discovery_adapter(SOURCE_REACT_BITS) is False
     assert _has_live_discovery_adapter(SOURCE_TWENTY_FIRST) is False
+
+
+# ---------------------------------------------------------------------------
+# Doc/code coherence: no doc claims a free 21st surface the contract denies
+# ---------------------------------------------------------------------------
+#
+# Audit question 9: "Are comments/docs claiming dependencies are allowlisted when
+# executable policy disagrees?" The same class applies to the 21st surface: the
+# module docstring once claimed "metadata search may work with no credential",
+# which the verified REST/OpenAPI surface disproves (global ApiKeyAuth; every
+# endpoint 401 without a key).
+
+
+def test_no_module_doc_claims_a_free_21st_surface():
+    import app.core.design_activation as activation
+
+    source = Path(activation.__file__).read_text(encoding="utf-8")
+    # Assertions, not refutations: the module may (and does) SAY the claim is a
+    # lie; what it must not do is STATE the claim as true.
+    for banned in (
+        "metadata search may work with no credential",
+        "21st: free search",
+        "free metadata search",
+        "21st.dev's metadata search",
+    ):
+        assert banned not in source, banned
+
+
+def test_the_21st_capability_is_credential_gated_on_BOTH_axes():
+    """The executable truth: no free discovery, no free retrieval."""
+    from app.core.design_activation import _catalog_capability, CREDENTIAL_ENV_NAMES
+    from app.core.design_registry import SOURCE_TWENTY_FIRST
+
+    cap = _catalog_capability(
+        "twenty_first",
+        metadata_without_auth=False,
+        retrieval_requires_auth=True,
+        credential_names=CREDENTIAL_ENV_NAMES["twenty_first"],
+        install_available=True,
+        adapter_exists=True,
+        reviewed_components=0,
+    )
+
+    assert cap.discovery_available is False
+    assert cap.retrieval_available is False
+    assert cap.authentication_required is True
+    assert cap.degraded is True
+
+
+def test_the_adapter_is_registered_as_credential_required_for_21st():
+    """The fetch adapter and the capability layer agree on the gate."""
+    from app.core import design_catalog_fetch as fetch
+    from app.core.design_registry import SOURCE_TWENTY_FIRST
+
+    assert SOURCE_TWENTY_FIRST in fetch.CREDENTIAL_REQUIRED_FOR_DISCOVERY
+    assert SOURCE_TWENTY_FIRST not in fetch.CATALOG_ENDPOINTS
+    assert fetch.CATALOG_SEARCH_ENDPOINTS[SOURCE_TWENTY_FIRST].endswith(
+        "/api/v1/components/search"
+    )

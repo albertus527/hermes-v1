@@ -7,8 +7,10 @@ It exists because the pre-D3a.5 model had a single boolean per resource, and a
 single boolean is the wrong shape. The resources have genuinely different and
 *simultaneously true* capabilities:
 
-* 21st.dev's metadata search may work with no credential while authenticated
-  component retrieval requires one.
+* 21st.dev requires a credential for BOTH its discovery and its retrieval: its
+  only machine surface is the authenticated REST API (verified live: HTTP 401
+  without a Bearer key) and its public ``llms.txt`` publishes no
+  component-identity schema. There is no free tier to report.
 * Refero's bundled local craft references are usable with no account at all,
   while its live MCP research is a paid enhancement.
 * Impeccable may be locally provisioned with a working critic while being
@@ -353,8 +355,8 @@ class ResourceActivationCapability:
     ``retrieval_available``
         Real content can be fetched. Usually a subset of discovery in practice,
         but kept separate because "we can search it" and "we can read it" are
-        different promises and upstream splits them (21st: free search vs paid
-        retrieval).
+        different promises and upstream may split them. (21st does NOT split
+        them: both its discovery and its retrieval require a credential.)
     ``install_available``
         A selected component can be materialized into a project. ``False`` for
         every resource that is inspiration-only.
