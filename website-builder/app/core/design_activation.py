@@ -64,6 +64,7 @@ from app.core.design_registry import (
     approved_registry_components,
 )
 from app.core.design_resources import (
+    CREDENTIAL_ENV_NAMES,
     DesignResource,
     DesignResourceManifest,
     design_profile_skills_dir,
@@ -562,29 +563,11 @@ def _dedupe(reasons: Sequence[str]) -> Tuple[str, ...]:
 #: then gates per project.
 INSTALLABLE_ON_DEMAND: frozenset = frozenset({"shadcn", "gsap", "three", "lenis"})
 
-#: Credential environment variable names per resource. EXACTLY these names are
-#: consulted, and only their PRESENCE is read.
-#:
-#: These are third-party research/CI credentials, never deployment credentials
-#: (Vercel/GitHub/Telegram): a design corpus has no business holding a
-#: release credential, so none of these names may ever name one.
-#:
-#: ``twenty_first`` includes the names 21st's OWN agent skill documents
-#: (``TWENTYFIRST_TOKEN`` / ``API_KEY_21ST``, from
-#: ``21st.dev/.well-known/skills/21st-cli-use/SKILL.md``) so a user who follows
-#: upstream's docs is recognised rather than silently reported as unconfigured.
-CREDENTIAL_ENV_NAMES: Dict[str, Tuple[str, ...]] = {
-    "refero": ("REFERO_API_KEY",),
-    "twenty_first": (
-        "TWENTYFIRST_TOKEN",
-        "API_KEY_21ST",
-        "TWENTY_FIRST_API_KEY",
-        "TWENTYFIRST_API_KEY",
-    ),
-    "react_bits": (),
-    "transitions_dev": (),
-    "impeccable": (),
-}
+#: Credential environment variable names come from the ONE table in
+#: :mod:`app.core.design_resources` (imported above). The capability layer reads
+#: only their PRESENCE; the fetch adapter reads the value to send it. Sharing the
+#: table is what keeps the reported capability and the executed request in
+#: agreement.
 
 
 def _absent(resource_id: str, reasons: Sequence[str]) -> ResourceActivationCapability:

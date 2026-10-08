@@ -37,6 +37,7 @@ IGNORED = shutil.ignore_patterns("__pycache__", "*.pyc", ".git", ".venv", "venv"
 
 ACTIVATION_TESTS = "tests/test_design_activation.py"
 ACTIVATION = "app/core/design_activation.py"
+RESOURCES = "app/core/design_resources.py"
 
 MUTATIONS = [
     # --- 1. the model is multi-dimensional, not an enum -------------------
@@ -92,7 +93,7 @@ MUTATIONS = [
     # makes a user who follows upstream's docs a false negative.
     (
         "the officially documented 21st credential names are recognised",
-        ACTIVATION,
+        RESOURCES,
         """    "twenty_first": (
         "TWENTYFIRST_TOKEN",
         "API_KEY_21ST",

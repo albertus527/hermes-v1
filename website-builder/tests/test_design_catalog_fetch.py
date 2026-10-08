@@ -18,6 +18,22 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+
+@pytest.fixture(autouse=True)
+def _no_ambient_credential(monkeypatch):
+    """Keep the module hermetic now that the adapter reads the environment.
+
+    ``fetch_catalog_payload`` falls back to the configured credential when no
+    provider is injected. Tests must not depend on whether the host happens to
+    have a 21st key set, so every credential name is cleared here; a test that
+    wants a credential passes an explicit ``credential_provider``.
+    """
+    from app.core.design_resources import CREDENTIAL_ENV_NAMES
+
+    for names in CREDENTIAL_ENV_NAMES.values():
+        for name in names:
+            monkeypatch.delenv(name, raising=False)
+
 from app.core.design_catalog_fetch import (
     ALLOWED_HOSTS,
     CATALOG_ENDPOINTS,
@@ -1016,3 +1032,107 @@ def test_the_adapter_sends_bearer_not_x_api_key():
 
     assert seen.get("Authorization") == "Bearer 21st_sk_present"
     assert "x-api-key" not in {k.lower() for k in seen}
+
+
+# ---------------------------------------------------------------------------
+# A CONFIGURED credential must reach the request without any caller wiring
+# ---------------------------------------------------------------------------
+#
+# The defect: fetch_catalog_payload accepted a credential_provider but had NO
+# default, and no production caller supplied one. So a key that was CONFIGURED
+# never reached the request -- the capability layer reported
+# discovery_available=True on the strength of that key while execution refused
+# with REASON_CREDENTIAL_REQUIRED. Capability and execution disagreed.
+
+
+def test_a_configured_env_credential_reaches_the_request(monkeypatch):
+    """No caller wiring: the adapter reads the configured key itself."""
+    monkeypatch.setenv("API_KEY_21ST", "21st_sk_configured")
+    seen = {}
+
+    def transport(url, headers, timeout):
+        seen.update(headers)
+        return 200, b'{"results":[{"slug":"hero-section","name":"Hero"}]}'
+
+    result = discover_catalog(SOURCE_TWENTY_FIRST, transport=transport)
+
+    assert seen.get("Authorization") == "Bearer 21st_sk_configured"
+    assert result.ok is True
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["TWENTYFIRST_TOKEN", "API_KEY_21ST", "TWENTY_FIRST_API_KEY", "TWENTYFIRST_API_KEY"],
+)
+def test_every_documented_name_reaches_the_request(monkeypatch, name):
+    """The adapter reads the SAME names the capability layer checks."""
+    monkeypatch.setenv(name, "21st_sk_x")
+    seen = {}
+
+    def transport(url, headers, timeout):
+        seen.update(headers)
+        return 200, b'{"results":[{"slug":"x"}]}'
+
+    fetch_catalog_payload(SOURCE_TWENTY_FIRST, transport=transport)
+
+    assert seen.get("Authorization") == "Bearer 21st_sk_x"
+
+
+def test_the_default_provider_and_the_capability_layer_share_one_table():
+    """The names cannot drift: there is exactly one table."""
+    import app.core.design_catalog_fetch as fetch
+    import app.core.design_activation as activation
+    from app.core.design_resources import CREDENTIAL_ENV_NAMES
+
+    assert activation.CREDENTIAL_ENV_NAMES is CREDENTIAL_ENV_NAMES
+    # The adapter resolves its default from the same object.
+    monkeypatch_name = CREDENTIAL_ENV_NAMES["twenty_first"][0]
+    assert fetch._environment_credential("twenty_first") is None  # fixture cleared it
+
+
+def test_capability_and_execution_agree_when_a_key_is_configured(monkeypatch):
+    """The end-to-end agreement the defect broke."""
+    from app.core import design_activation as activation
+    from app.core.design_resources import CREDENTIAL_ENV_NAMES
+
+    monkeypatch.setenv("API_KEY_21ST", "21st_sk_configured")
+    cap = activation._catalog_capability(
+        SOURCE_TWENTY_FIRST,
+        credential_names=CREDENTIAL_ENV_NAMES["twenty_first"],
+        install_available=True,
+        adapter_exists=True,
+        reviewed_components=0,
+    )
+
+    def transport(url, headers, timeout):
+        return 200, b'{"results":[{"slug":"x"}]}'
+
+    result = discover_catalog(SOURCE_TWENTY_FIRST, transport=transport)
+
+    assert cap.discovery_available is True
+    assert result.ok is True
+
+
+def test_capability_and_execution_agree_when_no_key_is_configured():
+    """Both say no, and no request is attempted."""
+    from app.core import design_activation as activation
+    from app.core.design_resources import CREDENTIAL_ENV_NAMES
+
+    cap = activation._catalog_capability(
+        SOURCE_TWENTY_FIRST,
+        credential_names=CREDENTIAL_ENV_NAMES["twenty_first"],
+        install_available=True,
+        adapter_exists=True,
+        reviewed_components=0,
+    )
+    calls = []
+
+    def transport(url, headers, timeout):
+        calls.append(url)
+        return 200, b"{}"
+
+    result = fetch_catalog_payload(SOURCE_TWENTY_FIRST, transport=transport)
+
+    assert cap.discovery_available is False
+    assert result.ok is False
+    assert calls == []

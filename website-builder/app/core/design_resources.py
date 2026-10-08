@@ -34,6 +34,35 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import yaml
 
+#: Credential environment variable names per design resource -- the ONE table.
+#:
+#: Two layers consult it and they must agree: the capability layer reads only
+#: PRESENCE ("is this resource configured?"), and the catalog fetch adapter reads
+#: the VALUE ("place it in an Authorization header"). Keeping the names in one
+#: place means what the capability layer reports and what execution uses cannot
+#: drift -- the defect this table's central position removes.
+#:
+#: These are third-party research/CI credentials, never deployment credentials
+#: (Vercel/GitHub/Telegram): a design corpus has no business holding a release
+#: credential, so none of these names may ever name one.
+#:
+#: ``twenty_first`` includes the names 21st's OWN agent skill documents
+#: (``TWENTYFIRST_TOKEN`` / ``API_KEY_21ST``, from
+#: ``21st.dev/.well-known/skills/21st-cli-use/SKILL.md``) so a user who follows
+#: upstream's docs is recognised rather than silently reported as unconfigured.
+CREDENTIAL_ENV_NAMES: Dict[str, Tuple[str, ...]] = {
+    "refero": ("REFERO_API_KEY",),
+    "twenty_first": (
+        "TWENTYFIRST_TOKEN",
+        "API_KEY_21ST",
+        "TWENTY_FIRST_API_KEY",
+        "TWENTYFIRST_API_KEY",
+    ),
+    "react_bits": (),
+    "transitions_dev": (),
+    "impeccable": (),
+}
+
 
 class DesignResourceManifestError(ValueError):
     """The design resource manifest is missing, unreadable, or invalid.

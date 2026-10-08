@@ -236,6 +236,37 @@ GET https://21st.dev/api/v1/components/search?q=<term>&scope=public&limit=24
 - **No fabrication.** A malformed or empty search response is a degraded empty
   result, never an invented entry.
 
+### A configured credential must actually REACH the request
+
+"If real discovery requires an API key": then a key that IS configured must be
+used. It was not.
+
+`fetch_catalog_payload` accepted a `credential_provider` but had **no default**,
+and no production caller supplied one. The capability layer reported
+`discovery_available=True` on the strength of a configured key, while execution
+refused with `REASON_CREDENTIAL_REQUIRED`:
+
+```
+API_KEY_21ST=21st_sk_...           # configured
+_catalog_capability(21st)  -> discovery_available=True   # capability says yes
+discover_catalog(21st)     -> ok=False, "this catalog needs a credential that
+                               is not configured"         # execution says no
+```
+
+A configured credential never reached the request. Fix: the adapter now has a
+default provider, `_environment_credential`, which reads the credential from the
+**same** names the capability layer checks. The names live in ONE table
+(`design_resources.CREDENTIAL_ENV_NAMES`), imported by both layers, so presence
+and use cannot drift.
+
+```
+configured key  -> Authorization: Bearer <key>   (attempted, 401 named if bad)
+no key          -> no request at all, bounded credential-required state
+```
+
+Property asserted: for every branch, `capability.discovery_available` agrees with
+what `discover_catalog` actually does.
+
 ### Capability truth is DERIVED from the adapter, never asserted
 
 Item 2: capability truth must match ACTUAL execution requirements.

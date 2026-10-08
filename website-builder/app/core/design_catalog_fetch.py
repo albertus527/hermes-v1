@@ -70,6 +70,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import socket
 import ssl
@@ -87,6 +88,7 @@ from app.core.design_catalog import (
     normalize_catalog,
 )
 from app.core.design_registry import SOURCE_REACT_BITS, SOURCE_TWENTY_FIRST
+from app.core.design_resources import CREDENTIAL_ENV_NAMES
 
 logger = logging.getLogger(__name__)
 
@@ -311,6 +313,27 @@ Transport = Callable[[str, Dict[str, str], int], Tuple[int, bytes]]
 CredentialProvider = Callable[[str], Optional[str]]
 
 
+def _environment_credential(source: str) -> Optional[str]:
+    """The DEFAULT credential provider: the resource's configured env value.
+
+    This is the wiring the adapter needs in production. Without a default the
+    ``credential_provider`` parameter had to be supplied by a caller -- and no
+    production caller did -- so a CONFIGURED key never reached the request while
+    the capability layer reported ``discovery_available=True`` on the strength of
+    that same key. The reported capability and the executed request disagreed.
+
+    It reads the SAME names the capability layer reads (the one table in
+    :mod:`app.core.design_resources`), so presence and use cannot drift. The
+    value is returned to be placed in an ``Authorization`` header and is never
+    logged, stored, or returned to a caller of this module.
+    """
+    for name in CREDENTIAL_ENV_NAMES.get(source, ()):
+        value = os.environ.get(name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """Turn every redirect into an error instead of following it.
 
@@ -400,11 +423,14 @@ def fetch_catalog_payload(
     if source not in ALLOWED_HOSTS:
         return CatalogFetchResult(source=source, reason=REASON_UNREACHABLE)
 
+    # A caller may inject a provider (tests do); otherwise the adapter reads the
+    # configured credential itself, from the SAME names the capability layer
+    # checks. No production wiring is required for a present key to be used.
+    provider = credential_provider or _environment_credential
     credential = None
-    if credential_provider is not None:
-        candidate = credential_provider(source)
-        if isinstance(candidate, str) and candidate.strip():
-            credential = candidate.strip()
+    candidate = provider(source)
+    if isinstance(candidate, str) and candidate.strip():
+        credential = candidate.strip()
 
     if source in CREDENTIAL_REQUIRED_FOR_DISCOVERY and credential is None:
         # No key -> no request. This is the designed bounded state, not an error.

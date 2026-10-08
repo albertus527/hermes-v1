@@ -255,6 +255,21 @@ MUTATIONS = [
         """    SOURCE_TWENTY_FIRST: "https://21st.dev/components/search",""",
     ),
     # ------------------------------------------------------------------
+    # A CONFIGURED credential reaches the request with no caller wiring
+    # ------------------------------------------------------------------
+    # Removing the default provider is the defect: a set key would never reach
+    # the request while the capability layer reported discovery available.
+    (
+        "a configured credential reaches the request without caller wiring",
+        FETCH,
+        """    provider = credential_provider or _environment_credential
+    credential = None
+    candidate = provider(source)""",
+        """    provider = credential_provider
+    credential = None
+    candidate = provider(source) if provider else None""",
+    ),
+    # ------------------------------------------------------------------
     # The fetch NEVER raises for an upstream problem (incl. HTTPException)
     # ------------------------------------------------------------------
     (
