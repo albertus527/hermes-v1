@@ -236,6 +236,28 @@ GET https://21st.dev/api/v1/components/search?q=<term>&scope=public&limit=24
 - **No fabrication.** A malformed or empty search response is a degraded empty
   result, never an invented entry.
 
+### Bearer credential: handling verified, and a leak vector closed
+
+Re-verified the credential end to end:
+
+- **Presence, never the value.** `CREDENTIAL_ENV_NAMES['twenty_first']` names two
+  env vars; `credential_present` returns a bool and treats whitespace-only as
+  absent. The value is never stored on an object (`CatalogFetchResult` has no
+  credential field), never in `to_dict()`, the capability report, a reason
+  string, or captured logs.
+- **Header construction.** Exactly `Authorization: Bearer <value>`, and only
+  when a credential is present.
+- **Scoping.** No `url`/`host`/`endpoint` parameter exists, so the header can
+  only go to the module-owned URL. `_NoRedirect` refuses every 3xx, so an
+  approved host cannot bounce the header to another host.
+- **Leak vector closed.** The module promises "never raises for an upstream
+  problem", but urllib raises `http.client.HTTPException` subclasses
+  (`BadStatusLine`, `IncompleteRead`, `LineTooLong`, `UnknownProtocol`) that are
+  NOT `OSError` and slipped past `except (OSError, ValueError)`. Confirmed by
+  repro: they PROPAGATED. An escaping traceback can carry the request headers,
+  i.e. the Bearer value. Fixed with a catch-all that returns the bounded
+  `REASON_UNEXPECTED_ERROR` and echoes nothing from the exception.
+
 ### The REST/OpenAPI surface: no endpoint is unauthenticated
 
 The whole OpenAPI surface was enumerated (33 operations). The spec declares

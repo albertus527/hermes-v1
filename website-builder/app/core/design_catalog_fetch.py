@@ -419,6 +419,19 @@ def fetch_catalog_payload(
         return CatalogFetchResult(
             source=source, reason=REASON_UNREACHABLE, degraded=True
         )
+    except Exception:
+        # Catch-all so the documented contract holds: a fetch NEVER raises for an
+        # upstream problem. This is load-bearing, not belt-and-braces: urllib's
+        # transport raises ``http.client.HTTPException`` subclasses
+        # (``BadStatusLine`` on a malformed status line, ``IncompleteRead`` on a
+        # truncated body, ``LineTooLong``, ``UnknownProtocol``) which are NOT
+        # ``OSError`` and so slip past the clause above. Letting one escape would
+        # both break the contract and risk the request HEADERS -- including
+        # ``Authorization: Bearer <key>`` -- appearing in a caller's traceback.
+        # The reason is a static label; nothing from the exception is echoed.
+        return CatalogFetchResult(
+            source=source, reason=REASON_UNEXPECTED_ERROR, degraded=True
+        )
 
     status = int(status)
     if status != 200:

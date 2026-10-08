@@ -6,6 +6,7 @@ LIVE path is documented at the bottom of this file rather than executed here.
 
 from __future__ import annotations
 
+import http.client
 import io
 import json
 import sys
@@ -914,3 +915,58 @@ def test_the_reason_set_still_covers_the_documented_contract():
 
     assert REASON_AUTH_REJECTED in CATALOG_FETCH_REASONS
     assert REASON_RATE_LIMITED in CATALOG_FETCH_REASONS
+
+
+# ---------------------------------------------------------------------------
+# The fetch NEVER raises for an upstream problem -- including HTTPException
+# ---------------------------------------------------------------------------
+#
+# The module's contract is "never raises for an upstream problem". urllib's
+# transport raises http.client.HTTPException subclasses (BadStatusLine,
+# IncompleteRead, LineTooLong, UnknownProtocol) which are NOT OSError, so they
+# slipped past the (OSError, ValueError) clause. An escaping traceback can carry
+# the request HEADERS, i.e. the Authorization: Bearer value.
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        http.client.BadStatusLine("garbage"),
+        http.client.IncompleteRead(b"partial"),
+        http.client.LineTooLong("line too long"),
+        http.client.UnknownProtocol("unknown"),
+        RuntimeError("unexpected"),
+    ],
+)
+def test_the_fetch_never_raises_for_an_upstream_problem(exc):
+    def transport(url, headers, timeout):
+        raise exc
+
+    result = fetch_catalog_payload(
+        SOURCE_TWENTY_FIRST,
+        transport=transport,
+        credential_provider=lambda _s: "21st_sk_present",
+    )
+
+    assert result.ok is False
+    assert result.reason in CATALOG_FETCH_REASONS
+    assert result.degraded is True
+
+
+def test_an_http_exception_does_not_leak_the_bearer_value():
+    """The reason is a static label; nothing from the exception is echoed."""
+    secret = "21st_sk_SUPERSECRETVALUE123"
+
+    def transport(url, headers, timeout):
+        # worst case: the exception itself embeds the headers
+        raise http.client.BadStatusLine(f"garbage headers={headers}")
+
+    result = fetch_catalog_payload(
+        SOURCE_TWENTY_FIRST,
+        transport=transport,
+        credential_provider=lambda _s: secret,
+    )
+
+    blob = json.dumps({"reason": result.reason, "payload": result.payload}, default=str)
+    assert secret not in blob
+    assert "Authorization" not in blob

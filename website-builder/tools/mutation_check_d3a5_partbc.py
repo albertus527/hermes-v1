@@ -229,6 +229,20 @@ MUTATIONS = [
         identity = match.group(1).strip()""",
     ),
     # ------------------------------------------------------------------
+    # The fetch NEVER raises for an upstream problem (incl. HTTPException)
+    # ------------------------------------------------------------------
+    (
+        "the fetch never raises for an upstream problem",
+        FETCH,
+        """    except Exception:
+        # Catch-all so the documented contract holds: a fetch NEVER raises for an
+        # upstream problem.""",
+        """    except Exception:
+        # Catch-all disabled by mutation.
+        raise
+        # (unreachable)""",
+    ),
+    # ------------------------------------------------------------------
     # The failure vocabulary matches the DOCUMENTED contract (401 / 429)
     # ------------------------------------------------------------------
     (
