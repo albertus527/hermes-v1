@@ -360,6 +360,32 @@ A test pins the reviewed surface as EXACTLY the four sections, so no section can
 be silently added or lost. A mutation guard proves that dropping
 ``peerDependencies`` fails the suite (the delta classification changes).
 
+### The comparison identifies a package MOVED between sections
+
+A relocated package (``dependencies`` -> ``devDependencies``) was previously
+reported only as a name appearing in BOTH ``added`` and ``removed`` -- the move was
+**inferable but not stated**. The instruction requires it be identified, so the
+verdict now carries ``moved`` as a first-class finding, a
+``(from_section, to_section, package)`` triple.
+
+Crucially, a relocated package was never genuinely ADDED (it existed before) and
+never genuinely REMOVED (it exists after), so keeping it in ``added``/``removed``
+was the same defect as conflating a version change with an addition. The move is
+now reported in ``moved`` ONLY, and the five buckets **partition** the delta:
+
+```
+moved:   [["dependencies", "devDependencies", "cn"]]
+added:   [["dependencies", "evil"]]        <- an independent addition
+removed: [["dependencies", "react"]]       <- an independent removal
+```
+
+| case | identified as |
+|---|---|
+| a move between any two reviewed sections | ``moved=(from, to, pkg)`` |
+| a move of a REVIEWED package | ``moved`` -> refused (allowed to add into a section is not a licence to move) |
+| a move + an independent addition + removal | each in its own bucket; no name in two buckets |
+| a move that ALSO re-pins | ``moved`` (the wrong section is the more actionable finding; the raw ``dependency_delta`` still carries the version) |
+
 ### The comparison identifies a REMOVED direct package
 
 The before/after comparison identifies a removed direct package via

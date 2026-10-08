@@ -249,6 +249,7 @@ MUTATIONS = [
         (section, name)
         for section, names in removed_direct_dependencies(before.direct, after.direct).items()
         for name in names
+        if (section, name) not in moved_pairs
     )""",
         """    removals = sorted(
         (section, name)
@@ -365,8 +366,19 @@ MUTATIONS = [
         (section, name)
         for section, names in removed_direct_dependencies(before.direct, after.direct).items()
         for name in names
+        if (section, name) not in moved_pairs
     )""",
         """    removals = []""",
+    ),
+    # If relocation detection is removed, a package moved between sections is
+    # reported as an addition + a removal instead of a MOVE.
+    (
+        "the comparison identifies a package moved between sections",
+        INSTALL,
+        """                moved.append((from_section, to_section, name))
+                moved_pairs.add((from_section, name))
+                moved_pairs.add((to_section, name))""",
+        """                pass""",
     ),
     # If install_dependency stops verifying the delta, a lifecycle-script-added
     # extra dependency survives an 'installed' claim.

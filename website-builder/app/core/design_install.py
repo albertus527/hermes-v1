@@ -1221,8 +1221,9 @@ class DirectDependencyDeltaVerdict:
 
     ok: bool
     #: ``(section, package)`` pairs that are genuinely NEW -- absent from the
-    #: ``before`` snapshot -- and outside policy. A version CHANGE is NOT here:
-    #: it is a different finding and is reported by ``changed``.
+    #: ``before`` snapshot -- and outside policy. A version CHANGE is NOT here
+    #: (that is ``changed``) and a RELOCATED package is NOT here (that is
+    #: ``moved``): ``added`` means an addition, nothing else.
     added: Tuple[Tuple[str, str], ...] = ()
     #: ``(section, package)`` pairs that were ALREADY present but whose VERSION
     #: changed, outside policy. Kept distinct from ``added`` so a consumer can
@@ -1231,6 +1232,13 @@ class DirectDependencyDeltaVerdict:
     #: ``(section, package)`` pairs present before and ABSENT after -- a project
     #: dependency the operation deleted.
     removed: Tuple[Tuple[str, str], ...] = ()
+    #: ``(from_section, to_section, package)`` triples -- a package that left one
+    #: reviewed section and appeared in ANOTHER. Named as its own finding so a
+    #: consumer does not have to infer a relocation from a name appearing in both
+    #: ``added`` and ``removed``; a relocated package is neither genuinely added
+    #: nor removed, so it is reported here ONLY, and the five buckets partition
+    #: the delta.
+    moved: Tuple[Tuple[str, str, str], ...] = ()
     #: Top-level sections outside the reviewed surface that changed.
     sections_changed: Tuple[str, ...] = ()
     #: The bounded reason when ``ok`` is False; ``None`` when it is True.
@@ -1241,7 +1249,11 @@ class DirectDependencyDeltaVerdict:
 
     def __post_init__(self) -> None:
         offending = bool(
-            self.added or self.changed or self.removed or self.sections_changed
+            self.added
+            or self.changed
+            or self.removed
+            or self.moved
+            or self.sections_changed
         )
         if self.ok and offending:
             raise ValueError("an ok dependency-delta verdict must carry no offending delta")
@@ -1257,6 +1269,7 @@ class DirectDependencyDeltaVerdict:
             "added": [list(pair) for pair in self.added],
             "changed": [list(pair) for pair in self.changed],
             "removed": [list(pair) for pair in self.removed],
+            "moved": [list(triple) for triple in self.moved],
             "sections_changed": list(self.sections_changed),
             "reason": self.reason,
             "truncated": self.truncated,
@@ -1280,6 +1293,15 @@ def verify_direct_dependency_delta(
     * CHANGED packages -- an already-present package whose VERSION moved, kept
       distinct from an addition so the verdict identifies "an added direct
       package" as its own finding rather than conflating it with a re-pin;
+    * MOVED packages -- a package that left one reviewed section and appeared in
+      ANOTHER, reported as a ``(from_section, to_section, package)`` triple. A
+      relocated package was never genuinely added, so it is NOT in ``added``; it
+      is its own finding so a consumer does not have to infer a move from a name
+      appearing in both ``added`` and ``removed``. The five buckets PARTITION the
+      delta: no pair appears in two. (A move that ALSO re-pins is reported as
+      ``moved`` -- the wrong section is the more actionable finding, and the
+      install is refused regardless; the raw :func:`dependency_delta` still
+      carries the version.)
     * removals -- :func:`removed_direct_dependencies`, because a delta only
       reports what ``after`` CONTAINS and is blind to a silent deletion;
     * unexpected sections -- :func:`changed_manifest_sections`, so a section
@@ -1311,6 +1333,31 @@ def verify_direct_dependency_delta(
     else:
         allowed = {str(name): SECTION_DEPENDENCIES for name in allowed_additions}
 
+    # A package that left one reviewed section and appeared in ANOTHER is
+    # RELOCATED: neither genuinely added nor removed. Detect that FIRST, from the
+    # name -> sections maps, so the buckets partition and a move is never reported
+    # as an addition/removal pair a consumer would have to infer.
+    before_sections: Dict[str, set] = {}
+    after_sections: Dict[str, set] = {}
+    for section, packages in before.direct.items():
+        for name in packages:
+            before_sections.setdefault(name, set()).add(section)
+    for section, packages in after.direct.items():
+        for name in packages:
+            after_sections.setdefault(name, set()).add(section)
+
+    moved: List[Tuple[str, str, str]] = []
+    moved_pairs: set = set()
+    for name in sorted(set(before_sections) & set(after_sections)):
+        left = sorted(s for s in before_sections[name] if s not in after_sections[name])
+        arrived = sorted(s for s in after_sections[name] if s not in before_sections[name])
+        for from_section in left:
+            for to_section in arrived:
+                moved.append((from_section, to_section, name))
+                moved_pairs.add((from_section, name))
+                moved_pairs.add((to_section, name))
+    moves = sorted(moved)
+
     # A package is ADDED when it is absent from `before`; it is CHANGED when it
     # was already present but its version differs. Splitting the two is what lets
     # the comparison identify "an added direct package" as a distinct finding --
@@ -1319,6 +1366,8 @@ def verify_direct_dependency_delta(
     changed: List[Tuple[str, str]] = []
     for section, packages in dependency_delta(before.direct, after.direct).items():
         for name in packages:
+            if (section, name) in moved_pairs:
+                continue
             if allowed.get(name) == section:
                 continue
             was_present = name in before.direct.get(section, {})
@@ -1329,6 +1378,7 @@ def verify_direct_dependency_delta(
         (section, name)
         for section, names in removed_direct_dependencies(before.direct, after.direct).items()
         for name in names
+        if (section, name) not in moved_pairs
     )
     sections = changed_manifest_sections(before.sections, after.sections)
 
@@ -1336,9 +1386,10 @@ def verify_direct_dependency_delta(
         len(additions) > _MAX_DELTA_NAMES
         or len(changes) > _MAX_DELTA_NAMES
         or len(removals) > _MAX_DELTA_NAMES
+        or len(moves) > _MAX_DELTA_NAMES
         or len(sections) > _MAX_DELTA_NAMES
     )
-    ok = not (additions or changes or removals or sections)
+    ok = not (additions or changes or removals or moves or sections)
 
     reason: Optional[str] = None
     if not ok:
@@ -1355,6 +1406,7 @@ def verify_direct_dependency_delta(
         added=tuple(additions[:_MAX_DELTA_NAMES]),
         changed=tuple(changes[:_MAX_DELTA_NAMES]),
         removed=tuple(removals[:_MAX_DELTA_NAMES]),
+        moved=tuple(moves[:_MAX_DELTA_NAMES]),
         sections_changed=tuple(sections[:_MAX_DELTA_NAMES]),
         reason=reason,
         truncated=truncated,

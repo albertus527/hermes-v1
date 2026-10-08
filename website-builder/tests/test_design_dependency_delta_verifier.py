@@ -706,15 +706,18 @@ def test_a_removal_is_identified_in_every_reviewed_section(tmp_path, section):
     assert v.ok is False
 
 
-def test_a_moved_package_is_a_removal_and_an_addition(tmp_path):
+def test_a_moved_package_is_reported_as_moved(tmp_path):
+    """A relocation is its OWN finding -- not an addition/removal pair to infer."""
     v = _verdict(
         tmp_path,
         {"name": "p", "dependencies": {"cn": "0.4.0"}},
         {"name": "p", "devDependencies": {"cn": "0.4.0"}},
     )
 
-    assert v.removed == (("dependencies", "cn"),)
-    assert v.added == (("devDependencies", "cn"),)
+    assert v.moved == (("dependencies", "devDependencies", "cn"),)
+    assert v.added == ()
+    assert v.removed == ()
+    assert v.ok is False
 
 
 def test_removing_a_reviewed_package_is_still_a_removal(tmp_path):
@@ -741,3 +744,114 @@ def test_a_removed_only_verdict_serializes_the_removed_bucket(tmp_path):
     assert document["removed"] == [["dependencies", "cn"]]
     assert document["added"] == []
     assert document["changed"] == []
+
+
+# ---------------------------------------------------------------------------
+# "Before/after comparison must identify: package moved between sections"
+# ---------------------------------------------------------------------------
+# A relocated package is its OWN finding, named as a (from, to, package) triple.
+# It was never genuinely ADDED, so it is not in `added`; it was not removed, so it
+# is not in `removed`. The five buckets PARTITION the delta.
+
+
+def test_a_moved_package_names_both_sections(tmp_path):
+    v = _verdict(
+        tmp_path,
+        {"name": "p", "dependencies": {"cn": "0.4.0"}},
+        {"name": "p", "devDependencies": {"cn": "0.4.0"}},
+    )
+
+    assert v.moved == (("dependencies", "devDependencies", "cn"),)
+
+
+@pytest.mark.parametrize(
+    "from_section,to_section",
+    [
+        ("dependencies", "optionalDependencies"),
+        ("devDependencies", "peerDependencies"),
+        ("peerDependencies", "dependencies"),
+    ],
+)
+def test_a_move_between_any_two_reviewed_sections_is_identified(
+    tmp_path, from_section, to_section
+):
+    v = _verdict(
+        tmp_path,
+        {"name": "p", from_section: {"x": "1.0.0"}},
+        {"name": "p", to_section: {"x": "1.0.0"}},
+    )
+
+    assert v.moved == ((from_section, to_section, "x"),)
+    assert v.ok is False
+
+
+def test_a_move_is_not_also_an_addition_or_a_removal(tmp_path):
+    v = _verdict(
+        tmp_path,
+        {"name": "p", "dependencies": {"cn": "0.4.0"}},
+        {"name": "p", "devDependencies": {"cn": "0.4.0"}},
+    )
+
+    assert v.added == ()
+    assert v.removed == ()
+    assert v.changed == ()
+
+
+def test_the_buckets_partition_a_mixed_delta(tmp_path):
+    """A move, an independent addition, and a removal -- each in its own bucket."""
+    v = _verdict(
+        tmp_path,
+        {"name": "p", "dependencies": {"cn": "0.4.0", "react": "19.3.0"}},
+        {"name": "p", "devDependencies": {"cn": "0.4.0"}, "dependencies": {"evil": "1.0.0"}},
+    )
+
+    assert v.moved == (("dependencies", "devDependencies", "cn"),)
+    assert v.added == (("dependencies", "evil"),)
+    assert v.removed == (("dependencies", "react"),)
+
+
+def test_a_moved_package_is_not_duplicated_across_buckets(tmp_path):
+    v = _verdict(
+        tmp_path,
+        {"name": "p", "dependencies": {"cn": "0.4.0"}},
+        {"name": "p", "devDependencies": {"cn": "0.4.0"}},
+    )
+
+    moved_names = {name for _from, _to, name in v.moved}
+    added_names = {name for _section, name in v.added}
+    removed_names = {name for _section, name in v.removed}
+
+    assert moved_names == {"cn"}
+    assert "cn" not in added_names
+    assert "cn" not in removed_names
+
+
+def test_a_move_of_a_reviewed_package_is_still_refused(tmp_path):
+    """Allowed to ADD a reviewed package into one section is not a licence to MOVE it."""
+    v = _verdict(
+        tmp_path,
+        {"name": "p", "dependencies": {"cn": "0.4.0"}},
+        {"name": "p", "devDependencies": {"cn": "0.4.0"}},
+        allowed=("cn",),
+    )
+
+    assert v.moved == (("dependencies", "devDependencies", "cn"),)
+    assert v.ok is False
+
+
+def test_a_moved_only_verdict_serializes_the_moved_bucket(tmp_path):
+    v = _verdict(
+        tmp_path,
+        {"name": "p", "dependencies": {"cn": "0.4.0"}},
+        {"name": "p", "devDependencies": {"cn": "0.4.0"}},
+    )
+
+    document = v.to_dict()
+    assert document["moved"] == [["dependencies", "devDependencies", "cn"]]
+    assert document["added"] == []
+    assert document["removed"] == []
+
+
+def test_the_ok_binding_covers_the_moved_bucket():
+    with pytest.raises(ValueError):
+        DirectDependencyDeltaVerdict(ok=True, moved=(("dependencies", "devDependencies", "x"),))
