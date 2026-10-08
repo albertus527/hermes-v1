@@ -1911,9 +1911,10 @@ what turns the driver's honest self-report into a checkable claim -- the same
 "enforcement must be as strong as the property it names" rule the whole batch is
 built on.
 
-**Observed on the qualification host (2026-10):** `14/14 checks passed`,
-`VERDICT: PASS` -- suite `3565 passed, 2 skipped, 4 deselected` (offline),
+**Observed on the qualification host (2026-10):** `13/13 checks passed`,
+`VERDICT: PASS` -- suite `3570 passed, 2 skipped, 4 deselected` (offline),
 drivers `16 / 73 / 35 / 36 / 18` and legacy `9 / 33 / 25`, guardrails all green.
+(13 = 1 suite + 5 D3a.5 drivers + 3 legacy drivers + 4 guardrails.)
 
 ## Part L — manual LIVE smokes (run AFTER the unit suite)
 
