@@ -158,6 +158,15 @@ class CatalogResult:
     warnings: Tuple[str, ...] = ()
     truncated: bool = False
 
+    def __post_init__(self) -> None:
+        # `ok` is `not warnings`, so an ok result MUST carry entries: otherwise
+        # `ok=True` would assert a usable catalog that has nothing in it -- the
+        # same "success flag not bound to its payload" defect as the container
+        # shape. Production always pairs empty entries with a warning; this makes
+        # that a property of the TYPE.
+        if not self.warnings and not self.entries:
+            raise ValueError("an ok catalog result must carry at least one entry")
+
     @property
     def ok(self) -> bool:
         return not self.warnings

@@ -35,6 +35,8 @@ from app.core.design_catalog import (
     MAX_FIELD_CHARS,
     SOURCE_HOSTS,
     WARNING_CATALOG_EMPTY,
+    CatalogEntry,
+    CatalogResult,
     WARNING_CATALOG_MALFORMED,
     component_id_is_valid,
     find_catalog_entry,
@@ -654,3 +656,36 @@ def test_a_21st_bare_list_is_not_its_shape():
 
     assert result.ok is False
     assert result.entries == ()
+
+
+# ---------------------------------------------------------------------------
+# A success flag is bound to its payload at CONSTRUCTION
+# ---------------------------------------------------------------------------
+#
+# The "success flag not bound to its payload" class: `ok` must not be
+# representable without the thing it asserts. Enforced by __post_init__, not by
+# a comment or an `assert` (which `python -O` strips).
+
+
+def test_an_ok_catalog_result_must_carry_entries():
+    with pytest.raises(ValueError):
+        CatalogResult(source=SOURCE_TWENTY_FIRST, entries=(), warnings=())
+
+
+def test_a_warned_empty_catalog_result_is_fine():
+    r = CatalogResult(
+        source=SOURCE_TWENTY_FIRST, entries=(), warnings=(WARNING_CATALOG_EMPTY,)
+    )
+    assert r.ok is False
+
+
+def test_a_warned_result_with_entries_is_fine():
+    """The invariant is exactly 'ok implies entries', not 'entries implies ok'."""
+    entry = CatalogEntry(
+        source=SOURCE_TWENTY_FIRST, component_id="x", display_name="X",
+        provenance_host="21st.dev", provenance_path="x",
+    )
+    r = CatalogResult(
+        source=SOURCE_TWENTY_FIRST, entries=(entry,), warnings=(WARNING_CATALOG_EMPTY,)
+    )
+    assert r.ok is False and len(r.entries) == 1

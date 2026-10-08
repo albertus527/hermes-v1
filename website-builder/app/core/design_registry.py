@@ -810,6 +810,16 @@ class RegistryRequestOutcome:
     reason: str
     dependency_ids: Tuple[str, ...] = ()
 
+    def __post_init__(self) -> None:
+        # `ok` means "an installable request was produced", so it MUST be bound
+        # to a request at CONSTRUCTION. Without this, `ok=True, request=None` is
+        # representable -- a success that carries nothing to install -- and every
+        # call site would have to remember to check both.
+        if self.ok and self.request is None:
+            raise ValueError("an ok registry request outcome must carry a request")
+        if not self.ok and self.request is not None:
+            raise ValueError("a refused registry request outcome must carry no request")
+
     def to_dict(self) -> Dict[str, object]:
         return {
             "ok": self.ok,

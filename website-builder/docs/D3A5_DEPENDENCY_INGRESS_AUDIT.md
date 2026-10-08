@@ -236,6 +236,36 @@ GET https://21st.dev/api/v1/components/search?q=<term>&scope=public&limit=24
 - **No fabrication.** A malformed or empty search response is a degraded empty
   result, never an invented entry.
 
+### A success flag is bound to its payload at CONSTRUCTION
+
+The `ok` fix was one instance of a general defect: a "success" flag whose
+implementation does not require the thing it asserts. Four such types were
+representable:
+
+| type | flag | could be constructed as |
+|---|---|---|
+| `CatalogFetchResult` | `ok` (`reason is None`) | `ok=True, payload=None` |
+| `RegistryRequestOutcome` | `ok` | `ok=True, request=None` |
+| `CatalogResult` | `ok` (`not warnings`) | `ok=True, entries=()` |
+| `InstallOutcome` | `installed` (`state=="installed"`) | installed, `verified_*=False/()` |
+
+The fetch case was the sharpest: its invariant was a **comment plus an `assert`**
+(`# implied by ok`), and `python -O` STRIPS asserts -- verified live: under `-O` a
+payload-less success silently normalized to an empty degraded result instead of
+failing.
+
+Fix: each flag is now bound by `__post_init__`, so the invariant is a property of
+the TYPE, not of a caller remembering (or of asserts being enabled):
+
+* `CatalogFetchResult`: `ok` requires a payload.
+* `RegistryRequestOutcome`: `ok` iff a request is present (both directions).
+* `CatalogResult`: `ok` requires at least one entry.
+* `InstallOutcome`: `installed` requires `verified_in_manifest` or
+  `verified_components`.
+
+All four are construction-time `ValueError`s; production already satisfied them,
+so nothing legitimate is refused.
+
 ### `ok` recognises only the source's OWN verified container shape
 
 `CatalogResult.ok` is `not warnings`, and warnings cover only EMPTY/MALFORMED --

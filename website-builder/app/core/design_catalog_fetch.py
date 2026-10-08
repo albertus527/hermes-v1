@@ -194,6 +194,12 @@ class CatalogFetchResult:
             raise ValueError(f"unregistered catalog fetch reason: {self.reason!r}")
         if self.reason is not None and self.payload is not None:
             raise ValueError("a failed fetch carries no payload")
+        # `ok` is `reason is None`, so a successful fetch MUST carry a payload.
+        # Enforced at CONSTRUCTION: the invariant is a property of the type, not
+        # a comment plus an `assert` a caller must remember (and which `python -O`
+        # strips). Without this, a payload-less success silently normalized.
+        if self.reason is None and self.payload is None:
+            raise ValueError("a successful fetch must carry a payload")
 
     @property
     def ok(self) -> bool:
@@ -213,7 +219,9 @@ class CatalogFetchResult:
                 warnings=(self.reason or REASON_UNREACHABLE,),
                 truncated=False,
             )
-        assert self.payload is not None  # implied by ok
+        # `ok` implies a payload, enforced by __post_init__, so this is a fact
+        # of the type rather than an `assert` (which `python -O` would strip).
+        assert self.payload is not None  # nosec - implied by ok, see __post_init__
 
         # A markdown index (React Bits llms.txt) is parsed into component
         # documents first; a JSON payload (21st's search response) is passed

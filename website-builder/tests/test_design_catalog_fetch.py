@@ -817,3 +817,16 @@ def test_the_parser_uses_the_anchored_pattern_not_the_generic_tail():
         assert {d["id"] for d in docs} == {"hero-banner"}
     finally:
         fetch._21ST_COMPONENT_IDENTITY_SCHEMA_VERIFIED = saved
+
+
+def test_a_successful_fetch_must_carry_a_payload():
+    """`ok` is `reason is None`, so ok MUST imply a payload -- at construction."""
+    with pytest.raises(ValueError):
+        CatalogFetchResult(source=SOURCE_TWENTY_FIRST, payload=None, reason=None)
+
+
+def test_a_failed_fetch_still_carries_no_payload():
+    with pytest.raises(ValueError):
+        CatalogFetchResult(
+            source=SOURCE_TWENTY_FIRST, payload={"x": 1}, reason=REASON_UNREACHABLE
+        )

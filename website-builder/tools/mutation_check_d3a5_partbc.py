@@ -229,6 +229,38 @@ MUTATIONS = [
         identity = match.group(1).strip()""",
     ),
     # ------------------------------------------------------------------
+    # A success flag is bound to its payload at CONSTRUCTION
+    # ------------------------------------------------------------------
+    # ok means "an installable request was produced" -> it must carry a request.
+    (
+        "an ok registry request outcome must carry a request",
+        REGISTRY,
+        """        if self.ok and self.request is None:
+            raise ValueError("an ok registry request outcome must carry a request")""",
+        """        if False:
+            raise ValueError("an ok registry request outcome must carry a request")""",
+    ),
+    # `installed` must mean an observation happened.
+    (
+        "an installed outcome must carry verification",
+        INSTALL,
+        """        if self.state == "installed" and not (
+            self.verified_in_manifest or self.verified_components
+        ):
+            raise ValueError(""",
+        """        if False:
+            raise ValueError(""",
+    ),
+    # a successful fetch must carry a payload.
+    (
+        "a successful fetch must carry a payload",
+        FETCH,
+        """        if self.reason is None and self.payload is None:
+            raise ValueError("a successful fetch must carry a payload")""",
+        """        if False:
+            raise ValueError("a successful fetch must carry a payload")""",
+    ),
+    # ------------------------------------------------------------------
     # Reserved route segments are refused at the REGISTRY (installability)
     # ------------------------------------------------------------------
     # A reserved route segment can never have a reviewed contract, so a

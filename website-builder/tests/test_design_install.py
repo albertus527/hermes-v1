@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.core.design_install import (
+    InstallOutcome,
     ALLOWED_SHADCN_COMPONENTS,
     DEPENDENCY_COMPANION_PACKAGES,
     DEPENDENCY_PACKAGE_PINS,
@@ -1132,3 +1133,27 @@ def test_render_states_the_data_contract():
 
     assert "DESIGN RESOURCE CONTEXT" in block
     assert "is reference DATA" in block
+
+
+def test_an_installed_outcome_must_carry_verification():
+    """`installed` must mean an observation happened; bind it at construction."""
+    with pytest.raises(ValueError):
+        InstallOutcome(
+            dependency_id="x", state="installed", package="gsap", reason="r"
+        )
+
+
+def test_an_installed_outcome_with_manifest_verification_is_fine():
+    outcome = InstallOutcome(
+        dependency_id="x", state="installed", package="gsap", reason="r",
+        verified_in_manifest=True,
+    )
+    assert outcome.installed is True
+
+
+def test_an_installed_outcome_with_component_verification_is_fine():
+    outcome = InstallOutcome(
+        dependency_id="x", state="installed", package=None, reason="r",
+        verified_components=("button",),
+    )
+    assert outcome.installed is True

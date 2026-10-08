@@ -848,6 +848,20 @@ class InstallOutcome:
     #: receipt stays bounded and leaks no filesystem layout.
     verified_components: Tuple[str, ...] = ()
 
+    def __post_init__(self) -> None:
+        # `installed` is `state == "installed"`, which must mean "verification
+        # observed the artifact". Binding it at CONSTRUCTION stops a success from
+        # being representable without the observation that justifies it -- the
+        # "success flag not bound to its payload" class. Either the package was
+        # seen in the manifest, or the components were seen on disk.
+        if self.state == "installed" and not (
+            self.verified_in_manifest or self.verified_components
+        ):
+            raise ValueError(
+                "an installed outcome must carry verification "
+                "(verified_in_manifest or verified_components)"
+            )
+
     @property
     def installed(self) -> bool:
         """True ONLY when verification observed the package in the project."""

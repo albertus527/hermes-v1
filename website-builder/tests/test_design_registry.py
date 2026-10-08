@@ -31,6 +31,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.core.design_install import ALLOWED_SHADCN_COMPONENTS, DEPENDENCY_PACKAGES
 from app.core.design_registry import (
+    REASON_COMPONENT_UNKNOWN,
+    REASON_REQUEST_OK,
+    RegistryRequestOutcome,
     component_id_is_reserved,
     ReviewedComponentContract,
     REGISTRY_HOSTS,
@@ -552,3 +555,21 @@ def test_the_catalog_and_registry_agree_on_the_reserved_set():
     from app.core.design_registry import RESERVED_COMPONENT_IDS
 
     assert catalog._RESERVED_COMPONENT_IDS is RESERVED_COMPONENT_IDS
+
+
+def test_an_ok_request_outcome_must_carry_a_request():
+    """`ok` means an installable request was produced; bind it at construction."""
+    with pytest.raises(ValueError):
+        RegistryRequestOutcome(ok=True, request=None, reason=REASON_REQUEST_OK)
+
+
+def test_a_refused_request_outcome_must_carry_no_request():
+    outcome = build_registry_request(
+        SOURCE_REACT_BITS, "SplitText",
+        declared_dependencies=["gsap@^3.13.0", "@gsap/react@^2.1.2"],
+    )
+    assert outcome.ok is True and outcome.request is not None
+    with pytest.raises(ValueError):
+        RegistryRequestOutcome(
+            ok=False, request=outcome.request, reason=REASON_COMPONENT_UNKNOWN
+        )

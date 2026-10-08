@@ -239,6 +239,15 @@ MUTATIONS = [
         return bool(_SLUG_RE.match(component_id) or _PASCAL_RE.match(component_id))
     return False""",
     ),
+    # --- 12a. an ok catalog result must carry entries -------------------
+    (
+        "an ok catalog result must carry entries",
+        CATALOG,
+        """        if not self.warnings and not self.entries:
+            raise ValueError("an ok catalog result must carry at least one entry")""",
+        """        if False:
+            raise ValueError("an ok catalog result must carry at least one entry")""",
+    ),
     # --- 12b. the container shape is per-source: a key the source never
     #          emits must NOT be reported ok (else ok=True is semantically false)
     (
