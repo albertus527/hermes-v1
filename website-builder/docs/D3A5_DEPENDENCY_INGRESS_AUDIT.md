@@ -438,7 +438,7 @@ keyed `results` -> `ok=True`; React Bits bare list -> `ok=True`, a mapping ->
 `ok=False`; and a bare list for 21st -> `ok=False`. Production only ever passes
 the verified shapes, so nothing legitimate is refused.
 
-### Root cause of the 21st route false positive: the ANCHOR was dropped
+### Root cause of the 21st route false positive: a scrape over `/components/<slug>`
 
 The old pattern matched the **generic tail** `/components/<slug>` and dropped the
 `/@<author>/` anchor. A 21st component page is
@@ -450,14 +450,24 @@ identity -- on the real `llms.txt` the generic pattern yields **exactly**
 
 ```
 generic  /components/([a-z0-9-]+)              -> 5 fabricated identities
-anchored /@<author>/components/([a-z0-9-]+)    -> (nothing)   <- honest
+anchored /@<author>/components/([a-z0-9-]+)    -> (nothing)
 ```
 
-Fix: the ONLY 21st identity pattern is now `_21ST_AUTHORED_COMPONENT_RE`, which
-keeps the `/@<author>/` anchor. The extraction branch uses it, so a route-only
-index produces zero even if the schema flag is flipped. This is the STRUCTURAL
-fix; the reserved-segment refusal (`RESERVED_COMPONENT_IDS`) remains as
-defense in depth.
+The first fix kept the anchored pattern. That is not enough: an anchored regex
+**still scrapes a path for which this application has no verified schema**, and
+its only consumer was a test -- so the extraction is **removed outright**. The
+module now keeps **no** regex over 21st's `/components/<slug>` paths, anchored or
+not; `parse_markdown_catalog` returns `[]` for 21st unconditionally.
+
+```
+kept alive only by tests  ->  removed
+property now asserted     ->  NO 21st path text becomes an identity, ever
+```
+
+The rule for any future schema is recorded in the module: it must be extracted
+with an `/@<author>/`-anchored pattern, never the generic `/components/<slug>`
+tail. The reserved-segment refusal (`RESERVED_COMPONENT_IDS`) remains as defense
+in depth.
 
 ### The import boundary sees EVERY module-loading form
 

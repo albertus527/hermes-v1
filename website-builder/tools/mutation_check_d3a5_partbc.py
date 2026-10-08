@@ -217,16 +217,23 @@ MUTATIONS = [
     # ------------------------------------------------------------------
     # Part G -- 21st route false positives
     # ------------------------------------------------------------------
-    # Reintroducing the route regex fabricates component identities.
+    # Reintroducing ANY scrape of /components/<slug> fabricates identities.
+    # The module keeps no such regex; this proves the tests catch one returning.
     (
         "21st route paths never become component identities",
         FETCH,
-        """    for match in _21ST_AUTHORED_COMPONENT_RE.finditer(text):
-        identity = match.group(1).strip()""",
-        """    import re as _re
+        """    # never the generic tail -- see the module constant above.)
+    return []""",
+        """    # never the generic tail -- see the module constant above.)
+    import re as _re
 
     for match in _re.finditer(r"/components/(?:s/)?([a-z0-9]+(?:-[a-z0-9]+)*)\\b", text):
-        identity = match.group(1).strip()""",
+        identity = match.group(1).strip()
+        if identity in seen:
+            continue
+        seen.add(identity)
+        found.append({"id": identity, "name": identity})
+    return found""",
     ),
     # ------------------------------------------------------------------
     # The adapter uses the AUTHORITATIVE interface + its documented auth
@@ -326,17 +333,23 @@ MUTATIONS = [
             raise ValueError(""",
     ),
     # ------------------------------------------------------------------
-    # The 21st identity pattern keeps the /@<author>/ ANCHOR. Dropping it for
-    # the generic /components/<slug> tail turns routes into identities.
+    # The 21st extraction is REMOVED, not merely anchored. Reintroducing even
+    # the ANCHORED scrape (a path with no verified schema) must fail.
     (
-        "the 21st identity pattern keeps the author anchor",
+        "no regex scrapes 21st component paths, anchored or not",
         FETCH,
-        """_21ST_AUTHORED_COMPONENT_RE = re.compile(
-    r"/@[A-Za-z0-9_.\-]+/components/([a-z0-9]+(?:-[a-z0-9]+)*)"
-)""",
-        """_21ST_AUTHORED_COMPONENT_RE = re.compile(
-    r"/components/([a-z0-9]+(?:-[a-z0-9]+)*)"
-)""",
+        """    # never the generic tail -- see the module constant above.)
+    return []""",
+        """    # never the generic tail -- see the module constant above.)
+    import re as _re
+
+    for match in _re.finditer(r"/@[A-Za-z0-9_.\\-]+/components/([a-z0-9]+(?:-[a-z0-9]+)*)", text):
+        identity = match.group(1).strip()
+        if identity in seen:
+            continue
+        seen.add(identity)
+        found.append({"id": identity, "name": identity})
+    return found""",
     ),
     # ------------------------------------------------------------------
     # Part G -- 21st discovery is the REAL authenticated REST search

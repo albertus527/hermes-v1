@@ -505,39 +505,25 @@ def _decode_payload(body: bytes) -> Optional[Any]:
 #: documented identity surface.
 _CLI_MARKER = re.compile(r"CLI:\s*`([A-Za-z0-9][A-Za-z0-9_-]*)`")
 
-#: The AUTHORED component-page shape: ``/@<author>/components/<slug>``. This is
-#: the ONLY 21st URL form that names a component. The ``/@<author>/`` anchor is
-#: load-bearing: a category route (``/community/components/s/<tag>``) and a
-#: highlight route (``/community/components/popular``) have the SAME
-#: ``/components/<tail>`` ending but NO author, so a pattern that keeps the
-#: generic tail and drops the anchor turns every route into a fabricated
-#: identity -- the exact false positive this module removes.
-_21ST_AUTHORED_COMPONENT_RE = re.compile(
-    r"/@[A-Za-z0-9_.\-]+/components/([a-z0-9]+(?:-[a-z0-9]+)*)"
-)
-
+#: 21st has NO markdown component-identity schema, so this module keeps NO regex
+#: over its ``/components/<slug>`` paths -- not even an anchored one.
+#:
 #: 21st documents component PAGES as ``/@author/components/<slug>`` and CATEGORY
 #: pages as ``/community/components/s/<tag>``, ``/community/components/popular``,
-#: ``/newest``, ``/featured``, ``/week``. Those are ROUTES, not component
-#: identities: the ``/components/<x>`` segment names a page path, and the bare
-#: highlight slugs (``popular``, ``newest``, ``featured``, ``week``) and the
-#: single-letter category prefix (``s`` in ``/components/s/hero``) are NOT
-#: installable component ids.
-#:
-#: The previous revision extracted the GENERIC tail ``/components/([a-z0-9-]+)``
-#: from the raw text, which turned every one of those routes into a fabricated
-#: catalog identity -- on the real ``llms.txt`` it produced exactly
-#: ``s``, ``popular``, ``newest``, ``featured``, ``week``. The correct pattern
-#: keeps the ``/@<author>/`` anchor (see :data:`_21ST_AUTHORED_COMPONENT_RE`) and
-#: yields ZERO from ``llms.txt``.
+#: ``/newest``, ``/featured``, ``/week``. A regex over those paths cannot tell a
+#: component page from a ROUTE: the previous revision extracted the generic tail
+#: ``/components/([a-z0-9-]+)`` and turned the routes into fabricated identities
+#: (on the real ``llms.txt``: exactly ``s``, ``popular``, ``newest``,
+#: ``featured``, ``week``). Anchoring on ``/@<author>/`` fixes the symptom, but
+#: it still scrapes a path this application has no verified schema for, and its
+#: only consumer would be a test -- so the extraction is REMOVED, not kept.
 #:
 #: Verified live (2026-10): 21st's ``llms.txt`` publishes NO machine-readable
 #: component-identity schema. Its real machine surface is the authenticated REST
 #: API (``/api/v1/components/search``), which returns HTTP 401 without a Bearer
-#: key. So there is NO unauthenticated official component catalog to parse, and
-#: this parser correctly produces ZERO identities from the documentation index
-#: rather than inventing them from route text.
-_21ST_COMPONENT_IDENTITY_SCHEMA_VERIFIED = False
+#: key. If a markdown schema is EVER verified, it must be extracted with an
+#: ``/@<author>/``-anchored pattern -- never the generic ``/components/<slug>``
+#: tail -- and this comment is the record of that rule.
 
 #: Upper bound on how many component lines one index may contribute. Upstream
 #: lists hundreds; the normalizer applies its own budget, and this keeps the
@@ -585,30 +571,12 @@ def parse_markdown_catalog(source: str, text: str) -> Any:
         return found
 
     # 21st: NO verified component-identity schema exists in the documented
-    # surface. Route paths are not identities, so nothing is extracted. This is
-    # the honest degraded result, not a fabricated catalog.
-    #
-    # If a schema is ever verified, it must be extracted with the ANCHORED
-    # pattern (``/@<author>/components/<slug>``), never the generic
-    # ``/components/<slug>`` tail: the anchor is what distinguishes a component
-    # page from a category/highlight ROUTE. Using the generic tail here is the
-    # exact defect this module removes, so the anchored pattern is the ONLY one
-    # wired in.
-    if not _21ST_COMPONENT_IDENTITY_SCHEMA_VERIFIED:
-        return []
-
-    for match in _21ST_AUTHORED_COMPONENT_RE.finditer(text):
-        identity = match.group(1).strip()
-        if not component_id_is_valid(source, identity):
-            continue
-        if identity in seen:
-            continue
-        seen.add(identity)
-        found.append({"id": identity, "name": identity})
-        if len(found) >= MAX_PARSED_IDS:
-            break
-
-    return found
+    # surface, so NOTHING is extracted -- there is no regex over its
+    # ``/components/<slug>`` paths at all. Route paths are not identities, and a
+    # scrape would fabricate them; the honest result is an empty listing. (A
+    # future schema must be extracted with an ``/@<author>/``-anchored pattern,
+    # never the generic tail -- see the module constant above.)
+    return []
 
 
 def discover_catalog(

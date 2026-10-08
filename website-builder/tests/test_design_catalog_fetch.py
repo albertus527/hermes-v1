@@ -620,11 +620,12 @@ def test_the_react_bits_cli_marker_still_parses():
     assert {d["id"] for d in docs} == {"ASCIIText", "BlurText", "CountUp"}
 
 
-def test_the_21st_schema_flag_is_explicitly_false():
-    """The verified fact: no unauthenticated 21st identity schema exists."""
+def test_the_21st_route_extraction_is_absent():
+    """The verified fact: no 21st markdown identity schema, so no scraper."""
     import app.core.design_catalog_fetch as fetch
 
-    assert fetch._21ST_COMPONENT_IDENTITY_SCHEMA_VERIFIED is False
+    assert not hasattr(fetch, "_21ST_COMPONENT_IDENTITY_SCHEMA_VERIFIED")
+    assert not any("COMPONENT_RE" in n for n in dir(fetch))
 
 
 # ---------------------------------------------------------------------------
@@ -771,16 +772,47 @@ def test_react_bits_still_needs_no_credential():
 # tail became a fabricated identity.
 
 
-def test_the_anchored_pattern_extracts_a_real_component_page():
-    from app.core.design_catalog_fetch import _21ST_AUTHORED_COMPONENT_RE
+def test_no_regex_scrapes_21st_component_paths():
+    """The module keeps NO regex over 21st's ``/components/<slug>`` paths.
 
-    text = "https://21st.dev/@someone/components/hero-banner\n"
-    assert _21ST_AUTHORED_COMPONENT_RE.findall(text) == ["hero-banner"]
+    Not the generic tail AND not an anchored one: 21st publishes no verified
+    markdown identity schema, so any such regex exists only to be scraped -- and
+    a scrape fabricates identities from ROUTES. If a schema is ever verified, the
+    pattern must be ``/@<author>/``-anchored; until then there is no pattern.
+    """
+    import app.core.design_catalog_fetch as fetch
+
+    names = [n for n in dir(fetch) if "COMPONENT_RE" in n]
+    assert names == [], names
+    # No compiled pattern mentions a component path either.
+    for n in dir(fetch):
+        obj = getattr(fetch, n)
+        if hasattr(obj, "pattern") and "components/" in str(getattr(obj, "pattern", "")):
+            raise AssertionError("a regex scrapes component paths: %r" % n)
+    # And the schema flag that guarded the scrape is gone too.
+    assert not hasattr(fetch, "_21ST_COMPONENT_IDENTITY_SCHEMA_VERIFIED")
 
 
-def test_the_anchored_pattern_never_matches_a_route():
-    from app.core.design_catalog_fetch import _21ST_AUTHORED_COMPONENT_RE
+# ---------------------------------------------------------------------------
+# The 21st extraction is REMOVED, not merely anchored
+# ---------------------------------------------------------------------------
+#
+# The root cause of the route false positive: a regex over `/components/<slug>`
+# turned 21st's ROUTES into fabricated identities. Anchoring on `/@<author>/`
+# fixes the symptom, but the extraction still scrapes a path with no verified
+# schema, and its only consumer is a test -- so it is removed outright. The
+# property that matters is: NO 21st path text becomes an identity, ever.
 
+
+def test_a_real_component_page_path_yields_no_identity():
+    """Even a genuine authored page is not scraped -- there is no schema."""
+    docs = parse_markdown_catalog(
+        SOURCE_TWENTY_FIRST, "https://21st.dev/@someone/components/hero-banner\n"
+    )
+    assert docs == []
+
+
+def test_route_paths_yield_no_identity():
     for route in (
         "https://21st.dev/community/components/s/hero\n",
         "https://21st.dev/community/components/popular\n",
@@ -788,36 +820,12 @@ def test_the_anchored_pattern_never_matches_a_route():
         "https://21st.dev/community/components/featured\n",
         "https://21st.dev/community/components/week\n",
     ):
-        assert _21ST_AUTHORED_COMPONENT_RE.findall(route) == [], route
+        assert parse_markdown_catalog(SOURCE_TWENTY_FIRST, route) == [], route
 
 
-def test_the_anchored_pattern_yields_nothing_from_the_real_index():
+def test_the_real_21st_index_yields_no_identity():
     """The real llms.txt is ROUTES, so the honest answer is zero identities."""
-    from app.core.design_catalog_fetch import _21ST_AUTHORED_COMPONENT_RE
-
-    assert _21ST_AUTHORED_COMPONENT_RE.findall(REAL_21ST_ROUTES) == []
-
-
-def test_the_parser_uses_the_anchored_pattern_not_the_generic_tail():
-    """A route-only index must produce zero, even if the flag is flipped."""
-    import app.core.design_catalog_fetch as fetch
-
-    # Force the extraction branch to run.
-    saved = fetch._21ST_COMPONENT_IDENTITY_SCHEMA_VERIFIED
-    try:
-        fetch._21ST_COMPONENT_IDENTITY_SCHEMA_VERIFIED = True
-        # Routes only -> the anchored pattern extracts nothing.
-        assert fetch.parse_markdown_catalog(
-            SOURCE_TWENTY_FIRST, REAL_21ST_ROUTES
-        ) == []
-        # A real authored component page -> extracted.
-        docs = fetch.parse_markdown_catalog(
-            SOURCE_TWENTY_FIRST,
-            "https://21st.dev/@someone/components/hero-banner\n",
-        )
-        assert {d["id"] for d in docs} == {"hero-banner"}
-    finally:
-        fetch._21ST_COMPONENT_IDENTITY_SCHEMA_VERIFIED = saved
+    assert parse_markdown_catalog(SOURCE_TWENTY_FIRST, REAL_21ST_ROUTES) == []
 
 
 def test_a_successful_fetch_must_carry_a_payload():
