@@ -921,3 +921,21 @@ def test_the_documented_build_command_states_the_shadow_config_fix():
     assert "TOOLCHAIN_MUTATION_REJECTED" in text
 
 
+def test_the_documented_transitions_command_is_present():
+    """The command materializes one bounded recipe with the pinned CLI."""
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    assert "Transitions `add card-resize`" in text
+    assert "transitions-dev add card-resize" in text
+    assert "transitions-dev@0.3.0" in text
+
+
+def test_the_documented_transitions_command_states_the_reserved_slug_fix():
+    """The doc must record that the bulk selectors are refused structurally."""
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    assert "refused at the slug VOCABULARY (`RESERVED_RECIPE_SLUGS`)" in text
+    assert "add all" in text
+    assert "32" in text
+
+

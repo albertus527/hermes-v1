@@ -100,6 +100,31 @@ SUPPORTED_TIERS: Tuple[str, ...] = (TIER_FREE,)
 #: Slugs are lowercase kebab, matching upstream's own manifest exactly.
 _SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
+#: Slug-shaped tokens that are CLI SELECTORS, never recipes.
+#:
+#: The pinned CLI's bulk installs are ``add --free`` / ``add --all`` / ``add
+#: --pro`` -- read from the tarball's ``bin/transitions-dev.mjs``:
+#: ``if (flags.free || flags.all || flags.pro) return cmdAddAll(...)``. The
+#: ``--``-prefixed forms are already refused by the slug SHAPE rule, but a BARE
+#: ``all``/``free``/``pro`` is a well-formed kebab slug, so a shape-only check
+#: forwards it. Requiring catalog membership only helps when the catalog omits
+#: these names: a manifest that LISTS ``all`` would make ``add all`` buildable,
+#: turning a bounded one-recipe selection into an open-ended action inside a
+#: build -- the exact loop this batch refuses.
+#:
+#: Refusing them at the VOCABULARY makes "no argv requests every recipe at once"
+#: structural rather than a property of the fixture, mirroring
+#: ``design_registry.RESERVED_COMPONENT_IDS``. The set is application-owned and
+#: closed. No real ``transitions-dev@0.3.0`` slug collides with it (32/32 free
+#: slugs verified), so this is a false-positive-free narrowing.
+RESERVED_RECIPE_SLUGS: frozenset = frozenset({"all", "free", "pro"})
+
+
+def recipe_slug_is_reserved(slug: object) -> bool:
+    """Whether ``slug`` is a CLI selector rather than a recipe name."""
+    return isinstance(slug, str) and slug in RESERVED_RECIPE_SLUGS
+
+
 #: Upstream's accessibility guard, matched as the ACTUAL ``@media`` BLOCK.
 #:
 #: The selector is matched with its opening brace -- ``@media
@@ -117,12 +142,17 @@ _REDUCED_MOTION_RE = re.compile(
 
 
 def recipe_slug_is_well_formed(slug: object) -> bool:
-    """Whether ``slug`` is a bare kebab-case slug.
+    """Whether ``slug`` is a bare kebab-case slug that is NOT a CLI selector.
 
     Strict enough that a URL, a path, or a shell fragment fails: those contain
-    ``:``/``/``/``;``/backticks and so cannot be substituted into an argv.
+    ``:``/``/``/``;``/backticks and so cannot be substituted into an argv. A
+    reserved CLI selector (``all``/``free``/``pro``) is refused HERE, at the
+    vocabulary, so it can never become a recipe on any path -- not merely when
+    a particular catalog happens to omit it. See :data:`RESERVED_RECIPE_SLUGS`.
     """
     if not isinstance(slug, str) or not slug or len(slug) > 64:
+        return False
+    if recipe_slug_is_reserved(slug):
         return False
     return bool(_SLUG_RE.match(slug))
 
@@ -313,6 +343,13 @@ def build_add_argv(
     guard structural rather than dependent on every caller remembering to call
     :func:`resolve_recipe_slug` first.
 
+    Catalog membership alone was NOT enough for the bulk selectors, though: the
+    guarantee held only when the catalog happened to omit ``all``/``free``/
+    ``pro``. A manifest that LISTED one made ``add all`` buildable. Those names
+    are now refused at the vocabulary (:func:`recipe_slug_is_well_formed`), so
+    "no argv requests every recipe at once" is a property of the module rather
+    than of the fixture.
+
     One slug, never ``--free`` (every free transition at once) and never
     ``--pro`` (browser sign-in plus an authenticated fetch). Both would turn a
     bounded selection into an open-ended action inside a build.
@@ -448,6 +485,7 @@ __all__ = [
     "RECIPE_OPTIONAL_SUFFIXES",
     "RECIPE_REQUIRED_SUFFIX",
     "RECIPE_SUFFIXES",
+    "RESERVED_RECIPE_SLUGS",
     "SUPPORTED_TIERS",
     "TIER_FREE",
     "TRANSITIONS_CLI_ID",
@@ -461,6 +499,7 @@ __all__ = [
     "detect_reduced_motion_guard",
     "normalize_recipe",
     "normalize_recipe_catalog",
+    "recipe_slug_is_reserved",
     "recipe_slug_is_well_formed",
     "resolve_recipe_slug",
     "verify_recipe_materialized",

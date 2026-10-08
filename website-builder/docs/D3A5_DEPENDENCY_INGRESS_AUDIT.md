@@ -619,6 +619,26 @@ reads as "a present `.css` IS accepted". It is not: `RECIPE_OPTIONAL_SUFFIXES`
 is empty, so the default IGNORES a stray `.css` beside the Markdown. The
 docstring now states the current truth, and a doc-coherence test + guard pin it.
 
+### The bulk selectors are refused at the VOCABULARY, not by the fixture
+
+`build_add_argv`'s docstring named `all` as dangerous ("a request for every
+recipe at once") and a test asserted `build_add_argv(..., "all", catalog) is
+None`. But the guard was **catalog membership**, so that held only while the
+fixture catalog omitted `all`. **Reproduced:** a manifest that LISTS
+`{"slug": "all", "tier": "free"}` made the catalog contain `all` and
+`build_add_argv` return `… transitions-dev add all` -- the exact open-ended
+action the module refuses. The CLI treats the `--`-prefixed forms
+(`--free`/`--all`/`--pro`) as bulk installs (`bin/transitions-dev.mjs`:
+`if (flags.free || flags.all || flags.pro) return cmdAddAll(...)`), so a bare
+`all` forwarded to `add` is one argv away from "install every recipe".
+
+**Fix:** `RESERVED_RECIPE_SLUGS = {"all", "free", "pro"}` +
+`recipe_slug_is_reserved`, and `recipe_slug_is_well_formed` refuses them at the
+vocabulary -- mirroring `design_registry.RESERVED_COMPONENT_IDS`. Now "no argv
+requests every recipe at once" is a property of the module, not of whichever
+manifest was supplied. **No false positive:** none of the 32 real
+`transitions-dev@0.3.0` free slugs collides with the set (verified).
+
 ### Item 2 evidence: a REGRESSION that pins capability == execution
 
 Item 2 ("capability truth must match actual execution requirements") is evidenced
@@ -2204,6 +2224,69 @@ platform-owned config: reproduced live, planting one with a different
 guard reported *untouched*. The build's toolchain guard now also rejects any
 `FORBIDDEN_TOOLCHAIN_FILES` (`vite.config.{js,mjs,cjs,mts,cts}`) and any
 protected file that APPEARS after capture — `TOOLCHAIN_MUTATION_REJECTED`.
+
+### VPS command: Transitions `add card-resize` (bounded recipe materialization)
+
+The pinned `transitions-dev@0.3.0` CLI materializes ONE free recipe as
+`transitions/<slug>.md`. The app builds the argv and verifies the artifact;
+neither is run by the unit suite (it bans subprocesses and sockets), so this is
+the live check.
+
+```bash
+cd website-builder && source .venv/bin/activate
+APP="$(pwd)"
+
+WORK="$(mktemp -d)" && cd "$WORK"
+printf '%s\n' '{"name":"p","version":"1.0.0"}' > package.json
+printf '%s\n' '{}' > package-lock.json
+BASELINE="$(mktemp)" && cp package.json "$BASELINE"
+
+# The pinned CLI, one catalog-listed slug.
+npm exec --yes --package=transitions-dev@0.3.0 -- transitions-dev add card-resize
+
+# It must write ONLY the Markdown, and NOT touch package.json.
+find . -type f -not -path './node_modules/*' | sort
+cmp -s "$BASELINE" package.json && echo "package.json UNCHANGED (no dependency delta)"
+
+# The app's argv + verification against that real artifact.
+python - "$APP" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from app.core.design_install import build_pinned_cli_prefix, detect_package_manager
+from app.core.design_transitions import (
+    build_add_argv, normalize_recipe_catalog, verify_recipe_materialized,
+    approved_recipes_dir, detect_reduced_motion_guard, RESERVED_RECIPE_SLUGS,
+)
+catalog = normalize_recipe_catalog({"transitions": [
+    {"slug": "card-resize", "name": "Card resize", "tier": "free"},
+]})
+root = Path(".")
+prefix = build_pinned_cli_prefix(detect_package_manager(root), "transitions_dev", root)
+print("argv          :", build_add_argv(prefix, "card-resize", catalog))
+print("verified files:", verify_recipe_materialized(root, "card-resize", approved_recipes_dir(root)))
+print("reduced-motion guard:", detect_reduced_motion_guard((Path("transitions")/"card-resize.md").read_text()))
+print("reserved slugs:", sorted(RESERVED_RECIPE_SLUGS))
+PY
+```
+
+**Observed on the qualification host (2026-10):** `add card-resize` prints
+`✓ Added Card resize → transitions/card-resize.md`, the only new file is
+`transitions/card-resize.md`, and `package.json` is **byte-identical**; the app's
+argv is `npm exec --yes --package=transitions-dev@0.3.0 -- transitions-dev add
+card-resize`, `verify_recipe_materialized` → `('card-resize.md',)`, and the
+reduced-motion guard is detected `True`.
+
+**Verified for EVERY free recipe, not just the sample:** all **32** free recipes
+were materialized in fresh dirs -- each wrote exactly `transitions/<slug>.md`,
+each left `package.json` byte-identical, and all 32 carry the
+`@media (prefers-reduced-motion: reduce) {` guard.
+
+**The bulk selectors are refused.** `add all` / `add free` / `add pro` are
+refused at the slug VOCABULARY (`RESERVED_RECIPE_SLUGS`), so `build_add_argv`
+returns `None` for them no matter what the catalog lists -- a manifest that
+LISTS `all` can no longer turn a bounded one-recipe selection into an
+open-ended bulk install.
 
 ### Why these are manual, not in the suite
 

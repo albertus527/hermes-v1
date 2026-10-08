@@ -461,6 +461,15 @@ MUTATIONS = [
         "FORBIDDEN_TOOLCHAIN_FILES",
         "the toolchain file list",
     ),
+    # --- 20. the documented transitions command records the reserved-slug fix
+    # The bulk selectors must be refused structurally. If the doc drops that, a
+    # reader cannot tell `add all` is refused at the vocabulary, not by fixture.
+    (
+        "the documented transitions command records the reserved-slug fix",
+        AUDIT_DOC,
+        "refused at the slug VOCABULARY (`RESERVED_RECIPE_SLUGS`)",
+        "refused by the catalog",
+    ),
 ]
 
 

@@ -37,12 +37,14 @@ from app.core.design_transitions import (
     TRANSITIONS_CLI_ID,
     WARNING_RECIPE_CATALOG_EMPTY,
     WARNING_RECIPE_CATALOG_MALFORMED,
+    RESERVED_RECIPE_SLUGS,
     approved_recipes_dir,
     build_add_argv,
     build_list_argv,
     detect_reduced_motion_guard,
     normalize_recipe,
     normalize_recipe_catalog,
+    recipe_slug_is_reserved,
     recipe_slug_is_well_formed,
     resolve_recipe_slug,
     verify_recipe_materialized,
@@ -168,6 +170,67 @@ def test_no_argv_can_request_every_recipe_at_once(catalog):
     """`add --free` would turn a bounded selection into an open-ended action."""
     for slug in ("--free", "--pro", "all", "free"):
         assert build_add_argv(PREFIX, slug, catalog) is None, slug
+
+
+def test_the_bulk_selectors_are_refused_even_when_a_manifest_lists_them():
+    """The guarantee must be STRUCTURAL, not a property of the fixture.
+
+    A manifest that LISTS ``all``/``free``/``pro`` as free slugs previously made
+    ``build_add_argv`` produce ``add all`` -- the exact open-ended action the
+    module refuses. The reserved names are now refused at the vocabulary, so the
+    same call is ``None`` no matter what the catalog contains.
+    """
+    hostile = normalize_recipe_catalog(
+        [
+            {"slug": "card-resize", "name": "Card resize", "tier": "free"},
+            {"slug": "all", "name": "Everything", "tier": "free"},
+            {"slug": "free", "name": "All free", "tier": "free"},
+            {"slug": "pro", "name": "All pro", "tier": "free"},
+        ]
+    )
+
+    # The reserved names never even enter the catalog.
+    assert hostile.slugs() == ("card-resize",)
+    for slug in ("all", "free", "pro"):
+        assert build_add_argv(PREFIX, slug, hostile) is None, slug
+        assert resolve_recipe_slug(slug, hostile) is None, slug
+        assert recipe_slug_is_reserved(slug) is True
+        assert recipe_slug_is_well_formed(slug) is False
+
+    # A non-reserved slug in the same hostile catalog still works.
+    assert build_add_argv(PREFIX, "card-resize", hostile) == PREFIX + (
+        "add",
+        "card-resize",
+    )
+
+
+def test_the_reserved_set_matches_the_cli_bulk_selectors():
+    """The set is the CLI's own bulk selectors, read from its source.
+
+    ``bin/transitions-dev.mjs``: ``if (flags.free || flags.all || flags.pro)
+    return cmdAddAll(...)`` -- those three names select EVERY recipe.
+    """
+    assert RESERVED_RECIPE_SLUGS == frozenset({"all", "free", "pro"})
+
+
+def test_no_real_upstream_slug_collides_with_the_reserved_set():
+    """No false positive: none of the 32 real free slugs is reserved."""
+    real = (
+        "card-resize", "number-pop-in", "notification-badge", "text-states-swap",
+        "menu-dropdown", "modal", "panel-reveal", "page-side-by-side",
+        "icon-swap", "success-check", "avatar-group-hover", "error-state-shake",
+        "input-clear-dissolve", "skeleton-reveal", "shimmer-text", "tabs-sliding",
+        "tooltip", "texts-reveal", "card-tilt", "plus-menu-morph", "accordion",
+        "toast", "like-button", "learn-more-hover", "checkbox-check",
+        "spinning-counter", "toggle", "thinking-states", "reasoning-stream",
+        "streaming-text", "matrix-loader", "banner-stacking",
+    )
+    assert len(real) == 32
+    assert not (set(real) & RESERVED_RECIPE_SLUGS)
+    catalog = normalize_recipe_catalog(
+        [{"slug": s, "name": s, "tier": "free"} for s in real]
+    )
+    assert catalog.ok and len(catalog.entries) == 32
 
 
 def test_a_valid_add_argv_names_exactly_one_recipe(catalog):

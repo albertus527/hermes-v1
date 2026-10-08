@@ -370,6 +370,19 @@ MUTATIONS = [
         return None
     return tuple(cli_prefix) + ("add", slug)""",
     ),
+    # --- 20b. the bulk selectors are refused at the VOCABULARY -------------
+        # Catalog membership alone held only while the catalog omitted
+        # all/free/pro; a manifest that LISTS one made `add all` buildable, an
+        # open-ended action inside a build. Dropping the reserved check
+        # reintroduces that gap.
+    (
+        "the bulk selectors are refused at the slug vocabulary",
+        TRANSITIONS,
+        """    if recipe_slug_is_reserved(slug):
+        return False
+    return bool(_SLUG_RE.match(slug))""",
+        """    return bool(_SLUG_RE.match(slug))""",
+    ),
     # --- 19c. the reduced-motion match requires the @media BLOCK ----------
         # A phrase-only pattern reports the guard PRESENT after the block is
         # removed (the prose still mentions it): a false positive.
