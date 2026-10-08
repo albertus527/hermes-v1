@@ -7,10 +7,12 @@ It exists because the pre-D3a.5 model had a single boolean per resource, and a
 single boolean is the wrong shape. The resources have genuinely different and
 *simultaneously true* capabilities:
 
-* 21st.dev requires a credential for BOTH its discovery and its retrieval: its
-  only machine surface is the authenticated REST API (verified live: HTTP 401
-  without a Bearer key) and its public ``llms.txt`` publishes no
-  component-identity schema. There is no free tier to report.
+* 21st.dev requires a credential on the surface THIS APPLICATION calls: the
+  REST API (verified live: HTTP 401 without a Bearer key for both search and
+  retrieval), and its public ``llms.txt`` publishes no component-identity
+  schema. 21st does advertise a free allowance, but for the Web/CLI/MCP
+  surfaces, which this application never calls -- so on the REST surface there
+  is no unauthenticated discovery or retrieval to report.
 * Refero's bundled local craft references are usable with no account at all,
   while its live MCP research is a paid enhancement.
 * Impeccable may be locally provisioned with a working critic while being
@@ -881,11 +883,12 @@ def activate_resource(
             # authenticated REST API (`GET /api/v1/components/search` -> HTTP 401
             # without a Bearer key), and its public `llms.txt` publishes NO
             # component-identity schema (only route/category links). So there is
-            # no unauthenticated component catalog to list: discovery is
-            # credential-gated, exactly like retrieval. The fetch adapter uses
-            # that REST search endpoint and sends no request without a key.
-            # Reporting free discovery would repeat the exact lie this repair
-            # removes.
+            # no unauthenticated component catalog to list: on the REST surface
+            # discovery is credential-gated, exactly like retrieval. (21st's
+            # marketing free allowance is for Web/CLI/MCP, which this
+            # application never calls.) The fetch adapter uses that REST search
+            # endpoint and sends no request without a key. Reporting free
+            # discovery would repeat the exact lie this repair removes.
             metadata_without_auth=False,
             retrieval_requires_auth=True,
             credential_names=CREDENTIAL_ENV_NAMES["twenty_first"],

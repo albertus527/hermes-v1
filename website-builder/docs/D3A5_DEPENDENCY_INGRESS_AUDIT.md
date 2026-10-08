@@ -236,6 +236,30 @@ GET https://21st.dev/api/v1/components/search?q=<term>&scope=public&limit=24
 - **No fabrication.** A malformed or empty search response is a degraded empty
   result, never an invented entry.
 
+### The free-tier claim is SURFACE-SCOPED, not absolute
+
+Removing the "free metadata search" claim over-corrected: the code then said
+"There is no free tier", which is its own inaccuracy. 21st's own pricing section
+says otherwise:
+
+```
+### Free access
+- Browse all public components, themes, and templates
+- 2 component code retrievals, copies, or installs per day across Web, MCP, CLI
+- Free marketplace search across Web, CLI, and MCP
+```
+
+So 21st DOES advertise a free allowance -- but for the **Web/CLI/MCP** surfaces,
+which this application never calls. The surface this application calls is the
+**REST API**, whose global `ApiKeyAuth` gates both search and retrieval (401
+live). The gate is a **credential**, not a payment: the API documents 401 and
+never 402.
+
+Fix: the module docstring, the inline comment, and the manifest comment now
+state the claim **scoped to the surface** ("on the surface this application
+calls..."), instead of the absolute "no free tier". A test asserts the absolute
+overstatement is absent, and a guard proves that assertion is load-bearing.
+
 ### The "free metadata search tier" claim is gone from EVERY surface
 
 The earlier review's finding (21st's metadata search is NOT free) had been

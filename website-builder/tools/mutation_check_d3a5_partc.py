@@ -73,6 +73,18 @@ MUTATIONS = [
             "install_available": _one == "install",
             "critic_available": _one == "critic",""",
     ),
+    # --- 0b. the free-tier claim is SURFACE-SCOPED, not absolute ----------
+    # 21st DOES advertise a free allowance (Web/CLI/MCP); the REST surface this
+    # application calls is credential-gated. "no free tier" absolutely would be
+    # its own inaccuracy.
+    (
+        "the free-tier claim is surface-scoped, not absolute",
+        ACTIVATION,
+        """  schema. 21st does advertise a free allowance, but for the Web/CLI/MCP
+  surfaces, which this application never calls -- so on the REST surface there
+  is no unauthenticated discovery or retrieval to report.""",
+        """  schema. There is no free tier to report.""",
+    ),
     # --- 1a. the MANIFEST comment must not claim a free 21st tier ---------
     # The resource manifest is the contract; its comment must agree with the
     # verified REST surface (audit question 9: docs vs executable policy).

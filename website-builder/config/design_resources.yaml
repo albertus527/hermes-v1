@@ -163,11 +163,14 @@ resources:
     # D3a.5 (verified live 2026-10): 21st's ONLY machine surface is the
     # authenticated REST API (`GET /api/v1/components/search` -> HTTP 401
     # without a Bearer key), and its public llms.txt publishes NO
-    # component-identity schema. So there is NO free tier: BOTH discovery and
-    # retrieval require a credential. The activation report still carries both
-    # axes separately (discovery_available vs retrieval_available), because a
-    # resource whose two surfaces differ (React Bits) needs both; for 21st both
-    # are credential-gated.
+    # component-identity schema. So on the surface this application calls, BOTH
+    # discovery and retrieval require a credential -- there is no
+    # unauthenticated surface. (21st advertises a free allowance, but for the
+    # Web/CLI/MCP surfaces, which this application never calls.) The activation
+    # report still carries both axes separately (discovery_available vs
+    # retrieval_available), because a resource whose surfaces genuinely differ
+    # (React Bits, which needs no credential) needs both; for 21st both are
+    # credential-gated.
     resolution: on_demand_registry
     adapter: twenty_first
 

@@ -839,7 +839,7 @@ def test_no_module_doc_claims_a_free_21st_surface():
 
 
 def test_the_21st_capability_is_credential_gated_on_BOTH_axes():
-    """The executable truth: no free discovery, no free retrieval."""
+    """The executable truth on the REST surface we call: both axes gated."""
     from app.core.design_activation import _catalog_capability, CREDENTIAL_ENV_NAMES
     from app.core.design_registry import SOURCE_TWENTY_FIRST
 
@@ -887,3 +887,16 @@ def test_the_manifest_comment_does_not_claim_a_free_21st_tier():
         assert banned not in text, banned
     # And it must state the verified fact.
     assert "NO free tier" in text or "credential" in text
+
+
+def test_the_free_tier_claim_is_surface_specific_not_absolute():
+    """21st DOES advertise a free allowance -- but for Web/CLI/MCP, not the REST
+    API this application calls. So the doc must not overstate to "no free tier"
+    absolutely; it must scope the claim to the surface."""
+    import app.core.design_activation as activation
+
+    source = Path(activation.__file__).read_text(encoding="utf-8")
+    # The overstatement this test guards against.
+    assert "There is no free tier to report" not in source
+    # The accurate, surface-scoped statement is present.
+    assert "surface" in source.lower()
