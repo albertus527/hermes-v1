@@ -301,6 +301,38 @@ guard proves that dropping it from ``SNAPSHOT_SECTIONS`` fails the suite (it wou
 become a FROZEN section, so the legitimate ``three`` install -- which adds
 ``@types/three`` to ``devDependencies`` -- would be refused).
 
+### `optionalDependencies`: reasoned over, and double-covered by the freeze layer
+
+`optionalDependencies` is part of the reviewed surface and is snapshotted
+unconditionally. Unlike ``dependencies`` and ``devDependencies``, **no
+application-owned spec targets it today** -- the four D2 specs write only
+``dependencies`` (gsap, @gsap/react, three, lenis) and ``devDependencies``
+(@types/three). It is therefore included **defensively**: an unreviewed package
+smuggled into ``optionalDependencies`` must still be refused.
+
+It is caught by TWO independent layers:
+
+1. **the delta/membership check** -- because it is in ``SNAPSHOT_SECTIONS``, an
+   addition there is compared against the reviewed set and the allowed section;
+2. **the section-freeze check** -- as a backstop, ``changed_manifest_sections``
+   catches ANY change outside the reviewed surface, so even if
+   ``optionalDependencies`` were removed from ``SNAPSHOT_SECTIONS`` an
+   unreviewed addition would still be refused (verified on a mutated tree: the
+   verdict flips from ``added=('optionalDependencies', 'evil')`` to
+   ``sections_changed=('optionalDependencies',)`` -- refused either way).
+
+| dimension of `optionalDependencies` | handled by |
+|---|---|
+| unreviewed addition | delta/membership -> refused (and the freeze as a backstop) |
+| reviewed addition via the mapping | accepted |
+| reviewed pkg via the runtime-only sequence form | section check -> refused |
+| removal | ``removed_direct_dependencies`` -> refused |
+| version change | the separate exactness dimension |
+
+Because no spec targets it, dropping it from the reviewed surface is caught by the
+delta classification changing (the section-specific test fails) rather than by a
+legitimate install breaking -- noted honestly so the guard is not over-claimed.
+
 ### The verifier is WIRED into every operation allowed to mutate the manifest
 
 Auditing which operations may mutate a generated project's `package.json` found

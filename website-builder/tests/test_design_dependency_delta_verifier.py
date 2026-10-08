@@ -428,3 +428,73 @@ def test_a_devdependency_version_change_is_backstopped_by_the_exactness_dimensio
         "devDependencies": {"@types/three": "0.186.0"},
     }))
     assert project_satisfies_dependency(tmp_path, "three") is True
+
+
+# ---------------------------------------------------------------------------
+# "At minimum reason over these sections: optionalDependencies"
+# ---------------------------------------------------------------------------
+# `optionalDependencies` is part of the reviewed surface and is snapshotted
+# unconditionally. Unlike `dependencies`/`devDependencies`, no application-owned
+# spec targets it today, so it is included DEFENSIVELY -- an unreviewed package
+# smuggled there must still be refused. It is caught by TWO layers: the
+# delta/membership check (because it is in SNAPSHOT_SECTIONS) and, as a backstop,
+# the section-freeze check (which catches ANY change outside the reviewed
+# surface). Both are pinned here.
+
+
+def test_optionaldependencies_is_always_a_reviewed_section():
+    from app.core.design_install import SNAPSHOT_SECTIONS
+
+    assert "optionalDependencies" in SNAPSHOT_SECTIONS
+
+
+def test_an_unreviewed_optional_dependency_is_refused(tmp_path):
+    v = _verdict(
+        tmp_path,
+        {"name": "p", "optionalDependencies": {}},
+        {"name": "p", "optionalDependencies": {"evil": "1.0.0"}},
+        allowed={"fsevents": "optionalDependencies"},
+    )
+
+    assert v.ok is False
+    assert ("optionalDependencies", "evil") in v.added
+
+
+def test_a_reviewed_package_may_be_added_to_optionaldependencies_via_the_mapping(tmp_path):
+    v = _verdict(
+        tmp_path,
+        {"name": "p", "optionalDependencies": {}},
+        {"name": "p", "optionalDependencies": {"fsevents": "2.3.3"}},
+        allowed={"fsevents": "optionalDependencies"},
+    )
+
+    assert v.ok is True
+
+
+def test_a_removal_from_optionaldependencies_is_always_reasoned_over(tmp_path):
+    v = _verdict(
+        tmp_path,
+        {"name": "p", "optionalDependencies": {"fsevents": "2.3.3"}},
+        {"name": "p", "optionalDependencies": {}},
+    )
+
+    assert v.ok is False
+    assert ("optionalDependencies", "fsevents") in v.removed
+
+
+def test_optionaldependencies_is_caught_by_the_section_freeze_layer_too(tmp_path):
+    """Defense in depth: even if it left the reviewed surface, the freeze catches it.
+
+    Passing it as an UNREVIEWED section to `changed_manifest_sections` must still
+    refuse ANY change -- so the property does not depend on one layer alone.
+    """
+    from app.core.design_install import changed_manifest_sections
+
+    before = {"name": '"p"', "dependencies": "{}"}
+    after = {"name": '"p"', "dependencies": "{}", "optionalDependencies": '{"evil": "1.0.0"}'}
+
+    changed = changed_manifest_sections(
+        before, after, reviewed_sections=("dependencies",)
+    )
+
+    assert "optionalDependencies" in changed
