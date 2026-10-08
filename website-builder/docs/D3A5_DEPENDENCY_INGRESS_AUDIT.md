@@ -1913,6 +1913,96 @@ python -c "import os, sys; from pathlib import Path; sys.path.insert(0, '.'); \
 # -> False (('dependencies', 'evil-lifecycle'),)
 ```
 
+### VPS command: install into a DISPOSABLE frontend starter
+
+Never install into a live project. Copy the starter to a throwaway dir, run the
+app's installers, and prove the result builds — the whole point is that the
+reviewed install produces a project that actually compiles.
+
+```bash
+cd website-builder && source .venv/bin/activate
+APP="$(pwd)"          # the website-builder dir, for sys.path
+
+# 0. A DISPOSABLE copy of the starter (no node_modules / dist).
+WORK="$(mktemp -d)" && cp -r ../templates/frontend-starter "$WORK/project"
+cd "$WORK/project" && rm -rf node_modules dist && npm ci --no-audit --no-fund
+
+# 1. The app's BUILTIN install (card) through the real runner.
+python - "$APP" <<'PY'
+import sys, subprocess
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from app.core.design_install import DesignDependencyInstaller
+
+class Runner:
+    def __init__(self): self.calls = []
+    def run_command(self, project_id, command, cwd=None, env=None, timeout=300.0):
+        self.calls.append(list(command))
+        return subprocess.run(list(command), cwd=cwd, capture_output=True,
+                              text=True, timeout=timeout, shell=False)
+
+runner = Runner()
+outcome, installed, _ = DesignDependencyInstaller(runner, "p", Path(".")).install_components(["card"])
+print("card:", outcome.state, installed)
+print("argv:", runner.calls)
+PY
+# expect: card: installed ('card',); argv = shadcn add card --yes --overwrite, then npm install cn@0.4.0 --save-exact
+
+# 2. The REVIEWED EXTERNAL component (SplitText) through install_external_component.
+python - "$APP" <<'PY'
+import sys, subprocess
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from app.core.design_registry import RegistryInstallRequest, resolve_registry_locator
+from app.core.design_install import DesignDependencyInstaller
+
+class Runner:
+    def __init__(self): self.calls = []
+    def run_command(self, project_id, command, cwd=None, env=None, timeout=300.0):
+        self.calls.append(list(command))
+        return subprocess.run(list(command), cwd=cwd, capture_output=True,
+                              text=True, timeout=timeout, shell=False)
+
+request = RegistryInstallRequest(
+    source="react_bits", component_id="SplitText",
+    registry_locator_id=resolve_registry_locator("react_bits", "SplitText"),
+    required_dependency_ids=("gsap", "gsap_react"),
+)
+runner = Runner()
+outcome = DesignDependencyInstaller(runner, "p", Path(".")).install_external_component(request)
+print("SplitText:", outcome.state)
+print("argv:", runner.calls)
+PY
+
+# 3. The result BUILDS. This is the real end-to-end proof.
+npm run typecheck     # tsc -b over include:["src"] -- covers the installed files
+npm run build         # vite build
+```
+
+**Observed on the qualification host (2026-10):**
+
+| step | observed |
+|---|---|
+| builtin `card` | `state=installed`, `installed=('card',)`; materializes `src/components/ui/card.tsx` |
+| external `SplitText` | `state=installed`; materializes `src/components/SplitText.tsx` |
+| CLI-written ranges | the CLI writes `gsap@^3.15.0` / `@gsap/react@^2.1.2` (floating) |
+| normalized pins | the app installs `gsap@3.15.0` and `@gsap/react@2.1.2` **exactly** (`--save-exact`) |
+| `npm run typecheck` | **clean** (`tsc -b`; `include: ["src"]` covers the installed files) |
+| `npm run build` | **clean** — `✓ 16 modules transformed`, `dist/assets/index-*.js 193.07 kB` |
+
+**The install is REFUSED when tampered — and the refusal is load-bearing.** With a
+runner that smuggles an extra dependency, the app returns `install_failed`
+(`…introduced a direct package dependency outside the reviewed set`). With an
+unreviewed source import, it returns `install_failed`
+(`…emitted source imports a package…`). And the refusal MATTERS: appending
+`import { Widget } from "brand-new-unreviewed-pkg"` to the installed component makes
+`npm run typecheck` FAIL (`error TS2307: Cannot find module …`). So the boundary is
+not ceremony — without it the disposable starter would not build.
+
+**Why disposable.** `install_external_component` writes real files and runs `npm
+install`; the whole batch's rule is that a build never mutates a live project. The
+disposable copy makes the smoke safe to run repeatedly and safe to discard.
+
 ### Why these are manual, not in the suite
 
 The suite bans sockets (`socket.socket.connect`, `create_connection`,

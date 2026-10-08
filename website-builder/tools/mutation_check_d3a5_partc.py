@@ -402,6 +402,15 @@ MUTATIONS = [
         "**Who fetches what.** The app does NOT read this JSON.",
         "**Who fetches what.** The app reads this JSON.",
     ),
+    # --- 14f. the documented disposable-starter command proves the build
+    # If the doc stops proving the RESULT builds (and that the refusal is
+    # load-bearing), a reader could read "installed" as "and it compiles".
+    (
+        "the documented disposable-starter command proves the build",
+        AUDIT_DOC,
+        "**The install is REFUSED when tampered — and the refusal is load-bearing.**",
+        "**The install is REFUSED when tampered.**",
+    ),
     # --- 15. Part L: the documented no-delta proof must be able to FAIL -----
     # The doc must not document a self-comparison as the "unchanged" proof:
     # `git diff --no-index package.json package.json` compares a file to itself,

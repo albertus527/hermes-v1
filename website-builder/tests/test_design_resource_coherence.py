@@ -848,3 +848,21 @@ def test_the_documented_contract_command_states_the_boundary_is_consulted_both_p
     assert "install_components" in text
     assert "install_external_component" in text
     assert "no command" in text.lower()
+
+
+def test_the_documented_disposable_starter_command_is_present():
+    """The command installs into a DISPOSABLE copy and proves the result builds."""
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    assert "install into a DISPOSABLE frontend starter" in text
+    assert "mktemp -d" in text
+    assert "frontend-starter" in text
+    assert "npm run build" in text
+
+
+def test_the_documented_disposable_starter_command_states_the_refusal_is_load_bearing():
+    """The command must show WHY the boundary matters, not just that it refuses."""
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    assert "the refusal is load-bearing" in text
+    assert "TS2307" in text
