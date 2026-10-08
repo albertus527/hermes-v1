@@ -236,6 +236,35 @@ GET https://21st.dev/api/v1/components/search?q=<term>&scope=public&limit=24
 - **No fabrication.** A malformed or empty search response is a degraded empty
   result, never an invented entry.
 
+### The sections the guard reasons over: `dependencies` is the FLOOR
+
+The instruction names `dependencies` as the MINIMUM the guard must reason over.
+It is the first member of the reviewed surface and is snapshotted
+UNCONDITIONALLY -- even with an empty allowed set, an addition to or a removal
+from `dependencies` is refused, because the section is part of the snapshot, not
+opted into by a caller.
+
+Every dimension of `dependencies` is covered:
+
+| dimension | handled by |
+|---|---|
+| reviewed addition | membership + section check (`verify_direct_dependency_delta`) |
+| unreviewed addition | membership check -> refused |
+| version change (either direction) | `dependency_delta` -> refused |
+| removal | `removed_direct_dependencies` -> refused |
+| wrong section (a runtime pkg moved to dev/optional/peer) | section check -> refused |
+| non-exact range | the SEPARATE exactness dimension (`--save-exact`, `project_satisfies_spec`, `reviewed_registry_package_pins`) |
+
+The four reviewed sections are a MINIMUM, not a maximum: everything OUTSIDE them
+is frozen by `changed_manifest_sections`, so a mutation to any other top-level
+section (``overrides``, ``resolutions``, ``pnpm``, ``packageManager``,
+``scripts``, ``engines``, ``workspaces``, ``bundle(d)Dependencies``,
+``peerDependenciesMeta``, ``publishConfig``, ``browser``, ``exports``,
+``imports``, ``files``, ``type``, ``private``) is refused too.
+
+A test pins `dependencies` as a REQUIRED section and a mutation guard proves that
+dropping it from ``SNAPSHOT_SECTIONS`` fails the suite.
+
 ### The verifier is WIRED into every operation allowed to mutate the manifest
 
 Auditing which operations may mutate a generated project's `package.json` found

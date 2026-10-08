@@ -999,6 +999,10 @@ def project_satisfies_dependency(project_root: Path, dependency_id: str) -> bool
 #: Every dependency section a snapshot covers. Wider than the two this module
 #: writes, because the guard must notice a package smuggled into
 #: ``optionalDependencies`` or ``peerDependencies`` by a registry.
+#:
+#: ``dependencies`` is the REQUIRED member -- the minimum the guard must reason
+#: over -- and is listed first so it reads as the floor, not one option among
+#: four. A test pins its presence, so a future edit cannot quietly drop it.
 SNAPSHOT_SECTIONS: Tuple[str, ...] = (
     "dependencies",
     "devDependencies",

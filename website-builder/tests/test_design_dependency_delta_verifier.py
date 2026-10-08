@@ -45,7 +45,7 @@ def _verdict(tmp_path: Path, before: dict, after: dict, allowed=REVIEWED):
     _project(tmp_path, after)
     snapshot_after = snapshot_direct_dependency_state(root)
     return verify_direct_dependency_delta(
-        snapshot_before, snapshot_after, allowed_packages=allowed
+        snapshot_before, snapshot_after, allowed_additions=allowed
     )
 
 
@@ -198,7 +198,7 @@ def test_the_decision_uses_the_full_delta_but_the_report_is_bounded():
     before = DirectDependencySnapshot(direct={"dependencies": {}}, sections={})
     after = DirectDependencySnapshot(direct={"dependencies": huge}, sections={})
 
-    v = verify_direct_dependency_delta(before, after, allowed_packages=())
+    v = verify_direct_dependency_delta(before, after, allowed_additions=())
 
     assert v.ok is False, "the decision is computed from the FULL delta"
     assert len(v.added) == _MAX_DELTA_NAMES, "the report is bounded"
@@ -273,7 +273,7 @@ def test_the_verifier_agrees_with_registry_dependency_delta_is_acceptable(before
     snapshot_before = DirectDependencySnapshot(direct=before, sections={})
     snapshot_after = DirectDependencySnapshot(direct=after, sections={})
     verdict = verify_direct_dependency_delta(
-        snapshot_before, snapshot_after, allowed_packages=REVIEWED
+        snapshot_before, snapshot_after, allowed_additions=REVIEWED
     )
 
     # The verdict also checks sections; with empty section snapshots that is a
@@ -282,3 +282,61 @@ def test_the_verifier_agrees_with_registry_dependency_delta_is_acceptable(before
     assert {name for _section, name in verdict.added} | {
         name for _section, name in verdict.removed
     } == set(offending)
+
+
+# ---------------------------------------------------------------------------
+# "At minimum reason over these sections: dependencies"
+# ---------------------------------------------------------------------------
+# The reviewed surface is a MINIMUM, not a maximum: `dependencies` must always be
+# snapshotted and reasoned over, whatever else the surface grows or shrinks to.
+# A future edit that quietly drops it from SNAPSHOT_SECTIONS must fail here.
+
+
+def test_dependencies_is_always_a_reviewed_section():
+    from app.core.design_install import SNAPSHOT_SECTIONS, SECTION_DEPENDENCIES
+
+    assert SECTION_DEPENDENCIES == "dependencies"
+    assert SECTION_DEPENDENCIES in SNAPSHOT_SECTIONS
+
+
+def test_a_dependencies_addition_is_reasoned_over_even_with_an_empty_allowed_set(tmp_path):
+    """The section is part of the snapshot UNCONDITIONALLY -- not opted into."""
+    before = snapshot_direct_dependency_state(
+        _project(tmp_path, {"name": "p", "dependencies": {}})
+    )
+    after = snapshot_direct_dependency_state(
+        _project(tmp_path, {"name": "p", "dependencies": {"anything": "1.0.0"}})
+    )
+
+    verdict = verify_direct_dependency_delta(before, after)  # no allowed set
+
+    assert verdict.ok is False
+    assert ("dependencies", "anything") in verdict.added
+
+
+def test_a_removal_from_dependencies_is_always_reasoned_over(tmp_path):
+    before = snapshot_direct_dependency_state(
+        _project(tmp_path, {"name": "p", "dependencies": {"react": "19.3.0"}})
+    )
+    after = snapshot_direct_dependency_state(
+        _project(tmp_path, {"name": "p", "dependencies": {}})
+    )
+
+    verdict = verify_direct_dependency_delta(before, after)
+
+    assert verdict.ok is False
+    assert ("dependencies", "react") in verdict.removed
+
+
+def test_the_whole_reviewed_surface_is_snapshotted(tmp_path):
+    """Every reviewed section is captured, so no section is silently skipped."""
+    from app.core.design_install import SNAPSHOT_SECTIONS
+
+    document = {"name": "p"}
+    for index, section in enumerate(SNAPSHOT_SECTIONS):
+        document[section] = {f"pkg-{index}": "1.0.0"}
+
+    state = snapshot_direct_dependency_state(_project(tmp_path, document))
+
+    for index, section in enumerate(SNAPSHOT_SECTIONS):
+        assert state.direct[section] == {f"pkg-{index}": "1.0.0"}

@@ -271,6 +271,23 @@ MUTATIONS = [
         """    sections = changed_manifest_sections(before.sections, after.sections)""",
         """    sections = ()""",
     ),
+    # If `dependencies` is dropped from the reviewed surface, the verifier stops
+    # reasoning over the one section the instruction names as the MINIMUM.
+    (
+        "the reviewed surface always includes dependencies",
+        INSTALL,
+        """SNAPSHOT_SECTIONS: Tuple[str, ...] = (
+    "dependencies",
+    "devDependencies",
+    "optionalDependencies",
+    "peerDependencies",
+)""",
+        """SNAPSHOT_SECTIONS: Tuple[str, ...] = (
+    "devDependencies",
+    "optionalDependencies",
+    "peerDependencies",
+)""",
+    ),
     # If install_dependency stops verifying the delta, a lifecycle-script-added
     # extra dependency survives an 'installed' claim.
     (
