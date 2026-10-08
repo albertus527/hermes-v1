@@ -375,6 +375,15 @@ MUTATIONS = [
         "21st REAL discovery, with a credential when required",
         "21st discovery (free, no credential needed)",
     ),
+    # --- 14c. the documented React Bits command states discovery != installability
+    # If the doc stops saying so, a reader could mistake a discovered component
+    # for an installable one -- the exact conflation the reviewed contract prevents.
+    (
+        "the documented React Bits command keeps discovery != installability",
+        AUDIT_DOC,
+        "**Discovery is not installability.** All 64 upstream components are discovered",
+        "**Discovery means installable.** All 64 upstream components are discovered",
+    ),
     # --- 15. Part L: the documented no-delta proof must be able to FAIL -----
     # The doc must not document a self-comparison as the "unchanged" proof:
     # `git diff --no-index package.json package.json` compares a file to itself,

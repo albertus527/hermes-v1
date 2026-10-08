@@ -748,3 +748,29 @@ def test_the_documented_discovery_states_the_proposal_not_install_rule():
 
     assert "PROPOSAL, not an install" in text
     assert "approved_registry_components" in text
+
+
+def test_the_documented_react_bits_command_states_no_credential():
+    """React Bits is the contrast case: discovery AND retrieval need no credential."""
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    assert "React Bits — real discovery + retrieval, NO credential" in text
+    assert "llms.txt" in text
+    assert "reactbits.dev/r/" in text
+
+
+def test_the_documented_react_bits_command_states_discovery_is_not_installability():
+    """64 discovered, exactly 1 installable -- the reviewed contract is the gate."""
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    assert "Discovery is not installability" in text
+    assert "installable_ids" in text
+    assert "the component has no approved canonical locator" in text
+
+
+def test_the_documented_react_bits_command_states_the_upstream_range_is_checked_not_installed():
+    """The upstream range is CHECKED; the app installs its own exact pins."""
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    assert "only CHECKED, never installed" in text
+    assert "outside the closed allowlist" in text

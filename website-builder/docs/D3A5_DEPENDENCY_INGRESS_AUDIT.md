@@ -1540,6 +1540,71 @@ is a bounded state, not a wasted 401.
 is `()` — nothing is reviewed for 21st, so a discovered id is never installable.
 Discovery proves a component EXISTS; only a reviewed contract makes it installable.
 
+### VPS command: React Bits — real discovery + retrieval, NO credential
+
+React Bits is the contrast to 21st: both its agent index (`llms.txt`) and its
+shadcn registry items (`/r/<Component>-<LANG>-<STYLE>`) are served **openly**, so
+discovery AND retrieval work with no credential. It is the one source where the
+capability layer legitimately reports `discovery_available=True,
+retrieval_available=True, authentication_required=False`.
+
+```bash
+cd website-builder && source .venv/bin/activate
+
+# 1. Discovery (LIVE, no credential) -- llms.txt -> catalog entries.
+python -c "from app.core.design_catalog_fetch import discover_catalog as d, \
+  build_discovery_url, credential_requirement; \
+  print('endpoint :', build_discovery_url('react_bits')); \
+  print('needs cred:', credential_requirement('react_bits')); \
+  r = d('react_bits'); \
+  print('ok=%s entries=%d truncated=%s' % (r.ok, len(r.entries), r.truncated)); \
+  print('SplitText discovered:', 'SplitText' in {e.component_id for e in r.entries}); \
+  print('installable_ids:', r.installable_ids())"
+
+# 2. Retrieval (LIVE, no credential) -- the reviewed component's registry item.
+python -c "import json, urllib.request; \
+  req = urllib.request.Request('https://reactbits.dev/r/SplitText-TS-TW', \
+    headers={'User-Agent': 'shadcn', 'Accept': 'application/json'}); \
+  doc = json.load(urllib.request.urlopen(req, timeout=30)); \
+  print('name:', doc['name']); \
+  print('dependencies:', doc.get('dependencies')); \
+  print('registryDependencies:', doc.get('registryDependencies'))"
+
+# 3. The reviewed contract, and the install request it authorizes.
+python -c "from app.core.design_registry import build_registry_request as b, \
+  reviewed_component_contract as c, resolve_registry_locator as l; \
+  k = c('react_bits', 'SplitText'); \
+  print('contract deps:', k.expected_dependency_ids); \
+  print('locator:', l('react_bits', 'SplitText')); \
+  o = b('react_bits', 'SplitText', \
+        declared_dependencies=['gsap@^3.13.0', '@gsap/react@^2.1.2']); \
+  print('request ok=%s required=%s' % (o.ok, o.request.required_dependency_ids))"
+```
+
+**Observed on the qualification host (2026-10):**
+
+| step | observed |
+|---|---|
+| discovery | `ok=True`, **64** entries, `truncated=True`, `SplitText` present |
+| `installable_ids()` | **`('SplitText',)`** — 64 discovered, exactly 1 installable |
+| retrieval | `HTTP 200`, `name=SplitText-TS-TW`, `dependencies=['gsap@^3.13.0','@gsap/react@^2.1.2']`, `registryDependencies=[]` |
+| contract | `expected_dependency_ids=('gsap','gsap_react')`, `expected_registry_dependencies=()` |
+| locator | `https://reactbits.dev/r/SplitText-TS-TW` (the `TS-TW` variant, app-owned) |
+
+**Discovery is not installability.** All 64 upstream components are discovered, but
+only the ONE with a reviewed contract is installable. Verified: an unreviewed
+discovered component (e.g. `ASCIIText`, `AnimatedContent`, `Antigravity`) is
+refused — `resolve_registry_locator` returns `None`, so `build_registry_request`
+returns `ok=False`, reason `the component has no approved canonical locator`.
+
+**A lying declaration is refused, not obeyed.** The upstream document declares
+`gsap@^3.13.0` / `@gsap/react@^2.1.2`; the app CHECKS those against its closed
+allowlist and installs its own exact pins. A declaration naming anything else
+(`evil-pkg`, or the wrong form `gsap_react@…`) returns `ok=False`, reason `the
+component requires a dependency outside the closed allowlist`. The upstream range
+is only CHECKED, never installed.
+
+
 
 
 ## Part L — manual LIVE smokes (run AFTER the unit suite)
