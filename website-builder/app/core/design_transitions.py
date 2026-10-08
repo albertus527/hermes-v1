@@ -332,8 +332,15 @@ def verify_recipe_materialized(
 
     **The required artifact is ``transitions/<slug>.md`` and nothing more.**
     Verified live: ``transitions-dev@0.3.0 add card-resize`` writes exactly one
-    file. A ``.css`` companion is accepted *if and only if* upstream emitted one,
-    and its absence is never a failure. Nothing is synthesized to make the set
+    file (``OUT_DIR = flags.dir || "transitions"``; the CLI writes
+    ``join(OUT_DIR, slug + ".md")``). The app passes no ``--dir``, so the
+    destination is that default.
+
+    No optional companion is accepted TODAY: upstream ships no recipe that emits
+    one, so :data:`RECIPE_OPTIONAL_SUFFIXES` is empty and a stray ``.css`` beside
+    the Markdown is ignored rather than counted. The ``optional_suffixes``
+    parameter exists so a future genuinely-shipped companion can be added
+    WITHOUT reintroducing a requirement. Nothing is synthesized to make the set
     look complete.
 
     Returns ``()`` if the required Markdown is missing: a partial

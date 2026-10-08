@@ -651,3 +651,37 @@ def test_transitions_materialization_does_not_touch_package_json(project):
     verify_recipe_materialized(project, "card-resize", approved_recipes_dir(project))
 
     assert (project / "package.json").read_text(encoding="utf-8") == before
+
+
+def test_a_stray_css_is_ignored_by_default(project):
+    """The default set is Markdown ONLY: a present .css is not counted.
+
+    Upstream ships no companion today, so the default verifier accepts the
+    Markdown alone and does NOT treat a stray .css as part of the artifact. This
+    is the behavior the docstring must describe.
+    """
+    _materialize(project, "card-resize")
+    (project / RECIPES_DIRNAME / "card-resize.css").write_text("body{}\n", encoding="utf-8")
+
+    verified = verify_recipe_materialized(
+        project, "card-resize", approved_recipes_dir(project)
+    )
+
+    assert verified == ("card-resize.md",)
+
+
+def test_the_docstring_does_not_claim_a_css_is_currently_accepted():
+    """Doc coherence: the verifier's docstring must match the empty suffix table.
+
+    An earlier revision said a .css companion is "accepted if and only if
+    upstream emitted one", which reads as "a present .css IS accepted". It is
+    not: RECIPE_OPTIONAL_SUFFIXES is empty, so the default ignores a stray .css.
+    The docstring must not overstate the current behavior.
+    """
+    from app.core import design_transitions as transitions
+
+    doc = verify_recipe_materialized.__doc__ or ""
+    assert "accepted *if and only if* upstream emitted one" not in doc
+    # The current truth is stated.
+    assert "RECIPE_OPTIONAL_SUFFIXES" in doc or "empty" in doc
+    assert transitions.RECIPE_OPTIONAL_SUFFIXES == ()

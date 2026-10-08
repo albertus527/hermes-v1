@@ -370,6 +370,18 @@ MUTATIONS = [
         return None
     return tuple(cli_prefix) + ("add", slug)""",
     ),
+    # --- 20b. the verifier's docstring matches the suffix table ---------
+        # The docstring once claimed a .css is "accepted if and only if upstream
+        # emitted one", which reads as "a present .css IS accepted". The table is
+        # empty, so the default ignores a stray .css. The doc must not overstate.
+    (
+        "the recipe verifier's docstring does not overstate .css acceptance",
+        TRANSITIONS,
+        """    No optional companion is accepted TODAY: upstream ships no recipe that emits
+    one, so :data:`RECIPE_OPTIONAL_SUFFIXES` is empty and a stray ``.css`` beside
+    the Markdown is ignored rather than counted.""",
+        """    A ``.css`` companion is accepted *if and only if* upstream emitted one.""",
+    ),
     # --- 21. the pro tier is unreachable --------------------------------
         # `add --pro` opens a browser device-flow sign-in. If pro entries were
         # catalogued, a build could trigger an interactive authenticated flow

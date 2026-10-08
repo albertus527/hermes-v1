@@ -236,6 +236,29 @@ GET https://21st.dev/api/v1/components/search?q=<term>&scope=public&limit=24
 - **No fabrication.** A malformed or empty search response is a degraded empty
   result, never an invented entry.
 
+### Transitions materialization is exactly `transitions/<slug>.md`
+
+Re-verified against the REAL `transitions-dev@0.3.0` package (downloaded from the
+npm registry, source read directly), not against documentation:
+
+```
+bin/transitions-dev.mjs
+  const OUT_DIR = flags.dir || "transitions";
+  cmdAdd(slug):  writeFileSync(join(OUT_DIR, slug + ".md"), md)   # ONE file
+```
+
+The tarball ships only `free/<slug>.md` (33 recipes) -- no `.css` companions. The
+app passes no `--dir`, so the destination is the CLI's default `transitions/`,
+and `verify_recipe_materialized` requires `transitions/<slug>.md`. No
+`package.json` or dependency code exists in `design_transitions.py` at all, so
+the transitions path cannot mutate dependencies.
+
+**Doc drift found + fixed.** `verify_recipe_materialized`'s docstring claimed a
+`.css` companion is "accepted *if and only if* upstream emitted one" -- which
+reads as "a present `.css` IS accepted". It is not: `RECIPE_OPTIONAL_SUFFIXES`
+is empty, so the default IGNORES a stray `.css` beside the Markdown. The
+docstring now states the current truth, and a doc-coherence test + guard pin it.
+
 ### Item 2 evidence: a REGRESSION that pins capability == execution
 
 Item 2 ("capability truth must match actual execution requirements") is evidenced
