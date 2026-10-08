@@ -340,3 +340,91 @@ def test_the_whole_reviewed_surface_is_snapshotted(tmp_path):
 
     for index, section in enumerate(SNAPSHOT_SECTIONS):
         assert state.direct[section] == {f"pkg-{index}": "1.0.0"}
+
+
+# ---------------------------------------------------------------------------
+# "At minimum reason over these sections: devDependencies"
+# ---------------------------------------------------------------------------
+# Like `dependencies`, `devDependencies` is part of the reviewed surface and is
+# snapshotted unconditionally. It differs in one way worth pinning: a reviewed
+# package is LEGITIMATELY added there (``@types/three``), so its allowed SECTION
+# is devDependencies, not the runtime default -- the mapping form exists for
+# exactly this. The verifier checks MEMBERSHIP + SECTION; the VERSION dimension
+# is the separate exactness check, verified here to backstop it.
+
+
+def test_devdependencies_is_always_a_reviewed_section():
+    from app.core.design_install import SNAPSHOT_SECTIONS
+
+    assert "devDependencies" in SNAPSHOT_SECTIONS
+
+
+def test_a_reviewed_package_may_be_added_to_devdependencies_when_the_mapping_says_so(tmp_path):
+    """The legitimate shape: @types/three belongs in devDependencies."""
+    v = _verdict(
+        tmp_path,
+        {"name": "p", "dependencies": {}},
+        {"name": "p", "dependencies": {}, "devDependencies": {"@types/three": "0.186.0"}},
+        allowed={"@types/three": "devDependencies"},
+    )
+
+    assert v.ok is True
+
+
+def test_a_devdependency_addition_is_refused_by_the_default_runtime_section(tmp_path):
+    """The registry shape maps everything to `dependencies`, so a dev addition fails."""
+    v = _verdict(
+        tmp_path,
+        {"name": "p", "dependencies": {}},
+        {"name": "p", "dependencies": {}, "devDependencies": {"cn": "0.4.0"}},
+        allowed=["cn"],
+    )
+
+    assert v.ok is False
+    assert ("devDependencies", "cn") in v.added
+
+
+def test_a_devdependency_removal_is_always_reasoned_over(tmp_path):
+    v = _verdict(
+        tmp_path,
+        {"name": "p", "devDependencies": {"vite": "7.0.0"}},
+        {"name": "p", "devDependencies": {}},
+    )
+
+    assert v.ok is False
+    assert ("devDependencies", "vite") in v.removed
+
+
+def test_a_devdependency_version_change_is_backstopped_by_the_exactness_dimension(tmp_path):
+    """Membership accepts an allowed package's version change; exactness must refuse it.
+
+    This pins the SPLIT: the verifier reasons over WHICH packages + their SECTION,
+    and a version change is the SEPARATE exactness dimension's job. Verified here
+    that the exactness postcondition refuses a devDependency that is not at its
+    exact pin -- so the version dimension is never left unguarded.
+    """
+    from app.core.design_install import project_satisfies_dependency
+
+    # membership alone: an allowed package's version change passes
+    v = _verdict(
+        tmp_path,
+        {"name": "p", "devDependencies": {"@types/three": "0.186.0"}},
+        {"name": "p", "devDependencies": {"@types/three": "0.100.0"}},
+        allowed={"@types/three": "devDependencies"},
+    )
+    assert v.ok is True
+
+    # exactness alone: the same change is refused at the postcondition
+    (tmp_path / "package.json").write_text(json.dumps({
+        "name": "p",
+        "dependencies": {"three": "0.186.1"},
+        "devDependencies": {"@types/three": "0.100.0"},
+    }))
+    assert project_satisfies_dependency(tmp_path, "three") is False
+
+    (tmp_path / "package.json").write_text(json.dumps({
+        "name": "p",
+        "dependencies": {"three": "0.186.1"},
+        "devDependencies": {"@types/three": "0.186.0"},
+    }))
+    assert project_satisfies_dependency(tmp_path, "three") is True

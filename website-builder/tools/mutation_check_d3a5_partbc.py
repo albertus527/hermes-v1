@@ -288,6 +288,25 @@ MUTATIONS = [
     "peerDependencies",
 )""",
     ),
+    # If `devDependencies` is dropped from the reviewed surface, it becomes a
+    # FROZEN section -- so the legitimate `three` install (which adds @types/three
+    # to devDependencies) is refused, and a version change there stops being
+    # reasoned over as a dependency section.
+    (
+        "the reviewed surface always includes devDependencies",
+        INSTALL,
+        """SNAPSHOT_SECTIONS: Tuple[str, ...] = (
+    "dependencies",
+    "devDependencies",
+    "optionalDependencies",
+    "peerDependencies",
+)""",
+        """SNAPSHOT_SECTIONS: Tuple[str, ...] = (
+    "dependencies",
+    "optionalDependencies",
+    "peerDependencies",
+)""",
+    ),
     # If install_dependency stops verifying the delta, a lifecycle-script-added
     # extra dependency survives an 'installed' claim.
     (

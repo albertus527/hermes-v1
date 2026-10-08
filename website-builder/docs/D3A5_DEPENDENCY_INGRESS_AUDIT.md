@@ -265,6 +265,42 @@ section (``overrides``, ``resolutions``, ``pnpm``, ``packageManager``,
 A test pins `dependencies` as a REQUIRED section and a mutation guard proves that
 dropping it from ``SNAPSHOT_SECTIONS`` fails the suite.
 
+### `devDependencies`: reasoned over, with the mapping form for its one legitimate shape
+
+`devDependencies` is part of the reviewed surface and is snapshotted
+unconditionally. It differs from `dependencies` in one way: a reviewed package is
+LEGITIMATELY added there -- ``@types/three`` is the companion of ``three`` -- so
+the allowed SECTION for that package is ``devDependencies``, not the runtime
+default. That is exactly what the verifier's MAPPING form
+(``package -> the ONE section it may be added to``) is for; the SEQUENCE form
+(the registry shape, where every reviewed helper is runtime) maps everything to
+``dependencies``, so a registry reviewed package placed in ``devDependencies`` is
+refused.
+
+| dimension of `devDependencies` | handled by |
+|---|---|
+| reviewed addition (``@types/three``) | mapping form -> accepted |
+| unreviewed addition | membership -> refused |
+| reviewed pkg via the runtime-only sequence form | section check -> refused |
+| version change | the SEPARATE exactness dimension (see below) |
+| removal | ``removed_direct_dependencies`` -> refused |
+
+**The membership / exactness split.** ``verify_direct_dependency_delta`` checks
+WHICH packages and their SECTION; a VERSION change of an already-allowed package
+passes membership by design. That dimension is the SEPARATE exactness check:
+``--save-exact`` on the argv, ``project_satisfies_spec`` /
+``project_satisfies_dependency`` as the postcondition, and
+``reviewed_registry_package_pins`` on the registry path. Verified for
+``devDependencies`` specifically: the postcondition refuses ``@types/three`` at a
+non-exact pin (``0.100.0`` and ``^0.186.0`` both fail; ``0.186.0`` passes), so no
+version change to a reviewed devDependency survives an ``installed`` claim.
+
+A test pins ``devDependencies`` as a reviewed section, the mapping-form addition,
+the sequence-form refusal, the removal, and the exactness backstop. A mutation
+guard proves that dropping it from ``SNAPSHOT_SECTIONS`` fails the suite (it would
+become a FROZEN section, so the legitimate ``three`` install -- which adds
+``@types/three`` to ``devDependencies`` -- would be refused).
+
 ### The verifier is WIRED into every operation allowed to mutate the manifest
 
 Auditing which operations may mutate a generated project's `package.json` found
