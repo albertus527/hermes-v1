@@ -157,6 +157,36 @@ CATALOG_SEARCH_ENDPOINTS: Dict[str, str] = {
 #: and not an empty catalog reported as a real one.
 CREDENTIAL_REQUIRED_FOR_DISCOVERY: frozenset = frozenset({SOURCE_TWENTY_FIRST})
 
+#: Sources whose RETRIEVAL surface -- fetching a component's real content, which
+#: the install path executes via the pinned CLI -- requires a credential.
+#: Verified live (2026-10): 21st's registry item
+#: (``https://21st.dev/r/<user>/<slug>``) answers **403 Authentication required**
+#: and its install API (``/api/v1/components/install/<user>/<slug>``) answers
+#: **401** without a key; React Bits' registry item
+#: (``https://reactbits.dev/r/<Component>-<LANG>-<STYLE>``) is served openly
+#: (HTTP 200 with no credential).
+#:
+#: This is the ONE place the credential requirement per axis is declared. The
+#: capability layer DERIVES its `authentication_required` and its discovery /
+#: retrieval gates from these tables rather than from caller-supplied booleans,
+#: so what the capability layer reports can never drift from what execution
+#: actually requires.
+CREDENTIAL_REQUIRED_FOR_RETRIEVAL: frozenset = frozenset({SOURCE_TWENTY_FIRST})
+
+
+def credential_requirement(source: str) -> Tuple[bool, bool]:
+    """``(discovery_requires_credential, retrieval_requires_credential)``.
+
+    The application's own, closed answer for ``source``. The capability layer
+    consumes THIS rather than accepting the requirement as a parameter, so the
+    reported truth is a derivation from the executable tables, not an assertion
+    a call site could get wrong.
+    """
+    return (
+        source in CREDENTIAL_REQUIRED_FOR_DISCOVERY,
+        source in CREDENTIAL_REQUIRED_FOR_RETRIEVAL,
+    )
+
 #: The scope and page size the application sends. Both are module constants, not
 #: caller input, so a request cannot widen what upstream returns. ``public`` is
 #: the community catalog; the API's own default is the caller's private scope.
@@ -616,6 +646,8 @@ __all__ = [
     "CATALOG_FETCH_REASONS",
     "CATALOG_SEARCH_ENDPOINTS",
     "CREDENTIAL_REQUIRED_FOR_DISCOVERY",
+    "CREDENTIAL_REQUIRED_FOR_RETRIEVAL",
+    "credential_requirement",
     "DEFAULT_DISCOVERY_QUERY",
     "DISCOVERY_LIMIT",
     "DISCOVERY_SCOPE",

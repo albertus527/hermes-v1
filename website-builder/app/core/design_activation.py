@@ -648,8 +648,6 @@ def _local_skill_capability(
 def _catalog_capability(
     resource_id: str,
     *,
-    metadata_without_auth: bool,
-    retrieval_requires_auth: bool,
     credential_names: Sequence[str],
     install_available: bool,
     adapter_exists: bool,
@@ -657,21 +655,27 @@ def _catalog_capability(
 ) -> ResourceActivationCapability:
     """A remote catalog resource (21st, React Bits).
 
-    ``metadata_without_auth`` states whether the catalog can be LISTED with no
-    credential. It must be the truth about the PRODUCTION adapter, not the
-    marketing tier: 21st's real machine surface is an authenticated REST API
-    (verified live -- ``/api/v1/components/search`` returns HTTP 401 without a
-    Bearer key) and its public ``llms.txt`` publishes no component-identity
-    schema, so 21st's discovery is credential-gated. React Bits publishes an
-    unauthenticated agent index with an explicit ``CLI:`` marker, so its
-    discovery needs no credential.
+    **The credential requirement is DERIVED, not accepted.** ``resource_id`` is
+    the catalog source, and whether each axis needs a credential comes from the
+    adapter's own closed tables (``credential_requirement`` in
+    ``design_catalog_fetch``) -- the SAME tables execution consults. Taking the
+    requirement as a parameter let a call site assert one thing while the
+    adapter did another: a capability could claim free discovery while
+    ``discover_catalog`` refused for want of a key. Deriving it makes the
+    reported truth and the executable truth the same fact.
 
-    Discovery therefore follows the credential WHENEVER the mechanism requires
-    one: a resource whose only real surface is authenticated must NOT report
-    ``discovery_available=True`` on the strength of a public page that yields no
-    identities. The honest state is a bounded credential-required/degraded one.
+    So 21st -- whose REST search returns HTTP 401 without a Bearer key and whose
+    registry item returns 403 -- reports discovery/retrieval gated, while React
+    Bits, which publishes an unauthenticated agent index and serves its registry
+    items openly, does not.
     """
-    auth_required = retrieval_requires_auth
+    from app.core import design_catalog_fetch as _fetch
+
+    discovery_requires_auth, retrieval_requires_auth = _fetch.credential_requirement(
+        resource_id
+    )
+    metadata_without_auth = not discovery_requires_auth
+    auth_required = retrieval_requires_auth or discovery_requires_auth
     auth_present = credential_present(credential_names) if credential_names else False
 
     reasons: List[str] = []
@@ -704,9 +708,9 @@ def _catalog_capability(
         discovery_available=discovery,
         # Retrieval follows the credential only when it is actually required.
         retrieval_available=discovery and (
-            not auth_required or auth_present
+            not retrieval_requires_auth or auth_present
         ),
-        install_available=install and (not auth_required or auth_present),
+        install_available=install and (not retrieval_requires_auth or auth_present),
         critic_available=False,
         authentication_required=auth_required,
         authentication_present=auth_present,
@@ -900,18 +904,13 @@ def activate_resource(
     if resource_id == "twenty_first":
         return _catalog_capability(
             resource_id,
-            # VERIFIED LIVE (2026-10): 21st's real machine surface is the
-            # authenticated REST API (`GET /api/v1/components/search` -> HTTP 401
-            # without a Bearer key), and its public `llms.txt` publishes NO
-            # component-identity schema (only route/category links). So there is
-            # no unauthenticated component catalog to list: on the REST surface
-            # discovery is credential-gated, exactly like retrieval. (21st's
-            # marketing free allowance is for Web/CLI/MCP, which this
-            # application never calls.) The fetch adapter uses that REST search
-            # endpoint and sends no request without a key. Reporting free
-            # discovery would repeat the exact lie this repair removes.
-            metadata_without_auth=False,
-            retrieval_requires_auth=True,
+            # The credential requirement is DERIVED inside _catalog_capability
+            # from the adapter's own tables -- verified live (2026-10): 21st's
+            # REST search returns HTTP 401 without a Bearer key, its registry
+            # item returns 403, and its public `llms.txt` publishes no
+            # component-identity schema. So BOTH axes are credential-gated on the
+            # surface this application calls. (21st's marketing free allowance is
+            # for Web/CLI/MCP, which this application never calls.)
             credential_names=CREDENTIAL_ENV_NAMES["twenty_first"],
             install_available=True,
             adapter_exists=_has_live_discovery_adapter(SOURCE_TWENTY_FIRST),
@@ -922,11 +921,10 @@ def activate_resource(
         )
     if resource_id == "react_bits":
         # Upstream publishes an agent index and a shadcn registry entry per
-        # component; no credential is required for either.
+        # component; no credential is required for either. The requirement is
+        # derived inside _catalog_capability from the adapter's tables.
         return _catalog_capability(
             resource_id,
-            metadata_without_auth=True,
-            retrieval_requires_auth=False,
             credential_names=(),
             install_available=True,
             adapter_exists=_has_live_discovery_adapter(SOURCE_REACT_BITS),

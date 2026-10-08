@@ -839,14 +839,16 @@ def test_no_module_doc_claims_a_free_21st_surface():
 
 
 def test_the_21st_capability_is_credential_gated_on_BOTH_axes():
-    """The executable truth on the REST surface we call: both axes gated."""
+    """The executable truth on the REST surface we call: both axes gated.
+
+    The requirement is DERIVED from the adapter's tables, so this test does not
+    pass booleans -- it asserts the derivation yields the gated truth.
+    """
     from app.core.design_activation import _catalog_capability, CREDENTIAL_ENV_NAMES
     from app.core.design_registry import SOURCE_TWENTY_FIRST
 
     cap = _catalog_capability(
         "twenty_first",
-        metadata_without_auth=False,
-        retrieval_requires_auth=True,
         credential_names=CREDENTIAL_ENV_NAMES["twenty_first"],
         install_available=True,
         adapter_exists=True,
@@ -857,6 +859,43 @@ def test_the_21st_capability_is_credential_gated_on_BOTH_axes():
     assert cap.retrieval_available is False
     assert cap.authentication_required is True
     assert cap.degraded is True
+
+
+def test_the_capability_derives_the_requirement_from_the_adapter():
+    """The reported truth IS the adapter's table -- no parameter can disagree.
+
+    The defect this closes: metadata_without_auth / retrieval_requires_auth were
+    PARAMETERS, so a call site could claim free discovery while the adapter
+    refused for want of a key. They are now derived.
+    """
+    import inspect
+
+    from app.core import design_activation as activation
+
+    params = inspect.signature(activation._catalog_capability).parameters
+    assert "metadata_without_auth" not in params, "the requirement must be derived"
+    assert "retrieval_requires_auth" not in params, "the requirement must be derived"
+
+
+def test_the_derived_gate_agrees_with_the_adapter_tables():
+    """For every catalog source, the capability agrees with the adapter."""
+    from app.core import design_catalog_fetch as fetch
+    from app.core.design_activation import _catalog_capability, CREDENTIAL_ENV_NAMES
+    from app.core.design_registry import SOURCE_REACT_BITS, SOURCE_TWENTY_FIRST
+
+    for source in (SOURCE_TWENTY_FIRST, SOURCE_REACT_BITS):
+        disc_auth, retr_auth = fetch.credential_requirement(source)
+        cap = _catalog_capability(
+            source,
+            credential_names=CREDENTIAL_ENV_NAMES.get(source, ()),
+            install_available=True,
+            adapter_exists=True,
+            reviewed_components=0,
+        )
+        # No credential present: a credential-gated axis must be closed.
+        if disc_auth:
+            assert cap.discovery_available is False, source
+        assert cap.authentication_required is (disc_auth or retr_auth), source
 
 
 def test_the_adapter_is_registered_as_credential_required_for_21st():

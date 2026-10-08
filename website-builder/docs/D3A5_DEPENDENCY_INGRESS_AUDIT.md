@@ -236,6 +236,43 @@ GET https://21st.dev/api/v1/components/search?q=<term>&scope=public&limit=24
 - **No fabrication.** A malformed or empty search response is a degraded empty
   result, never an invented entry.
 
+### Capability truth is DERIVED from the adapter, never asserted
+
+Item 2: capability truth must match ACTUAL execution requirements.
+
+The capability layer reported the credential requirement from **parameters**
+(`metadata_without_auth`, `retrieval_requires_auth`) that a call site supplied.
+Nothing bound them to the adapter's own tables, so they could drift -- and did
+so observably:
+
+```
+_catalog_capability("twenty_first", metadata_without_auth=True, ...)
+  -> discovery_available=True        # capability claims free discovery
+discover_catalog("twenty_first")
+  -> ok=False, "this catalog needs a credential that is not configured"
+```
+
+The capability asserted one thing while execution did another. The values
+happened to be correct at the two call sites, but the TYPE allowed a lie.
+
+Fix: the credential requirement is now DERIVED. `design_catalog_fetch` owns the
+closed tables (`CREDENTIAL_REQUIRED_FOR_DISCOVERY`, `CREDENTIAL_REQUIRED_FOR_RETRIEVAL`)
+and a `credential_requirement(source)` accessor; `_catalog_capability` consumes
+that -- the SAME fact execution consults. The two booleans are gone from its
+signature, so no call site can disagree with the adapter.
+
+Verified live (2026-10), which is why the two tables differ per source:
+
+| source | discovery | retrieval |
+|---|---|---|
+| 21st | `GET /api/v1/components/search` -> **401** | `https://21st.dev/r/<u>/<slug>` -> **403 Authentication required** |
+| React Bits | `llms.txt` open -> **200** | `https://reactbits.dev/r/<Component>-<LANG>-<STYLE>` -> **200** |
+
+Property asserted: for every catalog source,
+`authentication_required == (discovery_requires_auth or retrieval_requires_auth)`
+from the adapter's tables, and a credential-gated axis is closed when no
+credential is present.
+
 ### `discovery_available` is backed by a BUILDABLE request, not a key
 
 The live-adapter probe (`_has_live_discovery_adapter`) decides whether the

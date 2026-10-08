@@ -126,24 +126,22 @@ MUTATIONS = [
         """    # D3a.5: metadata SEARCH is real and works with no credential (the free""",
     ),
     # --- 1b. the 21st capability is credential-gated on BOTH axes ---------
-    # The module docstring once claimed a free 21st search surface; the verified
-    # REST/OpenAPI surface (global ApiKeyAuth, every endpoint 401) disproves it.
+    # The requirement is DERIVED from the adapter's tables. Ignoring the
+    # derivation and asserting "no credential needed" flips the capability to a
+    # free-discovery claim the adapter contradicts.
     (
         "21st is credential-gated on both discovery and retrieval",
         ACTIVATION,
-        """            metadata_without_auth=False,
-            retrieval_requires_auth=True,
-            credential_names=CREDENTIAL_ENV_NAMES["twenty_first"],""",
-        """            metadata_without_auth=True,
-            retrieval_requires_auth=True,
-            credential_names=CREDENTIAL_ENV_NAMES["twenty_first"],""",
+        """    discovery_requires_auth, retrieval_requires_auth = _fetch.credential_requirement(
+        resource_id
+    )""",
+        """    discovery_requires_auth, retrieval_requires_auth = (False, False)""",
     ),
     # --- 2. an UNCREDENTIALED catalog is not gated by the credential -----
         # A source whose catalog is listable WITHOUT a credential (React Bits)
         # must report discovery even with NO credential present. Gating discovery
         # on `auth_present` would make a working open catalog report itself
-        # absent. (21st is credential-gated and passes metadata_without_auth=False,
-        # so this branch is React Bits' alone.)
+        # absent. (21st is credential-gated, so this branch is React Bits' alone.)
     (
         "an uncredentialed catalog stays available without a credential",
         ACTIVATION,
