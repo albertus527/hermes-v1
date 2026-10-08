@@ -239,6 +239,21 @@ MUTATIONS = [
         return bool(_SLUG_RE.match(component_id) or _PASCAL_RE.match(component_id))
     return False""",
     ),
+    # --- 12b. the container shape is per-source: a key the source never
+    #          emits must NOT be reported ok (else ok=True is semantically false)
+    (
+        "the catalog container shape is the source's own",
+        CATALOG,
+        """        value = payload.get(expected_key)
+        if isinstance(value, (list, tuple)):
+            return [d for d in value if isinstance(d, Mapping)], True
+        return [], False""",
+        """        for _k in ("components", "results", "items", "data", "entries"):
+            _v = payload.get(_k)
+            if isinstance(_v, (list, tuple)):
+                return [d for d in _v if isinstance(d, Mapping)], True
+        return [], False""",
+    ),
     # --- 13. a malformed payload invents nothing ------------------------
     (
         "an unparseable payload yields no entries",

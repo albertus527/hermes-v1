@@ -236,6 +236,25 @@ GET https://21st.dev/api/v1/components/search?q=<term>&scope=public&limit=24
 - **No fabrication.** A malformed or empty search response is a degraded empty
   result, never an invented entry.
 
+### `ok` recognises only the source's OWN verified container shape
+
+`CatalogResult.ok` is `not warnings`, and warnings cover only EMPTY/MALFORMED --
+so `ok=True` reads as "the source's catalog was read". But the container keys it
+accepted were SOURCE-AGNOSTIC: `components`, `results`, `items`, `data`,
+`entries`. 21st's verified REST search response nests components under
+**`results`** only (OpenAPI `{"query","scope","results"}`), so a payload keyed
+`components` was reported `ok=True` -- a 21st catalog read that never happened.
+
+Fix: `CATALOG_CONTAINER_KEYS` is per-source and closed -- 21st maps to
+`"results"`, React Bits to `None` (its surface is a BARE LIST). A key a source
+never emits now yields `ok=False` with `WARNING_CATALOG_MALFORMED`, so `ok`
+means "this source's own shape was recognized".
+
+Verified: 21st keyed `components`/`items`/`data`/`entries` -> `ok=False`; 21st
+keyed `results` -> `ok=True`; React Bits bare list -> `ok=True`, a mapping ->
+`ok=False`; and a bare list for 21st -> `ok=False`. Production only ever passes
+the verified shapes, so nothing legitimate is refused.
+
 ### Root cause of the 21st route false positive: the ANCHOR was dropped
 
 The old pattern matched the **generic tail** `/components/<slug>` and dropped the

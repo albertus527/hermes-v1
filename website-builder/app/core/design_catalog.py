@@ -278,29 +278,61 @@ def normalize_catalog_entry(source: str, document: Any) -> Optional[CatalogEntry
     )
 
 
-def _iter_documents(payload: Any) -> Tuple[List[Mapping[str, Any]], bool]:
-    """Pull component-shaped objects out of the shapes a payload may take.
+#: Per-source, the container KEY under which that source's own list-response
+#: nests its component objects. Verified from each source's published contract:
+#:
+#: * 21st's REST search 200 response is ``{"query","scope","results":[...]}`` --
+#:   ``results`` is the ONLY component container the API emits.
+#: * React Bits has no JSON list surface; ``parse_markdown_catalog`` yields a
+#:   bare list, so it is keyed ``None`` (the bare-list form).
+#:
+#: Recognising a container key is NOT free: it is what ``ok`` reports. Accepting
+#: keys a source never emits makes ``ok=True`` mean "some JSON parsed" while
+#: reading as "this source's catalog was read" -- a semantic lie. The shape is
+#: therefore per-source and closed.
+CATALOG_CONTAINER_KEYS: Dict[str, Optional[str]] = {
+    SOURCE_TWENTY_FIRST: "results",
+    SOURCE_REACT_BITS: None,  # a bare list
+}
 
-    Returns ``(documents, ok)``. ``ok`` is False when the payload is not a
-    recognized container, which is the "cannot be parsed" case -- distinct from a
-    well-formed payload that simply lists nothing.
+
+def _iter_documents(
+    source: str, payload: Any
+) -> Tuple[List[Mapping[str, Any]], bool]:
+    """Pull component-shaped objects out of the shape ``source`` VERIFIABLY uses.
+
+    Returns ``(documents, ok)``. ``ok`` is False when the payload is not the
+    source's recognized container, which is the "cannot be parsed" case --
+    distinct from a well-formed payload that simply lists nothing.
+
+    The container shape is the SOURCE'S OWN verified shape, not a generic set of
+    plausible keys: a payload keyed ``components`` is NOT a 21st catalog (21st
+    emits ``results``), so accepting it would let ``ok`` claim a 21st read that
+    never happened.
     """
-    if isinstance(payload, Mapping):
-        for key in ("components", "results", "items", "data", "entries"):
-            value = payload.get(key)
-            if isinstance(value, (list, tuple)):
-                return [d for d in value if isinstance(d, Mapping)], True
-        return [], False
-
-    if isinstance(payload, (list, tuple)):
-        return [d for d in payload if isinstance(d, Mapping)], True
+    expected_key = CATALOG_CONTAINER_KEYS.get(source)
 
     if isinstance(payload, (str, bytes)):
         try:
             decoded = json.loads(payload)
         except (ValueError, TypeError):
             return [], False
-        return _iter_documents(decoded)
+        return _iter_documents(source, decoded)
+
+    if isinstance(payload, Mapping):
+        if expected_key is None:
+            # This source's surface is a bare list; a mapping is not it.
+            return [], False
+        value = payload.get(expected_key)
+        if isinstance(value, (list, tuple)):
+            return [d for d in value if isinstance(d, Mapping)], True
+        return [], False
+
+    if isinstance(payload, (list, tuple)):
+        if expected_key is not None:
+            # This source's surface is a keyed container; a bare list is not it.
+            return [], False
+        return [d for d in payload if isinstance(d, Mapping)], True
 
     return [], False
 
@@ -323,7 +355,7 @@ def normalize_catalog(
             warnings=(WARNING_CATALOG_MALFORMED,),
         )
 
-    documents, ok = _iter_documents(payload)
+    documents, ok = _iter_documents(source, payload)
     if not ok:
         return CatalogResult(
             source=source, entries=(), warnings=(WARNING_CATALOG_MALFORMED,)
@@ -368,6 +400,7 @@ def find_catalog_entry(result: CatalogResult, component_id: str) -> Optional[Cat
 
 
 __all__ = [
+    "CATALOG_CONTAINER_KEYS",
     "MAX_CATALOG_ENTRIES",
     "_RESERVED_COMPONENT_IDS",
     "MAX_FIELD_CHARS",

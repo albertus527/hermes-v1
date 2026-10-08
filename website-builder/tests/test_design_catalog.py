@@ -50,23 +50,25 @@ from app.core.design_registry import (
     resolve_registry_locator,
 )
 
-#: A payload shaped like what the 21st catalog returns.
+#: A payload shaped like what the 21st catalog ACTUALLY returns: the REST search
+#: response nests its components under ``results`` (verified from openapi.json).
 TWENTY_FIRST_PAYLOAD = {
-    "components": [
+    "query": "component",
+    "scope": "public",
+    "results": [
         {"id": "aurora-hero", "name": "Aurora Hero", "dependencies": ["gsap"]},
         {"id": "pricing-grid", "name": "Pricing Grid", "dependencies": []},
         {"id": "neon-marquee", "name": "Neon Marquee", "requires": "three, motion"},
-    ]
+    ],
 }
 
-#: A payload shaped like what the React Bits catalog returns.
-REACT_BITS_PAYLOAD = {
-    "components": [
-        {"id": "SplitText", "name": "Split Text"},
-        {"id": "BlurText", "name": "Blur Text", "dependencies": ["gsap"]},
-        {"id": "CountUp", "name": "Count Up", "dependencies": [{"name": "lenis"}]},
-    ]
-}
+#: React Bits has NO keyed JSON list surface: ``parse_markdown_catalog`` yields a
+#: BARE LIST of ``{"id","name"}`` documents. A dict is not its shape.
+REACT_BITS_PAYLOAD = [
+    {"id": "SplitText", "name": "Split Text"},
+    {"id": "BlurText", "name": "Blur Text", "dependencies": ["gsap"]},
+    {"id": "CountUp", "name": "Count Up", "dependencies": [{"name": "lenis"}]},
+]
 
 
 @pytest.fixture(autouse=True)
@@ -174,7 +176,7 @@ def test_url_shaped_ids_are_rejected():
 
 
 def test_an_unknown_source_is_refused():
-    result = normalize_catalog("evil-registry", {"components": [{"id": "x"}]})
+    result = normalize_catalog("evil-registry", {"results": [{"id": "x"}]})
 
     assert result.entries == ()
     assert result.warnings
@@ -189,7 +191,7 @@ def test_an_unknown_dependency_makes_a_component_non_installable():
     """Refusal, not allowlist widening: upstream proposes, we decide."""
     result = normalize_catalog(
         SOURCE_REACT_BITS,
-        {"components": [{"id": "SplitText", "dependencies": ["left-pad"]}]},
+        [{"id": "SplitText", "dependencies": ["left-pad"]}],
     )
     entry = result.entries[0]
 
@@ -207,16 +209,14 @@ def test_installable_ids_requires_BOTH_policy_and_a_reviewed_locator():
     """
     result = normalize_catalog(
         SOURCE_REACT_BITS,
-        {
-            "components": [
-                # Reviewed: an approved locator exists -> installable.
-                {"id": "SplitText"},
-                # Listed upstream, clean deps, but NOT reviewed -> not installable.
-                {"id": "BlurText"},
-                # Unreviewed AND an out-of-policy dependency -> not installable.
-                {"id": "CountUp", "dependencies": ["left-pad"]},
-            ]
-        },
+        [
+            # Reviewed: an approved locator exists -> installable.
+            {"id": "SplitText"},
+            # Listed upstream, clean deps, but NOT reviewed -> not installable.
+            {"id": "BlurText"},
+            # Unreviewed AND an out-of-policy dependency -> not installable.
+            {"id": "CountUp", "dependencies": ["left-pad"]},
+        ],
     )
 
     assert result.installable_ids() == ("SplitText",)
@@ -228,7 +228,7 @@ def test_the_dependency_allowlist_is_never_widened():
 
     before = dict(registry.PACKAGE_TO_DEPENDENCY_ID)
     normalize_catalog(
-        SOURCE_TWENTY_FIRST, {"components": [{"id": "x", "dependencies": ["left-pad"]}]}
+        SOURCE_TWENTY_FIRST, {"results": [{"id": "x", "dependencies": ["left-pad"]}]}
     )
 
     assert registry.PACKAGE_TO_DEPENDENCY_ID == before
@@ -238,14 +238,14 @@ def test_the_dependency_allowlist_is_never_widened():
 def test_upstream_text_is_bounded():
     result = normalize_catalog(
         SOURCE_TWENTY_FIRST,
-        {"components": [{"id": "big", "name": "x" * 5000}]},
+        {"results": [{"id": "big", "name": "x" * 5000}]},
     )
 
     assert len(result.entries[0].display_name) <= MAX_FIELD_CHARS
 
 
 def test_a_missing_display_name_falls_back_to_the_identity():
-    result = normalize_catalog(SOURCE_TWENTY_FIRST, {"components": [{"id": "anon"}]})
+    result = normalize_catalog(SOURCE_TWENTY_FIRST, {"results": [{"id": "anon"}]})
 
     assert result.entries[0].display_name == "anon"
 
@@ -261,7 +261,7 @@ def test_a_missing_display_name_falls_back_to_the_identity():
         None,
         42,
         {"unexpected": "shape"},
-        {"components": "not-a-list"},
+        {"results": "not-a-list"},
         "not json at all",
     ],
 )
@@ -273,7 +273,7 @@ def test_a_malformed_payload_yields_no_entries(payload):
 
 
 def test_an_empty_payload_yields_no_entries():
-    result = normalize_catalog(SOURCE_TWENTY_FIRST, {"components": []})
+    result = normalize_catalog(SOURCE_TWENTY_FIRST, {"results": []})
 
     assert result.entries == ()
     assert result.warnings == (WARNING_CATALOG_EMPTY,)
@@ -282,7 +282,7 @@ def test_an_empty_payload_yields_no_entries():
 def test_entries_without_a_valid_identity_are_dropped_not_invented():
     result = normalize_catalog(
         SOURCE_TWENTY_FIRST,
-        {"components": [{"name": "no id here"}, "a string", {"id": "real-one"}]},
+        {"results": [{"name": "no id here"}, "a string", {"id": "real-one"}]},
     )
 
     assert [e.component_id for e in result.entries] == ["real-one"]
@@ -291,7 +291,7 @@ def test_entries_without_a_valid_identity_are_dropped_not_invented():
 def test_duplicate_ids_collapse():
     result = normalize_catalog(
         SOURCE_TWENTY_FIRST,
-        {"components": [{"id": "same"}, {"id": "same"}]},
+        {"results": [{"id": "same"}, {"id": "same"}]},
     )
 
     assert len(result.entries) == 1
@@ -303,7 +303,7 @@ def test_duplicate_ids_collapse():
 
 
 def test_the_entry_limit_is_enforced_and_reported():
-    payload = {"components": [{"id": f"item-{i}"} for i in range(200)]}
+    payload = {"results": [{"id": f"item-{i}"} for i in range(200)]}
 
     result = normalize_catalog(SOURCE_TWENTY_FIRST, payload, limit=10)
 
@@ -419,7 +419,7 @@ def test_a_non_installable_component_is_refused_even_when_approved():
 
     result = normalize_catalog(
         SOURCE_TWENTY_FIRST,
-        {"components": [{"id": "risky", "dependencies": ["left-pad"]}]},
+        {"results": [{"id": "risky", "dependencies": ["left-pad"]}]},
     )
     entry = result.entries[0]
 
@@ -452,7 +452,7 @@ def test_a_shadcn_builtin_source_is_not_a_catalog_source():
 def test_a_listed_but_unreviewed_component_is_not_installable():
     """The exact false positive: clean deps, no approved locator."""
     result = normalize_catalog(
-        SOURCE_REACT_BITS, {"components": [{"id": "BlurText"}]}
+        SOURCE_REACT_BITS, [{"id": "BlurText"}]
     )
     entry = result.entries[0]
 
@@ -464,7 +464,7 @@ def test_a_listed_but_unreviewed_component_is_not_installable():
 
 def test_a_reviewed_component_with_clean_deps_is_installable():
     result = normalize_catalog(
-        SOURCE_REACT_BITS, {"components": [{"id": "SplitText"}]}
+        SOURCE_REACT_BITS, [{"id": "SplitText"}]
     )
     entry = result.entries[0]
 
@@ -477,7 +477,7 @@ def test_a_reviewed_component_with_an_out_of_policy_dep_is_not_installable():
     """Review is necessary but not sufficient: dependencies must be in policy."""
     result = normalize_catalog(
         SOURCE_REACT_BITS,
-        {"components": [{"id": "SplitText", "dependencies": ["left-pad"]}]},
+        [{"id": "SplitText", "dependencies": ["left-pad"]}],
     )
     entry = result.entries[0]
 
@@ -491,8 +491,8 @@ def test_installable_never_disagrees_with_the_registry():
     from app.core.design_registry import resolve_registry_locator
 
     for source, payload in (
-        (SOURCE_REACT_BITS, {"components": [{"id": "SplitText"}, {"id": "BlurText"}]}),
-        (SOURCE_TWENTY_FIRST, {"components": [{"id": "hero-section"}]}),
+        (SOURCE_REACT_BITS, [{"id": "SplitText"}, {"id": "BlurText"}]),
+        (SOURCE_TWENTY_FIRST, {"results": [{"id": "hero-section"}]}),
     ):
         for entry in normalize_catalog(source, payload).entries:
             expected = (
@@ -503,7 +503,7 @@ def test_installable_never_disagrees_with_the_registry():
 
 
 def test_the_serialized_entry_reports_both_conditions():
-    result = normalize_catalog(SOURCE_REACT_BITS, {"components": [{"id": "BlurText"}]})
+    result = normalize_catalog(SOURCE_REACT_BITS, [{"id": "BlurText"}])
     payload = result.entries[0].to_dict()
 
     assert payload["dependencies_in_policy"] is True
@@ -533,7 +533,7 @@ def test_a_reserved_21st_route_segment_is_not_a_component_id(segment):
 def test_a_reserved_segment_cannot_become_a_catalog_entry(segment):
     """Not just the parser: a JSON payload claiming one invents nothing."""
     result = normalize_catalog(
-        SOURCE_TWENTY_FIRST, {"components": [{"id": segment}]}
+        SOURCE_TWENTY_FIRST, {"results": [{"id": segment}]}
     )
 
     assert result.entries == ()
@@ -597,3 +597,60 @@ def test_no_route_derived_segment_is_installable():
 
     for segment in RESERVED_21ST_SEGMENTS:
         assert resolve_registry_locator(SOURCE_TWENTY_FIRST, segment) is None
+
+
+# ---------------------------------------------------------------------------
+# `ok` is honest: it recognises ONLY the source's OWN verified container shape
+# ---------------------------------------------------------------------------
+#
+# ok = not warnings. So `ok=True` must mean "the source's catalog shape was
+# read", never merely "some JSON parsed". The container shape is per-source and
+# closed; a key a source never emits is NOT that source's catalog.
+
+
+def test_the_container_shape_is_per_source_and_closed():
+    from app.core.design_catalog import CATALOG_CONTAINER_KEYS
+
+    assert CATALOG_CONTAINER_KEYS[SOURCE_TWENTY_FIRST] == "results"
+    assert CATALOG_CONTAINER_KEYS[SOURCE_REACT_BITS] is None  # a bare list
+
+
+@pytest.mark.parametrize("wrong_key", ["components", "items", "data", "entries"])
+def test_a_key_21st_never_emits_is_not_ok(wrong_key):
+    """21st's verified surface emits `results`; any other key is not its catalog."""
+    result = normalize_catalog(
+        SOURCE_TWENTY_FIRST, {wrong_key: [{"id": "aurora-hero"}]}
+    )
+
+    assert result.ok is False, wrong_key
+    assert result.entries == ()
+    assert result.warnings == (WARNING_CATALOG_MALFORMED,)
+
+
+def test_the_real_21st_shape_is_ok():
+    result = normalize_catalog(
+        SOURCE_TWENTY_FIRST, {"query": "x", "scope": "public",
+                              "results": [{"id": "aurora-hero"}]}
+    )
+
+    assert result.ok is True
+    assert [e.component_id for e in result.entries] == ["aurora-hero"]
+
+
+def test_react_bits_bare_list_is_its_shape_and_a_mapping_is_not():
+    """React Bits' surface is a bare list; a keyed mapping is NOT its catalog."""
+    ok = normalize_catalog(SOURCE_REACT_BITS, [{"id": "SplitText"}])
+    assert ok.ok is True
+    assert [e.component_id for e in ok.entries] == ["SplitText"]
+
+    wrong = normalize_catalog(SOURCE_REACT_BITS, {"components": [{"id": "SplitText"}]})
+    assert wrong.ok is False
+    assert wrong.entries == ()
+
+
+def test_a_21st_bare_list_is_not_its_shape():
+    """The converse: a keyed source does not accept a bare list."""
+    result = normalize_catalog(SOURCE_TWENTY_FIRST, [{"id": "aurora-hero"}])
+
+    assert result.ok is False
+    assert result.entries == ()
