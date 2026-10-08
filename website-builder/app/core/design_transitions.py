@@ -100,9 +100,19 @@ SUPPORTED_TIERS: Tuple[str, ...] = (TIER_FREE,)
 #: Slugs are lowercase kebab, matching upstream's own manifest exactly.
 _SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
-#: Upstream's accessibility guard. Its presence is REPORTED, never synthesized.
+#: Upstream's accessibility guard, matched as the ACTUAL ``@media`` BLOCK.
+#:
+#: The selector is matched with its opening brace -- ``@media
+#: (prefers-reduced-motion: reduce) {`` -- not the bare phrase. The real recipes
+#: ALSO explain the guard in prose ("The `@media (prefers-reduced-motion:
+#: reduce)` guard ... is required"), so a phrase-only pattern reports the guard
+#: PRESENT even when the CSS block has been removed: a false positive on the one
+#: property being reported. Requiring the block fixes it with ZERO change on all
+#: 32 real ``transitions-dev@0.3.0`` recipes (each has the block).
+#:
+#: Its presence is REPORTED, never synthesized.
 _REDUCED_MOTION_RE = re.compile(
-    r"prefers-reduced-motion\s*:\s*reduce", re.IGNORECASE
+    r"@media\s*\(\s*prefers-reduced-motion\s*:\s*reduce\s*\)\s*\{", re.IGNORECASE
 )
 
 
@@ -121,10 +131,22 @@ def recipe_slug_is_well_formed(slug: object) -> bool:
 class Recipe:
     """One real, free-tier transition recipe.
 
-    ``has_reduced_motion_guard`` reports what the recipe FILE contains. It is
-    informational: this module neither requires it nor adds it, because doing
-    either would mean shipping third-party motion code this application did not
-    review.
+    ``has_reduced_motion_guard`` records whether the recipe FILE carries
+    upstream's ``@media (prefers-reduced-motion: reduce)`` guard, computed by
+    :func:`detect_reduced_motion_guard` from the recipe's own text.
+
+    **``False`` here means NOT ESTABLISHED, not "absent".** Upstream's
+    ``free-manifest.json`` declares no such flag -- only ``slug``, ``name`` and
+    ``tier`` -- and this module never reads the materialized file itself, so a
+    catalog built from the manifest alone leaves the field ``False`` even though
+    every real recipe (all 32 of ``transitions-dev@0.3.0``) DOES contain the
+    guard. A caller that has the recipe text should set it with the detector;
+    the flag is never taken from untrusted manifest metadata, which could claim
+    a guard the file lacks.
+
+    It is informational: this module neither requires it nor adds it, because
+    doing either would mean shipping third-party motion code this application
+    did not review.
     """
 
     slug: str
@@ -386,11 +408,18 @@ def verify_recipe_materialized(
 def detect_reduced_motion_guard(recipe_text: str) -> bool:
     """Whether a recipe's text contains upstream's reduced-motion guard.
 
-    Verified live against the real ``card-resize.md``: the guard appears at
-    line 43 as a literal ``@media (prefers-reduced-motion: reduce) {`` INSIDE a
-    fenced ```css block, and is explained in prose on line 48. Because the CSS
-    is embedded in the Markdown rather than shipped beside it, detection runs
-    over the whole recipe body and needs no separate ``.css`` file.
+    Verified live against the real ``card-resize.md``: the guard appears as a
+    literal ``@media (prefers-reduced-motion: reduce) {`` INSIDE a fenced ```css
+    block. Because the CSS is embedded in the Markdown rather than shipped beside
+    it, detection runs over the whole recipe body and needs no separate ``.css``
+    file.
+
+    The match requires the ``@media`` BLOCK, not the bare phrase. Every real
+    recipe also explains the guard in prose ("The `@media (prefers-reduced-motion:
+    reduce)` guard ... is required"), so a phrase-only pattern would report the
+    guard PRESENT even after the CSS block was removed -- a false positive on the
+    very property being reported. Verified: requiring the block changes the
+    answer for NONE of the 32 real recipes, and rejects the prose-only case.
 
     Reporting only. This function never INSERTS the guard, and a recipe without
     one is still a valid recipe: adding accessibility code to a third-party

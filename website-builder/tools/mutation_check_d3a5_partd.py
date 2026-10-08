@@ -370,6 +370,19 @@ MUTATIONS = [
         return None
     return tuple(cli_prefix) + ("add", slug)""",
     ),
+    # --- 19c. the reduced-motion match requires the @media BLOCK ----------
+        # A phrase-only pattern reports the guard PRESENT after the block is
+        # removed (the prose still mentions it): a false positive.
+    (
+        "the reduced-motion guard is matched as the @media block, not the phrase",
+        TRANSITIONS,
+        """_REDUCED_MOTION_RE = re.compile(
+    r"@media\s*\(\s*prefers-reduced-motion\s*:\s*reduce\s*\)\s*\{", re.IGNORECASE
+)""",
+        """_REDUCED_MOTION_RE = re.compile(
+    r"prefers-reduced-motion\s*:\s*reduce", re.IGNORECASE
+)""",
+    ),
     # --- 20a. the optional suffix set is EMPTY (upstream emits none) -----
         # A non-empty optional set would make a companion part of the artifact.
         # Upstream emits only the Markdown, so the set must stay empty.

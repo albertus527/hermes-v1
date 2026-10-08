@@ -236,6 +236,33 @@ GET https://21st.dev/api/v1/components/search?q=<term>&scope=public&limit=24
 - **No fabrication.** A malformed or empty search response is a degraded empty
   result, never an invented entry.
 
+### The real recipe: embedded CSS + an `@media` reduced-motion guard
+
+The real `card-resize.md` (1658 bytes) contains: HTML usage, tunable `:root`
+variables, the CSS **embedded** in fenced ```css blocks (under `## CSS`), and a
+`@media (prefers-reduced-motion: reduce) { ... }` guard. "JavaScript
+orchestration: None -- pure CSS." That embedded CSS is WHY no
+`transitions/<slug>.css` file exists.
+
+Two defects found while verifying this, both fixed:
+
+1. **The guard detector over-matched.** `_REDUCED_MOTION_RE` matched the bare
+   phrase `prefers-reduced-motion: reduce`, and every real recipe ALSO explains
+   the guard in prose ("The `@media (prefers-reduced-motion: reduce)` guard ...
+   is required"). So removing the CSS block while leaving the prose still
+   reported the guard PRESENT -- a false positive on the one property being
+   reported. The pattern now requires the actual block
+   (`@media\s*\(\s*prefers-reduced-motion\s*:\s*reduce\s*\)\s*\{`), which changes
+   the answer for NONE of the 32 real recipes and rejects the prose-only case.
+
+2. **The flag's docstring overstated.** `Recipe.has_reduced_motion_guard` was
+   documented as "reports what the recipe FILE contains", but it is built from
+   `free-manifest.json`, which carries only `slug`/`name`/`tier` -- so it is
+   ALWAYS `False` while every real recipe DOES have the guard. A consumer reading
+   `False` would conclude "no guard" -- the opposite of the truth. The docstring
+   now states that `False` means NOT ESTABLISHED, not "absent", and that the
+   value is never taken from untrusted manifest metadata.
+
 ### The artifact contract: `required: transitions/<slug>.md`, `optional: (none)`
 
 The optional half is EMPTY, and that is the verified upstream truth:

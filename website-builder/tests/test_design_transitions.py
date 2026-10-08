@@ -685,3 +685,56 @@ def test_the_docstring_does_not_claim_a_css_is_currently_accepted():
     # The current truth is stated.
     assert "RECIPE_OPTIONAL_SUFFIXES" in doc or "empty" in doc
     assert transitions.RECIPE_OPTIONAL_SUFFIXES == ()
+
+
+def test_a_prose_mention_without_the_media_block_is_not_a_guard():
+    """The real recipes mention the guard in prose; that is NOT the guard.
+
+    Every transitions-dev@0.3.0 recipe explains the @media guard in prose AND
+    carries the block. A phrase-only detector reports PRESENT after the block is
+    removed -- a false positive on the property being reported. The match must
+    require the actual @media (...) { block.
+    """
+    prose_only = (
+        "The `@media (prefers-reduced-motion: reduce)` guard is required - "
+        "keep it.\n```css\n.t-x { transition: width 1s; }\n```\n"
+    )
+
+    assert detect_reduced_motion_guard(prose_only) is False
+
+
+def test_the_guard_block_itself_is_still_detected():
+    """The tightened match keeps the true positive."""
+    real = (
+        "```css\n.t-resize { transition: width 1s; }\n"
+        "@media (prefers-reduced-motion: reduce) {\n"
+        "  .t-resize { transition: none !important; }\n}\n```\n"
+    )
+
+    assert detect_reduced_motion_guard(real) is True
+
+
+def test_the_guard_is_matched_with_the_opening_brace_only():
+    """A dangling selector with no block is not a guard either."""
+    assert detect_reduced_motion_guard(
+        "/* @media (prefers-reduced-motion: reduce) */"
+    ) is False
+
+
+def test_the_flag_reports_not_established_rather_than_absent():
+    """A manifest-only catalog leaves the flag False -- NOT "no guard".
+
+    Upstream's free-manifest.json carries only slug/name/tier, so a catalog built
+    from it cannot know the file content. The field must read as not-established,
+    not as a claim that the guard is absent (every real recipe HAS it).
+    """
+    catalog = normalize_recipe_catalog(
+        [{"slug": "card-resize", "name": "Card resize", "tier": "free"}]
+    )
+
+    entry = catalog.entries[0]
+    # The manifest gives no guard metadata, so the field is False -- and the
+    # docstring must say False means NOT ESTABLISHED, not "absent".
+    assert entry.has_reduced_motion_guard is False
+    doc = type(entry).__doc__ or ""
+    assert "NOT ESTABLISHED" in doc
