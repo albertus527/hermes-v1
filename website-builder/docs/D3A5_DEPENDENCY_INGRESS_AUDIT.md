@@ -236,6 +236,41 @@ GET https://21st.dev/api/v1/components/search?q=<term>&scope=public&limit=24
 - **No fabrication.** A malformed or empty search response is a degraded empty
   result, never an invented entry.
 
+### A reusable bounded direct-dependency snapshot/diff verifier
+
+New: one reusable check an operation can wrap around ANY mutation, instead of each
+site re-deriving the delta logic:
+
+```
+snapshot = snapshot_direct_dependency_state(project_root)   # before
+...operation...
+verdict  = verify_direct_dependency_delta(snapshot, snapshot_direct_dependency_state(project_root),
+                                          allowed_packages=reviewed_set)
+```
+
+`DirectDependencySnapshot` pairs BOTH views in one capture -- the four reviewed
+dependency sections AND every top-level `package.json` key -- so an operation does
+not have to remember which snapshots to take.
+
+`DirectDependencyDeltaVerdict` binds `ok` to its payload AT CONSTRUCTION: `ok=True`
+iff no offending delta, and a refusal must name at least one offending item plus a
+reason. The verdict names only NAMES (sections, packages) -- never a manifest value
+-- so it is safe to log verbatim.
+
+The verifier composes the existing primitives rather than re-implementing them:
+`dependency_delta` (filtered by the reviewed set + the runtime section),
+`removed_direct_dependencies` (a delta is blind to a silent deletion), and
+`changed_manifest_sections` (a section outside the reviewed surface can redirect a
+package version or SOURCE). An EMPTY `allowed_packages` accepts no addition -- the
+conservative default.
+
+Bounded: the DECISION is computed from the full delta; only the REPORTED names are
+capped (`_MAX_DELTA_NAMES`), and `truncated` records when the cap bites.
+
+Verified: agreement with `registry_dependency_delta_is_acceptable` (the primitive
+the install paths call), the full decision matrix, the construction-time
+invariants, the bound, and names-only serialization. Pinned by 4 mutation guards.
+
 ### The D3a.5 mutation drivers: a KILL is a FAILED test, not an exit code
 
 While pinning the reduced-motion guard, a defect in the D3a.5 drivers themselves

@@ -53,6 +53,9 @@ REGISTRY_TESTS = "tests/test_design_registry.py"
 CONTRACT_TESTS = "tests/test_design_registry_contract.py"
 MUTATION_TESTS = "tests/test_design_registry_mutation.py"
 INSTALL_TESTS = "tests/test_design_install.py"
+#: The reusable dependency-delta verifier's own suite. It lives with INSTALL
+#: because the verifier composes the primitives that module owns.
+DELTA_VERIFIER_TESTS = "tests/test_design_dependency_delta_verifier.py"
 PIN_TESTS = "tests/test_design_dependency_pins.py"
 FETCH_TESTS = "tests/test_design_catalog_fetch.py"
 CRITIC_TESTS = "tests/test_design_critic.py"
@@ -234,6 +237,47 @@ MUTATIONS = [
         seen.add(identity)
         found.append({"id": identity, "name": identity})
     return found""",
+    ),
+    # ------------------------------------------------------------------
+    # The reusable dependency-delta verifier is load-bearing
+    # ------------------------------------------------------------------
+    # If removals stop being detected, a silent deletion passes as acceptable.
+    (
+        "the reusable delta verifier refuses a removal",
+        INSTALL,
+        """    removals = sorted(
+        (section, name)
+        for section, names in removed_direct_dependencies(before.direct, after.direct).items()
+        for name in names
+    )""",
+        """    removals = sorted(
+        (section, name)
+        for section, names in removed_direct_dependencies(before.direct, after.direct).items()
+        for name in names
+        if False
+    )""",
+    ),
+    # If the reviewed-set filter is dropped, ANY addition passes.
+    (
+        "the reusable delta verifier refuses an unreviewed addition",
+        INSTALL,
+        """        if name not in allowed or section != SECTION_DEPENDENCIES""",
+        """        if False""",
+    ),
+    # If the section check is dropped, an overrides/packageManager mutation passes.
+    (
+        "the reusable delta verifier refuses an unexpected section change",
+        INSTALL,
+        """    sections = changed_manifest_sections(before.sections, after.sections)""",
+        """    sections = ()""",
+    ),
+    # If the ok/payload binding is removed, an ok verdict can carry a delta.
+    (
+        "an ok verdict may not carry an offending delta",
+        INSTALL,
+        """        if self.ok and offending:
+            raise ValueError("an ok dependency-delta verdict must carry no offending delta")""",
+        """        pass""",
     ),
     # ------------------------------------------------------------------
     # The adapter uses the AUTHORITATIVE interface + its documented auth
@@ -910,7 +954,8 @@ def tests_for(relative: str) -> Tuple[str, ...]:
     if relative == REGISTRY:
         return (CONTRACT_TESTS, REGISTRY_TESTS, MUTATION_TESTS)
     if relative == INSTALL:
-        return (MUTATION_TESTS, INSTALL_TESTS, PIN_TESTS, CONTRACT_TESTS)
+        return (MUTATION_TESTS, INSTALL_TESTS, PIN_TESTS, CONTRACT_TESTS,
+                DELTA_VERIFIER_TESTS)
     if relative == FETCH:
         return (FETCH_TESTS,)
     if relative == CRITIC:

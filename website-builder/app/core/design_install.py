@@ -1163,6 +1163,164 @@ def changed_manifest_sections(
     return tuple(sorted(changed))
 
 
+#: Upper bound on how many offending NAMES a verdict reports. The DECISION is
+#: always computed from the full delta; this only bounds the reported tuples so a
+#: pathological manifest cannot produce unbounded output. Set far above any real
+#: project manifest, and ``DirectDependencyDeltaVerdict.truncated`` records when
+#: it bites, so a bound is never silently applied.
+_MAX_DELTA_NAMES = 512
+
+
+@dataclass(frozen=True)
+class DirectDependencySnapshot:
+    """A bounded snapshot of a project's direct-dependency state.
+
+    Pairs the two views a delta guard needs, so an operation captures ONCE:
+
+    * ``direct`` -- ``section -> {package: declared}`` for the four reviewed
+      dependency sections (:func:`snapshot_direct_dependencies`).
+    * ``sections`` -- ``section -> canonical JSON`` for EVERY top-level
+      ``package.json`` key (:func:`snapshot_manifest_sections`).
+
+    Both are bounded: package names, section names, and the project's OWN
+    declared strings. Nothing here is untrusted metadata.
+    """
+
+    direct: Dict[str, Dict[str, str]]
+    sections: Dict[str, str]
+
+
+def snapshot_direct_dependency_state(project_root: Path) -> DirectDependencySnapshot:
+    """Capture the reusable snapshot an operation verifies against afterwards.
+
+    An absent or unreadable manifest yields empty snapshots, so the delta computed
+    against it is the whole manifest -- the conservative direction.
+    """
+    return DirectDependencySnapshot(
+        direct=snapshot_direct_dependencies(project_root),
+        sections=snapshot_manifest_sections(project_root),
+    )
+
+
+@dataclass(frozen=True)
+class DirectDependencyDeltaVerdict:
+    """The bounded outcome of verifying a direct-dependency delta.
+
+    Every field is a NAME (a section, a package), never a manifest value and never
+    an upstream string, so a verdict is safe to log verbatim.
+
+    ``ok`` is BOUND to its payload at construction: ``ok=True`` iff no offending
+    delta exists, and a refusal must name at least one offending item plus a
+    reason. That makes "reported acceptable" and "actually acceptable" the same
+    fact of the type rather than a convention a caller could break.
+    """
+
+    ok: bool
+    #: ``(section, package)`` pairs added or changed OUTSIDE policy -- a package
+    #: not in the reviewed set, or a reviewed package in a non-runtime section.
+    added: Tuple[Tuple[str, str], ...] = ()
+    #: ``(section, package)`` pairs present before and ABSENT after -- a project
+    #: dependency the operation deleted.
+    removed: Tuple[Tuple[str, str], ...] = ()
+    #: Top-level sections outside the reviewed surface that changed.
+    sections_changed: Tuple[str, ...] = ()
+    #: The bounded reason when ``ok`` is False; ``None`` when it is True.
+    reason: Optional[str] = None
+    #: Whether the named tuples were capped by ``_MAX_DELTA_NAMES``. The DECISION
+    #: is unaffected -- ``ok`` is computed from the full delta.
+    truncated: bool = False
+
+    def __post_init__(self) -> None:
+        offending = bool(self.added or self.removed or self.sections_changed)
+        if self.ok and offending:
+            raise ValueError("an ok dependency-delta verdict must carry no offending delta")
+        if not self.ok and not offending:
+            raise ValueError("a refused dependency-delta verdict must name an offending delta")
+        if not self.ok and self.reason is None:
+            raise ValueError("a refused dependency-delta verdict must carry a reason")
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Deterministic, bounded serialization. Names only, no values."""
+        return {
+            "ok": self.ok,
+            "added": [list(pair) for pair in self.added],
+            "removed": [list(pair) for pair in self.removed],
+            "sections_changed": list(self.sections_changed),
+            "reason": self.reason,
+            "truncated": self.truncated,
+        }
+
+
+def verify_direct_dependency_delta(
+    before: DirectDependencySnapshot,
+    after: DirectDependencySnapshot,
+    *,
+    allowed_packages: Sequence[str] = (),
+) -> DirectDependencyDeltaVerdict:
+    """Verify an operation's direct-dependency delta against policy.
+
+    The ONE reusable check, composing the existing primitives so an operation does
+    not re-derive them:
+
+    * additions/changes -- :func:`dependency_delta` filtered by the reviewed set
+      and the runtime section (a reviewed package in a dev/optional/peer section
+      is not the reviewed shape);
+    * removals -- :func:`removed_direct_dependencies`, because a delta only
+      reports what ``after`` CONTAINS and is blind to a silent deletion;
+    * unexpected sections -- :func:`changed_manifest_sections`, so a section
+      outside the reviewed surface (``overrides``, ``packageManager``, ...) that
+      can redirect a package version or SOURCE fails closed.
+
+    ``allowed_packages`` is the application-owned reviewed set. An EMPTY set means
+    nothing may be added: the conservative default, so a caller that forgets to
+    pass the reviewed set cannot accidentally accept an addition.
+
+    Returns a bounded :class:`DirectDependencyDeltaVerdict`. A refusal names the
+    FIRST offending dimension in the order the install path checks (sections, then
+    the dependency delta) so the reason is the most actionable one.
+    """
+    allowed = set(allowed_packages)
+
+    additions = sorted(
+        (section, name)
+        for section, packages in dependency_delta(before.direct, after.direct).items()
+        for name in packages
+        if name not in allowed or section != SECTION_DEPENDENCIES
+    )
+    removals = sorted(
+        (section, name)
+        for section, names in removed_direct_dependencies(before.direct, after.direct).items()
+        for name in names
+    )
+    sections = changed_manifest_sections(before.sections, after.sections)
+
+    truncated = (
+        len(additions) > _MAX_DELTA_NAMES
+        or len(removals) > _MAX_DELTA_NAMES
+        or len(sections) > _MAX_DELTA_NAMES
+    )
+    ok = not (additions or removals or sections)
+
+    reason: Optional[str] = None
+    if not ok:
+        # Sections first: the install path checks the unexpected-section mutation
+        # before the dependency delta, and a section change can redirect a SOURCE.
+        reason = (
+            REASON_MANIFEST_SECTION_CHANGED
+            if sections
+            else REASON_REGISTRY_DEPENDENCY_DRIFT
+        )
+
+    return DirectDependencyDeltaVerdict(
+        ok=ok,
+        added=tuple(additions[:_MAX_DELTA_NAMES]),
+        removed=tuple(removals[:_MAX_DELTA_NAMES]),
+        sections_changed=tuple(sections[:_MAX_DELTA_NAMES]),
+        reason=reason,
+        truncated=truncated,
+    )
+
+
 #: The package-manager argv that normalizes a floating range to an exact pin.
 #: The registry writes ``cn@^0.4.0``; this rewrites it to ``cn@0.4.0`` with the
 #: manager's own ``--save-exact`` so the final manifest matches the
@@ -3335,6 +3493,10 @@ __all__ = [
     "snapshot_component_files",
     "snapshot_direct_dependencies",
     "snapshot_manifest_sections",
+    "snapshot_direct_dependency_state",
+    "DirectDependencySnapshot",
+    "DirectDependencyDeltaVerdict",
+    "verify_direct_dependency_delta",
     "verify_external_component_materialized",
     "InstallReport",
     "DesignDependencyInstaller",
