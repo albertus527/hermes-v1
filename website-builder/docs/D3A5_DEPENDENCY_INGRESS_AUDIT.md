@@ -236,6 +236,28 @@ GET https://21st.dev/api/v1/components/search?q=<term>&scope=public&limit=24
 - **No fabrication.** A malformed or empty search response is a degraded empty
   result, never an invented entry.
 
+### The guard string: `@media (prefers-reduced-motion: reduce)` — scope pinned
+
+The detector handles the canonical selector and every realistic spelling of it
+(no space after `@media`, extra/absent whitespace, uppercase, a newline before
+the brace). Its scope is pinned as the STANDALONE block:
+
+| input | result |
+|---|---|
+| `@media (prefers-reduced-motion: reduce) {` | **True** |
+| `@media(prefers-reduced-motion: reduce){` / case/whitespace variants | **True** |
+| `@media (prefers-reduced-motion: no-preference) {` | False |
+| `@media (min-width: 40em) {` | False |
+| bare phrase / no brace | False |
+| **combined** `@media (prefers-reduced-motion: reduce) and (min-width: 40em) {` | **False (deliberate)** |
+| **comma list** `@media screen, (prefers-reduced-motion: reduce) {` | **False (deliberate)** |
+
+The combined/comma forms are a deliberate false NEGATIVE: upstream ships only the
+standalone block (32/32), and widening the pattern to reach them would re-match
+the PROSE mention and reintroduce the false positive. `True` asserts that
+accessibility code is present, so the safe error is to under-report, not to claim
+a guard a file may lack.
+
 ### The real recipe: embedded CSS + an `@media` reduced-motion guard
 
 The real `card-resize.md` (1658 bytes) contains: HTML usage, tunable `:root`

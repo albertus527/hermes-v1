@@ -421,6 +421,17 @@ def detect_reduced_motion_guard(recipe_text: str) -> bool:
     very property being reported. Verified: requiring the block changes the
     answer for NONE of the 32 real recipes, and rejects the prose-only case.
 
+    **Scope: the STANDALONE block only.** The pattern matches
+    ``@media (prefers-reduced-motion: reduce) {`` as a self-contained selector.
+    It deliberately does NOT match a media query that COMBINES the feature with
+    another (``@media (prefers-reduced-motion: reduce) and (min-width: 40em) {``)
+    or a comma list. Every recipe upstream ships is the standalone form (32/32
+    verified), and widening the match to reach the combined forms would also match
+    the PROSE mention again -- reintroducing the false positive. A false negative
+    on an unshipped spelling is the safe direction here: ``True`` asserts that
+    accessibility code is present, so an over-broad match would claim a guard the
+    file may lack.
+
     Reporting only. This function never INSERTS the guard, and a recipe without
     one is still a valid recipe: adding accessibility code to a third-party
     transition after the fact would mean shipping motion behaviour upstream

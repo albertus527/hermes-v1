@@ -738,3 +738,54 @@ def test_the_flag_reports_not_established_rather_than_absent():
     assert entry.has_reduced_motion_guard is False
     doc = type(entry).__doc__ or ""
     assert "NOT ESTABLISHED" in doc
+
+
+def test_the_canonical_guard_string_is_detected():
+    """The exact upstream form: `@media (prefers-reduced-motion: reduce) {`."""
+    assert detect_reduced_motion_guard("@media (prefers-reduced-motion: reduce) {") is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "@media (prefers-reduced-motion: reduce) {",
+        "@media(prefers-reduced-motion: reduce){",
+        "@media   (  prefers-reduced-motion :  reduce  )  {",
+        "@MEDIA (PREFERS-REDUCED-MOTION: REDUCE) {",
+        "@Media (prefers-reduced-motion: Reduce) {",
+        "@media\n(prefers-reduced-motion: reduce)\n{",
+    ],
+)
+def test_every_realistic_spelling_of_the_guard_is_detected(text):
+    """Whitespace and case variants of the SAME standalone selector."""
+    assert detect_reduced_motion_guard(text) is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "@media (prefers-reduced-motion: no-preference) {",
+        "@media (min-width: 40em) {",
+        "prefers-reduced-motion: reduce",
+        "@media (prefers-reduced-motion: reduce)",  # no brace
+        "",
+    ],
+)
+def test_a_non_guard_media_query_is_not_detected(text):
+    assert detect_reduced_motion_guard(text) is False
+
+
+def test_the_combined_form_is_deliberately_out_of_scope():
+    """The detector matches the STANDALONE block only.
+
+    Upstream ships only the standalone form (32/32). Widening to match a combined
+    query would also re-match the PROSE mention and reintroduce the false
+    positive, so the combined form is a deliberate false NEGATIVE -- the safe
+    direction, since True asserts accessibility code is present.
+    """
+    assert detect_reduced_motion_guard(
+        "@media (prefers-reduced-motion: reduce) and (min-width: 40em) {"
+    ) is False
+    assert detect_reduced_motion_guard(
+        "@media screen, (prefers-reduced-motion: reduce) {"
+    ) is False
