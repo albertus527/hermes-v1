@@ -939,3 +939,12 @@ def test_the_documented_transitions_command_states_the_reserved_slug_fix():
     assert "32" in text
 
 
+def test_the_doc_records_the_linux_containment_family_and_shadowed_tests():
+    """The 26/26 containment family and the two shadowed tests must be recorded."""
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    assert "26/26" in text
+    assert "defined" in text and "three times" in text
+    assert "test_suite_hygiene.py" in text
+
+

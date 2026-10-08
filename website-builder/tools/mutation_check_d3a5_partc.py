@@ -40,7 +40,10 @@ ACTIVATION_TESTS = "tests/test_design_activation.py"
 #: truth must MATCH the adapter's execution requirement. It is run alongside the
 #: activation tests so a drift between the two layers is caught here.
 COHERENCE_TESTS = "tests/test_design_resource_coherence.py"
-RUN_TESTS = (ACTIVATION_TESTS, COHERENCE_TESTS)
+#: Suite hygiene: no test file may define the same test name twice (a duplicate
+#: silently shadows every earlier body). Carried here so the guard is proven.
+HYGIENE_TESTS = "tests/test_suite_hygiene.py"
+RUN_TESTS = (ACTIVATION_TESTS, COHERENCE_TESTS, HYGIENE_TESTS)
 ACTIVATION = "app/core/design_activation.py"
 RESOURCES = "app/core/design_resources.py"
 #: The audit doc records the manual LIVE smokes (Part L). The doc-rot guard in
@@ -469,6 +472,18 @@ MUTATIONS = [
         AUDIT_DOC,
         "refused at the slug VOCABULARY (`RESERVED_RECIPE_SLUGS`)",
         "refused by the catalog",
+    ),
+    # --- 21. the suite-hygiene scanner actually detects a duplicate
+    # A duplicate `def test_x` silently shadows every earlier body. If the
+    # scanner returns [] unconditionally, the guard is vacuous. Mutate it so it
+    # never reports a duplicate; the self-proof test must fail.
+    (
+        "the duplicate-test-name scanner actually detects a duplicate",
+        HYGIENE_TESTS,
+        """    for name in names:
+        seen[name] = seen.get(name, 0) + 1
+    return sorted(name for name, count in seen.items() if count > 1)""",
+        """    return []""",
     ),
 ]
 

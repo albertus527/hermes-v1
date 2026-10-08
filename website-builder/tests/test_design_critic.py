@@ -528,16 +528,6 @@ def test_containment_is_measured_against_the_resolved_root(skill_root):
     assert engine.resolve().is_relative_to(resolved)
 
 
-def test_containment_is_measured_against_the_resolved_root(skill_root):
-    """Containment holds, expressed against resolved paths (no symlink needed)."""
-    resolved = skill_root.resolve()
-
-    engine = resolve_engine_path(skill_root)
-
-    assert engine is not None
-    assert engine.resolve().is_relative_to(resolved)
-
-
 def test_a_complete_engine_chain_outside_the_root_is_refused(tmp_path):
     """The refused half of containment, proven without a privileged operation.
 

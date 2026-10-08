@@ -2288,6 +2288,34 @@ returns `None` for them no matter what the catalog lists -- a manifest that
 LISTS `all` can no longer turn a bounded one-recipe selection into an
 open-ended bulk install.
 
+### The Linux containment family: 26/26 -- and two SHADOWED tests found
+
+The Part D driver (`tools/mutation_check_d3a5_partd.py`) carries the containment
+family: `a recipe file outside the project is not materialized`,
+`an unresolved destination verifies nothing`, and `a recipes dir escaping the
+project is refused`. On Windows the third is a `HOST-SKIP` (a directory symlink
+needs Developer Mode), so the VPS figure is **26/26**; on this Linux host the
+symlink test **runs** and the guard **kills**, and the whole driver is green.
+
+Auditing that family surfaced a real defect of the batch's class -- a guard whose
+enforcement is weaker than the property it names:
+
+- `tests/test_design_transitions.py` defined
+  `test_a_symlinked_recipes_dir_escaping_the_project_is_refused` **three times**
+  (a paste at `74fc55e6c`). Python binds only the LAST definition, so the two
+  earlier bodies were **dead code that pytest never collected** -- and one of
+  them carried a latent `_symlinks_available(tmp_path)` **arity bug** that never
+  ran. The file also had a duplicated `# Reduced-motion ...` section header.
+- `tests/test_design_critic.py` defined
+  `test_containment_is_measured_against_the_resolved_root` **twice** (identical
+  bodies, so no coverage was lost -- the same paste defect).
+
+**Fix:** both files now define each name exactly once, and a new
+`tests/test_suite_hygiene.py` pins the general property -- **no `tests/test_*.py`
+may define the same `test_*` name twice** -- with a self-proof that the scanner
+actually flags a planted duplicate (so the guard cannot be vacuous). A test that
+is defined but never collected is not a test.
+
 ### Why these are manual, not in the suite
 
 The suite bans sockets (`socket.socket.connect`, `create_connection`,

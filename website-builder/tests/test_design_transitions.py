@@ -420,21 +420,28 @@ def _symlinks_available() -> bool:
     return True
 
 
-_SYMLINKS_AVAILABLE = _symlinks_available()
-
-
-@pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="a symlink escape is exercised on the POSIX lane; the containment "
-           "property itself is proven portably above",
-)
 def test_a_symlinked_recipes_dir_escaping_the_project_is_refused(project, tmp_path):
-    if not _symlinks_available(tmp_path):
+    """A ``transitions/`` symlink pointing outside the project is refused.
+
+    The symlink-escape arm of the containment property. Host-gated twice: a
+    Windows host without the symlink privilege skips (the property is proven
+    portably by ``test_a_destination_outside_the_project_verifies_nothing``),
+    and an unexpected ``OSError`` at link time skips rather than erroring.
+
+    This file previously defined this SAME test name three times (a paste at
+    ``74fc55e6c``); Python keeps only the last definition, so two bodies were
+    dead code -- one of them with a latent ``_symlinks_available(tmp_path)``
+    arity bug. There is now exactly one definition.
+    """
+    if not _symlinks_available():
         pytest.skip("symlink creation unavailable on this host")
 
     outside = tmp_path / "outside"
     outside.mkdir()
-    (project / RECIPES_DIRNAME).symlink_to(outside, target_is_directory=True)
+    try:
+        (project / RECIPES_DIRNAME).symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation unavailable")
 
     assert approved_recipes_dir(project) is None
 
@@ -579,20 +586,6 @@ def test_an_unrelated_file_cannot_satisfy_the_postcondition(project):
     )
 
 
-@pytest.mark.skipif(not _SYMLINKS_AVAILABLE, reason="symlink creation needs privilege here")
-def test_a_symlinked_recipes_dir_escaping_the_project_is_refused(project, tmp_path):
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    (project / RECIPES_DIRNAME).symlink_to(outside, target_is_directory=True)
-
-    assert approved_recipes_dir(project) is None
-
-
-# ---------------------------------------------------------------------------
-# Reduced-motion metadata is reported, never invented
-# ---------------------------------------------------------------------------
-
-
 def test_no_recipes_dir_means_nothing_is_verified(project):
     assert (
         verify_recipe_materialized(project, "card-resize", approved_recipes_dir(project))
@@ -603,18 +596,6 @@ def test_no_recipes_dir_means_nothing_is_verified(project):
 def test_a_none_directory_verifies_nothing(project):
     """The fail-closed answer when the destination is unknown."""
     assert verify_recipe_materialized(project, "card-resize", None) == ()
-
-
-@pytest.mark.skipif(sys.platform == "win32", reason="symlink creation needs privilege on Windows")
-def test_a_symlinked_recipes_dir_escaping_the_project_is_refused(project, tmp_path):
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    try:
-        (project / RECIPES_DIRNAME).symlink_to(outside, target_is_directory=True)
-    except OSError:
-        pytest.skip("symlink creation unavailable")
-
-    assert approved_recipes_dir(project) is None
 
 
 # ---------------------------------------------------------------------------
