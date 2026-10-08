@@ -333,6 +333,33 @@ Because no spec targets it, dropping it from the reviewed surface is caught by t
 delta classification changing (the section-specific test fails) rather than by a
 legitimate install breaking -- noted honestly so the guard is not over-claimed.
 
+### `peerDependencies`: reasoned over, and `peerDependenciesMeta` frozen beside it
+
+`peerDependencies` is the last of the four reviewed sections and is snapshotted
+unconditionally. Like ``optionalDependencies``, no application-owned spec targets
+it today, so it is included DEFENSIVELY and is caught by the same TWO layers: the
+delta/membership check (it is in ``SNAPSHOT_SECTIONS``) and the section-freeze
+backstop (verified on a mutated tree: dropping it flips the verdict from
+``added=('peerDependencies', 'evil')`` to
+``sections_changed=('peerDependencies',)`` -- refused either way).
+
+Its sibling ``peerDependenciesMeta`` -- which marks a peer optional/required -- is
+a **separate top-level key OUTSIDE the surface**, so any change there is frozen
+by ``changed_manifest_sections`` and refused. Verified.
+
+| dimension of `peerDependencies` | handled by |
+|---|---|
+| unreviewed addition | delta/membership -> refused (freeze as a backstop) |
+| reviewed addition via the mapping | accepted |
+| reviewed pkg via the runtime-only sequence form | section check -> refused |
+| removal | ``removed_direct_dependencies`` -> refused |
+| version change | the separate exactness dimension |
+| ``peerDependenciesMeta`` change | outside the surface -> frozen -> refused |
+
+A test pins the reviewed surface as EXACTLY the four sections, so no section can
+be silently added or lost. A mutation guard proves that dropping
+``peerDependencies`` fails the suite (the delta classification changes).
+
 ### The verifier is WIRED into every operation allowed to mutate the manifest
 
 Auditing which operations may mutate a generated project's `package.json` found

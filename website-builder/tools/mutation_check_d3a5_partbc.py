@@ -326,6 +326,24 @@ MUTATIONS = [
     "peerDependencies",
 )""",
     ),
+    # If `peerDependencies` is dropped from the reviewed surface, a package
+    # smuggled there is only caught by the section-freeze backstop, so the delta
+    # classification changes and the section-specific test fails.
+    (
+        "the reviewed surface always includes peerDependencies",
+        INSTALL,
+        """SNAPSHOT_SECTIONS: Tuple[str, ...] = (
+    "dependencies",
+    "devDependencies",
+    "optionalDependencies",
+    "peerDependencies",
+)""",
+        """SNAPSHOT_SECTIONS: Tuple[str, ...] = (
+    "dependencies",
+    "devDependencies",
+    "optionalDependencies",
+)""",
+    ),
     # If install_dependency stops verifying the delta, a lifecycle-script-added
     # extra dependency survives an 'installed' claim.
     (

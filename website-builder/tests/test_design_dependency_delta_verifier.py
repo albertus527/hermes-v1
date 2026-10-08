@@ -498,3 +498,79 @@ def test_optionaldependencies_is_caught_by_the_section_freeze_layer_too(tmp_path
     )
 
     assert "optionalDependencies" in changed
+
+
+# ---------------------------------------------------------------------------
+# "At minimum reason over these sections: peerDependencies"
+# ---------------------------------------------------------------------------
+# `peerDependencies` is the last of the four reviewed sections and is snapshotted
+# unconditionally. Like `optionalDependencies`, no application-owned spec targets
+# it today, so it is included DEFENSIVELY. It is caught by the same two layers:
+# the delta/membership check (it is in SNAPSHOT_SECTIONS) and the section-freeze
+# backstop. Its sibling `peerDependenciesMeta` is a SEPARATE top-level section
+# OUTSIDE the surface, so a change there is frozen -- pinned below too.
+
+
+def test_peerdependencies_is_always_a_reviewed_section():
+    from app.core.design_install import SNAPSHOT_SECTIONS
+
+    assert "peerDependencies" in SNAPSHOT_SECTIONS
+
+
+def test_an_unreviewed_peer_dependency_is_refused(tmp_path):
+    v = _verdict(
+        tmp_path,
+        {"name": "p", "peerDependencies": {}},
+        {"name": "p", "peerDependencies": {"evil": "1.0.0"}},
+        allowed={"react": "peerDependencies"},
+    )
+
+    assert v.ok is False
+    assert ("peerDependencies", "evil") in v.added
+
+
+def test_a_reviewed_package_may_be_added_to_peerdependencies_via_the_mapping(tmp_path):
+    v = _verdict(
+        tmp_path,
+        {"name": "p", "peerDependencies": {}},
+        {"name": "p", "peerDependencies": {"react": "19.3.0"}},
+        allowed={"react": "peerDependencies"},
+    )
+
+    assert v.ok is True
+
+
+def test_a_removal_from_peerdependencies_is_always_reasoned_over(tmp_path):
+    v = _verdict(
+        tmp_path,
+        {"name": "p", "peerDependencies": {"react": "19.3.0"}},
+        {"name": "p", "peerDependencies": {}},
+    )
+
+    assert v.ok is False
+    assert ("peerDependencies", "react") in v.removed
+
+
+def test_peerdependenciesmeta_is_frozen_outside_the_surface(tmp_path):
+    """A peer's modifier section is a SEPARATE top-level key, outside the surface."""
+    v = _verdict(
+        tmp_path,
+        {"name": "p", "dependencies": {}},
+        {"name": "p", "dependencies": {}, "peerDependenciesMeta": {"react": {"optional": True}}},
+        allowed=(),
+    )
+
+    assert v.ok is False
+    assert "peerDependenciesMeta" in v.sections_changed
+
+
+def test_the_reviewed_surface_is_exactly_the_four_dependency_sections():
+    """The surface is a closed, known set -- no section is silently added or lost."""
+    from app.core.design_install import SNAPSHOT_SECTIONS
+
+    assert SNAPSHOT_SECTIONS == (
+        "dependencies",
+        "devDependencies",
+        "optionalDependencies",
+        "peerDependencies",
+    )
