@@ -1424,6 +1424,58 @@ pre-existing `react` dependency was dropped from `package.json`.
   scan is `critic_available=True, critic_degraded=True, authoritative=False` —
   a clean result there is never authoritative.
 
+### VPS command: a FULL, non-degraded Impeccable scan
+
+The scan target is **load-bearing**. The engine's CLI reads
+``if (!process.stdin.isTTY && targets.length === 0) -> read STDIN``; every
+subprocess has a non-TTY stdin, so an invocation with NO target returns ``[]``
+with exit 0 — a clean, non-degraded, "authoritative" verdict over a project it
+never opened. The app's argv therefore ends in a FIXED ``.``
+(`CRITIC_ENGINE_ARGV_SUFFIX = ("detect", "--json", "--quiet", ".")`).
+
+```bash
+cd website-builder && source .venv/bin/activate
+
+# 1. What quality is the skill on THIS host?  (full | degraded | missing)
+python -c "from pathlib import Path; from app.core.design_activation import engine_quality; \
+  print(engine_quality(Path.home()/'.hermes-website'/'skills'/'impeccable'))"
+
+# 2. Provision the parser runtime for a FULL scan (operator step, once).
+#    Exact pins; into the SKILL's own node_modules. A build never does this.
+SKILL="$HOME/.hermes-website/skills/impeccable"
+npm install --no-save --prefix "$SKILL" --no-audit --no-fund \
+  htmlparser2@12.0.0 css-select@7.0.0 css-tree@3.2.1 domutils@4.0.2
+
+# 3. Confirm the quality is now `full`.
+python -c "from pathlib import Path; from app.core.design_activation import engine_quality; \
+  print(engine_quality(Path.home()/'.hermes-website'/'skills'/'impeccable'))"
+
+# 4. Run the APP's scan against a project. This is the real seam.
+python -c "from pathlib import Path; from app.core.design_critic import run_critic_scan, scan_is_authoritative; \
+  root = Path.home()/'.hermes-website'/'skills'/'impeccable'; \
+  o = run_critic_scan(root/'scripts'/'detect.mjs', node_executable='/usr/bin/node', skill_root=Path('<PROJECT>')); \
+  print('ok=%s degraded=%s authoritative=%s findings=%d' % (o.ok, o.degraded, scan_is_authoritative(o), len(o.findings)))"
+
+# 5. Cross-check against the engine directly (the same fixed target).
+node "$SKILL/scripts/detect.mjs" detect --json --quiet .   # run from the project
+```
+
+**Observed on the qualification host (2026-10), a project with real findings:**
+
+| skill state | app `ok` | `degraded` | `authoritative` | findings |
+|---|---|---|---|---|
+| **full** (parser runtime present) | True | False | **True** | **2** (`low-contrast`, `tiny-text`) |
+| **degraded** (engine only) | True | True | **False** | 0, reason `parser_runtime_unavailable` |
+
+A degraded scan is callable but **never authoritative**: its 0 findings is an
+undercount, not a pass. Only the `full` row may be read as a certification.
+
+**Defect found and fixed while writing this command.** The argv previously had
+**no target**, so in any non-TTY context the full scan returned 0 findings and
+`authoritative=True` — certifying a project it never opened. Fixed by the fixed
+`.` target; pinned by tests and a mutation guard (see the audit's Part I notes).
+
+
 ## Part L — manual LIVE smokes (run AFTER the unit suite)
 
 The unit suite is socket-free by construction, so every claim that has a LIVE

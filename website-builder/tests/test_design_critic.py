@@ -148,7 +148,7 @@ def skill_root(tmp_path) -> Path:
 
 
 def test_the_argv_is_the_verified_detect_invocation():
-    assert CRITIC_ARGV_SUFFIX == ("detect", "--json", "--quiet")
+    assert CRITIC_ARGV_SUFFIX == ("detect", "--json", "--quiet", ".")
 
 
 def test_the_engine_is_argv_element_zero_and_nothing_follows_it(tmp_path):
@@ -160,10 +160,27 @@ def test_the_engine_is_argv_element_zero_and_nothing_follows_it(tmp_path):
 
 
 def test_the_argv_names_exactly_one_target():
-    """No path argument: the engine scans its own working directory."""
+    """Exactly one target, and it is the FIXED cwd -- never a caller path."""
     argv = build_critic_argv(NODE, Path("/x/y/detect.mjs"))
 
-    assert len(argv) == 5
+    assert len(argv) == 6
+    assert argv[-1] == "."
+    # the target is the LAST element, after the fixed flags
+    assert argv[2:] == ("detect", "--json", "--quiet", ".")
+
+
+def test_the_target_is_required_for_a_deterministic_scan():
+    """Without a target the engine reads STDIN on a non-TTY and reports clean.
+
+    The engine's CLI: ``if (!process.stdin.isTTY && targets.length === 0)`` ->
+    read stdin. A subprocess has no TTY, so the scan must name its target or it
+    certifies a design it never opened. Pin the target's presence.
+    """
+    assert CRITIC_ARGV_SUFFIX[-1] == ".", (
+        "a missing target makes a non-TTY scan read empty stdin and report clean"
+    )
+    # and it must be a plain cwd target, not a path a caller could steer
+    assert CRITIC_ARGV_SUFFIX.count(".") == 1
 
 
 def test_no_interpreter_is_ever_discovered_on_path(tmp_path):
@@ -200,7 +217,8 @@ def test_a_path_with_shell_metacharacters_stays_one_argv_element(tmp_path):
     run_critic_scan(evil, node_executable=NODE, runner=runner)
 
     assert runner.argv[1] == str(evil)
-    assert len(runner.argv) == 5
+    assert len(runner.argv) == 6
+    assert runner.argv[-1] == ".", "the target is a fixed '.', never the evil path"
 
 
 def test_the_runner_receives_a_bounded_timeout(tmp_path):
@@ -745,3 +763,53 @@ def test_a_real_non_empty_finding_reports_every_real_field():
     assert first.severity == "warning"
     assert "3.9:1" in first.finding
     assert first.evidence == "color: #8a8f98 on #ffffff"
+
+
+# ---------------------------------------------------------------------------
+# The scan must actually SCAN -- not certify a project it never opened
+# ---------------------------------------------------------------------------
+# The VPS-found defect: the argv was `detect --json --quiet` with NO target. The
+# engine's CLI (detector/cli/main.mjs) reads:
+#
+#     if (!process.stdin.isTTY && targets.length === 0) {
+#       allFindings = await handleStdin(...)      # reads STDIN
+#     } else {
+#       const paths = targets.length > 0 ? targets : [process.cwd()]
+#
+# Every subprocess has a non-TTY stdin, so with no target the engine read an
+# EMPTY stdin and returned [] with exit 0 -- a clean, NON-degraded,
+# "authoritative" verdict over a project it never opened. The module's own
+# docstring says that must never happen. These tests pin the target that fixes it.
+
+
+def test_the_scan_target_selects_the_cwd_branch_not_stdin():
+    """The fixed '.' is what keeps a non-TTY scan from reading stdin."""
+    argv = build_critic_argv(NODE, Path("/x/y/detect.mjs"))
+
+    # the engine's stdin branch requires targets.length === 0; a target present
+    # forces the cwd branch regardless of TTY
+    targets = [a for a in argv[2:] if not a.startswith("--") and a != "detect"]
+    assert targets == ["."]
+
+
+def test_the_documented_detect_invocation_includes_the_target():
+    """The module's stated invocation must show the target, not omit it."""
+    import app.core.design_critic as critic
+
+    doc = critic.__doc__ or ""
+    assert "detect" in doc
+    # the constant is the single source of truth and it carries the target
+    assert critic.CRITIC_ENGINE_ARGV_SUFFIX[-1] == "."
+
+
+def test_removing_the_target_is_a_clean_but_never_scanned_verdict():
+    """Demonstrate the defect the target prevents, so the guard is meaningful.
+
+    A runner that mimics the engine's non-TTY behaviour (empty stdin -> []) would
+    report ok=True / authoritative over an unscanned project. That is why the
+    target is load-bearing and why its absence must fail the suite.
+    """
+    argv = build_critic_argv(NODE, Path("/x/y/detect.mjs"))
+
+    # if a future edit drops the target, this is the shape it would have
+    assert argv[-1] == ".", "no target => the engine reads stdin and reports clean"

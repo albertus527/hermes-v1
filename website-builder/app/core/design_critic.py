@@ -49,9 +49,11 @@ argv below is a fixed constant and the caller cannot extend it.
   the project -- an unvetted interpreter is exactly the "npm shim" this batch
   refused.
 * The engine flags are :data:`CRITIC_ENGINE_ARGV_SUFFIX` and nothing else. No
-  caller-supplied flags, no target paths, no shell. ``shell=True`` is never
-  used, so a path containing shell metacharacters is an argv element, never a
-  command.
+  caller-supplied flags, no caller-supplied target paths, no shell. The one
+  target is a FIXED ``.``: without it the engine reads STDIN on a non-TTY and
+  returns a clean verdict over a project it never opened (see the constant's
+  comment). ``shell=True`` is never used, so a path containing shell
+  metacharacters is an argv element, never a command.
 * JSON that does not parse, or that is not the expected shape, yields zero
   findings plus a static reason. It is never coerced into an empty pass.
 """
@@ -71,12 +73,28 @@ from app.core.design_retrieval import CriticFinding
 
 logger = logging.getLogger(__name__)
 
-#: The engine's ``detect`` subcommand with machine-readable output. **Fixed**:
-#: the caller may not add flags, paths, or targets. This is the reason the seam
-#: is safe -- there is no argument through which a caller can steer the engine.
+#: The engine's ``detect`` subcommand with machine-readable output, and a FIXED
+#: ``.`` scan target. **Fixed**: the caller may not add flags, paths, or targets
+#: -- there is no argument through which a caller can steer the engine.
+#:
+#: The ``.`` target is LOAD-BEARING, not decorative. The engine's own CLI
+#: (``detector/cli/main.mjs``) reads:
+#:
+#:     if (!process.stdin.isTTY && targets.length === 0) {
+#:       allFindings = await handleStdin(...)      # reads STDIN
+#:     } else {
+#:       const paths = targets.length > 0 ? targets : [process.cwd()]
+#:
+#: With NO target and a non-TTY stdin -- every subprocess, daemon, and CI run --
+#: the engine reads an EMPTY stdin and returns ``[]`` with exit 0. That is a
+#: clean, non-degraded, "authoritative" verdict over a project it never opened:
+#: exactly the "certify a design that was never scanned" failure this module
+#: exists to prevent. Passing ``.`` selects the cwd branch unconditionally, so
+#: the scan is the same whether or not a TTY is attached.
+#:
 #: ``--quiet`` only suppresses the human summary on stderr; the JSON payload and
 #: the exit code are unaffected, and those are what this module reads.
-CRITIC_ENGINE_ARGV_SUFFIX: Tuple[str, ...] = ("detect", "--json", "--quiet")
+CRITIC_ENGINE_ARGV_SUFFIX: Tuple[str, ...] = ("detect", "--json", "--quiet", ".")
 
 #: Backwards-compatible alias for the flag suffix. It names the FLAGS passed to
 #: the engine, never the engine path.

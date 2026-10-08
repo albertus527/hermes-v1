@@ -177,6 +177,15 @@ MUTATIONS = [
         str(engine_path),
     ) + CRITIC_ENGINE_ARGV_SUFFIX + (FIX,)""",
     ),
+    # --- 13b. the scan target is fixed and load-bearing ----------------
+    # Without the target the engine reads STDIN on a non-TTY and returns a clean
+    # verdict over a project it never opened. Dropping the "." must fail.
+    (
+        "the scan target is fixed so the scan is deterministic",
+        CRITIC,
+        '''CRITIC_ENGINE_ARGV_SUFFIX: Tuple[str, ...] = ("detect", "--json", "--quiet", ".")''',
+        '''CRITIC_ENGINE_ARGV_SUFFIX: Tuple[str, ...] = ("detect", "--json", "--quiet")''',
+    ),
     # --- 14. the engine is never a shell word ---------------------------
     (
         "the engine is never run through a shell",
