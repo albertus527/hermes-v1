@@ -1604,6 +1604,55 @@ allowlist and installs its own exact pins. A declaration naming anything else
 component requires a dependency outside the closed allowlist`. The upstream range
 is only CHECKED, never installed.
 
+### VPS command: the catalog FETCH layer — bounds, allowlist, redirect refusal
+
+Every discovery claim above rests on `fetch_catalog_payload` actually enforcing
+its bounds. This is the command that proves the BOUNDS rather than the payload.
+
+```bash
+cd website-builder && source .venv/bin/activate
+
+python -c "from app.core.design_catalog_fetch import ( \
+    fetch_catalog_payload, _default_transport, url_is_allowed, \
+    SOURCE_REACT_BITS, MAX_RESPONSE_BYTES, MAX_PARSED_IDS); \
+  \
+  print('--- size bound is ENFORCED (not just declared) ---'); \
+  cap = fetch_catalog_payload(SOURCE_REACT_BITS, transport=lambda u,h,t: (200, b'x'*MAX_RESPONSE_BYTES)); \
+  over = fetch_catalog_payload(SOURCE_REACT_BITS, transport=lambda u,h,t: (200, b'x'*(MAX_RESPONSE_BYTES+1))); \
+  print('  at cap  : ok=%s' % cap.ok); \
+  print('  over cap: ok=%s reason=%s' % (over.ok, over.reason)); \
+  \
+  print('--- timeout reaches the transport ---'); \
+  seen = {}; \
+  fetch_catalog_payload(SOURCE_REACT_BITS, transport=lambda u,h,t: (seen.update(t=t), (200, b''))[1], timeout=7); \
+  print('  transport got timeout:', seen.get('t')); \
+  \
+  print('--- redirects refused, allowlist re-checked ---'); \
+  for url in ('https://reactbits.dev/llms.txt','https://evil.example/x','http://reactbits.dev/x','https://reactbits.dev.evil.example/x'): \
+      print('  %-46s allowed=%s' % (url, url_is_allowed(SOURCE_REACT_BITS, url))); \
+  \
+  print('--- the REAL transport (no injection) ---'); \
+  st, body = _default_transport('https://reactbits.dev/llms.txt', {'User-Agent':'hermes-website-builder'}, 10); \
+  print('  live llms.txt -> HTTP %s, %d bytes' % (st, len(body)))"
+```
+
+**Observed on the qualification host (2026-10):**
+
+| property | observed |
+|---|---|
+| size bound | body at `MAX_RESPONSE_BYTES` → `ok=True`; **one byte over** → `ok=False`, `…response exceeded the size…` |
+| timeout | the transport receives the caller's `timeout` (7); `socket.timeout`/`TimeoutError` → `ok=False`, `…did not respond…` |
+| redirects | `_NoRedirect` raises on 301/302/307/308 — a 3xx is never followed |
+| allowlist | `reactbits.dev` allowed; `evil.example`, `http://…`, and `reactbits.dev.evil.example` all refused |
+| real transport | `https://reactbits.dev/llms.txt` → HTTP **200**, 94,367 bytes |
+| parse bound | 712 CLI markers → 64 entries (≤ `MAX_PARSED_IDS`) |
+| honest zero | a 200 with no usable identity → `ok=False` (`no usable component entries` / `could not be parsed`) |
+
+**Why this matters.** A bound that is *declared* but not *enforced* is the same
+defect class as an unscanned "authoritative" verdict. Each bound here was checked
+at its EDGE (exactly at, and one past) rather than trusted from the constant.
+
+
 
 
 

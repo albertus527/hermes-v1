@@ -774,3 +774,26 @@ def test_the_documented_react_bits_command_states_the_upstream_range_is_checked_
 
     assert "only CHECKED, never installed" in text
     assert "outside the closed allowlist" in text
+
+
+def test_the_documented_fetch_layer_command_states_bounds_are_enforced():
+    """The fetch-layer command must prove BOUNDS, not just show constants."""
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    assert "catalog FETCH layer" in text
+    assert "MAX_RESPONSE_BYTES" in text
+    # the ENFORCEMENT claim itself, not merely the constant's name
+    assert "size bound is ENFORCED (not just declared)" in text
+    # the edge check (at cap vs over cap) is the point
+    assert "at cap" in text and "over cap" in text
+    # redirect refusal and the allowlist re-check
+    assert "redirects refused" in text.lower() or "redirect" in text.lower()
+    assert "url_is_allowed" in text
+
+
+def test_the_documented_fetch_layer_command_uses_the_real_transport():
+    """A fetch-layer proof that only used injected transports would prove nothing."""
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    assert "_default_transport" in text
+    assert "no injection" in text.lower()

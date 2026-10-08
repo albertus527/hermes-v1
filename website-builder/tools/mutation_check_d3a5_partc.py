@@ -384,6 +384,15 @@ MUTATIONS = [
         "**Discovery is not installability.** All 64 upstream components are discovered",
         "**Discovery means installable.** All 64 upstream components are discovered",
     ),
+    # --- 14d. the documented fetch layer proves the bounds, not just the payload
+    # If the doc stops stating that the bounds are ENFORCED (checked at the edge),
+    # a reader could trust a declared-but-unenforced bound.
+    (
+        "the documented fetch layer states the bounds are enforced",
+        AUDIT_DOC,
+        "print('--- size bound is ENFORCED (not just declared) ---')",
+        "print('--- size bound (declared) ---')",
+    ),
     # --- 15. Part L: the documented no-delta proof must be able to FAIL -----
     # The doc must not document a self-comparison as the "unchanged" proof:
     # `git diff --no-index package.json package.json` compares a file to itself,
