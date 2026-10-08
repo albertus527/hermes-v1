@@ -556,6 +556,16 @@ MUTATIONS = [
         "The default suite is **offline** (no non-loopback network), enforced by",
         "The suite bans sockets (`socket.socket.connect`, `create_connection`), enforced by",
     ),
+    # --- 26. the doc names ALL FOUR package-name sources (audit Q9)
+    # The old claim "nothing else can produce a package" was an overstatement:
+    # companion + registry-introduced tables also produce package names. If the
+    # doc drops back to naming only DEPENDENCY_PACKAGES, the Q9 test must fail.
+    (
+        "the doc names all four package-name sources",
+        AUDIT_DOC,
+        "comes from one of FOUR closed, application-owned",
+        "maps a dependency *id* to a package name; nothing else can produce a package",
+    ),
 ]
 
 

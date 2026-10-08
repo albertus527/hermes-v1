@@ -236,12 +236,17 @@ DEPENDENCY_COMPANION_PACKAGES: Dict[str, Tuple[CompanionPackage, ...]] = {
 
 
 def resolve_package(dependency_id: str) -> Optional[str]:
-    """The package for ``dependency_id``, or ``None`` if it is not allowlisted.
+    """The RUNTIME package for ``dependency_id``, or ``None`` if not allowlisted.
 
-    This is the ONLY function that turns a name into an installable package.
-    Returning ``None`` rather than the input is deliberate: an unrecognised id
-    has no package, and inventing one from the id would recreate the arbitrary
-    install this module exists to prevent.
+    This is the ONLY function that turns a dependency id into a RUNTIME package
+    name. (Companion packages -- e.g. ``@types/three`` -- come from the separate
+    closed :data:`DEPENDENCY_COMPANION_PACKAGES` table via
+    :func:`resolve_companion_packages`, and registry-introduced packages from
+    :data:`REGISTRY_INTRODUCED_PACKAGE_PINS`; all three are application-owned
+    closed tables, and no path derives a package from model/resource/upstream
+    text.) Returning ``None`` rather than the input is deliberate: an
+    unrecognised id has no package, and inventing one from the id would recreate
+    the arbitrary install this module exists to prevent.
     """
     if not isinstance(dependency_id, str):
         return None

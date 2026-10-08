@@ -965,12 +965,12 @@ def test_the_doc_has_the_final_proof_part_m_section():
     assert "d3a5_final_proof.py" in text
     assert "VERDICT" in text
     # The pinned counts must be the real ones (a dropped guard changes a count).
-    assert "`parta 16`, `partbc 73`, `partc 38`" in text
+    assert "`parta 16`, `partbc 73`, `partc 39`" in text
     # The observed tally must be the real one (13 = 1 suite + 8 drivers + 4 rails).
     assert "`13/13 checks passed`" in text
     # The observed driver tally must match the pinned counts too -- this is the
-    # line that went stale when partc grew to 38 and the suite to 3604.
-    assert "drivers `16 / 73 / 38 / 36 / 18`" in text
+    # line that went stale when partc grew and the suite passed 3606.
+    assert "drivers `16 / 73 / 39 / 36 / 18`" in text
 
 
 def test_the_doc_does_not_claim_a_socket_ban_the_suite_does_not_have():
@@ -998,12 +998,28 @@ def test_the_doc_records_the_stale_claim_sweep():
     assert "three stale claims" in text
 
 
+def test_the_doc_records_the_executable_policy_q9_finding():
+    """Q9: the 'nothing else can produce a package' overstatement must be fixed.
+
+    The doc must name all FOUR package-name sources, not just DEPENDENCY_PACKAGES.
+    """
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    assert "### Audit Q9: the \"Final dependency policy\" claims are now EXECUTABLE" in text
+    # The overstatement must be GONE from the policy list.
+    assert "maps a dependency *id* to a package name; nothing else can produce" not in text
+    # All four sources must be named.
+    assert "DEPENDENCY_COMPANION_PACKAGES" in text
+    assert "REGISTRY_INTRODUCED_PACKAGE_PINS" in text
+    assert "FOUR closed, application-owned" in text
+
+
 def test_the_doc_has_the_source_review_bullets_part_n_section():
     """Part N must document the live re-verification of every bullet."""
     text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
 
     assert "## Part N — the source-review bullets, re-verified as LIVE properties" in text
     assert "test_source_review_bullets.py" in text
-    assert "30 tests" in text
+    assert "33 tests" in text
 
 

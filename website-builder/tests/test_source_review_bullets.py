@@ -300,3 +300,73 @@ def test_the_manifest_section_guard_helpers_exist():
     source = Path(install.__file__).read_text(encoding="utf-8")
     assert "snapshot_manifest_sections" in source
     assert "changed_manifest_sections" in source
+
+
+# ---------------------------------------------------------------------------
+# Audit Q9: the policy claims must be EXECUTABLE, not prose
+# ---------------------------------------------------------------------------
+#
+# The doc's Final dependency policy says "every package name that can reach an
+# install argv comes from one of FOUR closed, application-owned tables". This
+# pins that claim as a property of the code: the four tables are exactly the
+# ones named, and each produces package names. A FIFTH table producing a package
+# would make the sentence false again -- the same "docs vs executable policy"
+# mismatch the audit's Q9 asks about.
+
+
+def test_every_package_name_source_is_one_of_the_four_closed_tables():
+    """The doc names four tables; the code must have exactly those four sources."""
+    from app.core import design_install as di
+
+    runtime = set(di.DEPENDENCY_PACKAGES.values())
+    companions = {
+        c.package
+        for comps in di.DEPENDENCY_COMPANION_PACKAGES.values()
+        for c in comps
+    }
+    registry_introduced = set(di.REGISTRY_INTRODUCED_PACKAGE_PINS)
+    always_provided = set(di._ALWAYS_PROVIDED_PACKAGES)
+
+    # Each named table actually produces package names (not an empty claim).
+    assert runtime == {"gsap", "@gsap/react", "three", "lenis"}
+    assert companions == {"@types/three"}
+    assert registry_introduced == {"cn", "radix-ui", "lucide-react"}
+    assert always_provided == {
+        "class-variance-authority", "react", "react-dom"
+    }
+
+
+def test_the_reviewed_builtin_tables_are_a_subset_of_the_four_sources():
+    """The per-component builtin tables may only NAME packages the four cover.
+
+    They describe WHICH reviewed package a component introduces/imports, not a
+    fifth package source: every entry must already be in the four closed tables.
+    """
+    from app.core import design_install as di
+
+    covered = (
+        set(di.DEPENDENCY_PACKAGES.values())
+        | {
+            c.package
+            for comps in di.DEPENDENCY_COMPANION_PACKAGES.values()
+            for c in comps
+        }
+        | set(di.REGISTRY_INTRODUCED_PACKAGE_PINS)
+        | set(di._ALWAYS_PROVIDED_PACKAGES)
+    )
+    builtin_named = set()
+    for packages in di.REVIEWED_BUILTIN_COMPONENT_DEPENDENCIES.values():
+        builtin_named.update(packages)
+    for packages in di.REVIEWED_BUILTIN_COMPONENT_IMPORTS.values():
+        builtin_named.update(packages)
+
+    assert builtin_named <= covered, builtin_named - covered
+
+
+def test_resolve_package_returns_none_for_an_unowned_id():
+    """Q9: "no path by which model/resource text contributes a package name"."""
+    from app.core import design_install as di
+
+    for hostile in ("evil-pkg", "gsap@^3.0.0", "../etc", "", "https://x/y.tgz"):
+        assert di.resolve_package(hostile) is None
+        assert di.resolve_companion_packages(hostile) == ()

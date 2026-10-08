@@ -1454,8 +1454,13 @@ narrower than the property it names.
 
 ## Final dependency policy (post-repair)
 
-- **Package identity is closed and application-owned.** `DEPENDENCY_PACKAGES`
-  maps a dependency *id* to a package name; nothing else can produce a package.
+- **Package identity is closed and application-owned.** Every package name that
+  can reach an install argv comes from one of FOUR closed, application-owned
+  tables — never from model/resource/upstream text: `DEPENDENCY_PACKAGES`
+  (D2-selectable runtime deps), `DEPENDENCY_COMPANION_PACKAGES` (`@types/three`),
+  `REGISTRY_INTRODUCED_PACKAGE_PINS` (`cn`/`radix-ui`/`lucide-react`), and the
+  starter's always-provided set (`react`/`react-dom`/
+  `class-variance-authority`). Nothing else can produce a package.
 - **Every install is an EXACT pin.** `DEPENDENCY_PACKAGE_PINS` holds
   `gsap 3.15.0`, `gsap_react (@gsap/react) 2.1.2`, `three 0.186.1`,
   `lenis 1.3.26`; `three`'s companion `@types/three 0.186.0` lands in
@@ -1878,7 +1883,8 @@ a proven guard.
 Every bullet above was verified once, by hand, in the session that fixed it.
 Part N re-checks each as a property of the CURRENT code, so a later commit cannot
 silently weaken one. The durable form is
-`tests/test_source_review_bullets.py` (30 tests), one per bullet:
+`tests/test_source_review_bullets.py` (33 tests), one per bullet plus the three
+audit-Q9 policy checks:
 
 ```bash
 cd website-builder && source .venv/bin/activate
@@ -1915,6 +1921,30 @@ the code, so the same defect the batch hunts -- a guard weaker than the claim it
 names -- would fail CI. `partc` guard #24 mutates `_reason_for_status` to collapse
 429 into the generic reason and proves the bullets file catches it (2 failed), so
 the re-verification is load-bearing rather than a restatement.
+
+### Audit Q9: the "Final dependency policy" claims are now EXECUTABLE
+
+Q9 asks whether a comment/doc claims something is allowlisted when executable
+policy disagrees. The "Final dependency policy" section opened with:
+
+> "`DEPENDENCY_PACKAGES` maps a dependency *id* to a package name; **nothing else
+>  can produce a package**."
+
+That is an **overstatement**. Mechanically, **four** closed, application-owned
+tables produce package names: `DEPENDENCY_PACKAGES` (`gsap`, `@gsap/react`,
+`three`, `lenis`), `DEPENDENCY_COMPANION_PACKAGES` (`@types/three`),
+`REGISTRY_INTRODUCED_PACKAGE_PINS` (`cn`, `radix-ui`, `lucide-react`), and the
+starter's always-provided set (`react`, `react-dom`,
+`class-variance-authority`). `resolve_package`'s docstring made the same
+too-narrow claim ("the ONLY function that turns a name into an installable
+package" -- true for the RUNTIME package only).
+
+Both were corrected to name the four tables. The claim is now pinned by three
+tests in `tests/test_source_review_bullets.py`: the four tables are exactly the
+ones named and each produces package names; the per-component builtin tables may
+only NAME a package one of the four already covers (they are not a fifth
+source); and `resolve_package`/`resolve_companion_packages` return `None`/`()` for
+any unowned id, so no model/resource/upstream text contributes a package.
 
 ### A latent interpreter-upgrade break, found by a plain `pytest tests/ -q`
 
@@ -1955,7 +1985,7 @@ What it proves, in three blocks:
    excluded, not silently run.
 2. **Every mutation driver kills all its guards, at the PINNED count.** A driver
    prints "all N guards killed", which stays true if a mutation is DELETED -- so
-   the runner pins each N externally (`parta 16`, `partbc 73`, `partc 38`,
+   the runner pins each N externally (`parta 16`, `partbc 73`, `partc 39`,
    `partd 36`, `parti 18`). A dropped guard makes the count mismatch and the
    proof FAIL. The three legacy D0/D1/D2-D3a drivers are reported for the record
    (separate work; their host-masked kills are a documented artifact).
@@ -1974,7 +2004,7 @@ built on.
 
 **Observed on the qualification host (2026-10):** `13/13 checks passed`,
 `VERDICT: PASS` -- suite `3604 passed, 2 skipped, 4 deselected` (offline),
-drivers `16 / 73 / 38 / 36 / 18` and legacy `9 / 33 / 25`, guardrails all green.
+drivers `16 / 73 / 39 / 36 / 18` and legacy `9 / 33 / 25`, guardrails all green.
 (13 = 1 suite + 5 D3a.5 drivers + 3 legacy drivers + 4 guardrails.)
 
 ### A stale-claim sweep of the batch diff
