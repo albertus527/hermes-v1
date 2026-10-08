@@ -965,8 +965,17 @@ def test_the_doc_has_the_final_proof_part_m_section():
     assert "d3a5_final_proof.py" in text
     assert "VERDICT" in text
     # The pinned counts must be the real ones (a dropped guard changes a count).
-    assert "`parta 16`, `partbc 73`, `partc 35`" in text
+    assert "`parta 16`, `partbc 73`, `partc 36`" in text
     # The observed tally must be the real one (13 = 1 suite + 8 drivers + 4 rails).
     assert "`13/13 checks passed`" in text
+
+
+def test_the_doc_has_the_source_review_bullets_part_n_section():
+    """Part N must document the live re-verification of every bullet."""
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    assert "## Part N — the source-review bullets, re-verified as LIVE properties" in text
+    assert "test_source_review_bullets.py" in text
+    assert "30 tests" in text
 
 

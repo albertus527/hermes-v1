@@ -50,9 +50,12 @@ OFFLINE_TESTS = "tests/test_suite_offline.py"
 FINAL_PROOF_TESTS = "tests/test_final_proof_runner.py"
 #: The runner itself (mutated by guard #23 to prove the pin cross-check).
 FINAL_PROOF_RUNNER = "tools/d3a5_final_proof.py"
+#: Part N: the source-review bullets, re-verified as live properties.
+BULLETS_TESTS = "tests/test_source_review_bullets.py"
 RUN_TESTS = (ACTIVATION_TESTS, COHERENCE_TESTS, HYGIENE_TESTS, OFFLINE_TESTS,
-             FINAL_PROOF_TESTS)
+             FINAL_PROOF_TESTS, BULLETS_TESTS)
 ACTIVATION = "app/core/design_activation.py"
+CATALOG_FETCH = "app/core/design_catalog_fetch.py"
 RESOURCES = "app/core/design_resources.py"
 #: The audit doc records the manual LIVE smokes (Part L). The doc-rot guard in
 #: the coherence suite resolves every symbol those commands import, so mutating
@@ -515,6 +518,18 @@ MUTATIONS = [
         FINAL_PROOF_RUNNER,
         '''    ("mutation_check_d3a5_parta.py", 16),''',
         '''    ("mutation_check_d3a5_parta.py", 99),''',
+    ),
+    # --- 24. the source-review bullets are re-verified as LIVE properties
+    # Part N. The bullets file pins e.g. "401 -> auth rejected, 429 -> rate
+    # limited". Collapse 429 into the generic reason; the bullet test must fail,
+    # proving the re-verification is load-bearing rather than a doc restatement.
+    (
+        "the source-review bullets are enforced on HEAD",
+        CATALOG_FETCH,
+        """    if status == 429:
+        return REASON_RATE_LIMITED""",
+        """    if status == 429:
+        return REASON_BAD_STATUS""",
     ),
 ]
 

@@ -1873,6 +1873,49 @@ a proven guard.
 
 
 
+## Part N — the source-review bullets, re-verified as LIVE properties
+
+Every bullet above was verified once, by hand, in the session that fixed it.
+Part N re-checks each as a property of the CURRENT code, so a later commit cannot
+silently weaken one. The durable form is
+`tests/test_source_review_bullets.py` (30 tests), one per bullet:
+
+```bash
+cd website-builder && source .venv/bin/activate
+python -m pytest tests/test_source_review_bullets.py -q
+```
+
+What it pins, grouped by the surface it protects:
+
+- **The 21st surface** — the endpoint we call is the REST v1 search; auth is
+  `Authorization: Bearer` and never `x-api-key`; no credential VALUE is stored on
+  a result type; the fetch never raises (the header-leak vector stays closed);
+  401 and 429 stay named distinctly; a successful fetch is bound to a payload at
+  construction; the container key is per-source (`results` for 21st, bare list
+  for React Bits); no `/components/<slug>` scrape survives; the live-adapter
+  probe agrees with `build_discovery_url` for every source; and no surface claims
+  a free metadata-search tier.
+- **The registry** — reserved route segments are refused at the vocabulary AND
+  the locator; no contract can exist for a reserved segment; a builtin carrying
+  declared deps is a bounded refusal; a clean builtin carries no required deps;
+  no builtin name is an approved external identity; React Bits approves exactly
+  `SplitText`; an unreviewed external id resolves to no locator; the boundary is
+  a validated type; the SplitText contract is exactly `{gsap, gsap_react}`; and a
+  URL as a component identity is refused.
+- **Parser / pins / transitions** — every hostile npm spec is refused and every
+  approved one parses; the always-provided set EQUALS the starter's runtime
+  `dependencies`; the dependency / registry-introduced / Impeccable-parser /
+  pinned-CLI versions are all exact; the bulk selector slugs are refused at the
+  transitions vocabulary; the transitions optional-suffix set is empty; and the
+  manifest-section guard helpers exist.
+
+**Why it is a test, not a paragraph.** A bullet recorded only in prose drifts the
+moment someone edits the code it describes. Each bullet here is an assertion on
+the code, so the same defect the batch hunts -- a guard weaker than the claim it
+names -- would fail CI. `partc` guard #24 mutates `_reason_for_status` to collapse
+429 into the generic reason and proves the bullets file catches it (2 failed), so
+the re-verification is load-bearing rather than a restatement.
+
 ## Part M — FINAL PROOF (one command, one verdict)
 
 The acceptance gate. `tools/d3a5_final_proof.py` runs the whole D3a.5 battery and
@@ -1894,7 +1937,7 @@ What it proves, in three blocks:
    excluded, not silently run.
 2. **Every mutation driver kills all its guards, at the PINNED count.** A driver
    prints "all N guards killed", which stays true if a mutation is DELETED -- so
-   the runner pins each N externally (`parta 16`, `partbc 73`, `partc 35`,
+   the runner pins each N externally (`parta 16`, `partbc 73`, `partc 36`,
    `partd 36`, `parti 18`). A dropped guard makes the count mismatch and the
    proof FAIL. The three legacy D0/D1/D2-D3a drivers are reported for the record
    (separate work; their host-masked kills are a documented artifact).
