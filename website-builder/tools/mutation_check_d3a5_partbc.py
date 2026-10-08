@@ -977,6 +977,27 @@ MUTATIONS = [
                 "a package the builtins introduce has no exact application-owned pin"
             )""",
     ),
+    # 12h-bis. install_external_component must consult the trusted boundary.
+    # The external EXECUTION path is public and bypasses build_registry_request,
+    # so without this an incoherent boundary still drives `shadcn add`.
+    (
+        "install_external_component consults the trusted boundary",
+        INSTALL,
+        """        try:
+            trusted_registry_boundary()
+        except ValueError:
+            logger.error(
+                "The trusted registry boundary is incoherent; refusing the "
+                "external registry install."
+            )""",
+        """        try:
+            pass
+        except ValueError:
+            logger.error(
+                "The trusted registry boundary is incoherent; refusing the "
+                "external registry install."
+            )""",
+    ),
     # 12i. install_components must consult the trusted boundary (builtin path).
     (
         "install_components consults the trusted boundary",

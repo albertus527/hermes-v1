@@ -1575,3 +1575,51 @@ def test_an_unreviewed_require_or_dynamic_import_is_refused(project, form):
 
     assert outcome.state == INSTALL_FAILED
     assert outcome.reason == REASON_REGISTRY_SOURCE_IMPORT_UNREVIEWED
+
+
+def test_install_external_component_consults_the_trusted_boundary(project, monkeypatch):
+    """The EXTERNAL execution path must consult the boundary too.
+
+    The doc claims a drifted trust model cannot drive a registry command on
+    EITHER path. build_registry_request consults it, but install_external_component
+    is PUBLIC and a duck-typed stand-in bypasses the request builder -- so the
+    executing function must consult it itself. Verified before the fix: with an
+    incoherent boundary, `shadcn add <locator>` STILL ran.
+    """
+    import app.core.design_registry as registry
+
+    def _broken():
+        raise ValueError("drift")
+
+    monkeypatch.setattr(registry, "trusted_registry_boundary", _broken)
+
+    runner = RegistryRunner(dependency_writes={}, materializes=True,
+                            component_name="SplitText")
+    outcome = _installer(project, runner).install_external_component(_split_text_request())
+
+    assert outcome.state == INSTALL_FAILED
+    assert outcome.reason == registry.REASON_BOUNDARY_INCOHERENT
+    assert runner.commands == [], "an incoherent boundary must run no command"
+
+
+def test_the_external_path_consults_the_boundary_on_the_coherent_path_too(
+    project, monkeypatch
+):
+    """A coherent install STILL consults the boundary -- it is not only a refusal
+    branch. Counts the call rather than trusting the source."""
+    import app.core.design_registry as registry
+
+    real = registry.trusted_registry_boundary
+    calls = {"n": 0}
+
+    def _counting():
+        calls["n"] += 1
+        return real()
+
+    monkeypatch.setattr(registry, "trusted_registry_boundary", _counting)
+
+    runner = RegistryRunner(dependency_writes={}, materializes=True,
+                            component_name="SplitText")
+    _installer(project, runner).install_external_component(_split_text_request())
+
+    assert calls["n"] >= 1, "the boundary must be consulted on the executing path"

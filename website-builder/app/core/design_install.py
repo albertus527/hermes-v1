@@ -3207,16 +3207,34 @@ class DesignDependencyInstaller:
                 reason=REASON_COMPONENT_NOT_ALLOWED,
             )
 
-        # The accepted package set is derived from the APPLICATION-OWNED reviewed
-        # contract for this (source, component) -- NOT from a field on the passed
-        # object. A duck-typed stand-in with a widened
-        # ``required_dependency_ids`` therefore cannot expand what the boundary
-        # accepts: the contract is the single source of truth, resolved here
-        # rather than trusted from the argument.
+        # The trusted boundary is CONSULTED, not merely declared. The doc's claim
+        # is that a drifted trust model cannot drive a registry command on EITHER
+        # path -- but this function is PUBLIC and a duck-typed stand-in bypasses
+        # build_registry_request (which is where the external path consulted it).
+        # Verified: with an incoherent boundary, a command still ran. Consulting
+        # it HERE makes "no registry command from a drifted trust model" a
+        # property of the executing function, not of the caller having gone
+        # through the request builder. Mirrors install_components.
         from app.core.design_registry import (
+            REASON_BOUNDARY_INCOHERENT,
             resolve_registry_locator,
             reviewed_component_contract,
+            trusted_registry_boundary,
         )
+
+        try:
+            trusted_registry_boundary()
+        except ValueError:
+            logger.error(
+                "The trusted registry boundary is incoherent; refusing the "
+                "external registry install."
+            )
+            return InstallOutcome(
+                dependency_id=REGISTRY_DEPENDENCY,
+                state=INSTALL_FAILED,
+                package=None,
+                reason=REASON_BOUNDARY_INCOHERENT,
+            )
 
         source = getattr(request, "source", "")
         component_id = getattr(request, "component_id", "")
@@ -3241,6 +3259,12 @@ class DesignDependencyInstaller:
                 reason=REASON_LOCATOR_NOT_CANONICAL,
             )
 
+        # The accepted package set is derived from the APPLICATION-OWNED reviewed
+        # contract for this (source, component) -- NOT from a field on the passed
+        # object. A duck-typed stand-in with a widened
+        # ``required_dependency_ids`` therefore cannot expand what the boundary
+        # accepts: the contract is the single source of truth, resolved here
+        # rather than trusted from the argument.
         contract = reviewed_component_contract(source, component_id)
         if contract is None:
             return InstallOutcome(

@@ -115,12 +115,23 @@ The trust boundary follows the SAME idiom: `TrustedRegistryBoundary`
 
 **It is load-bearing, not decorative.** `trusted_registry_boundary()` is
 CONSULTED on BOTH install paths — the external path in `build_registry_request`
-(which builds the only installable request) and the builtin path in
-`install_components` (which never goes through the request builder). An
-incoherent boundary refuses the request / runs **no command**
-(`REASON_BOUNDARY_INCOHERENT`), so a drifted trust model cannot drive a registry
-command. "A guard that no execution path depends on is not a guard" is
-satisfied by construction: both paths call it.
+(which builds the only installable request) AND in the executing
+`install_external_component`, and the builtin path in `install_components` (which
+never goes through the request builder). An incoherent boundary refuses the
+request / runs **no command** (`REASON_BOUNDARY_INCOHERENT`), so a drifted trust
+model cannot drive a registry command.
+
+**A defect found and fixed here.** The claim above was only *half* true before this
+pass: `build_registry_request` consulted the boundary, but `install_external_component`
+— the PUBLIC executing function — did **not**, and a duck-typed stand-in bypasses
+the request builder entirely. Verified: with an incoherent boundary (a builtin dep
+row outside the allowlist), `install_external_component` STILL ran
+`shadcn add https://reactbits.dev/r/SplitText-TS-TW`. This is the SAME class as the
+locator bypass already fixed in that function ("`install_external_component` is
+public and a duck-typed stand-in bypasses the constructor"). Fix: consult the
+boundary in `install_external_component` itself, mirroring `install_components`, so
+"no registry command from a drifted trust model" is a property of the EXECUTING
+function, not of the caller having gone through the request builder.
 
 Pinned by `tests/test_design_registry_contract.py`
 (`test_the_live_trusted_boundary_is_coherent`,
@@ -1718,6 +1729,87 @@ checks the upstream metadata *before* the CLI runs — is a **caller-supplied se
 today; it is reachable via the public `install_external_component` API and covered
 by `tests/test_design_registry_mutation.py`, but it is not yet wired into
 `execute_selection`, which routes only the builtin component list.
+
+### VPS command: validate the reviewed dependency contract
+
+The reviewed contract (`_REVIEWED_COMPONENT_CONTRACTS`) is only as strong as the
+trust boundary that validates it. This command checks BOTH: the boundary is
+coherent, and every drift it claims to catch is actually caught.
+
+```bash
+cd website-builder && source .venv/bin/activate
+
+python -c "from app.core import design_registry as R; \
+  b = R.trusted_registry_boundary(); \
+  print('sources            :', b.sources); \
+  print('reviewed contracts :', sorted(b.reviewed_contracts)); \
+  print('introduced packages:', b.introduced_packages()); \
+  k = b.reviewed_contracts[('react_bits', 'SplitText')]; \
+  print('SplitText deps     :', k.expected_dependency_ids); \
+  print('SplitText nested   :', k.expected_registry_dependencies)"
+
+# Each drift is caught. Run this self-contained script (it isolates ONE drift at
+# a time, because one check can mask another):
+python - <<'PY'
+from app.core import design_registry as R
+
+def build(**overrides):
+    base = dict(
+        sources=tuple(R.REGISTRY_SOURCES), hosts=dict(R.REGISTRY_HOSTS),
+        locator_templates=dict(R._LOCATOR_TEMPLATES),
+        approved_components={s: tuple(sorted(c)) for s, c in R._APPROVED_COMPONENTS.items()},
+        reviewed_contracts=dict(R._REVIEWED_COMPONENT_CONTRACTS),
+        builtin_components=tuple(R.ALLOWED_SHADCN_COMPONENTS),
+        builtin_packages={c: tuple(p) for c, p in R.REVIEWED_BUILTIN_COMPONENT_DEPENDENCIES.items()},
+        builtin_imports={c: tuple(p) for c, p in R.REVIEWED_BUILTIN_COMPONENT_IMPORTS.items()},
+        builtin_nested={c: tuple(t) for c, t in R.REVIEWED_BUILTIN_COMPONENT_NESTED.items()},
+        introduced_pins=dict(R.REGISTRY_INTRODUCED_PACKAGE_PINS), shadcn_cli_spec='shadcn@4.21.0',
+    )
+    base.update(overrides)
+    return base
+
+for name, overrides in [
+    ('inexact introduced pin', dict(introduced_pins={'cn': '^0.4.0'})),
+    ('missing introduced pin', dict(introduced_pins={})),
+    ('floating CLI pin', dict(shadcn_cli_spec='shadcn@latest')),
+    ('stray locator template', dict(locator_templates={**R._LOCATOR_TEMPLATES, 'ghost': 'https://x/{component}'})),
+    ('nested row outside the allowlist',
+     dict(builtin_nested={**{c: tuple(t) for c, t in R.REVIEWED_BUILTIN_COMPONENT_NESTED.items()}, 'dialog': ('ghost',)})),
+]:
+    try:
+        R.TrustedRegistryBoundary(**build(**overrides))
+        print('  %-30s ACCEPTED (defect)' % name)
+    except ValueError as e:
+        print('  %-30s REFUSED: %s' % (name, str(e)[:44]))
+PY
+
+# The boundary is CONSULTED on the executing paths (both must refuse):
+python -c "import app.core.design_registry as R; \
+  orig = R.trusted_registry_boundary; \
+  R.trusted_registry_boundary = lambda: (_ for _ in ()).throw(ValueError('drift')); \
+  try: R.trusted_registry_boundary(); print('boundary: ACCEPTED (defect)') \
+  except ValueError: print('boundary REFUSES drift -> both install paths run NO command')"
+```
+
+**Observed on the qualification host (2026-10):**
+
+| check | result |
+|---|---|
+| live boundary | constructs: sources `('shadcn_builtin','twenty_first','react_bits')`, contracts `[('react_bits','SplitText')]`, introduced `('cn','lucide-react','radix-ui')` |
+| SplitText contract | `expected_dependency_ids=('gsap','gsap_react')`, `expected_registry_dependencies=()` |
+| inexact introduced pin | **REFUSED** (`registry-introduced pin is not exact`) |
+| missing introduced pin | **REFUSED** (`…has no exact application-owned pin`) |
+| floating CLI pin | **REFUSED** (`the pinned shadcn CLI spec is not an exact pin`) |
+| stray locator template | **REFUSED** (`locator templates must exist for exactly the hosted sources`) |
+| contract keyed to the builtin source | **REFUSED** |
+| builtin name as an approved external identity | **REFUSED** |
+| nested row outside the allowlist | **REFUSED** |
+| **the boundary is consulted on BOTH executing paths** | `install_components` AND `install_external_component` refuse with `REASON_BOUNDARY_INCOHERENT` and run **no command** |
+
+Each check was isolated (a single drift at a time), because an earlier probe let
+one check fire first and mask the others — a guard that is never exercised is not
+a proven guard.
+
 
 
 

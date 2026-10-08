@@ -830,3 +830,21 @@ def test_the_documented_registry_json_command_states_the_external_path_is_not_wi
 
     assert "execute_selection" in text
     assert "not yet wired" in text
+
+
+def test_the_documented_contract_validation_command_is_present():
+    """The command validates the reviewed contract AND the trust boundary."""
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    assert "validate the reviewed dependency contract" in text
+    assert "trusted_registry_boundary" in text
+    assert "REFUSED" in text
+
+
+def test_the_documented_contract_command_states_the_boundary_is_consulted_both_paths():
+    """The claim is that BOTH executing paths refuse an incoherent boundary."""
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    assert "install_components" in text
+    assert "install_external_component" in text
+    assert "no command" in text.lower()
