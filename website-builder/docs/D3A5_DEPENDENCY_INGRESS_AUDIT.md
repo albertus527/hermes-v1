@@ -236,6 +236,25 @@ GET https://21st.dev/api/v1/components/search?q=<term>&scope=public&limit=24
 - **No fabrication.** A malformed or empty search response is a degraded empty
   result, never an invented entry.
 
+### Item 2 evidence: a REGRESSION that pins capability == execution
+
+Item 2 ("capability truth must match actual execution requirements") is evidenced
+by a regression suite in `tests/test_design_resource_coherence.py` -- the file
+whose stated purpose is catching DRIFT between layers. The assertions:
+
+* `authentication_required` equals the adapter's own `credential_requirement`
+  for every catalog source (no second opinion);
+* with no credential, exactly the gated axes are closed;
+* with a credential, exactly the gated axes open;
+* install is gated by REVIEW, never by a credential (a key does not confer
+  install for a source with an empty reviewed allowlist);
+* an unmet required credential degrades the capability;
+* every installable on-demand resource has the mechanism its axis claims.
+
+These run in the partc driver (`RUN_TESTS`), so the `21st is credential-gated`
+mutation now kills 7 tests rather than 3 -- the drift cannot return without the
+coherence regression going red.
+
 ### A configured credential must actually REACH the request
 
 "If real discovery requires an API key": then a key that IS configured must be

@@ -459,3 +459,131 @@ def test_the_missing_required_skill_is_reported_not_hidden(manifest, tmp_path):
     report = _activate(tmp_path, manifest)
 
     assert "ui_ux_pro_max" in report.degraded or "ui_ux_pro_max" in report.failures
+
+
+# ---------------------------------------------------------------------------
+# Capability truth MATCHES the execution requirement (item 2)
+# ---------------------------------------------------------------------------
+# The capability layer and the execution layer must answer the same question the
+# same way: does using this resource need a credential? The adapter owns the
+# closed tables (CREDENTIAL_REQUIRED_FOR_DISCOVERY / _RETRIEVAL); the capability
+# layer must report exactly that -- no more, no less. These are REGRESSION
+# assertions: they fail if either layer drifts from the other.
+
+
+def _catalog_ids():
+    from app.core.design_registry import SOURCE_REACT_BITS, SOURCE_TWENTY_FIRST
+
+    return (SOURCE_TWENTY_FIRST, SOURCE_REACT_BITS)
+
+
+@pytest.mark.parametrize("source", _catalog_ids())
+def test_capability_auth_requirement_matches_the_adapter_table(source, manifest, tmp_path):
+    """authentication_required is the adapter's own answer, not a second opinion."""
+    from app.core.design_catalog_fetch import credential_requirement
+
+    disc_auth, retr_auth = credential_requirement(source)
+    capability = _activate(tmp_path, manifest).capabilities[source]
+
+    assert capability.authentication_required is (disc_auth or retr_auth), source
+
+
+@pytest.mark.parametrize("source", _catalog_ids())
+def test_no_credential_closes_exactly_the_gated_axes(source, manifest, tmp_path):
+    """With no credential, each axis matches what its executor actually needs."""
+    from app.core.design_catalog_fetch import credential_requirement
+
+    disc_auth, retr_auth = credential_requirement(source)
+    capability = _activate(tmp_path, manifest).capabilities[source]
+
+    if disc_auth:
+        assert capability.discovery_available is False, source
+    if retr_auth:
+        assert capability.retrieval_available is False, source
+
+
+@pytest.mark.parametrize("source", _catalog_ids())
+def test_a_present_credential_opens_exactly_the_gated_axes(
+    source, manifest, tmp_path, monkeypatch
+):
+    """A configured credential must restore precisely the axes it gates."""
+    from app.core.design_catalog_fetch import credential_requirement
+    from app.core.design_resources import CREDENTIAL_ENV_NAMES
+
+    names = CREDENTIAL_ENV_NAMES.get(source, ())
+    if not names:
+        pytest.skip(f"{source} needs no credential")
+
+    for name in names:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(names[0], "present-not-verified")
+
+    disc_auth, retr_auth = credential_requirement(source)
+    capability = _activate(tmp_path, manifest).capabilities[source]
+
+    assert capability.authentication_present is True
+    if disc_auth:
+        assert capability.discovery_available is True, source
+    if retr_auth:
+        assert capability.retrieval_available is True, source
+
+
+def test_install_is_gated_by_review_not_by_a_credential(manifest, tmp_path, monkeypatch):
+    """A credential never confers install: review does.
+
+    Nothing is reviewed for 21st, so install stays closed even with a present
+    credential -- the install axis must track the reviewed allowlist, not the key.
+    """
+    from app.core.design_registry import (
+        SOURCE_TWENTY_FIRST,
+        approved_registry_components,
+    )
+
+    monkeypatch.setenv("TWENTY_FIRST_API_KEY", "present-not-verified")
+    capability = _activate(tmp_path, manifest).capabilities["twenty_first"]
+
+    assert approved_registry_components(SOURCE_TWENTY_FIRST) == ()
+    assert capability.install_available is False
+
+
+def test_a_credential_gated_resource_is_degraded_without_its_credential(
+    manifest, tmp_path
+):
+    """The blanket consequence of item 2: an unmet required credential degrades.
+
+    For every resource whose execution needs a credential, the capability layer
+    must report the reduction (degraded) when that credential is absent -- not a
+    clean, fully-available state.
+    """
+    from app.core.design_catalog_fetch import credential_requirement
+
+    report = _activate(tmp_path, manifest)
+    for resource_id, capability in report.capabilities.items():
+        disc_auth, retr_auth = credential_requirement(resource_id)
+        if not (disc_auth or retr_auth):
+            continue
+        if capability.authentication_present:
+            continue
+        assert capability.authentication_required is True, resource_id
+        assert capability.degraded is True, resource_id
+
+
+def test_every_installable_on_demand_resource_has_a_real_mechanism():
+    """install_available=True for an on-demand dep means a mechanism exists.
+
+    The execution requirement differs by kind -- an npm package builds an
+    install argv, the registry CLI builds a registry request -- so the capability
+    must not claim install without the matching mechanism.
+    """
+    from app.core.design_activation import INSTALLABLE_ON_DEMAND
+    from app.core.design_install import build_install_argv
+
+    for dependency_id in INSTALLABLE_ON_DEMAND:
+        if dependency_id == "shadcn":
+            # The registry CLI has no npm argv; its mechanism is the registry.
+            from app.core.design_registry import ALLOWED_SHADCN_COMPONENTS
+
+            assert ALLOWED_SHADCN_COMPONENTS, dependency_id
+            continue
+        argv = build_install_argv(("npm", "install"), dependency_id)
+        assert argv, dependency_id

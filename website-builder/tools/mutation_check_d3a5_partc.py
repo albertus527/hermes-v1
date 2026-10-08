@@ -36,6 +36,11 @@ ROOT = Path(__file__).resolve().parents[1]
 IGNORED = shutil.ignore_patterns("__pycache__", "*.pyc", ".git", ".venv", "venv")
 
 ACTIVATION_TESTS = "tests/test_design_activation.py"
+#: The cross-layer coherence suite carries the item-2 regression: capability
+#: truth must MATCH the adapter's execution requirement. It is run alongside the
+#: activation tests so a drift between the two layers is caught here.
+COHERENCE_TESTS = "tests/test_design_resource_coherence.py"
+RUN_TESTS = (ACTIVATION_TESTS, COHERENCE_TESTS)
 ACTIVATION = "app/core/design_activation.py"
 RESOURCES = "app/core/design_resources.py"
 
@@ -373,7 +378,7 @@ def run_tests(cwd, test_files):
 
 
 def main():
-    baseline_code, tail = run_tests(ROOT, ACTIVATION_TESTS)
+    baseline_code, tail = run_tests(ROOT, RUN_TESTS)
     print(f"Part C baseline: exit={baseline_code} {tail}")
     if baseline_code != 0:
         return 1
@@ -400,7 +405,7 @@ def main():
             shutil.copytree(ROOT, work, ignore=IGNORED)
             (work / relative).write_text(mutated, encoding="utf-8")
 
-            code, tail = run_tests(work, ACTIVATION_TESTS)
+            code, tail = run_tests(work, RUN_TESTS)
             if code == 0:
                 print(f"[SURVIVED]   {label} -- tests still pass without this guard")
                 unproven.append(f"{label}: tests still pass without this guard")
