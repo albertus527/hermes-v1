@@ -947,3 +947,64 @@ def test_a_user_following_upstream_docs_gets_discovery(home, monkeypatch):
 
     assert capability.authentication_present is True
     assert capability.discovery_available is True
+
+
+# ---------------------------------------------------------------------------
+# `discovery_available` is backed by a BUILDABLE request, not a key
+# ---------------------------------------------------------------------------
+#
+# The defect: _has_live_discovery_adapter tested KEY MEMBERSHIP in the endpoint
+# tables. A source present as a key with a None value (or one whose endpoint
+# fails its own host allowlist) was reported as having a live adapter, so the
+# capability layer said discovery_available=True while build_discovery_url()
+# returned None -- discovery APPEARED available with no request behind it.
+
+
+def test_a_none_valued_endpoint_key_is_not_a_live_adapter(monkeypatch):
+    """A key with no usable URL must NOT count as an adapter."""
+    import app.core.design_catalog_fetch as fetch
+
+    monkeypatch.setattr(fetch, "CATALOG_ENDPOINTS", {"twenty_first": None})
+    monkeypatch.setattr(fetch, "CATALOG_SEARCH_ENDPOINTS", {})
+
+    assert fetch.build_discovery_url("twenty_first") is None
+    assert _has_live_discovery_adapter("twenty_first") is False
+
+
+def test_an_endpoint_failing_its_own_allowlist_is_not_a_live_adapter(monkeypatch):
+    """A URL that fails the host allowlist is not a usable adapter."""
+    import app.core.design_catalog_fetch as fetch
+
+    monkeypatch.setattr(
+        fetch, "CATALOG_SEARCH_ENDPOINTS",
+        {"twenty_first": "https://evil.example/api/v1/components/search"},
+    )
+    monkeypatch.setattr(fetch, "CATALOG_ENDPOINTS", {})
+
+    assert fetch.build_discovery_url("twenty_first") is None
+    assert _has_live_discovery_adapter("twenty_first") is False
+
+
+def test_the_probe_agrees_with_build_discovery_url_for_every_source():
+    """The property: adapter reported <=> a URL can actually be built."""
+    import app.core.design_catalog_fetch as fetch
+    from app.core.design_registry import SOURCE_REACT_BITS, SOURCE_TWENTY_FIRST
+
+    for source in (SOURCE_TWENTY_FIRST, SOURCE_REACT_BITS, "unknown_source"):
+        assert _has_live_discovery_adapter(source) is (
+            fetch.build_discovery_url(source) is not None
+        ), source
+
+
+def test_a_dead_endpoint_key_yields_no_discovery_capability(home, monkeypatch):
+    """End to end: the capability layer must not report discovery for it."""
+    import app.core.design_catalog_fetch as fetch
+
+    monkeypatch.setattr(fetch, "CATALOG_ENDPOINTS", {"react_bits": None})
+    monkeypatch.setattr(fetch, "CATALOG_SEARCH_ENDPOINTS", {})
+
+    capability = _activate(_manifest_resource(REACT_BITS, skill_name="x"), home)
+
+    assert capability.discovery_available is False
+    assert capability.degraded is True
+    assert REASON_NO_LIVE_ADAPTER in capability.reasons

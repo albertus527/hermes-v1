@@ -73,6 +73,20 @@ MUTATIONS = [
             "install_available": _one == "install",
             "critic_available": _one == "critic",""",
     ),
+    # --- 0z. discovery needs a BUILDABLE request, not a key ---------------
+    # Testing key membership reports discovery available for a None-valued
+    # endpoint (nothing to fetch): discovery APPEARS available.
+    (
+        "the adapter probe asks for a buildable URL, not a key",
+        ACTIVATION,
+        """    try:
+        return builder(source) is not None
+    except Exception:  # pragma: no cover - a broken builder is not a capability
+        return False""",
+        """    index_endpoints = getattr(_fetch, "CATALOG_ENDPOINTS", None) or {}
+    search_endpoints = getattr(_fetch, "CATALOG_SEARCH_ENDPOINTS", None) or {}
+    return source in index_endpoints or source in search_endpoints""",
+    ),
     # --- 0a. the official credential env names are recognised ------------
     # 21st's own skill documents TWENTYFIRST_TOKEN / API_KEY_21ST. Dropping them
     # makes a user who follows upstream's docs a false negative.
@@ -189,12 +203,16 @@ MUTATIONS = [
     (
         "the discovery adapter probe is per-source",
         ACTIVATION,
-        """    index_endpoints = getattr(_fetch, "CATALOG_ENDPOINTS", None) or {}
-    search_endpoints = getattr(_fetch, "CATALOG_SEARCH_ENDPOINTS", None) or {}
-    return source in index_endpoints or source in search_endpoints""",
-        """    index_endpoints = getattr(_fetch, "CATALOG_ENDPOINTS", None) or {}
-    search_endpoints = getattr(_fetch, "CATALOG_SEARCH_ENDPOINTS", None) or {}
-    return bool(index_endpoints or search_endpoints)""",
+        """    try:
+        return builder(source) is not None
+    except Exception:  # pragma: no cover - a broken builder is not a capability
+        return False""",
+        """    try:
+        return builder(source) is not None or builder(
+            next(iter(getattr(_fetch, "CATALOG_SEARCH_ENDPOINTS", {}) or {"_": "_"}))
+        ) is not None
+    except Exception:  # pragma: no cover
+        return False""",
     ),
     # --- 6. declared does not mean capable --------------------------------
     (

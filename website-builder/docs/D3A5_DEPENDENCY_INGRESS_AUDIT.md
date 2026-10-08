@@ -236,6 +236,28 @@ GET https://21st.dev/api/v1/components/search?q=<term>&scope=public&limit=24
 - **No fabrication.** A malformed or empty search response is a degraded empty
   result, never an invented entry.
 
+### `discovery_available` is backed by a BUILDABLE request, not a key
+
+The live-adapter probe (`_has_live_discovery_adapter`) decides whether the
+capability layer may report `discovery_available=True`. It tested **KEY
+MEMBERSHIP** in the endpoint tables:
+
+```
+CATALOG_ENDPOINTS = {"twenty_first": None}   # a dead key
+_has_live_discovery_adapter("twenty_first") -> True    # WRONG
+build_discovery_url("twenty_first")         -> None    # nothing to fetch
+```
+
+So a source present as a key with a `None` value -- or one whose endpoint fails
+its own host allowlist -- was reported as having a live adapter: **discovery
+appeared available with no request behind it.**
+
+Fix: the probe now delegates to the adapter's own `build_discovery_url(source)`,
+the single function that decides whether a request can be built (host allowlist
+included), and reports available iff it returns a URL. The property asserted is
+now `_has_live_discovery_adapter(s) <=> build_discovery_url(s) is not None`, for
+every source.
+
 ### The interface we call is the AUTHORITATIVE one (21st says so)
 
 21st publishes several machine-readable surfaces. Which one is authoritative is

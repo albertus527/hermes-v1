@@ -81,9 +81,16 @@ def _has_live_discovery_adapter(source: str) -> bool:
     index endpoint (``CATALOG_ENDPOINTS``) OR an authenticated REST search
     (``CATALOG_SEARCH_ENDPOINTS``). A source-agnostic check would confer one
     source's capability on another -- reporting 21st's adapter available because
-    React Bits happens to populate a table, or vice versa. The question is
-    always "does THIS source have an endpoint this module can build a request
-    for", so both tables are consulted for the SAME source.
+    React Bits happens to populate a table, or vice versa.
+
+    **Asks whether a URL can actually be BUILT, not whether a key exists.** The
+    question the capability layer needs answered is "can this build issue a
+    discovery request for THIS source", so the probe delegates to the adapter's
+    own ``build_discovery_url`` -- the single function that decides that, host
+    allowlist included. Testing mere KEY membership would report discovery
+    available for a source whose endpoint value is ``None`` or fails its own
+    allowlist, i.e. a source the module cannot build any request for: discovery
+    would APPEAR available with nothing behind it.
 
     ``design_catalog_fetch`` is the adapter. It is IMPORTED HERE on purpose:
     the import is local and pure (stdlib plus the offline normalizer), and it
@@ -95,11 +102,15 @@ def _has_live_discovery_adapter(source: str) -> bool:
         from app.core import design_catalog_fetch as _fetch
     except Exception:  # pragma: no cover - import failure is the answer
         return False
+    builder = getattr(_fetch, "build_discovery_url", None)
+    if not callable(builder):
+        return False
     if not getattr(_fetch, "discover_catalog", None):
         return False
-    index_endpoints = getattr(_fetch, "CATALOG_ENDPOINTS", None) or {}
-    search_endpoints = getattr(_fetch, "CATALOG_SEARCH_ENDPOINTS", None) or {}
-    return source in index_endpoints or source in search_endpoints
+    try:
+        return builder(source) is not None
+    except Exception:  # pragma: no cover - a broken builder is not a capability
+        return False
 
 logger = logging.getLogger(__name__)
 
