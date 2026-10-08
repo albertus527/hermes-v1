@@ -1916,6 +1916,24 @@ names -- would fail CI. `partc` guard #24 mutates `_reason_for_status` to collap
 429 into the generic reason and proves the bullets file catches it (2 failed), so
 the re-verification is load-bearing rather than a restatement.
 
+### A latent interpreter-upgrade break, found by a plain `pytest tests/ -q`
+
+Running the suite surfaced **8 warnings**, one of them a
+`SyntaxWarning: invalid escape sequence '\s'` originating in this project's own
+code. Traced to `tools/mutation_check_d3a5_partd.py`: two mutation ANCHORS held
+the reduced-motion regex snippets as **non-raw** string literals, so `\s` / `\(`
+/ `\{` were invalid escapes. The VALUE was correct (an invalid escape is
+preserved literally), so every guard still passed -- but the construct compiles
+today with a warning and becomes a hard `SyntaxError` on a future interpreter.
+That is the same class again: a defect the normal run does not fail on.
+
+Fixed by making both anchors **raw strings** (`r"""..."""`); the anchors are
+byte-identical, and `partd` still kills **36/36**. Guarded by
+`tests/test_suite_hygiene.py`, which now scans every `app/`, `tests/` and
+`tools/` `.py` with `compile()` under a warnings filter and fails on any invalid
+escape -- with a self-proof that a planted `"\s"` is caught and an `r"\s"` is
+clean. `partc` guard #21b proves that scanner is load-bearing (2 failed).
+
 ## Part M — FINAL PROOF (one command, one verdict)
 
 The acceptance gate. `tools/d3a5_final_proof.py` runs the whole D3a.5 battery and
@@ -1937,7 +1955,7 @@ What it proves, in three blocks:
    excluded, not silently run.
 2. **Every mutation driver kills all its guards, at the PINNED count.** A driver
    prints "all N guards killed", which stays true if a mutation is DELETED -- so
-   the runner pins each N externally (`parta 16`, `partbc 73`, `partc 36`,
+   the runner pins each N externally (`parta 16`, `partbc 73`, `partc 37`,
    `partd 36`, `parti 18`). A dropped guard makes the count mismatch and the
    proof FAIL. The three legacy D0/D1/D2-D3a drivers are reported for the record
    (separate work; their host-masked kills are a documented artifact).

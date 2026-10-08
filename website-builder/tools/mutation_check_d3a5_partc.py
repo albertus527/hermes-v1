@@ -496,6 +496,20 @@ MUTATIONS = [
     return sorted(name for name, count in seen.items() if count > 1)""",
         """    return []""",
     ),
+    # --- 21b. the invalid-escape scanner actually detects one
+    # A non-raw string with `\s` is a SyntaxWarning today and a SyntaxError in a
+    # future Python. If the scanner returns [] unconditionally the guard is
+    # vacuous. Mutate it so it never reports a finding; the self-proof must fail.
+    (
+        "the invalid-escape scanner actually detects one",
+        HYGIENE_TESTS,
+        """        for item in caught:
+            if issubclass(item.category, SyntaxWarning):
+                found.append((item.lineno or 0, str(item.message)))
+    return found""",
+        """        pass
+    return []""",
+    ),
     # --- 22. the offline guard actually detects a network-reaching test
     # If the scanner never reports an offender, a test that shells out to npm
     # would slip back into the default suite. Mutate the reachability check so

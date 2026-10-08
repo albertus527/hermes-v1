@@ -40,7 +40,7 @@ REPO = ROOT.parent
 D3A5_DRIVERS: Tuple[Tuple[str, int], ...] = (
     ("mutation_check_d3a5_parta.py", 16),
     ("mutation_check_d3a5_partbc.py", 73),
-    ("mutation_check_d3a5_partc.py", 36),
+    ("mutation_check_d3a5_partc.py", 37),
     ("mutation_check_d3a5_partd.py", 36),
     ("mutation_check_d3a5_parti.py", 18),
 )

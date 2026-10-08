@@ -389,10 +389,10 @@ MUTATIONS = [
     (
         "the reduced-motion guard is matched as the @media block, not the phrase",
         TRANSITIONS,
-        """_REDUCED_MOTION_RE = re.compile(
+        r"""_REDUCED_MOTION_RE = re.compile(
     r"@media\s*\(\s*prefers-reduced-motion\s*:\s*reduce\s*\)\s*\{", re.IGNORECASE
 )""",
-        """_REDUCED_MOTION_RE = re.compile(
+        r"""_REDUCED_MOTION_RE = re.compile(
     r"prefers-reduced-motion\s*:\s*reduce", re.IGNORECASE
 )""",
     ),
