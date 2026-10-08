@@ -667,3 +667,45 @@ def test_the_documented_delta_verifier_symbols_exist():
     assert "verify_direct_dependency_delta" in text
     assert callable(snapshot_direct_dependency_state)
     assert callable(verify_direct_dependency_delta)
+
+
+def test_the_live_smoke_doc_has_no_vacuous_self_comparison():
+    """The no-delta proof must be a check that CAN fail.
+
+    `git diff --no-index package.json package.json` compares a file to ITSELF:
+    it exits 0 with empty output no matter what changed. Documenting it as the
+    "unchanged" proof would be a check whose enforcement is weaker than the
+    property it names -- the exact defect class this batch fixes.
+    """
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    assert "git diff --no-index package.json package.json" not in text
+    # the real check compares against a SEPARATE baseline
+    assert "cmp -s" in text
+    assert "BASELINE" in text
+
+
+def test_the_live_smoke_uses_a_fresh_disposable_dir():
+    """`mkdir -p` reuses state; the doc must use a fresh dir per run."""
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    assert "mktemp -d" in text
+    # the old re-usable path must be gone
+    assert "mkdir -p /tmp/partL" not in text
+
+
+def test_the_live_smoke_doc_requires_the_venv():
+    """pytest lives only in the venv; the doc must say so explicitly."""
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+
+    assert "source .venv/bin/activate" in text
+    assert "REQUIRED" in text
+
+
+def test_the_live_smoke_doc_does_not_hard_code_a_test_count():
+    """A hard-coded count self-drifts on every test added; keep it qualitative."""
+    import re
+
+    text = LIVE_SMOKE_DOC.read_text(encoding="utf-8")
+    # no `# <N> passed, <N> skipped` comment beside the pytest line
+    assert not re.search(r"pytest tests/ -q\s+#\s*\d+ passed", text)

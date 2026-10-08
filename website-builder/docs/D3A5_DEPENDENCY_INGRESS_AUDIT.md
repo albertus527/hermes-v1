@@ -1437,11 +1437,15 @@ smoke — each live smoke below was checked to FAIL when its upstream is removed
 ### L.1 — offline unit suite first
 
 ```bash
-cd website-builder && source .venv/bin/activate
-python -m pytest tests/ -q          # 3505 passed, 2 skipped
+cd website-builder
+source .venv/bin/activate          # REQUIRED: pytest lives only in the venv
+python -m pytest tests/ -q         # expect: all green (the count grows as tests are added)
 ```
 
 ### L.2 — the live smokes
+
+Run these from the same activated shell. Every command below is the exact one
+observed in L.3; none is illustrative.
 
 ```bash
 # 1. SplitText resolves to the reviewed contract (local).
@@ -1466,10 +1470,22 @@ python -c "from app.core.design_activation import engine_quality as q; \
 # 5. transitions-dev list (LIVE pinned CLI; no account).
 npm exec --yes --package=transitions-dev@0.3.0 -- transitions-dev list
 
-# 6. transitions-dev add card-resize, in a DISPOSABLE dir (LIVE pinned CLI).
-mkdir -p /tmp/partL && cd /tmp/partL && echo '{"name":"p","version":"1.0.0"}' > package.json
+# 6. transitions-dev add card-resize, in a FRESH disposable dir (LIVE pinned CLI).
+#    mktemp, not `mkdir -p`: a re-used dir would carry run 1's artifact, so
+#    "creates ONLY ..." would no longer be a clean observation.
+WORK="$(mktemp -d)" && cd "$WORK"
+printf '%s\n' '{"name":"p","version":"1.0.0"}' > package.json
+BASELINE="$(mktemp)" && cp package.json "$BASELINE"   # baseline OUTSIDE the tree
 npm exec --yes --package=transitions-dev@0.3.0 -- transitions-dev add card-resize
-ls transitions/ && git diff --no-index package.json package.json   # unchanged
+find . -type f -not -path './node_modules/*' | sort
+# expect exactly: ./package.json  ./transitions/card-resize.md
+# The no-dependency-delta proof MUST be a check that can fail. `git diff --no-index
+# package.json package.json` compares a file to ITSELF -- it exits 0 with empty
+# output no matter what changed, so it proves nothing. Compare against the copy:
+cmp -s "$BASELINE" package.json \
+  && echo "package.json UNCHANGED (no dependency delta)" \
+  || { echo "package.json CHANGED:"; diff "$BASELINE" package.json; }
+# expect: "package.json UNCHANGED (no dependency delta)"
 ```
 
 ### L.3 — observed on the qualification host (2026-10)
@@ -1481,22 +1497,23 @@ ls transitions/ && git diff --no-index package.json package.json   # unchanged
 | 3 | 21st credential gate | `discovery_available=False`, `authentication_required=True`, `degraded=True`; with `API_KEY_21ST` set → `discovery_available=True`, `degraded=False` |
 | 4 | Impeccable engine quality | `missing` on a host with no provisioned skill |
 | 5 | transitions-dev list | exit 0, 32 free recipes incl. `card-resize` |
-| 6 | transitions-dev add | exit 0, `✓ Added Card resize → transitions/card-resize.md`; creates ONLY `transitions/card-resize.md`; `package.json` byte-identical (no dependency delta) |
+| 6 | transitions-dev add | exit 0, `✓ Added Card resize → transitions/card-resize.md`; `find` shows ONLY `package.json` + `transitions/card-resize.md`; `cmp -s` reports `package.json UNCHANGED` (no dependency delta) |
 
 **Live-ness proven, not assumed.** Smoke 2 returns `ok=False` with the socket
 layer disabled and `ok=True` with it — it is a real live smoke, not a fake one.
 Smoke 3 flips `discovery_available` False→True when a credential is configured,
-so it is testing the gate, not a constant.
+so it is testing the gate, not a constant. Smoke 6's `cmp -s` check was verified
+to FAIL when an extra dependency is injected, so it is a real check.
 
 ### L.4 — the reusable delta verifier against a real CLI artifact
 
-After smoke 6, the delta verifier must still accept the real artifact and refuse an
-injected extra dependency:
+After smoke 6, in the same disposable `$WORK` dir, the delta verifier must accept
+the real artifact and refuse an injected extra dependency:
 
 ```bash
-python -c "import sys; from pathlib import Path; sys.path.insert(0, '.'); \
+python -c "import os, sys; from pathlib import Path; sys.path.insert(0, '.'); \
   from app.core.design_install import snapshot_direct_dependency_state as s, verify_direct_dependency_delta as v; \
-  root = Path('/tmp/partL'); before = s(root); \
+  root = Path(os.environ['WORK']); before = s(root); \
   import json; d = json.loads((root/'package.json').read_text()); \
   d.setdefault('dependencies', {})['evil-lifecycle'] = '9.9.9'; \
   (root/'package.json').write_text(json.dumps(d)); \
@@ -1510,5 +1527,7 @@ The suite bans sockets (`socket.socket.connect`, `create_connection`,
 `getaddrinfo`) and does not shell out to `npm`. A live smoke therefore cannot be a
 unit test without weakening that ban. The doc records the COMMANDS and the
 OBSERVED outputs; the suite separately pins the offline behaviour
-(`test_live_smoke_is_documented_rather_than_executed`).
+(`test_live_smoke_is_documented_rather_than_executed`) and the fact that every
+symbol these commands import still exists.
+
 

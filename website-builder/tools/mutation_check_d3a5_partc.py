@@ -366,7 +366,18 @@ MUTATIONS = [
         reasons=(),
     )""",
     ),
-    # --- 15. Part L: the documented LIVE smokes stay runnable -------------
+    # --- 15. Part L: the documented no-delta proof must be able to FAIL -----
+    # The doc must not document a self-comparison as the "unchanged" proof:
+    # `git diff --no-index package.json package.json` compares a file to itself,
+    # so it exits 0 with empty output no matter what changed. Mutate the doc to
+    # reintroduce it; the doc-integrity test must fail.
+    (
+        "the documented no-delta proof can actually fail",
+        AUDIT_DOC,
+        'cmp -s "$BASELINE" package.json \\\n  && echo "package.json UNCHANGED (no dependency delta)"',
+        'git diff --no-index package.json package.json   # unchanged',
+    ),
+    # --- 16. Part L: the documented LIVE smokes stay runnable --------------
     # The doc records manual smoke commands. If a command names a symbol that no
     # longer exists, a reader following the doc hits an ImportError -- so the
     # doc-rot guard must fail. Mutate a documented import to a bogus name.
