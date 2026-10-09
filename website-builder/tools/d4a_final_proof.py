@@ -42,6 +42,12 @@ D4A_TEST_FILES: Tuple[str, ...] = (
     "tests/test_openviking_composition.py",
 )
 
+#: The D4a.1 focused tests: the live backend + reviewed corpus (offline,
+#: deterministic; the real-server run is a separate, approval-gated command).
+D4A1_TEST_FILES: Tuple[str, ...] = (
+    "tests/test_openviking_live.py",
+)
+
 #: Applicable D3a.5 + D3b regression tests: the seams D4a builds beside and must
 #: not have broken.
 D3_REGRESSION_TESTS: Tuple[str, ...] = (
@@ -79,6 +85,8 @@ D3A5_DRIVERS: Tuple[Tuple[str, int], ...] = (
 #: The D3b and D4a mutation drivers and their PINNED guard counts.
 D3B_DRIVER = ("mutation_check_d3b.py", 14)
 D4A_DRIVER = ("mutation_check_d4a.py", 17)
+#: D4a.1: the live backend + corpus guards.
+D4A1_DRIVER = ("mutation_check_d4a1.py", 7)
 
 EXPECTED_DESELECTED = 4
 
@@ -100,12 +108,19 @@ NO_OPENVIKING_IMPORTS: Tuple[str, ...] = (
     "app/core/composition.py",        # project instruction composition
 )
 
-#: Files that MUST exist after D4a.
+#: Files that MUST exist after D4a/D4a.1.
 REQUIRED_ARTIFACTS: Tuple[str, ...] = (
     "app/core/openviking_library.py",
     "app/core/openviking_retrieval.py",
+    "app/core/openviking_live.py",
+    "app/core/openviking_corpus.py",
     "tools/mutation_check_d4a.py",
+    "tools/mutation_check_d4a1.py",
     "tools/d4a_final_proof.py",
+    "tools/openviking_qualify.py",
+    "tools/openviking_provision.sh",
+    "deploy/openviking/ov.conf.template",
+    "deploy/openviking/openviking-website.service",
     "docs/D4A_OPENVIKING_FOUNDATION_ACCEPTANCE.md",
     "app/core/design_retrieval.py",   # the D1 seam is untouched
 )
@@ -178,12 +193,12 @@ def _summary(output: str) -> str:
 
 def check_focused() -> Check:
     proc = _run(
-        [sys.executable, "-m", "pytest", *D4A_TEST_FILES, "-q", "-p", "no:cacheprovider"],
+        [sys.executable, "-m", "pytest", *(D4A_TEST_FILES + D4A1_TEST_FILES), "-q", "-p", "no:cacheprovider"],
         cwd=ROOT,
     )
     tail = _summary(proc.stdout)
     ok = proc.returncode == 0 and "failed" not in tail and "error" not in tail
-    return Check("focused D4a tests", ok, tail)
+    return Check("focused D4a/D4a.1 tests", ok, tail)
 
 
 def check_d3_regression() -> Check:
@@ -297,38 +312,43 @@ def main() -> int:
 
     checks: List[Check] = []
 
-    print("\n[1/7] focused D4a tests ...", flush=True)
+    print("\n[1/8] focused D4a/D4a.1 tests ...", flush=True)
     c = check_focused()
     checks.append(c)
     print(f"      {'PASS' if c.ok else 'FAIL'}  {c.name}: {c.detail}", flush=True)
 
-    print("\n[2/7] full offline suite (non-loopback network BLOCKED) ...", flush=True)
+    print("\n[2/8] full offline suite (non-loopback network BLOCKED) ...", flush=True)
     c = check_suite_offline()
     checks.append(c)
     print(f"      {'PASS' if c.ok else 'FAIL'}  {c.name}: {c.detail}", flush=True)
 
-    print("\n[3/7] D3a.5/D3b regression tests ...", flush=True)
+    print("\n[3/8] D3a.5/D3b regression tests ...", flush=True)
     c = check_d3_regression()
     checks.append(c)
     print(f"      {'PASS' if c.ok else 'FAIL'}  {c.name}: {c.detail}", flush=True)
 
-    print("\n[4/7] D3a.5 mutation drivers ...", flush=True)
+    print("\n[4/8] D3a.5 mutation drivers ...", flush=True)
     for filename, expected in D3A5_DRIVERS:
         c = check_driver(filename, expected, label="D3a.5")
         checks.append(c)
         print(f"      {'PASS' if c.ok else 'FAIL'}  {c.name}: {c.detail}", flush=True)
 
-    print("\n[5/7] D3b mutation driver ...", flush=True)
+    print("\n[5/8] D3b mutation driver ...", flush=True)
     c = check_driver(D3B_DRIVER[0], D3B_DRIVER[1], label="D3b")
     checks.append(c)
     print(f"      {'PASS' if c.ok else 'FAIL'}  {c.name}: {c.detail}", flush=True)
 
-    print("\n[6/7] D4a mutation driver ...", flush=True)
+    print("\n[6/8] D4a mutation driver ...", flush=True)
     c = check_driver(D4A_DRIVER[0], D4A_DRIVER[1], label="D4a")
     checks.append(c)
     print(f"      {'PASS' if c.ok else 'FAIL'}  {c.name}: {c.detail}", flush=True)
 
-    print("\n[7/7] guardrails ...", flush=True)
+    print("\n[7/8] D4a.1 mutation driver ...", flush=True)
+    c = check_driver(D4A1_DRIVER[0], D4A1_DRIVER[1], label="D4a.1")
+    checks.append(c)
+    print(f"      {'PASS' if c.ok else 'FAIL'}  {c.name}: {c.detail}", flush=True)
+
+    print("\n[8/8] guardrails ...", flush=True)
     for c in check_guardrails():
         checks.append(c)
         print(f"      {'PASS' if c.ok else 'FAIL'}  {c.name}: {c.detail}", flush=True)

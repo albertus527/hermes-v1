@@ -712,12 +712,24 @@ def build_adapter(
     """Build an adapter, choosing the backend from the config.
 
     When a backend is supplied (the offline fake, in tests) it is used as-is.
-    Otherwise a live :class:`HttpOpenVikingBackend` is built -- but only lazily
-    reached, so constructing the adapter touches no network.
+    Otherwise a live backend is built -- but only lazily reached, so constructing
+    the adapter touches no network.
+
+    D4a.1: the enabled path prefers the *live* backend
+    (:class:`~app.core.openviking_live.LiveOpenVikingBackend`), which implements
+    retrieval AND qualified ingestion behind the same protocol. If that module
+    is unavailable the retrieval-only D4a HTTP backend is used as a fallback, so
+    enabling the flag never fails to construct. The import is lazy to avoid a
+    circular import (the live module imports this one).
     """
     effective = config or OpenVikingConfig()
     if backend is None and effective.enabled:
-        backend = HttpOpenVikingBackend(effective)
+        try:
+            from app.core.openviking_live import LiveOpenVikingBackend
+
+            backend = LiveOpenVikingBackend(effective)
+        except Exception:
+            backend = HttpOpenVikingBackend(effective)
     return OpenVikingRetrievalAdapter(effective, backend)
 
 

@@ -1,0 +1,37 @@
+# D4a.1 OpenViking dedicated service (systemd USER unit TEMPLATE).
+#
+# Installed to ~/.config/systemd/user/openviking-website.service by
+# tools/openviking_provision.sh. It runs OpenViking as an application-owned
+# background service -- INDEPENDENT of the interactive `website` tmux session --
+# bound to loopback only, with its own isolated venv, data dir, and env file.
+#
+# It does NOT touch Hermes Trade, the Hermes gateway, or any global config.
+#
+# Linger is already enabled for this user (loginctl), so the service starts on
+# boot without an interactive login and survives a VPS reboot.
+
+[Unit]
+Description=OpenViking context database (Hermes Website Builder, D4a.1)
+Documentation=file:///home/albertus527/hermes-website/website-builder/docs/D4A1_OPENVIKING_OPERATIONS.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Secret-free of itself: NINEROUTER_API_KEY and OPENVIKING_ROOT_KEY live in this
+# 0600 env file, never in the unit, never in the repo.
+EnvironmentFile=/home/albertus527/.website-builder/openviking/openviking.env
+WorkingDirectory=/home/albertus527/.website-builder/openviking
+ExecStart=/home/albertus527/.website-builder/openviking/venv/bin/openviking-server \
+    --config /home/albertus527/.website-builder/openviking/ov.conf \
+    --host 127.0.0.1 --port 1933
+Restart=on-failure
+RestartSec=5
+# Bounded startup/shutdown.
+TimeoutStartSec=90
+TimeoutStopSec=30
+# Smallest viable footprint: one worker, loopback only.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=default.target

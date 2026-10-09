@@ -1,0 +1,55 @@
+{
+  "//": "D4a.1 OpenViking server config TEMPLATE. Copy to ~/.website-builder/openviking/ov.conf (mode 0600) and run tools/openviking_provision.sh, which substitutes ${...} from the environment at server start. Never commit a real key.",
+
+  "embedding": {
+    "dense": {
+      "provider": "openai",
+      "model": "openrouter/text-embedding-3-small",
+      "api_base": "http://127.0.0.1:20128/v1",
+      "api_key": "${NINEROUTER_API_KEY}",
+      "dimension": 1536,
+      "input": "text",
+      "batch_size": 32,
+      "max_retries": 3
+    }
+  },
+
+  "vlm": {
+    "provider": "openai",
+    "model": "openrouter/z-ai/glm-5.3-flash",
+    "api_base": "http://127.0.0.1:20128/v1",
+    "api_key": "${NINEROUTER_API_KEY}",
+    "temperature": 0,
+    "max_retries": 3,
+    "thinking": false
+  },
+
+  "storage": {
+    "workspace": "/home/albertus527/.website-builder/openviking/data",
+    "agfs": { "backend": "local" },
+    "vectordb": { "backend": "local" },
+    "parse_output": { "mode": "local" }
+  },
+
+  "server": {
+    "host": "127.0.0.1",
+    "port": 1933,
+    "workers": 1,
+    "auth_mode": "api_key",
+    "root_api_key": "${OPENVIKING_ROOT_KEY}",
+    "cors_origins": ["http://127.0.0.1:1933"],
+    "temp_upload": { "default_mode": "local" }
+  },
+
+  "retrieval": { "enable_intent": false },
+
+  "memory": {
+    "extraction_enabled": false,
+    "session_skill_extraction_enabled": false,
+    "link_enabled": false
+  },
+
+  "log": { "level": "INFO" },
+
+  "//allow_private_networks": "The 9router embedding/VLM endpoint is on loopback; the default (false) already permits loopback. This key is documentation only and is ignored by the loader."
+}
