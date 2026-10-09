@@ -26,7 +26,7 @@ so live qualification is reported honestly as **BLOCKED**, not PASS.
 | D3a.5 acceptance doc | `docs/D3A5_DEPENDENCY_INGRESS_AUDIT.md` |
 | `feature/website` | untouched at `868ed00e3f24e06f1dcf9944d6d031105dff0646` |
 | Hermes Trade | **not touched** (no runtime, tmux, gateway, credentials, or storage change) |
-| Final commit | recorded in §16 (set at commit time) |
+| Final commit | `77223f04870052aa554601a619aeff158c31b6f7` (D4a.1 implementation); the report-finalizing doc commit follows it |
 
 The VPS hosts both Hermes Website and Hermes Trade. D4a.1 modified **only**
 `website-builder/` inside the Hermes Website checkout. No global install was
