@@ -13,6 +13,33 @@ website_builder:
     # set this once real credentials/webhooks are configured.
     graph_api_version: null
 
+  # D4a: OpenViking context-retrieval foundation. A bounded, READ-ONLY context
+  # provider for a future Laya context pack. It is NOT an authority: it cannot
+  # make requirements decisions, install dependencies, override Design DNA,
+  # mutate project state, or execute anything.
+  #
+  # DISABLED BY DEFAULT. When disabled the retrieval adapter is a no-op: it
+  # contacts no backend, invents no context, and changes no existing behaviour
+  # (Design DNA retrieval is unaffected). Enable only after a real OpenViking
+  # server has been provisioned and LIVE-QUALIFIED -- see
+  # docs/D4A_OPENVIKING_FOUNDATION_ACCEPTANCE.md. D4a qualified the adapter
+  # against a deterministic offline backend only, so live ingestion is NOT yet
+  # qualified and the live write path refuses to run.
+  #
+  # ``base_url`` defaults to a LOCALHOST endpoint. The service must never be
+  # exposed publicly; bind it to localhost and, where supported, require an API
+  # key. The API key is read from the ``OPENVIKING_API_KEY`` environment
+  # variable, NEVER from this file.
+  openviking:
+    enabled: false
+    base_url: 'http://localhost:1933'
+    # Request timeout (seconds) and bounded retries AFTER the first attempt.
+    timeout_seconds: 10
+    max_retries: 1
+    # The exact OpenViking release this batch was reviewed against. Recorded for
+    # provenance; nothing here installs or upgrades it.
+    pinned_version: '0.4.23'
+
   # Workspace root for generated projects
   workspace_root: '~/website-workspaces'
 

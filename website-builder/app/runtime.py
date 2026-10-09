@@ -72,6 +72,12 @@ from app.core.critic_repair import scanner_from_config
 from app.core.design_capabilities import preflight_design_capabilities
 from app.core.design_resources import DesignResourceManifestError
 from app.core.intake import IntakeProcessor
+from app.core.openviking_retrieval import (
+    OpenVikingConfig,
+    OpenVikingRetrievalAdapter,
+    build_adapter as build_openviking_adapter,
+    config_from_mapping as openviking_config_from_mapping,
+)
 from app.core.state import ProjectStateStore, reconcile_stranded_projects
 from app.core.registry import ConversationRegistryStore, DuplicateProjectName, slugify_display_name
 from app.core.secrets import BYPASS_STORE_DIRNAME, BypassSecretStore, migrate_legacy_bypass_secrets
@@ -137,6 +143,11 @@ class RuntimeConfig:
     # .env. The key's contents are never read by this application.
     github_source_repo: Optional[str] = None
     github_ssh_key: Optional[Path] = None
+    # D4a: OpenViking context-retrieval configuration. NON-SECRET by
+    # construction (``OpenVikingConfig.api_key`` carries its own ``repr=False``).
+    # Disabled by default; when disabled the retrieval adapter is constructed but
+    # makes no backend call, so existing behaviour is unchanged.
+    openviking_config: OpenVikingConfig = field(default_factory=OpenVikingConfig)
 
     def __post_init__(self):
         # Expand ~ in paths
@@ -230,6 +241,16 @@ def load_runtime_config(config_path: Optional[Path] = None) -> RuntimeConfig:
     # tests will fail closed at runtime (which is the correct behavior).
     smoke_browser_factory = _load_smoke_browser_factory()
 
+    # D4a: OpenViking context-retrieval configuration. DISABLED by default --
+    # a missing block, a malformed block, or an explicit ``enabled: false`` all
+    # yield a disabled config, so the retrieval adapter is a no-op and existing
+    # behaviour is unchanged. The API key is read from the environment (never
+    # from the YAML file) so a secret is never committed to config/default.yaml.
+    openviking_cfg = dict(wb.get("openviking") or {})
+    if not openviking_cfg.get("api_key"):
+        openviking_cfg["api_key"] = _optional_env("OPENVIKING_API_KEY")
+    openviking_config = openviking_config_from_mapping(openviking_cfg)
+
     return RuntimeConfig(
         telegram_bot_token=telegram_bot_token,
         hermes_home=hermes_home,
@@ -243,6 +264,7 @@ def load_runtime_config(config_path: Optional[Path] = None) -> RuntimeConfig:
         smoke_browser_factory=smoke_browser_factory,
         github_source_repo=github_source_repo,
         github_ssh_key=github_ssh_key,
+        openviking_config=openviking_config,
     )
 
 
@@ -691,6 +713,11 @@ class RuntimeComposition:
     # them with a second credential/identity path.
     vercel: VercelAdapter
     registry_store: ConversationRegistryStore
+    # D4a: the OpenViking context-retrieval adapter. Disabled by default; a
+    # no-op until an operator enables the feature. It is a CONTEXT PROVIDER,
+    # never an authority -- it is not wired into FRONTEND, FAST, or QA in this
+    # batch, and it exposes no write path.
+    openviking: "OpenVikingRetrievalAdapter"
 
 
 def compose(config: RuntimeConfig) -> RuntimeComposition:
@@ -1003,6 +1030,14 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
         preview=preview,
     )
 
+    # D4a: the OpenViking retrieval adapter. Constructed unconditionally so the
+    # composition root always exposes the seam, but it is a NO-OP unless the
+    # feature flag is enabled: no backend is contacted, no network is touched,
+    # and existing Design DNA retrieval is unaffected. It is deliberately NOT
+    # injected into FRONTEND, FAST, or QA in this batch.
+    openviking = build_openviking_adapter(config.openviking_config)
+    logger.info("D4a openviking adapter: %s", config.openviking_config.to_dict())
+
     return RuntimeComposition(
         config=config,
         store=store,
@@ -1021,6 +1056,7 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
         dispatcher=dispatcher,
         vercel=vercel,
         registry_store=registry_store,
+        openviking=openviking,
     )
 
 @dataclass
