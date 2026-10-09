@@ -476,3 +476,188 @@ mutation, no toolchain escape, no unrelated file mutation.
 See the batch delivery summary. The verdict is `FULLY_ACCEPTED` only if every
 mandatory real VPS scenario passed; otherwise it is
 `IMPLEMENTED_LIVE_QUALIFICATION_BLOCKED`.
+
+---
+
+## 16. Post-acceptance operational hardening (2026-10-09)
+
+Status: engineering record for the D3b post-acceptance hardening pass.
+Branch: `web-design`. Baseline HEAD: `0665a11597be22f782977ff54b5682a13604c469`.
+Scope: close the two operational gaps §13/§14 recorded — a **degraded provisioned
+Impeccable skill** and a **generation profile that carried `TELEGRAM_BOT_TOKEN`** —
+without weakening any security boundary.
+
+Every claim below is backed by an executed command. No PASS is written for an
+unexecuted check. No secret value appears anywhere in this section.
+
+### 16.1 Initial operational gaps (as recorded in §13/§14)
+
+1. **Degraded provisioned skill.** `~/.hermes-website/skills/impeccable` had the
+   engine but **no parser runtime**, so `engine_quality == "degraded"`. §13
+   Scenario A passed only by using a **disposable full-quality skill root**; the
+   actual provisioned profile remained degraded.
+2. **Credential isolation.** `~/.hermes-website/.env` declared
+   `TELEGRAM_BOT_TOKEN`, so the R2 guard (`assert_profile_dotenv_clean`)
+   correctly **refused to spawn** a generation agent against that profile. §13
+   Scenarios B/C used a **disposable profile** with only the provider key.
+
+Neither disposable substitute closes the gap: both must hold for the **real
+operational** skill and the **real operational** profile.
+
+### 16.2 Actual root causes
+
+* **Parser runtime.** No application-owned provisioning mechanism existed. The
+  repository carried the exact pins (`design_install.IMPECCABLE_PARSER_PACKAGE_PINS`)
+  and a documented *manual* `npm install --prefix <skill>` command, but no code
+  path that could provision the runtime, so the operator step had never run and
+  the skill shipped without `node_modules`.
+* **Credential isolation.** `HermesAdapter.hermes_home` serves two roles at once:
+  it is the profile the generation child is pointed at (`HERMES_HOME`), and the
+  directory whose `.env` the child re-loads unfiltered with `override=True`
+  inside the child (`get_hermes_home()` → `load_hermes_dotenv()`). The application
+  has no *separate* source for its own operational credentials, so they had been
+  placed in the generation profile's `.env` — exactly what the guard refuses.
+
+### 16.3 Configuration / code changes
+
+**Code (tracked):**
+
+* `app/core/design_install.py` — new application-owned parser provisioner:
+  `provision_impeccable_parser_runtime()` plus
+  `build_impeccable_parser_install_argv()`, `installed_parser_package_versions()`,
+  `parser_runtime_matches_pins()`, and static reasons. It installs **only** the
+  exact reviewed pins, into the skill's own `node_modules`, with
+  `--no-save --package-lock=false --ignore-scripts`, under `credentials.shell_env()`,
+  `shell=False`, bounded by a timeout. It fails closed on a missing skill root,
+  no verified engine, a symlinked/escaping runtime dir, missing npm, a nonzero
+  exit, or a **version read back from `package.json` that does not equal the
+  pin** (npm's exit code is never trusted). A build never calls it.
+* `app/core/app_env.py` (new) — the application's own operational env loader.
+  The file lives at `<state_root>/app.env` (default `~/.website-builder/state/`),
+  mirroring `BypassSecretStore`'s placement. It refuses a symlinked file and any
+  file inside the generation profile home (`assert_application_env_outside_profile`),
+  is hermetic when `HOME` is unset, and returns variable **names only**.
+* `app/runtime.py` — `main()` loads the application env before config load, and
+  a new operator flag `--provision-impeccable-parser` dispatches the provisioner
+  before config load (it needs no channel/deploy credential and no role config).
+
+**VPS configuration (no secrets shown):**
+
+* `TELEGRAM_BOT_TOKEN` was moved out of `~/.hermes-website/.env` (0600, backed up
+  as `.env.d3b-hardening-backup-20261009T090558Z`) into
+  `~/.website-builder/state/app.env` (0600). The generation profile `.env` now
+  declares **only** `NINEROUTER_API_KEY` (the custom provider key, which the
+  child legitimately receives through the profile at runtime).
+* The provisioner ran once against the real skill, adding only
+  `~/.hermes-website/skills/impeccable/node_modules`. Rollback is
+  `rm -rf ~/.hermes-website/skills/impeccable/node_modules`; no existing skill
+  file is modified or removed. No `package.json`/lockfile was created.
+
+No global npm install was performed. No project dependency manifest was touched.
+No unreviewed Impeccable release was downloaded. Path containment and symlink
+checks were preserved; deterministic dependency behavior was preserved; the
+package names/versions remain application-owned and cannot be model-supplied.
+
+### 16.4 Exact parser runtime qualification (ACTUAL provisioned skill)
+
+`engine_quality(real skill) == "full"`. The **real provisioned engine** — not a
+disposable copy — was run through the app's scan seam:
+
+| target | state | authoritative | intended_project_scanned | degraded | findings | clean certification |
+|---|---|---|---|---|---|---|
+| defective project | `FINDINGS` | **True** | **True** | False | **4** (`low-contrast`×2, `tiny-text`×2) | — |
+| clean project | `CLEAN` | **True** | **True** | False | 0 | **True** |
+
+The clean scan is accepted **only because it is authoritative**
+(`is_clean_certification is True`); a degraded zero-findings scan is still not a
+certification.
+
+### 16.5 Credential-isolation verification
+
+| check | evidence |
+|---|---|
+| gateway / Telegram config intact | gateway runs under `HERMES_HOME=/home/albertus527/.hermes`, which was **not touched**; its `.env` has no active `TELEGRAM_BOT_TOKEN` (platforms disabled), so nothing depended on the moved value |
+| profile is now clean | `assert_profile_dotenv_clean` + `assert_profile_home_clean` both PASS |
+| spawn no longer rejected | real `HermesAdapter._run_hermes_cli` spawns; `result.success=True` |
+| child does **not** inherit `TELEGRAM_BOT_TOKEN` | captured child env: `TELEGRAM_BOT_TOKEN` absent, `VERCEL_TOKEN` absent; `assert_no_privileged` passes |
+| generation receives only authorized credentials | child env is the role-scoped allowlist; the model key arrives via the profile `.env`, not the operational file |
+| existing credential-isolation tests | `tests/test_r2_credential_isolation.py` (73) green |
+| contaminated profiles still rejected | existing fail-closed tests (`.env` with a deploy credential; a `vercel-bypass/` store) still refuse to spawn |
+
+The boundary is **stronger**: a privileged credential now has exactly one
+application-owned home outside the generation profile, and the loader refuses to
+place it anywhere the generation agent can read.
+
+### 16.6 Real operational smoke results (PASSED, paid)
+
+`tools/d3b_operational_smoke.py` drove the **real** end-to-end path with the
+**actual provisioned skill** and the **corrected operational profile-routing**
+(real `~/.hermes-website` profile, real configured provider
+`custom:openai-api` / `openrouter/z-ai/glm-5.3-flash`):
+
+| step | evidence |
+|---|---|
+| pre-scan | `FINDINGS`, authoritative, 1 `layout-transition` (warning) |
+| FRONTEND | real model call; attempt 1 of 2; edited `src/index.css` only |
+| the fix | removed `transition: width 300ms, height 300ms` (→ `opacity`/`transform` was already present on the other rule) |
+| build + typecheck | clean (the orchestrator's post-repair `npm run build` + `npm run typecheck`) |
+| browser / VISION QA | real `agent-browser` capture; `qa/attempt-0` + `qa/attempt-1` evidence |
+| post-scan | `CLEAN`, authoritative, 0 findings |
+| convergence | history `FULLY_VALIDATED`, resolved the finding identity |
+| outcome | `REPAIRED` → lifecycle `PREVIEW_READY` |
+| repair budget | `attempts_used=1` ≤ 2 |
+| dependency integrity | changed files `['src/index.css']` only; no added/removed files; `toolchain violation: None` |
+| publication | none — the stage can only reach `PREVIEW_READY`; no deployment was triggered |
+
+Verdict: **`SMOKE VERDICT: PASS`**.
+
+### 16.7 Regression / mutation results
+
+Command: `python tools/d3b_final_proof.py`
+
+| check | result |
+|---|---|
+| focused D3b tests | **109 passed** |
+| full offline suite (non-loopback network BLOCKED) | **3752 passed, 2 skipped, 4 deselected** (was 3726; +26 new hardening tests) |
+| D3a.5 regression tests | **589 passed** |
+| D3a.5 mutation drivers | pinned counts 16 / 73 / 39 / 36 / 18 — all killed |
+| D3b mutation driver | **all 14 guards killed** |
+| guardrails | branch `web-design`; `feature/website` untouched; D3b + D3a.5 artifacts present; critic argv fixed with the `.` target |
+
+New regression tests added by this pass:
+
+* `tests/test_impeccable_parser_provisioning.py` (14) — argv carries only exact
+  pins; no manifest written; symlinked/escaping runtime dir refused; no engine
+  refused; **wrong version on a zero-exit install is not reported as provisioned**;
+  already-correct is a no-op; the npm call runs with a clean shell env.
+* `tests/test_app_env.py` (12) — the operational file is outside the profile;
+  symlinked/inside-profile files refused; missing file is not an error; the
+  loader returns names only and never reaches a generation role env.
+
+No existing test was weakened and no expected outcome was changed. The
+historical D3a.5 `no D3b artifacts` guard remains intact (the D3b runner runs the
+D3a.5 drivers/tests directly rather than invoking that phase-boundary assertion).
+
+### 16.8 Remaining limitations
+
+* The provisioned skill's parser runtime is a **host-local, operator-run**
+  artifact: a fresh clone/host still needs `python -m app --provision-impeccable-parser`
+  once. It is deliberately not installed by a build.
+* The operational env file is loaded **only** by the runtime entrypoint
+  (`app/runtime.py:main`). A caller that constructs `HermesAdapter` directly (a
+  tool or test) must load it itself, as the smoke driver does.
+* `install_external_component()` remains unwired into `execute_selection()`
+  (unchanged from D3a.5; out of scope).
+* `CRITIC_FAILURE_POLICY = "degrade"` is unchanged: a genuinely missing/degraded
+  critic still yields an explicit degraded outcome and never blocks a build —
+  but with the real skill now full-quality, the operational path is authoritative.
+
+### 16.9 Final verdict
+
+`D3B_OPERATIONAL_HARDENING_ACCEPTED`. Both operational gaps are closed on the
+**real** provisioned skill and the **real** operational profile-routing; the real
+FRONTEND generation/repair ran safely end-to-end to `PREVIEW_READY`; build,
+typecheck and browser/VISION QA passed; the Impeccable re-scan is authoritative;
+dependency boundaries are intact; regression and mutation tests pass; and no
+production or Hermes Trade workload was disturbed.
+

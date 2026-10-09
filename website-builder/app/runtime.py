@@ -2755,6 +2755,7 @@ _KNOWN_FLAGS = frozenset({
     "--reconcile-publish",
     "--inspect-canonical-url",
     "--as",
+    "--provision-impeccable-parser",
 })
 
 _USAGE = """\
@@ -2770,14 +2771,46 @@ Usage:
                                                writes nothing.
     python -m app --reconcile-publish <project_id> --as <principal_id>
                                                Operator-only publish recovery.
+    python -m app --provision-impeccable-parser
+                                               OPERATOR STEP: install the reviewed
+                                               Impeccable parser runtime into the
+                                               provisioned skill's own node_modules
+                                               (exact pins only), then exit.
     python -m app --help                       Show this message.
 
 Environment: TELEGRAM_BOT_TOKEN, VERCEL_TOKEN, VERCEL_TEAM_ID (required).
+Operational credentials are loaded from <state_root>/app.env when present, so the
+generation profile's .env can stay free of them.
 """
 
 def _print_usage(stream=None) -> None:
     """Print the operator usage block."""
     print(_USAGE.rstrip("\n"), file=stream or sys.stdout, flush=True)
+
+
+def _run_provision_impeccable_parser() -> int:
+    """``python -m app --provision-impeccable-parser`` — provision, then exit.
+
+    An explicit operator maintenance step. Resolves the provisioned skill from
+    the generation profile home (``$HERMES_HOME/skills/impeccable``), then calls
+    :func:`app.core.design_install.provision_impeccable_parser_runtime`, which
+    installs ONLY the reviewed exact pins into the skill's own ``node_modules``.
+    Never installs globally, never touches a project manifest, never downloads
+    an unreviewed release. Prints a value-free receipt and returns 0/1.
+    """
+    from app.core import app_env as _app_env
+    from app.core.design_install import provision_impeccable_parser_runtime
+
+    skill_root = _app_env.resolve_profile_home() / "skills" / "impeccable"
+    logger.info("Provisioning Impeccable parser runtime into: %s", skill_root)
+    result = provision_impeccable_parser_runtime(skill_root)
+    if result.ok:
+        logger.info("Parser runtime provisioning: OK (%s)", result.reason)
+        for package, version in result.installed:
+            logger.info("  %s@%s", package, version)
+        return 0
+    logger.error("Parser runtime provisioning: FAILED (%s)", result.reason)
+    return 1
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -2804,6 +2837,37 @@ def main(argv: Optional[List[str]] = None) -> int:
         logger.error("Unknown option(s): %s", " ".join(unknown))
         _print_usage(stream=sys.stderr)
         return 2
+
+    # ---- Application-owned operational credentials. The generation profile's
+    # own ``.env`` must stay free of the channel/deploy credentials the
+    # application needs (the R2 profile guard refuses to spawn a generation
+    # agent against a profile that declares one). The application therefore
+    # reads its OWN operational env file, under the application state root and
+    # OUTSIDE the generation profile, and applies it to this process before any
+    # config load. A missing file is not an error: a deployment that supplies
+    # the credentials via systemd ``Environment=`` or a shell export is equally
+    # valid. Values are never logged.
+    from app.core import app_env as _app_env
+
+    try:
+        _loaded = _app_env.load_application_env()
+    except ValueError as exc:
+        logger.error(
+            "Website Builder refused to load its operational env file: %s", exc
+        )
+        return 1
+    if _loaded:
+        logger.info(
+            "Loaded %d operational credential(s) from the application env file: %s",
+            len(_loaded), ", ".join(_loaded),
+        )
+
+    # ---- Operator step: provision the Impeccable parser runtime. Dispatched
+    # BEFORE config load: it is a standalone maintenance command that needs no
+    # channel/deploy credential and must not require a fully resolvable role
+    # config. Exact reviewed pins only; into the skill's own node_modules.
+    if "--provision-impeccable-parser" in argv:
+        return _run_provision_impeccable_parser()
 
     try:
         config = load_runtime_config()

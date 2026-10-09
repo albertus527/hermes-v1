@@ -617,6 +617,271 @@ def impeccable_parser_package_pins() -> Tuple[Tuple[str, str], ...]:
     return tuple(sorted(IMPECCABLE_PARSER_PACKAGE_PINS.items()))
 
 
+#: Directory INSIDE a skill root where the parser runtime is provisioned.
+#: Node resolves a bare ``import('htmlparser2')`` from the skill's scripts by
+#: walking up to ``<skill>/node_modules``, so that is where the modules must
+#: land. Mirrors ``design_activation.PARSER_RUNTIME_DIRNAME``; kept as a local
+#: literal so this module does not import the activation layer at load time.
+IMPECCABLE_PARSER_RUNTIME_DIRNAME = "node_modules"
+
+#: The npm flags every provisioning command is built from. ``--no-save`` and
+#: ``--package-lock=false`` guarantee no ``package.json``/lockfile is written
+#: into the skill root (it ships none, and a build must never create one);
+#: ``--ignore-scripts`` refuses any package lifecycle script; ``--no-audit`` /
+#: ``--no-fund`` remove network chatter. The pins themselves are positional and
+#: come ONLY from :data:`IMPECCABLE_PARSER_PACKAGE_PINS`.
+IMPECCABLE_PARSER_INSTALL_FLAGS: Tuple[str, ...] = (
+    "install",
+    "--no-save",
+    "--no-audit",
+    "--no-fund",
+    "--ignore-scripts",
+    "--package-lock=false",
+)
+
+#: Bound on the single provisioning npm invocation. Generous: it is one
+#: operator-run command, not a per-build step.
+IMPECCABLE_PARSER_INSTALL_TIMEOUT_SECONDS = 300
+
+REASON_PARSER_SKILL_ROOT_MISSING = (
+    "the skill root is not a directory; no command was attempted"
+)
+REASON_PARSER_ENGINE_MISSING = (
+    "the skill root has no verified detector engine; no command was attempted"
+)
+REASON_PARSER_RUNTIME_DIR_UNSAFE = (
+    "the skill's node_modules path is a symlink or resolves outside the skill "
+    "root; no command was attempted"
+)
+REASON_PARSER_NPM_MISSING = (
+    "no npm executable is available to provision the parser runtime; no "
+    "command was attempted"
+)
+REASON_PARSER_INSTALL_FAILED = "the parser runtime install command did not succeed"
+REASON_PARSER_VERSION_MISMATCH = (
+    "the parser runtime install did not produce the exact reviewed package "
+    "versions; the state is not upgraded to provisioned"
+)
+REASON_PARSER_ALREADY_PROVISIONED = (
+    "the parser runtime is already present at the exact reviewed versions"
+)
+REASON_PARSER_PROVISIONED = (
+    "the parser runtime was provisioned at the exact reviewed versions"
+)
+
+
+def installed_parser_package_versions(skill_root: Path) -> Dict[str, Optional[str]]:
+    """The installed version of each parser package, or ``None`` when absent.
+
+    Reads each ``<skill>/node_modules/<pkg>/package.json`` directly rather than
+    trusting npm's exit code: an install that "succeeded" while leaving the
+    wrong version on disk must not be reported as provisioned. Pure filesystem
+    inspection; no import, no execution.
+    """
+    modules = Path(skill_root) / IMPECCABLE_PARSER_RUNTIME_DIRNAME
+    versions: Dict[str, Optional[str]] = {}
+    for package in IMPECCABLE_PARSER_PACKAGE_PINS:
+        manifest = modules / package / "package.json"
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            versions[package] = None
+            continue
+        version = data.get("version") if isinstance(data, dict) else None
+        versions[package] = version if isinstance(version, str) else None
+    return versions
+
+
+def parser_runtime_matches_pins(skill_root: Path) -> bool:
+    """Whether every parser package is present at its EXACT reviewed version."""
+    versions = installed_parser_package_versions(skill_root)
+    return all(
+        versions.get(package) == version
+        for package, version in IMPECCABLE_PARSER_PACKAGE_PINS.items()
+    )
+
+
+def _parser_runtime_dir_is_safe(skill_root: Path) -> bool:
+    """Whether ``<skill>/node_modules`` is a real dir contained in the skill root.
+
+    A symlinked runtime directory could point anywhere, so provisioning through
+    it would write outside the skill root. The resolved path must be strictly
+    inside the resolved skill root; a symlink that happens to point back inside
+    is accepted (linking a shared runtime in is legitimate), one that escapes is
+    not.
+    """
+    root = Path(skill_root)
+    modules = root / IMPECCABLE_PARSER_RUNTIME_DIRNAME
+    try:
+        if modules.is_symlink():
+            return False
+        resolved_root = root.resolve()
+        resolved_modules = modules.resolve()
+        resolved_modules.relative_to(resolved_root)
+    except (OSError, ValueError, RuntimeError):
+        return False
+    return True
+
+
+def build_impeccable_parser_install_argv(
+    skill_root: Path, *, npm_executable: Optional[str] = None
+) -> Optional[Tuple[str, ...]]:
+    """The ONE argv that provisions the reviewed parser runtime into a skill.
+
+    ``package@version`` specs come only from
+    :data:`IMPECCABLE_PARSER_PACKAGE_PINS`; there is deliberately no
+    ``install_any(package, version)`` form, so no caller, model, prompt, or
+    finding can inject a package name or version. ``npm`` is resolved by the
+    application (never from the project, never a shim) and the interpreter is
+    never searched for on a model-controlled PATH. Returns ``None`` when no npm
+    executable is available, so the caller runs NOTHING rather than guessing.
+    """
+    npm = npm_executable or shutil.which("npm")
+    if not npm:
+        return None
+    specs = tuple(
+        f"{package}@{version}" for package, version in impeccable_parser_package_pins()
+    )
+    return (
+        npm,
+        *IMPECCABLE_PARSER_INSTALL_FLAGS,
+        "--prefix",
+        str(Path(skill_root)),
+        *specs,
+    )
+
+
+@dataclass(frozen=True)
+class ImpeccableParserProvisionResult:
+    """The bounded outcome of one parser-runtime provisioning attempt."""
+
+    ok: bool
+    reason: str
+    command: Optional[Tuple[str, ...]] = None
+    installed: Tuple[Tuple[str, Optional[str]], ...] = ()
+    returncode: Optional[int] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "reason": self.reason,
+            "command": list(self.command) if self.command else None,
+            "installed": {k: v for k, v in self.installed},
+            "returncode": self.returncode,
+        }
+
+
+def provision_impeccable_parser_runtime(
+    skill_root: Path,
+    *,
+    npm_executable: Optional[str] = None,
+    timeout: float = IMPECCABLE_PARSER_INSTALL_TIMEOUT_SECONDS,
+) -> ImpeccableParserProvisionResult:
+    """Provision the reviewed parser runtime into a skill's OWN ``node_modules``.
+
+    The only function that installs the Impeccable parser modules. It is an
+    explicit, operator-run step — a website build NEVER calls it. Every input is
+    application-owned; nothing is derived from a model or a project.
+
+    Order of checks (each fails closed with a static reason):
+
+    1. the skill root is a real directory;
+    2. it contains a verified detector engine (the SAME containment-checked
+       entrypoint :func:`design_activation.resolve_engine_path` resolves), so the
+       runtime is only ever provisioned for a skill that can actually use it;
+    3. its ``node_modules`` path is not a symlink and stays inside the skill root;
+    4. an npm executable is available;
+    5. the install command succeeds; and
+    6. the four packages are present at their EXACT pinned versions, read back
+       from each ``package.json`` — npm's exit code alone is never trusted.
+
+    The command is ``shell=False`` and bounded by *timeout*. No ``package.json``
+    or lockfile is written into the skill root. Returns a result; it never raises
+    for an ordinary failure.
+    """
+    root = Path(skill_root)
+    if not root.is_dir():
+        return ImpeccableParserProvisionResult(False, REASON_PARSER_SKILL_ROOT_MISSING)
+
+    # Reuse the activation layer's containment-checked engine resolver rather
+    # than re-deriving "is this a real skill" here.
+    from app.core.design_activation import resolve_engine_path
+
+    if resolve_engine_path(root) is None:
+        return ImpeccableParserProvisionResult(False, REASON_PARSER_ENGINE_MISSING)
+
+    if not _parser_runtime_dir_is_safe(root):
+        return ImpeccableParserProvisionResult(
+            False, REASON_PARSER_RUNTIME_DIR_UNSAFE
+        )
+
+    if parser_runtime_matches_pins(root):
+        return ImpeccableParserProvisionResult(
+            True,
+            REASON_PARSER_ALREADY_PROVISIONED,
+            installed=tuple(
+                (p, v) for p, v in installed_parser_package_versions(root).items()
+            ),
+        )
+
+    argv = build_impeccable_parser_install_argv(root, npm_executable=npm_executable)
+    if argv is None:
+        return ImpeccableParserProvisionResult(False, REASON_PARSER_NPM_MISSING)
+
+    # The provisioning command runs with the strictest shell environment: no
+    # model credential and no deploy credential is reachable from an npm
+    # lifecycle step. ``--ignore-scripts`` already refuses lifecycle scripts;
+    # this is the second, independent layer.
+    from app.core import credentials as _credentials
+
+    try:
+        process = subprocess.run(
+            list(argv),
+            cwd=str(root),
+            env=_credentials.shell_env(),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            shell=False,
+        )
+    except subprocess.TimeoutExpired:
+        return ImpeccableParserProvisionResult(
+            False, REASON_PARSER_INSTALL_FAILED, command=argv, returncode=None
+        )
+    except Exception:
+        logger.exception("Parser runtime provisioning command failed to start.")
+        return ImpeccableParserProvisionResult(
+            False, REASON_PARSER_INSTALL_FAILED, command=argv
+        )
+
+    installed = tuple(
+        (p, v) for p, v in installed_parser_package_versions(root).items()
+    )
+    if process.returncode != 0:
+        return ImpeccableParserProvisionResult(
+            False,
+            REASON_PARSER_INSTALL_FAILED,
+            command=argv,
+            installed=installed,
+            returncode=process.returncode,
+        )
+    if not parser_runtime_matches_pins(root):
+        return ImpeccableParserProvisionResult(
+            False,
+            REASON_PARSER_VERSION_MISMATCH,
+            command=argv,
+            installed=installed,
+            returncode=process.returncode,
+        )
+    return ImpeccableParserProvisionResult(
+        True,
+        REASON_PARSER_PROVISIONED,
+        command=argv,
+        installed=installed,
+        returncode=process.returncode,
+    )
+
+
 def required_package_specs(dependency_id: str) -> Tuple[PackageSpec, ...]:
     """Every package spec a dependency needs: its runtime pin plus companions.
 
@@ -3629,6 +3894,15 @@ __all__ = [
     "DEPENDENCY_PACKAGE_PINS",
     "DEPENDENCY_PACKAGES",
     "DEPENDENCY_SECTIONS",
+    "IMPECCABLE_PARSER_PACKAGE_PINS",
+    "IMPECCABLE_PARSER_INSTALL_FLAGS",
+    "IMPECCABLE_PARSER_RUNTIME_DIRNAME",
+    "ImpeccableParserProvisionResult",
+    "build_impeccable_parser_install_argv",
+    "impeccable_parser_package_pins",
+    "installed_parser_package_versions",
+    "parser_runtime_matches_pins",
+    "provision_impeccable_parser_runtime",
     "INSTALL_FAILED",
     "PINNED_CLIS",
     "PinnedCli",
