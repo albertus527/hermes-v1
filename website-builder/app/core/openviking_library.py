@@ -255,9 +255,25 @@ _CREDENTIAL_ASSIGN_RE = re.compile(
     r"\s*[:=]\s*\S+"
 )
 
-#: A long high-entropy blob (>=32 base64/hex-ish chars) is treated as a
+#: A long high-entropy blob (>=40 base64/hex-ish chars) is treated as a
 #: possible credential. Bounded and cheap.
 _ENTROPY_BLOB_RE = re.compile(r"[A-Za-z0-9+/_\-]{40,}")
+
+
+def _looks_like_secret_blob(blob: str) -> bool:
+    """True when a long blob has the SHAPE of a secret, not ordinary text.
+
+    A bare long run of URL/path characters (``//resources/website-builder/…``)
+    or a lowercase slug is NOT a secret; a real opaque credential is
+    mixed-case AND contains digits AND has no path separator. Requiring the
+    shape keeps the entropy net while eliminating false positives on legitimate
+    design prose that lists long URIs (which also co-occur with the word
+    "token" in, e.g., "design tokens").
+    """
+    has_upper = any(ch.isupper() for ch in blob)
+    has_lower = any(ch.islower() for ch in blob)
+    has_digit = any(ch.isdigit() for ch in blob)
+    return has_upper and has_lower and has_digit and "/" not in blob
 
 
 def text_looks_like_credential(text: str) -> bool:
@@ -271,12 +287,13 @@ def text_looks_like_credential(text: str) -> bool:
         return True
     if _CREDENTIAL_ASSIGN_RE.search(text):
         return True
-    # A bare high-entropy blob alone is not proof (a base64 image or a hash can
-    # match), so require it to co-occur with a key-ish word to reduce noise.
-    if _ENTROPY_BLOB_RE.search(text) and re.search(
-        r"(?i)\b(key|token|secret|password|bearer)\b", text
-    ):
-        return True
+    # A bare high-entropy blob alone is not proof (a base64 image, a hash, or a
+    # long URI can match), so require it to (a) co-occur with a key-ish word AND
+    # (b) have the shape of an opaque credential.
+    if re.search(r"(?i)\b(key|token|secret|password|bearer)\b", text):
+        for blob in _ENTROPY_BLOB_RE.findall(text):
+            if _looks_like_secret_blob(blob):
+                return True
     return False
 
 

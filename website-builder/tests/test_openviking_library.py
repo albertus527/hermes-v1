@@ -352,6 +352,29 @@ def test_ordinary_guidance_is_not_flagged(text):
     assert lib.text_looks_like_credential(text) is False
 
 
+def test_a_long_uri_alongside_the_word_token_is_not_flagged():
+    """Regression (D4a.1): a design doc that lists long URIs AND mentions
+    "design tokens" must not be misread as a credential. The real OpenViking L1
+    overview sidecars list ``viking://resources/…`` paths, and "tokens" appears
+    throughout design prose; the entropy heuristic previously fired on the URI
+    blob."""
+    text = (
+        "Directory: viking://resources/website-builder/projects/wb-design/"
+        "design_dna/refero_typography\n"
+        "Covers design tokens, type scale, and color tokens.\n"
+    )
+    assert lib.text_looks_like_credential(text) is False
+
+
+def test_a_real_opaque_secret_blob_IS_still_flagged():
+    """The false-positive fix must not blind the detector: a mixed-case,
+    digit-bearing opaque blob next to a key word is still caught."""
+    text = "api_key sk-proj-AbCdEf0123456789AbCdEf0123456789zz"
+    assert lib.text_looks_like_credential(text) is True
+    text2 = "bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9AbCdEf0123456789"
+    assert lib.text_looks_like_credential(text2) is True
+
+
 # ---------------------------------------------------------------------------
 # No dependency or toolchain mutation
 # ---------------------------------------------------------------------------

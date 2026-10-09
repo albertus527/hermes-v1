@@ -70,9 +70,40 @@ say "installed + started openviking-website.service"
 for i in $(seq 1 60); do
     if curl -fsS "http://127.0.0.1:1933/health" >/dev/null 2>&1; then
         say "healthy after ${i}s"
-        curl -fsS "http://127.0.0.1:1933/health" | "$VENV/bin/python" -m json.tool >&2 || true
-        exit 0
+        break
     fi
     sleep 1
+    if [ "$i" = "60" ]; then
+        die "service did not become healthy within 60s (journalctl --user -u openviking-website)"
+    fi
 done
-die "service did not become healthy within 60s (journalctl --user -u openviking-website)"
+
+# 6. Create the application account + admin USER key.
+# OpenViking's api_key mode uses a TWO-LAYER key model: the root key can only
+# administer; tenant DATA APIs require a user/admin key. The application sends
+# ONE key, so it must be the user key. Idempotent.
+ROOT_KEY_NOW="$(grep -E '^OPENVIKING_ROOT_KEY=' "$ENV_FILE" | cut -d= -f2-)"
+USER_KEY="$("$VENV/bin/python" "$ROOT/tools/openviking_admin.py" \
+    --base-url http://127.0.0.1:1933 \
+    --root-key "$ROOT_KEY_NOW" \
+    --account website-builder --admin-user wb-admin)" \
+    || die "could not create the application account/user key"
+if [ -z "$USER_KEY" ]; then die "admin helper returned an empty user key"; fi
+if grep -q '^OPENVIKING_USER_KEY=' "$ENV_FILE"; then
+    # replace in place (keep 0600)
+    "$VENV/bin/python" - "$ENV_FILE" "$USER_KEY" <<'PY'
+import sys
+path, key = sys.argv[1], sys.argv[2]
+lines = [l.rstrip("\n") for l in open(path) if l.strip() and not l.startswith("OPENVIKING_USER_KEY=")]
+lines.append(f"OPENVIKING_USER_KEY={key}")
+open(path, "w").write("\n".join(lines) + "\n")
+PY
+else
+    printf 'OPENVIKING_USER_KEY=%s\n' "$USER_KEY" >> "$ENV_FILE"
+fi
+chmod 600 "$ENV_FILE"
+say "application account + user key provisioned (OPENVIKING_USER_KEY set)"
+
+curl -fsS "http://127.0.0.1:1933/health" | "$VENV/bin/python" -m json.tool >&2 || true
+say "provisioning complete; run tools/openviking_qualify.py with OPENVIKING_API_KEY=OPENVIKING_USER_KEY"
+exit 0

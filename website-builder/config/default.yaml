@@ -30,6 +30,12 @@ website_builder:
   # exposed publicly; bind it to localhost and, where supported, require an API
   # key. The API key is read from the ``OPENVIKING_API_KEY`` environment
   # variable, NEVER from this file.
+  #
+  # AUTH (verified live, D4a.1): OpenViking's api_key mode is TWO-LAYER. The root
+  # key (in ov.conf) can ONLY administer; tenant DATA APIs (search/find,
+  # resources, fs, content) require an account USER key. ``OPENVIKING_API_KEY``
+  # must therefore hold the USER key (provisioned by tools/openviking_provision.sh),
+  # not the root key.
   openviking:
     enabled: false
     base_url: 'http://localhost:1933'

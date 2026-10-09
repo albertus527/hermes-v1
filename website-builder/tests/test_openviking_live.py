@@ -66,6 +66,7 @@ class FakeServer:
         self._task_counter = 0
         #: Overrides for negative tests.
         self.find_extra: List[Dict[str, Any]] = []
+        self.find_extra_only = False
         self.fail_find = False
         self.fail_health = False
         self.task_status = "completed"
@@ -134,16 +135,17 @@ class FakeServer:
                 return httpx.Response(500, json={"status": "error"})
             body = self._json(request)
             target = str(body.get("target_uri", "")).rstrip("/")
+            want_content = bool(body.get("read_content"))
             resources: List[Dict[str, Any]] = []
-            for uri in sorted(self.files):
-                if not uri.endswith("/" + LIVE_CONTENT_FILENAME):
-                    continue
-                directory = resource_directory_uri(uri)
-                if not lib.is_uri_within_scope(directory, target):
-                    continue
-                content = self.files[uri]
-                resources.append(
-                    {
+            if not self.find_extra_only:
+                for uri in sorted(self.files):
+                    if not uri.endswith("/" + LIVE_CONTENT_FILENAME):
+                        continue
+                    directory = resource_directory_uri(uri)
+                    if not lib.is_uri_within_scope(directory, target):
+                        continue
+                    content = self.files[uri]
+                    entry = {
                         "uri": directory,
                         "context_type": "resource",
                         "level": 1,
@@ -152,7 +154,9 @@ class FakeServer:
                         "score": 0.9,
                         "match_reason": "semantic",
                     }
-                )
+                    if want_content:
+                        entry["content"] = content
+                    resources.append(entry)
             resources.extend(self.find_extra)
             return httpx.Response(200, json={"status": "ok", "result": {"resources": resources}})
 
@@ -428,6 +432,133 @@ def test_put_resource_refuses_an_out_of_scope_uri():
     foreign = lib.project_root_uri("beta") + "/design_dna/x"
     with pytest.raises(Exception):
         backend.put_resource(PROJECT, foreign, b"body", record)
+
+
+def test_a_file_level_match_resolves_to_its_resource_directory():
+    """The real server returns file-level sidecar matches; the backend must
+    present them at the path-safe resource directory and attach the record."""
+    server = FakeServer()
+    backend = _backend(server)
+    adapter = _adapter(server)
+    src = lib.SourceSpec(
+        source_id="refero_typography", project_id=PROJECT, category="design_dna",
+        trust="reviewed", locator="refero-design/references/typography.md",
+    )
+    _seed(server, backend, [(src, b"# Typography\nEditorial type scale.")])
+    directory = src.uri
+    # Force the find response to be the FILE-level L1 sidecar, exactly as the
+    # real server returns it (a hidden `.overview.md` whose dot segment is not a
+    # path-safe URI segment).
+    server.find_extra = [{
+        "uri": directory + "/.overview.md",
+        "context_type": "resource",
+        "level": 1,
+        "abstract": "typography reference",
+        "overview": "typography reference",
+        "score": 0.9,
+    }]
+    # Remove the directory-level match the fake would otherwise add.
+    server.find_extra_only = True
+    result = adapter.retrieve_context("typography", PROJECT)
+    assert result.status == "ok"
+    assert result.returned_items == 1
+    item = result.items[0]
+    assert item.uri == directory                 # resolved to the directory
+    assert item.source_id == "refero_typography"  # provenance attached
+    assert item.trust == "reviewed"
+
+
+def test_duplicate_matches_for_one_resource_are_collapsed():
+    """The real server returns one resource at multiple levels; the backend must
+    present it once (highest score), not spend the budget on duplicates."""
+    server = FakeServer()
+    backend = _backend(server)
+    adapter = _adapter(server)
+    src = lib.SourceSpec(
+        source_id="refero_typography", project_id=PROJECT, category="design_dna",
+        trust="reviewed", locator="refero-design/references/typography.md",
+    )
+    _seed(server, backend, [(src, b"# Typography\nEditorial type scale.")])
+    directory = src.uri
+    server.find_extra_only = True
+    server.find_extra = [
+        {"uri": directory + "/.overview.md", "context_type": "resource", "level": 1,
+         "abstract": "overview", "overview": "overview", "score": 0.71},
+        {"uri": directory + "/refero_typography.md", "context_type": "resource",
+         "level": 2, "abstract": "body", "overview": "body", "score": 0.66},
+    ]
+    result = adapter.retrieve_context("typography", PROJECT)
+    assert result.returned_items == 1
+    assert result.items[0].uri == directory
+
+
+def test_processing_mode_is_an_application_owned_cost_control():
+    """Ingestion cost control: the backend sends the configured processing_mode
+    so a caller can choose vectors_only (no paid VLM) over the OpenViking default
+    semantic_and_vectors (which also refreshes every ancestor directory)."""
+    server = FakeServer()
+    backend = _backend(server)
+    backend.processing_mode = "vectors_only"
+    sent = {}
+    original = server.handler
+
+    def capture(request):
+        if request.url.path == "/api/v1/resources":
+            sent.update(json.loads(request.content.decode("utf-8")))
+        return original(request)
+
+    backend._client = httpx.Client(
+        base_url="http://127.0.0.1:1933", transport=httpx.MockTransport(capture)
+    )
+    src = lib.SourceSpec(
+        source_id="s", project_id=PROJECT, category="design_dna",
+        trust="reviewed", locator="a/b.md",
+    )
+    lib.ingest_sources(backend, [src], reader=lambda loc: b"body", project_id=PROJECT)
+    assert sent.get("processing_mode") == "vectors_only"
+
+
+def test_paid_vlm_ingestion_is_fail_closed_by_default():
+    """PREVENTIVE CONTROL for the D4a.1 budget overrun: the free path is the
+    default and a paid-VLM write without an explicit opt-in is REFUSED before any
+    upload, so no paid call can happen by accident."""
+    server = FakeServer()
+    backend = _backend(server)
+    # Default is vectors_only (free). Force the paid mode WITHOUT opting in.
+    backend.processing_mode = "semantic_and_vectors"
+    src = lib.SourceSpec(
+        source_id="s", project_id=PROJECT, category="design_dna",
+        trust="reviewed", locator="a/b.md",
+    )
+    report = lib.ingest_sources(backend, [src], reader=lambda loc: b"body", project_id=PROJECT)
+    assert report.statuses == {"error": 1}       # refused
+    assert server.uploads == {}                   # nothing uploaded -> no paid call
+
+
+def test_paid_vlm_ingestion_requires_opt_in_and_honors_the_ceiling():
+    server = FakeServer()
+    backend = _backend(server)
+    backend.enable_paid_vlm(ceiling=2)
+    assert backend.processing_mode == "semantic_and_vectors"
+    sources = [
+        lib.SourceSpec(source_id=f"s{i}", project_id=PROJECT, category="design_dna",
+                       trust="reviewed", locator=f"a/b{i}.md")
+        for i in range(4)
+    ]
+    report = lib.ingest_sources(
+        backend, sources, reader=lambda loc: b"body", project_id=PROJECT
+    )
+    # Two paid writes succeed; the rest are refused by the ceiling (not spent).
+    assert report.statuses.get("indexed") == 2
+    assert report.statuses.get("error") == 2
+    assert backend._paid_vlm_sources == 2
+
+
+def test_enable_paid_vlm_rejects_a_free_mode():
+    server = FakeServer()
+    backend = _backend(server)
+    with pytest.raises(ValueError):
+        backend.enable_paid_vlm(processing_mode="vectors_only")
 
 
 def test_put_resource_refuses_a_record_for_another_project():

@@ -346,6 +346,47 @@ def test_a_budget_cannot_be_widened_past_the_module_ceiling():
     assert widened.max_tokens == lib.MAX_CONTEXT_TOKENS
 
 
+def test_a_relevance_floor_drops_low_scoring_matches():
+    """A caller may require relevance, not merely top-N: matches below the floor
+    are dropped (honest empty), never fabricated."""
+    backend = lib.FakeOpenVikingBackend()
+    src = lib.SourceSpec(
+        source_id="s", project_id="alpha", category="design_dna",
+        trust="reviewed", locator="skills/x/s.md",
+    )
+    lib.ingest_sources(backend, [src], reader=lambda loc: b"typography", project_id="alpha")
+    backend.override_matches = [
+        lib.RawMatch(uri=lib.project_root_uri("alpha") + "/design_dna/hi",
+                     record=_record(source_id="hi"), score=0.9),
+        lib.RawMatch(uri=lib.project_root_uri("alpha") + "/design_dna/lo",
+                     record=_record(source_id="lo"), score=0.2),
+    ]
+    adapter = _enabled(backend)
+    unfiltered = adapter.retrieve_context("x", "alpha")
+    filtered = adapter.retrieve_context("x", "alpha", budget=ovr.RetrievalBudget(min_score=0.5))
+    assert unfiltered.returned_items == 2
+    assert filtered.returned_items == 1
+    assert filtered.items[0].source_id == "hi"
+
+
+def test_a_relevance_floor_that_matches_nothing_is_honestly_empty():
+    backend = lib.FakeOpenVikingBackend()
+    src = lib.SourceSpec(
+        source_id="s", project_id="alpha", category="design_dna",
+        trust="reviewed", locator="skills/x/s.md",
+    )
+    lib.ingest_sources(backend, [src], reader=lambda loc: b"typography", project_id="alpha")
+    backend.override_matches = [
+        lib.RawMatch(uri=lib.project_root_uri("alpha") + "/design_dna/lo",
+                     record=_record(source_id="lo"), score=0.2),
+    ]
+    result = _enabled(backend).retrieve_context(
+        "x", "alpha", budget=ovr.RetrievalBudget(min_score=0.9)
+    )
+    assert result.status == "ok"
+    assert result.returned_items == 0
+
+
 # ---------------------------------------------------------------------------
 # L0/L1/L2 loading policy
 # ---------------------------------------------------------------------------

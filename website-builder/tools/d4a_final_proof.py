@@ -86,7 +86,7 @@ D3A5_DRIVERS: Tuple[Tuple[str, int], ...] = (
 D3B_DRIVER = ("mutation_check_d3b.py", 14)
 D4A_DRIVER = ("mutation_check_d4a.py", 17)
 #: D4a.1: the live backend + corpus guards.
-D4A1_DRIVER = ("mutation_check_d4a1.py", 7)
+D4A1_DRIVER = ("mutation_check_d4a1.py", 9)
 
 EXPECTED_DESELECTED = 4
 
@@ -119,6 +119,7 @@ REQUIRED_ARTIFACTS: Tuple[str, ...] = (
     "tools/d4a_final_proof.py",
     "tools/openviking_qualify.py",
     "tools/openviking_provision.sh",
+    "tools/openviking_admin.py",
     "deploy/openviking/ov.conf.template",
     "deploy/openviking/openviking-website.service",
     "docs/D4A_OPENVIKING_FOUNDATION_ACCEPTANCE.md",

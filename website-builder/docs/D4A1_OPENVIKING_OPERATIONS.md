@@ -41,8 +41,8 @@ mkdir -p ~/.website-builder/openviking
 ~/.hermes/bin/uv venv --python 3.12 ~/.website-builder/openviking/venv
 ~/.hermes/bin/uv pip install --python ~/.website-builder/openviking/venv/bin/python openviking==0.4.23
 
-# Provision config + env + systemd unit and start the service.
-# This refuses to run without --yes (the approval gate).
+# Provision config + env + systemd unit, start the service, and create the
+# application account + user key. Refuses to run without --yes (approval gate).
 website-builder/tools/openviking_provision.sh --yes
 ```
 
@@ -54,7 +54,25 @@ The provision script:
 3. writes `ov.conf` from `deploy/openviking/ov.conf.template`;
 4. installs + starts `openviking-website.service` (linger is already enabled, so
    it starts on boot without an interactive login);
-5. waits for `/health`.
+5. waits for `/health`;
+6. creates the application account + admin **user key** via
+   `tools/openviking_admin.py` and stores it as `OPENVIKING_USER_KEY`.
+
+### Authentication model (two-layer keys) — IMPORTANT
+
+OpenViking's `api_key` mode uses a **two-layer key model**:
+
+| Key | Source | Can do |
+|---|---|---|
+| Root key | `ov.conf` `server.root_api_key` | account administration + system routes ONLY |
+| User/admin key | Admin API | tenant DATA APIs: `/api/v1/resources`, `/api/v1/search/find`, `/api/v1/fs`, `/api/v1/content` |
+
+A **root key cannot access tenant data APIs** — doing so returns
+`403 PERMISSION_DENIED` ("ROOT API keys cannot access tenant-scoped data APIs in
+api_key mode"). The application sends ONE key as `X-API-Key`, so the application
+must be configured with the **USER key**. The provision script sets this up
+automatically; `tools/openviking_admin.py` is idempotent and returns the same
+user key on re-run.
 
 Provider configuration (in `ov.conf`, secret-free — the key is `${NINEROUTER_API_KEY}`):
 
@@ -97,15 +115,37 @@ checks the AGFS filesystem and vector backend.
 
 ## 5. Index the reviewed corpus + qualify
 
+> **COST WARNING + CONTROL (measured, D4a.1).** Ingestion with
+> `processing_mode=semantic_and_vectors` calls the **paid VLM** to generate L0/L1
+> for every resource directory **and refreshes every ancestor directory** — so
+> ingesting N sources costs many more than N paid LLM calls. A first 11-file
+> corpus cost **≈ US$0.58**. The paid path is now **fail-closed**: the FREE
+> `vectors_only` mode is the default; the paid mode requires an explicit opt-in
+> (`--allow-paid-vlm`, or `backend.enable_paid_vlm(ceiling=…)`) and is bounded by
+> a hard per-run ceiling (`MAX_PAID_VLM_SOURCES_PER_RUN`, default 12). The
+> qualifier **refuses** `semantic_and_vectors` without `--allow-paid-vlm`.
+
 ```bash
 cd ~/hermes-website/website-builder
-export OPENVIKING_API_KEY="$(grep '^OPENVIKING_ROOT_KEY=' ~/.website-builder/openviking/openviking.env | cut -d= -f2-)"
+export OPENVIKING_API_KEY="$(grep '^OPENVIKING_USER_KEY=' ~/.website-builder/openviking/openviking.env | cut -d= -f2-)"
+# Free path (default; embeddings only, no L0/L1, $0.00 metered):
 ./.venv/bin/python tools/openviking_qualify.py \
     --base-url http://127.0.0.1:1933 \
     --profile-skills-dir ~/.hermes-website/skills \
     --project-id wb-design \
     --out ~/.website-builder/openviking/qualification.json
+
+# Paid L0/L1 path — ONLY with an approved budget, explicitly opted in and bounded:
+./.venv/bin/python tools/openviking_qualify.py \
+    --base-url http://127.0.0.1:1933 \
+    --profile-skills-dir ~/.hermes-website/skills \
+    --project-id wb-design \
+    --processing-mode semantic_and_vectors --allow-paid-vlm --paid-vlm-ceiling 12 \
+    --out ~/.website-builder/openviking/qualification.json
 ```
+
+> `OPENVIKING_API_KEY` must be the **USER key** (`OPENVIKING_USER_KEY`), not the
+> root key — a root key is rejected by the data APIs (see §2).
 
 This ingests the reviewed corpus through the **production** D4a ingestion policy
 and exercises retrieval A–J through the production adapter. It writes a
@@ -139,9 +179,10 @@ reported, never invented.
 |---|---|
 | `NINEROUTER_API_KEY` | update `~/.hermes-website/.env`, then re-run the provision script (it re-reads the file) |
 | `OPENVIKING_ROOT_KEY` | edit `~/.website-builder/openviking/openviking.env`, then `systemctl --user restart openviking-website` |
+| `OPENVIKING_USER_KEY` | re-run `tools/openviking_admin.py` (idempotent; returns the account's user key) and update the env file, or delete the account's user and recreate it |
 
 Both files are `0600`. Neither is ever logged or committed. The application reads
-the root key from `OPENVIKING_API_KEY` and sends it as `X-API-Key`; the D4a
+the **user** key from `OPENVIKING_API_KEY` and sends it as `X-API-Key`; the D4a
 adapter's `to_dict()` reports the key by **presence only**.
 
 ---

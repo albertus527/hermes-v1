@@ -154,6 +154,10 @@ class RetrievalBudget:
     #: When False (the default), only L0/L1 summaries are loaded. L2 detail is
     #: fetched only when a caller explicitly justifies it.
     allow_detail: bool = False
+    #: Optional minimum relevance score. A match scoring below this is dropped, so
+    #: a caller can require that returned context be RELEVANT rather than merely
+    #: top-N. Default 0.0 = keep everything the backend returned (D4a behaviour).
+    min_score: float = 0.0
 
     def normalized(self) -> "RetrievalBudget":
         """Clamp every field to the module ceiling (never widen)."""
@@ -162,6 +166,7 @@ class RetrievalBudget:
             max_bytes=max(0, min(int(self.max_bytes), MAX_CONTEXT_BYTES)),
             max_tokens=max(0, min(int(self.max_tokens), MAX_CONTEXT_TOKENS)),
             allow_detail=bool(self.allow_detail),
+            min_score=float(self.min_score),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -170,6 +175,7 @@ class RetrievalBudget:
             "max_bytes": self.max_bytes,
             "max_tokens": self.max_tokens,
             "allow_detail": self.allow_detail,
+            "min_score": self.min_score,
         }
 
 
@@ -445,6 +451,12 @@ class OpenVikingRetrievalAdapter:
             trust = str(record.get("trust", "")) or "external"
             if trust not in TRUST_LEVELS:
                 trust = "external"
+
+            # (3b) Relevance floor: a caller may require that returned context be
+            # RELEVANT, not merely top-N. A match below the floor is dropped (not
+            # a violation). Default 0.0 keeps D4a behaviour.
+            if budget.min_score > 0.0 and float(raw.score or 0.0) < budget.min_score:
+                continue
 
             # (4) Credential-shaped content fails closed.
             haystack = " ".join(

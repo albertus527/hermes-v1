@@ -36,6 +36,7 @@
     "port": 1933,
     "workers": 1,
     "auth_mode": "api_key",
+    "//root_api_key": "ROOT key: administration + system routes ONLY. It CANNOT call tenant data APIs; the application must use an account USER key (created by tools/openviking_admin.py).",
     "root_api_key": "${OPENVIKING_ROOT_KEY}",
     "cors_origins": ["http://127.0.0.1:1933"],
     "temp_upload": { "default_mode": "local" }

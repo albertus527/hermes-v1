@@ -62,12 +62,12 @@ MUTATIONS = [
     (
         "an unprovenanced live match is dropped before the adapter sees it",
         LIVE,
-        """            record = self._read_record(match.uri)
-            if record is None:
+        """            record_dir, record = self._find_record_dir(match.uri)
+            if record is None or record_dir is None:
                 # Not application-provenanced content (e.g. a server-generated
                 # directory node with no record). Never surfaced.
                 continue""",
-        """            record = self._read_record(match.uri)
+        """            record_dir, record = self._find_record_dir(match.uri)
             if False:
                 continue""",
     ),
@@ -94,6 +94,34 @@ MUTATIONS = [
             continue""",
         """        if False:
             continue""",
+    ),
+    (
+        "a paid-VLM write without explicit opt-in is refused",
+        LIVE,
+        """            if not self._allow_paid_vlm:
+                raise LiveBackendError(
+                    "paid VLM ingestion is not enabled; call enable_paid_vlm() "
+                    "with an approved budget, or use vectors_only"
+                )""",
+        """            if False:
+                raise LiveBackendError(
+                    "paid VLM ingestion is not enabled; call enable_paid_vlm() "
+                    "with an approved budget, or use vectors_only"
+                )""",
+    ),
+    (
+        "the paid-VLM per-run ceiling is enforced",
+        LIVE,
+        """            if self._paid_vlm_sources >= ceiling:
+                raise LiveBackendError(
+                    f"paid VLM ingestion ceiling reached ({ceiling} sources this run); "
+                    "refusing further paid writes"
+                )""",
+        """            if False:
+                raise LiveBackendError(
+                    f"paid VLM ingestion ceiling reached ({ceiling} sources this run); "
+                    "refusing further paid writes"
+                )""",
     ),
 ]
 

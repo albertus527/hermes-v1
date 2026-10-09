@@ -93,6 +93,15 @@ LIVE_RECORD_FILENAME = ".openviking-record.json"
 #: The single content file written for one ingested source.
 LIVE_CONTENT_FILENAME = "content.md"
 
+#: HARD CEILING on paid-VLM source ingestions in ONE backend instance / run.
+#: ``semantic_and_vectors`` calls the paid VLM to generate L0/L1 for every
+#: resource directory AND refreshes every ancestor directory, so the number of
+#: paid LLM calls grows with the tree, not just the source count. This ceiling
+#: is a fail-closed backstop: the backend refuses the (N+1)th paid ingestion
+#: rather than silently spending past it. It is deliberately small; raise it
+#: explicitly per run only with an approved budget.
+MAX_PAID_VLM_SOURCES_PER_RUN = 12
+
 #: The application-owned top-level directory name used for a resource. Each
 #: ingested source owns ``<resource_uri>/`` (the D4a ``resource_uri``).
 #:
@@ -242,6 +251,40 @@ class LiveOpenVikingBackend(HttpOpenVikingBackend):
         #: Optional injected httpx-like client (used by the offline tests via a
         #: MockTransport). ``None`` means "build one per call".
         self._client = client
+        #: When True, ``find`` asks the server for full L2 content per match so
+        #: the adapter's credential check sees the REAL body (a security control
+        #: must not be blind to L2), and its ``allow_detail`` policy can surface
+        #: it. Default True; the adapter still bounds how much is kept and only
+        #: surfaces L2 when the caller asked for detail.
+        self.read_content = True
+        #: Application-owned ingestion cost control. ``semantic_and_vectors``
+        #: calls the paid VLM to generate L0/L1 AND refreshes every ancestor
+        #: directory, so N sources cost many paid LLM calls. ``vectors_only``
+        #: skips the VLM (embeddings only; no L0/L1).
+        #:
+        #: FAIL-CLOSED DEFAULT: the FREE path is the default. Selecting the paid
+        #: path requires an explicit ``allow_paid_vlm=True`` opt-in, and it is
+        #: bounded by :data:`MAX_PAID_VLM_SOURCES_PER_RUN` per run. This is the
+        #: preventive control for the D4a.1 budget overrun: no paid call happens
+        #: unless a caller deliberately asks for it AND stays under the ceiling.
+        self.processing_mode = "vectors_only"
+        self._allow_paid_vlm = False
+        self._paid_vlm_sources = 0
+
+    def enable_paid_vlm(
+        self, *, processing_mode: str = "semantic_and_vectors", ceiling: int = MAX_PAID_VLM_SOURCES_PER_RUN
+    ) -> None:
+        """Explicitly opt in to paid-VLM ingestion, bounded by ``ceiling``.
+
+        This is the ONLY way to reach the paid path. Calling it records the
+        caller's intent and the hard per-run ceiling; ingestion then refuses
+        past the ceiling instead of spending unboundedly.
+        """
+        if processing_mode != "semantic_and_vectors":
+            raise ValueError("enable_paid_vlm requires processing_mode=semantic_and_vectors")
+        self._allow_paid_vlm = True
+        self.processing_mode = processing_mode
+        self._paid_vlm_ceiling = max(1, int(ceiling))
 
     # -- transport ---------------------------------------------------------
 
@@ -250,9 +293,16 @@ class LiveOpenVikingBackend(HttpOpenVikingBackend):
             return self._client
         import httpx  # lazy: never imported at module load
 
+        # Do NOT set a default Content-Type: it breaks the multipart
+        # ``temp_upload`` (httpx would otherwise send application/json on a
+        # multipart body). JSON requests set their own Content-Type; uploads set
+        # a multipart one.
+        headers = {
+            k: v for k, v in self._headers().items() if k.lower() != "content-type"
+        }
         return httpx.Client(
             base_url=self._config.base_url.rstrip("/"),
-            headers=self._headers(),
+            headers=headers,
             timeout=self._config.timeout_seconds,
         )
 
@@ -303,23 +353,36 @@ class LiveOpenVikingBackend(HttpOpenVikingBackend):
                 return content
         return None
 
-    def _read_record(self, uri: str) -> Optional[ResourceRecord]:
-        """Resolve the application-owned provenance record for ``uri``.
+    def _find_record_dir(self, uri: str) -> Tuple[Optional[str], Optional[ResourceRecord]]:
+        """Walk UP from ``uri`` to the resource directory that holds a record.
 
-        Tries the resource directory that owns ``uri``; a trailing content leaf
-        resolves to its parent directory. Returns ``None`` when no record exists
-        (so the caller drops the match rather than surfacing an unprovenanced
-        item).
+        The real server returns matches at the FILE level -- e.g. the L1 sidecar
+        ``…/<slug>/.overview.md`` -- while the application-owned record lives at
+        the resource directory ``…/<slug>/.openviking-record.json``. So we try
+        the URI itself, then each ancestor, and return the first directory whose
+        record resolves. The walk is bounded by the ``viking://`` path and never
+        leaves the project scope (the caller still validates containment).
+
+        Returns ``(directory, record)`` or ``(None, None)``.
         """
-        directory = resource_directory_uri(uri)
-        for candidate in (f"{directory}/{LIVE_RECORD_FILENAME}",):
-            text = self._read_text(candidate)
-            if text is None:
-                continue
-            record = _decode_record(text)
-            if record is not None:
-                return record
-        return None
+        candidate = str(uri or "").rstrip("/")
+        if not candidate.startswith("viking://"):
+            return None, None
+        while True:
+            text = self._read_text(f"{candidate}/{LIVE_RECORD_FILENAME}")
+            if text is not None:
+                record = _decode_record(text)
+                if record is not None:
+                    return candidate, record
+            parent = candidate.rsplit("/", 1)[0]
+            if parent == candidate or not parent.startswith("viking://"):
+                return None, None
+            candidate = parent
+
+    def _read_record(self, uri: str) -> Optional[ResourceRecord]:
+        """The application-owned provenance record for ``uri``, or ``None``."""
+        _, record = self._find_record_dir(uri)
+        return record
 
     def find(
         self, *, query: str, target_uri: str, limit: int, level: Optional[int] = None
@@ -340,32 +403,50 @@ class LiveOpenVikingBackend(HttpOpenVikingBackend):
         }
         if level is not None:
             payload["level"] = level
+        # Ask for full content only when the caller's policy can use it. This is
+        # what lets the adapter's L2 policy AND its credential check see the real
+        # body; the adapter still bounds how much is kept.
+        if self.read_content:
+            payload["read_content"] = True
         body = self._request("POST", "/api/v1/search/find", json=payload)
         if not isinstance(body, Mapping):
             raise LiveBackendError("openviking response body was not an object")
         matches = list(_parse_find_response(body))
-        resolved: List[RawMatch] = []
+        # The server returns the SAME resource at multiple levels (an L0/L1
+        # directory sidecar AND the L2 body), which resolve to the same
+        # application resource directory. Present each resource ONCE, keeping its
+        # highest-scoring match, so a result is a set of distinct resources and
+        # never spends the context budget on duplicates.
+        best: Dict[str, RawMatch] = {}
         for match in matches:
-            record = self._read_record(match.uri)
-            if record is None:
+            record_dir, record = self._find_record_dir(match.uri)
+            if record is None or record_dir is None:
                 # Not application-provenanced content (e.g. a server-generated
                 # directory node with no record). Never surfaced.
                 continue
-            resolved.append(
-                RawMatch(
-                    uri=match.uri,
-                    context_type=match.context_type,
-                    level=match.level,
-                    abstract=match.abstract,
-                    overview=match.overview,
-                    content=match.content,
-                    score=match.score,
-                    category=record.category or match.category,
-                    match_reason=match.match_reason,
-                    record=record.to_dict(),
-                )
+            # Present the match at its RESOURCE DIRECTORY, not the server's
+            # file-level leaf (which may be a hidden `.overview.md` sidecar whose
+            # dot-prefixed segment is not a path-safe URI segment). The directory
+            # is the application-owned resource identity and is path-safe. Scope
+            # is NOT filtered here: the adapter remains the single fail-closed
+            # isolation boundary, so a foreign match reaches it and is refused
+            # there rather than being silently dropped.
+            candidate = RawMatch(
+                uri=record_dir,
+                context_type=match.context_type,
+                level=match.level,
+                abstract=match.abstract,
+                overview=match.overview,
+                content=match.content,
+                score=match.score,
+                category=record.category or match.category,
+                match_reason=match.match_reason,
+                record=record.to_dict(),
             )
-        return resolved
+            existing = best.get(record_dir)
+            if existing is None or candidate.score > existing.score:
+                best[record_dir] = candidate
+        return sorted(best.values(), key=lambda m: (-m.score, m.uri))
 
     # -- ingestion ---------------------------------------------------------
 
@@ -443,13 +524,37 @@ class LiveOpenVikingBackend(HttpOpenVikingBackend):
         if not is_uri_within_scope(directory, project_root_uri(project_id)):
             raise LiveBackendError("resource uri escapes the project scope")
 
+        # COST GUARD (fail closed): a paid-VLM ingestion must be explicitly
+        # opted in AND stay under the per-run ceiling. This is the preventive
+        # control for the D4a.1 budget overrun -- the backend refuses the
+        # over-ceiling write instead of silently spending.
+        if self.processing_mode == "semantic_and_vectors":
+            if not self._allow_paid_vlm:
+                raise LiveBackendError(
+                    "paid VLM ingestion is not enabled; call enable_paid_vlm() "
+                    "with an approved budget, or use vectors_only"
+                )
+            ceiling = getattr(self, "_paid_vlm_ceiling", MAX_PAID_VLM_SOURCES_PER_RUN)
+            if self._paid_vlm_sources >= ceiling:
+                raise LiveBackendError(
+                    f"paid VLM ingestion ceiling reached ({ceiling} sources this run); "
+                    "refusing further paid writes"
+                )
+
         # 1. Stage the content and commit it as a resource directory.
         temp_id = self._temp_upload(LIVE_CONTENT_FILENAME, bytes(content))
         payload: Dict[str, Any] = {
             "temp_file_id": temp_id,
             "to": directory,
             "source_name": record.source_id,
-            "processing_mode": "semantic_and_vectors",
+            # The processing mode is an APPLICATION-OWNED cost control. The
+            # default ``semantic_and_vectors`` calls the paid VLM to generate
+            # L0/L1 for the resource directory AND refreshes every ancestor
+            # directory (each refresh is another paid LLM call), so ingesting N
+            # sources costs far more than N VLM calls. ``vectors_only`` skips
+            # the VLM entirely (embeddings only) at the cost of no L0/L1
+            # summaries. Callers choose via ``self.processing_mode``.
+            "processing_mode": self.processing_mode,
             "wait": True,
             "timeout": self._config.timeout_seconds,
             "tags": retrieval_tags_for(record),
@@ -470,6 +575,10 @@ class LiveOpenVikingBackend(HttpOpenVikingBackend):
         # 2. Await semantic + vector processing so the resource is searchable.
         if task_id:
             self._await_task(str(task_id))
+
+        # A paid-VLM write succeeded: count it against the per-run ceiling.
+        if self.processing_mode == "semantic_and_vectors":
+            self._paid_vlm_sources += 1
 
         # 3. Write provenance LAST: this is what marks the resource indexed.
         self._write_text(f"{directory}/{LIVE_RECORD_FILENAME}", _encode_record(record))
