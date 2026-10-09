@@ -627,6 +627,10 @@ class TestPhase8Handoff(unittest.TestCase):
             hermes_adapter=self.mock_adapter,
             web3forms_access_key=None,
             toolchain_verify=unittest.mock.ANY,
+            # D3b: the bounded critic repair stage is wired into every QA
+            # handoff. This builder was constructed without a scanner, so the
+            # stage records an explicit NOT_RUN degraded outcome.
+            critic_scanner=None,
         )
         # MEDIUM-5: the toolchain verifier closes over this build's hashes.
         verify_fn = mock_qa_cls.call_args.kwargs["toolchain_verify"]
@@ -1809,10 +1813,14 @@ class TestPhase7CompileRepair(unittest.TestCase):
         # ...and Phase-8 QA is then handed off with exactly the standard
         # constructor/handoff surface — no compile-repair budget or state is
         # threaded into it, so its own bounded repair budget is untouched.
+        # D3b adds ONLY the injected critic scanner; the QA repair budget
+        # (MAX_REPAIR_ATTEMPTS) is a separate, untouched constant.
         self.assertEqual(
             set(mock_qa_cls.call_args.kwargs.keys()),
-            {"hermes_adapter", "web3forms_access_key", "toolchain_verify"},
+            {"hermes_adapter", "web3forms_access_key", "toolchain_verify",
+             "critic_scanner"},
         )
+        self.assertIsNone(mock_qa_cls.call_args.kwargs["critic_scanner"])
         mock_qa.run.assert_called_once_with(
             project_id="proj-repair-g",
             workspace=result.workspace,

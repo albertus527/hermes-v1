@@ -147,6 +147,7 @@ class RevisionOrchestrator:
         web3forms_access_key: Optional[str] = None,
         hydrator=None,
         source_repo_url: Optional[str] = None,
+        critic_scanner=None,
     ):
         self.runner = runner
         self.store = store
@@ -160,6 +161,10 @@ class RevisionOrchestrator:
         # Operator-configured source remote (SSH form). Used only to prove the
         # recorded repository identity still names the configured one, offline.
         self.source_repo_url = source_repo_url
+        # D3b: the production Impeccable critic scanner, injected into the QA
+        # orchestrator this revision runs so the bounded critic repair stage is
+        # part of the revision path too.
+        self.critic_scanner = critic_scanner
 
     # ------------------------------------------------------------------
     # Revision base (frozen at reservation time)
@@ -680,6 +685,7 @@ class RevisionOrchestrator:
             qa_orchestrator = QAOrchestrator(
                 self.runner, self.store, hermes_adapter=self.hermes_adapter,
                 web3forms_access_key=self.web3forms_access_key,
+                critic_scanner=self.critic_scanner,
             )
             qa_result = qa_orchestrator.run(
                 project_id=project_id,

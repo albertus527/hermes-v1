@@ -28,6 +28,7 @@ from app.core.selfcontained import (
     normalize_and_check_self_contained,
 )
 from app.core.state import ProjectStateStore
+from app.qa.critic_stage import CriticStage
 from app.qa.deterministic import run_deterministic_checks
 from app.qa.findings import DeterministicFindings, QAAttempt, QAResult, VisionFindings
 from app.qa.render import LocalRenderer, RenderError
@@ -70,6 +71,7 @@ class QAOrchestrator:
         screenshot_capture: Optional[ScreenshotCapture] = None,
         web3forms_access_key: Optional[str] = None,
         toolchain_verify=None,
+        critic_scanner=None,
     ):
         self.runner = runner
         self.store = store
@@ -86,6 +88,13 @@ class QAOrchestrator:
         # blocking finding. Never persisted as evidence (the artifact itself
         # is the evidence).
         self._self_contained_report = None
+        # D3b: the production Impeccable critic scanner. When None, the critic
+        # stage records an explicit NOT_RUN degraded outcome instead of
+        # pretending a scan happened.
+        self._critic_scanner = critic_scanner
+        # Set by the critic stage so the caller can persist an honest degraded
+        # record instead of claiming full verification.
+        self._critic_stage_result = None
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -146,6 +155,48 @@ class QAOrchestrator:
                     )
 
                 if qa_attempt.final_pass:
+                    # --- D3b: the bounded critic repair stage -----------------
+                    # Runs AFTER the existing browser/VISION QA passes and
+                    # BEFORE acceptance. It may perform further bounded FRONTEND
+                    # repairs; if it fails, this QA run FAILS and no preview or
+                    # publication is reached.
+                    #
+                    # It runs BEFORE the tested snapshot is captured, because a
+                    # critic repair invalidates the ``checked`` binding and the
+                    # browser QA evidence: the snapshot must bind the bytes that
+                    # FINALLY passed, not the pre-critic ones.
+                    critic_stage = self._run_critic_stage(
+                        project_id=project_id,
+                        workspace=workspace,
+                        brief=brief,
+                        design_dna=design_dna,
+                        attempts=attempts,
+                        next_attempt_num=next_attempt_num,
+                        qa_dir=qa_dir,
+                    )
+                    if critic_stage is not None:
+                        attempts = critic_stage["attempts"]
+                        next_attempt_num = critic_stage["next_attempt_num"]
+                        repair_count += critic_stage["extra_repairs"]
+                        if critic_stage["failed"]:
+                            self._finalize_failure(
+                                project_id, attempts, repair_count,
+                                error=critic_stage["error"],
+                                critic=critic_stage["record"],
+                            )
+                            return QAResult(
+                                project_id=project_id,
+                                success=False,
+                                attempts=attempts,
+                                repair_attempts=repair_count,
+                                error=critic_stage["error"],
+                            )
+
+                    # The attempt that FINALLY passed QA. After a critic repair
+                    # this is the stage's fresh browser/VISION attempt; without
+                    # one it is the original passing attempt.
+                    final_attempt = attempts[-1] if attempts else qa_attempt
+
                     state = self.store.load(project_id)
                     checked = state.deployment.get('checked') or {}
                     tested_snapshot = None
@@ -165,16 +216,17 @@ class QAOrchestrator:
                             raise
                         if checked['source_revision'] != state.revisions.source_revision:
                             raise QABlockingError('STALE_QA_BINDING')
-                        if qa_attempt.vision is None or qa_attempt.vision.pass_ is not True:
+                        if final_attempt.vision is None or final_attempt.vision.pass_ is not True:
                             raise QABlockingError('VISION_REQUIRED')
                         tested_snapshot = snapshot.to_dict()
+
                     # ONE writer block commits the tested snapshot AND the
                     # RUNNING -> PREVIEW_READY transition together. Writing
                     # them separately left a window in which a crash left a
                     # fully passing QA result persisted under a RUNNING
                     # lifecycle, and nothing ever drove it forward.
                     self._finalize_success(
-                        project_id, qa_attempt, tested_snapshot=tested_snapshot
+                        project_id, final_attempt, tested_snapshot=tested_snapshot
                     )
                     return QAResult(
                         project_id=project_id,
@@ -386,6 +438,240 @@ class QAOrchestrator:
         )
 
     # ------------------------------------------------------------------
+    # D3b: the bounded critic repair stage
+    # ------------------------------------------------------------------
+
+    def _critic_repair(
+        self,
+        project_id: str,
+        workspace: Path,
+        findings,
+        previous_results,
+        budget,
+        attempt_index: int,
+    ) -> bool:
+        """One critic-driven FRONTEND repair, through the EXISTING mechanism.
+
+        Uses the same writer lock, the same ``frontend_build`` adapter call, the
+        same toolchain verification, and the same Design DNA validation as every
+        other repair. No second pipeline, no second lock manager.
+
+        Returns True only when the repair call itself succeeded; the resulting
+        rebuild is verified separately (never trusted from the model's claim).
+        """
+        if self.hermes_adapter is None:
+            return False
+
+        from app.core.critic_policy import build_repair_request
+
+        with self.store.acquire_writer(project_id) as state:
+            request = build_repair_request(
+                requirements=state.brief or {},
+                design_dna=state.design_dna or {},
+                findings=findings,
+                browser_findings=(),
+                build_errors="",
+                project_id=project_id,
+                source_revision=state.revisions.source_revision,
+                previous_results=previous_results,
+                budget=budget,
+            )
+            instructions = compose_project_instructions(
+                state, access_key=self.web3forms_access_key, task=request,
+            )
+            brief = dict(state.brief)
+            design_references = dict(state.design_references or {})
+            state.revisions.source_revision += 1
+            repair_operation_id = str(state.revisions.source_revision)
+            invalidate_artifact(state)
+            self.store.save(state)
+
+        result = self.hermes_adapter.frontend_build(
+            project_id=project_id,
+            brief=brief,
+            workspace=workspace,
+            design_dna_instructions=instructions,
+            build_operation_id=repair_operation_id,
+        )
+
+        # MEDIUM-5: verify protected starter/toolchain files after EVERY
+        # FRONTEND repair invocation — regardless of the repair's own result.
+        if self._toolchain_verify is not None:
+            violation = self._toolchain_verify(workspace)
+            if violation:
+                logger.warning(
+                    "Protected toolchain file mutated during critic repair of %s: %s",
+                    project_id, violation,
+                )
+                self._toolchain_error = f"TOOLCHAIN_MUTATION_REJECTED ({violation})"
+                return False
+
+        if not result.get("success"):
+            return False
+        dna = result.get("design_dna")
+        try:
+            validate_composed_dna(dna, ReferenceSnapshot(design_references))
+        except ValueError:
+            return False
+        with self.store.acquire_writer(project_id) as locked:
+            locked.design_dna = dna
+            locked.revisions.design_dna_version = dna.get(
+                "version", locked.revisions.design_dna_version + 1
+            )
+            invalidate_artifact(locked)
+            self.store.save(locked)
+        return True
+
+    def _run_critic_stage(
+        self,
+        *,
+        project_id: str,
+        workspace: Path,
+        brief: Dict[str, Any],
+        design_dna: Optional[Dict[str, Any]],
+        attempts: list,
+        next_attempt_num: int,
+        qa_dir: Path,
+    ) -> Optional[Dict[str, Any]]:
+        """Run the bounded critic repair stage; return the updated bookkeeping.
+
+        Returns None only when no scanner is configured AND no record should be
+        produced -- which does not happen: a missing scanner is itself an
+        explicit NOT_RUN degraded outcome. The returned dict always carries a
+        durable ``record`` so the caller persists the honest critic state.
+        """
+        from app.core import critic_policy
+        from app.core.critic_repair import CriticScanResult
+
+        # --- a missing scanner is an explicit NOT_RUN degraded state --------
+        if self._critic_scanner is None:
+            record = {
+                "state": critic_policy.NOT_RUN,
+                "outcome": critic_policy.OUTCOME_DEGRADED_ACCEPTED,
+                "authoritative": False,
+                "degraded_record": True,
+                "failed": False,
+                "attempts_used": 0,
+                "reason": "critic_not_run",
+            }
+            self._critic_stage_result = record
+            self._record_critic_record(project_id, record)
+            return {
+                "attempts": attempts,
+                "next_attempt_num": next_attempt_num,
+                "extra_repairs": 0,
+                "failed": False,
+                "error": None,
+                "record": record,
+            }
+
+        # A durable attempt sink: the attempt identity survives a crash.
+        def _record_attempt(entry: Dict[str, Any]) -> None:
+            with self.store.acquire_writer(project_id) as state:
+                bag = state.deployment.setdefault("critic_repair", {})
+                bag["last_attempt"] = dict(entry)
+                bag["attempts_started"] = int(bag.get("attempts_started", 0)) + 1
+                self.store.save(state)
+
+        def _revision_of() -> int:
+            st = self.store.load(project_id)
+            return int(st.revisions.source_revision) if st is not None else -1
+
+        start_revision = _revision_of()
+
+        # The stage's browser QA produces a fresh QAAttempt that the caller must
+        # keep in its history (and which consumes an attempt number).
+        captured: Dict[str, Any] = {"attempts": attempts, "next": next_attempt_num}
+
+        def _browser_qa():
+            attempt = self._run_one_attempt(
+                project_id, workspace, qa_dir, captured["next"], brief, design_dna
+            )
+            captured["next"] += 1
+            captured["attempts"].append(attempt)
+            return attempt
+
+        def _rebuild():
+            return self._run_rebuild_checks(project_id, workspace)
+
+        stage = CriticStage(
+            scanner=self._critic_scanner,
+            repair_fn=lambda findings, prev, budget, idx: self._critic_repair(
+                project_id, workspace, findings, prev, budget, idx
+            ),
+            rebuild_fn=_rebuild,
+            browser_qa_fn=_browser_qa,
+            initial_attempts=0,
+            record_attempt=_record_attempt,
+            revision_of=_revision_of,
+            expected_start_revision=start_revision,
+            protected_terms=self._critic_protected_terms(project_id),
+        )
+        result = stage.run(workspace)
+        self._critic_stage_result = result.to_dict()
+
+        record = result.to_dict()
+        self._record_critic_record(project_id, record)
+
+        extra_repairs = result.attempts_used
+        error = result.error
+        if error is None and result.failed:
+            error = f"CRITIC_{result.outcome}"
+
+        return {
+            "attempts": captured["attempts"],
+            "next_attempt_num": captured["next"],
+            "extra_repairs": extra_repairs,
+            "failed": bool(result.failed),
+            "error": error,
+            "record": record,
+        }
+
+    def _critic_protected_terms(self, project_id: str):
+        """Terms a critic finding must not propose to change.
+
+        Drawn from the project's OWN accepted requirements and Design DNA, so a
+        finding that proposes removing or replacing a required element is
+        classified as a requirement conflict and never auto-repaired.
+        """
+        terms = []
+        try:
+            state = self.store.load(project_id)
+        except Exception:
+            return tuple(terms)
+        if state is None:
+            return tuple(terms)
+        brief = state.brief or {}
+        for key in ("name", "what", "why"):
+            value = brief.get(key)
+            if isinstance(value, str) and value.strip():
+                terms.append(value.strip())
+        dna = state.design_dna or {}
+        if isinstance(dna, dict):
+            for key in ("brand_personality", "brand_name", "font_family", "palette"):
+                value = dna.get(key)
+                if isinstance(value, str) and value.strip():
+                    terms.append(value.strip())
+        # Deduplicate while preserving order; bound each term.
+        seen = set()
+        out = []
+        for term in terms:
+            t = term[:80]
+            if t and t.lower() not in seen:
+                seen.add(t.lower())
+                out.append(t)
+        return tuple(out[:12])
+
+    def _record_critic_record(self, project_id: str, record: Dict[str, Any]) -> None:
+        """Persist the critic stage record durably (never a source mutation)."""
+        try:
+            with self.store.acquire_writer(project_id) as state:
+                state.deployment["critic"] = record
+                self.store.save(state)
+        except Exception:
+            logger.warning("could not persist critic record for %s", project_id, exc_info=True)
+
+    # ------------------------------------------------------------------
     # Repair
     # ------------------------------------------------------------------
 
@@ -559,6 +845,7 @@ Instructions:
         attempts: list,
         repair_attempts: int,
         error: Optional[str] = None,
+        critic: Optional[Dict[str, Any]] = None,
     ) -> None:
         with self.store.acquire_writer(project_id) as state:
             self.store.transition_lifecycle_locked(state, ProjectLifecycle.FAILED)
@@ -572,4 +859,8 @@ Instructions:
                 "error": error,
                 "failed_at": time.time(),
             }
+            if critic is not None:
+                # D3b: the critic stage's own evidence for the failure, so an
+                # operator can see WHICH finding/regression ended the loop.
+                state.failure["critic"] = critic
             self.store.save(state)

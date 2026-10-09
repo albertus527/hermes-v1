@@ -68,6 +68,7 @@ def _diag_log(tag: str) -> None:
 from app.channels.dispatch import AuthenticatedTelegramContext, TelegramDispatcher
 from app.channels.telegram import NormalizedMessage, TelegramNormalizer
 from app.core import credentials
+from app.core.critic_repair import scanner_from_config
 from app.core.design_capabilities import preflight_design_capabilities
 from app.core.design_resources import DesignResourceManifestError
 from app.core.intake import IntakeProcessor
@@ -722,6 +723,25 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
         hermes_home=config.hermes_home,
     )
 
+    # D3b: the production Impeccable critic scanner. The Node interpreter is
+    # resolved HERE, by the application, from the SAME declared toolchain the
+    # Node preflight validated -- the critic module itself never searches PATH.
+    # When no interpreter is found the scanner is still constructed: it then
+    # reports an explicit NOT_RUN/DEGRADED state rather than pretending a scan
+    # happened. Nothing is installed and no network is touched.
+    import shutil as _shutil
+
+    _critic_node = _shutil.which("node")
+    critic_scanner = scanner_from_config(
+        hermes_home=config.hermes_home,
+        node_executable=_critic_node,
+    )
+    logger.info(
+        "D3b critic scanner: node=%s skill_root=%s",
+        "found" if _critic_node else "absent",
+        config.hermes_home / "skills" / "impeccable",
+    )
+
     # Conversation-level project registry + router. Separate from per-project
     # state so the registry survives any active-project switch. Shares the
     # single HermesAdapter instance above for FAST-first routing.
@@ -898,6 +918,7 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
         hermes_adapter=hermes,
         preview_orchestrator=preview,
         web3forms_access_key=config.web3forms_access_key,
+        critic_scanner=critic_scanner,
     )
 
     # Revision orchestrator.
@@ -922,6 +943,7 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
         web3forms_access_key=config.web3forms_access_key,
         hydrator=hydrator,
         source_repo_url=config.github_source_repo,
+        critic_scanner=critic_scanner,
     )
 
     # LIVE source publication (R1). The friendly branch name is the project's

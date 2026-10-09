@@ -438,6 +438,7 @@ class FrontendBuilder:
         starter_path: Optional[Path] = None,
         preview_orchestrator=None,
         web3forms_access_key: Optional[str] = None,
+        critic_scanner=None,
     ):
         self.preview_orchestrator = preview_orchestrator
         self.runner = runner
@@ -447,6 +448,10 @@ class FrontendBuilder:
         # Phase 14: caller-injected verified destination secret, never
         # hardcoded. None selects the deterministic fallback-link path.
         self.web3forms_access_key = web3forms_access_key
+        # D3b: the production Impeccable critic scanner, injected into every
+        # QAOrchestrator this builder constructs so the bounded critic repair
+        # stage runs on the real production path.
+        self.critic_scanner = critic_scanner
 
     def _copy_starter(self, workspace: Path) -> None:
         """Copy the fixed frontend starter into the project workspace."""
@@ -1043,6 +1048,8 @@ Respond with a JSON summary:
                 # MEDIUM-5: QA repair must verify the same protected toolchain
                 # files after every FRONTEND repair invocation.
                 toolchain_verify=lambda ws: _verify_toolchain_untouched(ws, toolchain_hashes),
+                # D3b: the bounded Impeccable critic repair stage.
+                critic_scanner=self.critic_scanner,
             )
             qa_result = qa_orchestrator.run(
                 project_id=project_id,
