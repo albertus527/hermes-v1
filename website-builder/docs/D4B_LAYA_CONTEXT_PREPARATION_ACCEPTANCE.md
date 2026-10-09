@@ -543,5 +543,5 @@ passes all five scenarios (new brief, revision brief, no-relevant-references,
 temporary outage, prompt injection) with **zero paid model calls**, no reindex,
 no Vercel deployment, and Hermes Trade untouched.
 
-* Commit SHA: `______________________________________` (set at commit time)
+* Commit SHA: `67f3be871450816bdc203cc1e2f30f1e242e79bb` (set at commit time)
 * Push: `origin/web-design` (fast-forward, no force)
