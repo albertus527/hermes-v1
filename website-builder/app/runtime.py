@@ -72,6 +72,11 @@ from app.core.critic_repair import scanner_from_config
 from app.core.design_capabilities import preflight_design_capabilities
 from app.core.design_resources import DesignResourceManifestError
 from app.core.intake import IntakeProcessor
+from app.core.laya_context import (
+    LayaConfig,
+    LayaContextPreparer,
+    config_from_mapping as laya_config_from_mapping,
+)
 from app.core.openviking_retrieval import (
     OpenVikingConfig,
     OpenVikingRetrievalAdapter,
@@ -148,6 +153,10 @@ class RuntimeConfig:
     # Disabled by default; when disabled the retrieval adapter is constructed but
     # makes no backend call, so existing behaviour is unchanged.
     openviking_config: OpenVikingConfig = field(default_factory=OpenVikingConfig)
+    # D4b: Laya context-preparation configuration. DISABLED by default, so the
+    # FAST intake path is byte-identical to the pre-D4b path unless an operator
+    # explicitly enables it (which also requires OpenViking to be enabled).
+    laya_config: "LayaConfig" = field(default_factory=LayaConfig)
 
     def __post_init__(self):
         # Expand ~ in paths
@@ -251,6 +260,11 @@ def load_runtime_config(config_path: Optional[Path] = None) -> RuntimeConfig:
         openviking_cfg["api_key"] = _optional_env("OPENVIKING_API_KEY")
     openviking_config = openviking_config_from_mapping(openviking_cfg)
 
+    # D4b: Laya context-preparation configuration. DISABLED by default. Even
+    # when enabled, Laya performs no retrieval unless the OpenViking adapter is
+    # also enabled, so enabling Laya alone cannot contact a backend.
+    laya_config = laya_config_from_mapping(dict(wb.get("laya") or {}))
+
     return RuntimeConfig(
         telegram_bot_token=telegram_bot_token,
         hermes_home=hermes_home,
@@ -265,6 +279,7 @@ def load_runtime_config(config_path: Optional[Path] = None) -> RuntimeConfig:
         github_source_repo=github_source_repo,
         github_ssh_key=github_ssh_key,
         openviking_config=openviking_config,
+        laya_config=laya_config,
     )
 
 
@@ -775,8 +790,24 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
     registry_store = ConversationRegistryStore(config.state_root / "conversations")
     conversations = ConversationRouter(store, registry_store, hermes=hermes)
 
-    # Intake processor
-    intake = IntakeProcessor(store, hermes_adapter=hermes)
+    # D4a: the OpenViking retrieval adapter. Constructed unconditionally so the
+    # composition root always exposes the seam, but it is a NO-OP unless the
+    # feature flag is enabled: no backend is contacted, no network is touched,
+    # and existing Design DNA retrieval is unaffected. It is deliberately NOT
+    # injected into FRONTEND or QA in this batch (D4b wires it ONLY into the
+    # FAST intake seam, through Laya below).
+    openviking = build_openviking_adapter(config.openviking_config)
+    logger.info("D4a openviking adapter: %s", config.openviking_config.to_dict())
+
+    # D4b: the Laya context preparer. It consumes the OpenViking adapter and is
+    # a strict no-op unless BOTH Laya AND OpenViking are enabled -- so the FAST
+    # intake path is unchanged by default. Laya is a CONTEXT PROVIDER only.
+    laya = LayaContextPreparer(config.laya_config, openviking)
+    logger.info("D4b laya preparer: %s", config.laya_config.to_dict())
+
+    # Intake processor. D4b: the optional Laya context preparer is injected; it
+    # never decides scope/requirements/actions and never mutates state.
+    intake = IntakeProcessor(store, hermes_adapter=hermes, laya=laya)
 
     # Reference intake
     references = ReferenceIntake(store, hermes_adapter=hermes)
@@ -1029,14 +1060,6 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
         builder=builder,
         preview=preview,
     )
-
-    # D4a: the OpenViking retrieval adapter. Constructed unconditionally so the
-    # composition root always exposes the seam, but it is a NO-OP unless the
-    # feature flag is enabled: no backend is contacted, no network is touched,
-    # and existing Design DNA retrieval is unaffected. It is deliberately NOT
-    # injected into FRONTEND, FAST, or QA in this batch.
-    openviking = build_openviking_adapter(config.openviking_config)
-    logger.info("D4a openviking adapter: %s", config.openviking_config.to_dict())
 
     return RuntimeComposition(
         config=config,

@@ -111,11 +111,18 @@ class IntakeProcessor:
     Uses Hermes FAST for semantic interpretation when available.
     Falls back to deterministic heuristics only when Hermes is unavailable.
     Application code owns all state transitions.
+
+    D4b: an OPTIONAL, application-owned Laya context preparer may enrich the FAST
+    input with bounded, lower-trust REFERENCE material. Laya is disabled by
+    default; when disabled (or when OpenViking is unavailable) no retrieval is
+    performed and the FAST path is exactly the pre-D4b path. Laya is a context
+    provider only -- it never decides scope, requirements, or actions.
     """
 
-    def __init__(self, store: ProjectStateStore, hermes_adapter=None):
+    def __init__(self, store: ProjectStateStore, hermes_adapter=None, laya=None):
         self.store = store
         self.hermes_adapter = hermes_adapter
+        self.laya = laya
 
     # Brief fields the multi-turn merge accumulates. Order matters: the
     # smallest sufficient website brief is NAME + WHAT + WHY.
@@ -318,6 +325,35 @@ class IntakeProcessor:
             "Cukup 1-2 kalimat aja."
         )
 
+    def _prepare_reference_context(
+        self, text: str, project_id: Optional[str], persisted: Dict[str, Any]
+    ) -> Optional[str]:
+        """Prepare an optional Laya reference block for FAST (D4b).
+
+        Returns the rendered lower-trust reference block, or ``None`` when Laya
+        is absent/disabled or produced no usable context. This is a pure
+        enrichment step: it NEVER raises (any Laya failure degrades to ``None``,
+        so the original FAST path runs unchanged) and it NEVER mutates state.
+        The block is reference DATA appended to the FAST prompt; it is not an
+        instruction and it cannot override the user's brief.
+        """
+        if self.laya is None or self.hermes_adapter is None:
+            return None
+        try:
+            result = self.laya.prepare_context(
+                text, project_id, project_context=persisted,
+            )
+            from app.core.laya_context import render_laya_context_block
+
+            block = render_laya_context_block(result)
+            return block or None
+        except Exception:
+            # Fail open on availability: any Laya/internal failure must leave
+            # the original FAST path intact.
+            logger.debug("Laya context preparation failed; continuing without it",
+                         exc_info=True)
+            return None
+
     def process(
         self, message: NormalizedMessage, project_id: Optional[str] = None
     ) -> IntakeResult:
@@ -362,11 +398,27 @@ class IntakeProcessor:
         used_fallback = False
         fast_ambiguity_question: Optional[str] = None
         if self.hermes_adapter is not None:
+            # D4b: optional, bounded Laya reference enrichment for FAST. Returns
+            # None (no-op) unless Laya is enabled AND produced usable context, so
+            # the FAST prompt is unchanged in every other case.
+            reference_context = self._prepare_reference_context(
+                text, project_id, persisted
+            )
             try:
-                fast_result = self.hermes_adapter.fast_interpret(
-                    text, project_id,
-                    self._context_messages(persisted, pending_clarification),
-                )
+                if reference_context:
+                    fast_result = self.hermes_adapter.fast_interpret(
+                        text, project_id,
+                        self._context_messages(persisted, pending_clarification),
+                        reference_context=reference_context,
+                    )
+                else:
+                    # No reference context: keep the EXACT pre-D4b call shape so
+                    # every existing adapter/fake (and the original FAST path)
+                    # is byte-identical when Laya is disabled.
+                    fast_result = self.hermes_adapter.fast_interpret(
+                        text, project_id,
+                        self._context_messages(persisted, pending_clarification),
+                    )
             except Exception:
                 fast_result = None
 

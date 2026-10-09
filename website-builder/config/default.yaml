@@ -46,6 +46,38 @@ website_builder:
     # provenance; nothing here installs or upgrades it.
     pinned_version: '0.4.23'
 
+  # D4b: Laya context-preparation layer. Laya enriches the FAST intake path with
+  # a bounded, lower-trust REFERENCE context pack retrieved through the D4a
+  # OpenViking adapter. It is a context PROVIDER, never an authority: it cannot
+  # decide scope, approve/reject/override requirements, install dependencies,
+  # mutate project/publication state, or call FRONTEND/QA/deploy.
+  #
+  # DISABLED BY DEFAULT. Even when ``enabled: true``, Laya performs no retrieval
+  # unless the ``openviking`` block above is ALSO enabled -- enabling Laya alone
+  # cannot contact a backend. With Laya disabled the FAST prompt is byte-identical
+  # to the pre-D4b prompt.
+  #
+  # ``library_project_id`` is the application-owned REVIEWED design-library scope.
+  # It is a fixed application constant (never derived from user input), so a user
+  # can never redirect retrieval to an unrelated project. The remaining bounds
+  # may only NARROW the module ceilings in app/core/laya_context.py.
+  #
+  # ``min_score`` is the relevance floor, calibrated from LIVE measurements of the
+  # wb-design corpus (see docs/D4B_LAYA_CONTEXT_PREPARATION_ACCEPTANCE.md): a
+  # RELEVANT brief scores 0.66-0.77 at the top, an UNRELATED brief 0.54-0.58, so
+  # 0.62 cleanly drops irrelevant references (honest-empty) rather than presenting
+  # them as relevant. The module transport default is 0.0 (predictable), but the
+  # operational floor is this config value.
+  laya:
+    enabled: false
+    library_project_id: 'wb-design'
+    max_queries: 3
+    max_query_chars: 200
+    per_query_max_items: 6
+    min_score: 0.62
+    categories: ['design_dna', 'components', 'motion']
+    max_pack_chars: 6000
+
   # Workspace root for generated projects
   workspace_root: '~/website-workspaces'
 
