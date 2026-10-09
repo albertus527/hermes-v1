@@ -384,7 +384,11 @@ VERDICT: PASS
 
 ## 18. Final commit / proof record
 
-*(Populated at commit time.)*
+* Baseline: `9a04ef1caa49584f35bf1519a3c8250546ec463c`
+* D4a.1 live-enablement commit: `a2ab15b94baee813acf31d500560a695d07b5393`
+  (pushed to `origin/web-design`, fast-forward, no force)
+* `feature/website`: untouched at `868ed00e3f24e06f1dcf9944d6d031105dff0646`
+* Proof: `tools/d4a_final_proof.py` → **18/18 checks passed, VERDICT: PASS**
 
 ---
 
