@@ -1,0 +1,2944 @@
+{
+  "floor": 0.62,
+  "project_id": "wb-design",
+  "candidates": {
+    "B": [
+      {
+        "id": "H01-editorial-travel-journal",
+        "language": "en",
+        "pair": "H01",
+        "scenario": "editorial website design",
+        "queries": [
+          "design editorial travel journal long form destination essays serif led",
+          "editorial design editorial travel journal",
+          "form design editorial travel journal"
+        ],
+        "top_score": 0.7176,
+        "n_returned": 33,
+        "admitted_ge_floor": 33,
+        "empty_pack_with_floor": false,
+        "admitted_scores": [
+          0.7176,
+          0.7105,
+          0.6961,
+          0.6937,
+          0.6785,
+          0.6776,
+          0.6721,
+          0.6699,
+          0.6684,
+          0.6545,
+          0.6244,
+          0.691,
+          0.6834,
+          0.6805,
+          0.6758,
+          0.6748,
+          0.6743,
+          0.6677,
+          0.6643,
+          0.6591,
+          0.6499,
+          0.6365,
+          0.6865,
+          0.6816,
+          0.6794,
+          0.6698,
+          0.6643,
+          0.663,
+          0.6579,
+          0.6575,
+          0.6539,
+          0.6535,
+          0.6216
+        ],
+        "admitted_items": [
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.7176
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.7105
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_layout",
+            "category": "components",
+            "score": 0.6961
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.6937
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_craft_details",
+            "category": "components",
+            "score": 0.6785
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_skill",
+            "category": "design_dna",
+            "score": 0.6776
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_visual_workflow",
+            "category": "design_dna",
+            "score": 0.6721
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/motion/refero_motion",
+            "category": "motion",
+            "score": 0.6699
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_color",
+            "category": "design_dna",
+            "score": 0.6684
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_critique",
+            "category": "design_dna",
+            "score": 0.6545
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_audit",
+            "category": "components",
+            "score": 0.6244
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_layout",
+            "category": "components",
+            "score": 0.691
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.6834
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.6805
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_skill",
+            "category": "design_dna",
+            "score": 0.6758
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_craft_details",
+            "category": "components",
+            "score": 0.6748
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_visual_workflow",
+            "category": "design_dna",
+            "score": 0.6743
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_critique",
+            "category": "design_dna",
+            "score": 0.6677
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.6643
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/motion/refero_motion",
+            "category": "motion",
+            "score": 0.6591
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_color",
+            "category": "design_dna",
+            "score": 0.6499
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_audit",
+            "category": "components",
+            "score": 0.6365
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_craft_details",
+            "category": "components",
+            "score": 0.6865
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_layout",
+            "category": "components",
+            "score": 0.6816
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.6794
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.6698
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_skill",
+            "category": "design_dna",
+            "score": 0.6643
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/motion/refero_motion",
+            "category": "motion",
+            "score": 0.663
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.6579
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_visual_workflow",
+            "category": "design_dna",
+            "score": 0.6575
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_color",
+            "category": "design_dna",
+            "score": 0.6539
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_critique",
+            "category": "design_dna",
+            "score": 0.6535
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_audit",
+            "category": "components",
+            "score": 0.6216
+          }
+        ],
+        "latencies_s": [
+          2.9774,
+          2.7363,
+          2.8938
+        ],
+        "ground_truth": {
+          "retrieval_beneficial": true,
+          "relevant_categories": [
+            "design_dna",
+            "components"
+          ],
+          "motion_relevant": false
+        }
+      },
+      {
+        "id": "H01-jurnal-perjalanan-editorial",
+        "language": "id",
+        "pair": "H01",
+        "scenario": "editorial website design",
+        "queries": [
+          "rancang jurnal perjalanan editorial esai destinasi panjang hierarki tipografi berbasis",
+          "editorial rancang jurnal perjalanan editorial"
+        ],
+        "top_score": 0.6764,
+        "n_returned": 22,
+        "admitted_ge_floor": 7,
+        "empty_pack_with_floor": false,
+        "admitted_scores": [
+          0.6764,
+          0.652,
+          0.6505,
+          0.6389,
+          0.6341,
+          0.6236,
+          0.6206
+        ],
+        "admitted_items": [
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.6764
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.652
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_layout",
+            "category": "components",
+            "score": 0.6505
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.6389
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/motion/refero_motion",
+            "category": "motion",
+            "score": 0.6341
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_visual_workflow",
+            "category": "design_dna",
+            "score": 0.6236
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_craft_details",
+            "category": "components",
+            "score": 0.6206
+          }
+        ],
+        "latencies_s": [
+          2.8778,
+          2.7163
+        ],
+        "ground_truth": {
+          "retrieval_beneficial": true,
+          "relevant_categories": [
+            "design_dna",
+            "components"
+          ],
+          "motion_relevant": false
+        }
+      },
+      {
+        "id": "H02-saas-landing-ai-notetaker",
+        "language": "en",
+        "pair": "H02",
+        "scenario": "landing page",
+        "queries": [
+          "saas meeting notetaker hero product screenshot three tier pricing table"
+        ],
+        "top_score": 0.6437,
+        "n_returned": 11,
+        "admitted_ge_floor": 3,
+        "empty_pack_with_floor": false,
+        "admitted_scores": [
+          0.6437,
+          0.6222,
+          0.62
+        ],
+        "admitted_items": [
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.6437
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.6222
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.62
+          }
+        ],
+        "latencies_s": [
+          2.7708
+        ],
+        "ground_truth": {
+          "retrieval_beneficial": true,
+          "relevant_categories": [
+            "design_dna",
+            "components"
+          ],
+          "motion_relevant": false
+        }
+      },
+      {
+        "id": "H02-landing-saas-notulen-ai",
+        "language": "id",
+        "pair": "H02",
+        "scenario": "landing page",
+        "queries": [
+          "saas pencatat rapat berbasis hero tangkapan layar produk tabel harga"
+        ],
+        "top_score": 0.6078,
+        "n_returned": 11,
+        "admitted_ge_floor": 0,
+        "empty_pack_with_floor": true,
+        "admitted_scores": [],
+        "admitted_items": [],
+        "latencies_s": [
+          2.7588
+        ],
+        "ground_truth": {
+          "retrieval_beneficial": true,
+          "relevant_categories": [
+            "design_dna",
+            "components"
+          ],
+          "motion_relevant": false
+        }
+      },
+      {
+        "id": "H03-portfolio-illustrator",
+        "language": "en",
+        "pair": "H03",
+        "scenario": "portfolio site",
+        "queries": [
+          "portfolio freelance illustrator bold gallery first layout individual project pages",
+          "layout portfolio freelance illustrator bold"
+        ],
+        "top_score": 0.7046,
+        "n_returned": 22,
+        "admitted_ge_floor": 20,
+        "empty_pack_with_floor": false,
+        "admitted_scores": [
+          0.6952,
+          0.6909,
+          0.677,
+          0.6753,
+          0.675,
+          0.672,
+          0.6712,
+          0.6673,
+          0.6649,
+          0.6384,
+          0.7046,
+          0.7037,
+          0.6935,
+          0.6779,
+          0.6732,
+          0.6708,
+          0.6683,
+          0.6646,
+          0.6608,
+          0.6351
+        ],
+        "admitted_items": [
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.6952
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_layout",
+            "category": "components",
+            "score": 0.6909
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_craft_details",
+            "category": "components",
+            "score": 0.677
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.6753
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.675
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_visual_workflow",
+            "category": "design_dna",
+            "score": 0.672
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_skill",
+            "category": "design_dna",
+            "score": 0.6712
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/motion/refero_motion",
+            "category": "motion",
+            "score": 0.6673
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_color",
+            "category": "design_dna",
+            "score": 0.6649
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_critique",
+            "category": "design_dna",
+            "score": 0.6384
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.7046
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.7037
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.6935
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_color",
+            "category": "design_dna",
+            "score": 0.6779
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_layout",
+            "category": "components",
+            "score": 0.6732
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_skill",
+            "category": "design_dna",
+            "score": 0.6708
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_craft_details",
+            "category": "components",
+            "score": 0.6683
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/motion/refero_motion",
+            "category": "motion",
+            "score": 0.6646
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_visual_workflow",
+            "category": "design_dna",
+            "score": 0.6608
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_critique",
+            "category": "design_dna",
+            "score": 0.6351
+          }
+        ],
+        "latencies_s": [
+          2.7766,
+          3.0278
+        ],
+        "ground_truth": {
+          "retrieval_beneficial": true,
+          "relevant_categories": [
+            "design_dna",
+            "components"
+          ],
+          "motion_relevant": false
+        }
+      },
+      {
+        "id": "H03-portofolio-ilustrator",
+        "language": "id",
+        "pair": "H03",
+        "scenario": "portfolio site",
+        "queries": [
+          "portofolio ilustrator lepas tata letak mengutamakan galeri berani proyek tersendiri"
+        ],
+        "top_score": 0.6755,
+        "n_returned": 11,
+        "admitted_ge_floor": 9,
+        "empty_pack_with_floor": false,
+        "admitted_scores": [
+          0.6755,
+          0.6401,
+          0.639,
+          0.6376,
+          0.6357,
+          0.632,
+          0.6298,
+          0.6293,
+          0.6278
+        ],
+        "admitted_items": [
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.6755
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_craft_details",
+            "category": "components",
+            "score": 0.6401
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_visual_workflow",
+            "category": "design_dna",
+            "score": 0.639
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_layout",
+            "category": "components",
+            "score": 0.6376
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_color",
+            "category": "design_dna",
+            "score": 0.6357
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.632
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_skill",
+            "category": "design_dna",
+            "score": 0.6298
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.6293
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/motion/refero_motion",
+            "category": "motion",
+            "score": 0.6278
+          }
+        ],
+        "latencies_s": [
+          2.8335
+        ],
+        "ground_truth": {
+          "retrieval_beneficial": true,
+          "relevant_categories": [
+            "design_dna",
+            "components"
+          ],
+          "motion_relevant": false
+        }
+      },
+      {
+        "id": "H04-product-showcase-headphones",
+        "language": "en",
+        "pair": "H04",
+        "scenario": "product showcase website",
+        "queries": [
+          "product showcase premium wireless headphones large hero imagery feature comparison"
+        ],
+        "top_score": 0.6505,
+        "n_returned": 11,
+        "admitted_ge_floor": 4,
+        "empty_pack_with_floor": false,
+        "admitted_scores": [
+          0.6505,
+          0.6459,
+          0.6332,
+          0.627
+        ],
+        "admitted_items": [
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.6505
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.6459
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.6332
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_color",
+            "category": "design_dna",
+            "score": 0.627
+          }
+        ],
+        "latencies_s": [
+          2.7597
+        ],
+        "ground_truth": {
+          "retrieval_beneficial": true,
+          "relevant_categories": [
+            "design_dna",
+            "components"
+          ],
+          "motion_relevant": false
+        }
+      },
+      {
+        "id": "H04-pameran-produk-headphone",
+        "language": "id",
+        "pair": "H04",
+        "scenario": "product showcase website",
+        "queries": [
+          "pameran produk headphone nirkabel premium gambar hero besar tabel perbandingan"
+        ],
+        "top_score": 0.5854,
+        "n_returned": 11,
+        "admitted_ge_floor": 0,
+        "empty_pack_with_floor": true,
+        "admitted_scores": [],
+        "admitted_items": [],
+        "latencies_s": [
+          2.8226
+        ],
+        "ground_truth": {
+          "retrieval_beneficial": true,
+          "relevant_categories": [
+            "design_dna",
+            "components"
+          ],
+          "motion_relevant": false
+        }
+      },
+      {
+        "id": "H05-motion-brand-launch",
+        "language": "en",
+        "pair": "H05",
+        "scenario": "motion and animation",
+        "queries": [
+          "motion led brand launch microsite scroll triggered reveals hero video",
+          "brand motion led brand launch",
+          "motion scroll motion led brand launch"
+        ],
+        "top_score": 0.713,
+        "n_returned": 33,
+        "admitted_ge_floor": 19,
+        "empty_pack_with_floor": false,
+        "admitted_scores": [
+          0.713,
+          0.6673,
+          0.6586,
+          0.6454,
+          0.6423,
+          0.6422,
+          0.6404,
+          0.637,
+          0.637,
+          0.6615,
+          0.6488,
+          0.6295,
+          0.628,
+          0.6997,
+          0.6393,
+          0.634,
+          0.6302,
+          0.6281,
+          0.6205
+        ],
+        "admitted_items": [
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/motion/refero_motion",
+            "category": "motion",
+            "score": 0.713
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.6673
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.6586
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_craft_details",
+            "category": "components",
+            "score": 0.6454
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_visual_workflow",
+            "category": "design_dna",
+            "score": 0.6423
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_layout",
+            "category": "components",
+            "score": 0.6422
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_color",
+            "category": "design_dna",
+            "score": 0.6404
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.637
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_skill",
+            "category": "design_dna",
+            "score": 0.637
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/motion/refero_motion",
+            "category": "motion",
+            "score": 0.6615
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.6488
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.6295
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_visual_workflow",
+            "category": "design_dna",
+            "score": 0.628
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/motion/refero_motion",
+            "category": "motion",
+            "score": 0.6997
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_layout",
+            "category": "components",
+            "score": 0.6393
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_visual_workflow",
+            "category": "design_dna",
+            "score": 0.634
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.6302
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_craft_details",
+            "category": "components",
+            "score": 0.6281
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.6205
+          }
+        ],
+        "latencies_s": [
+          2.7166,
+          2.794,
+          2.6882
+        ],
+        "ground_truth": {
+          "retrieval_beneficial": true,
+          "relevant_categories": [
+            "design_dna",
+            "motion",
+            "components"
+          ],
+          "motion_relevant": true
+        }
+      },
+      {
+        "id": "H05-peluncuran-merek-beranimasi",
+        "language": "id",
+        "pair": "H05",
+        "scenario": "motion and animation",
+        "queries": [
+          "microsite peluncuran merek dipimpin animasi muncul saat digulir transisi video"
+        ],
+        "top_score": 0.6674,
+        "n_returned": 11,
+        "admitted_ge_floor": 7,
+        "empty_pack_with_floor": false,
+        "admitted_scores": [
+          0.6674,
+          0.6526,
+          0.6372,
+          0.6344,
+          0.6272,
+          0.6266,
+          0.6264
+        ],
+        "admitted_items": [
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/motion/refero_motion",
+            "category": "motion",
+            "score": 0.6674
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.6526
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.6372
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_craft_details",
+            "category": "components",
+            "score": 0.6344
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_color",
+            "category": "design_dna",
+            "score": 0.6272
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.6266
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_skill",
+            "category": "design_dna",
+            "score": 0.6264
+          }
+        ],
+        "latencies_s": [
+          2.7069
+        ],
+        "ground_truth": {
+          "retrieval_beneficial": true,
+          "relevant_categories": [
+            "design_dna",
+            "motion",
+            "components"
+          ],
+          "motion_relevant": true
+        }
+      },
+      {
+        "id": "H06-component-dashboard-admin",
+        "language": "en",
+        "pair": "H06",
+        "scenario": "component selection",
+        "queries": [
+          "design admin dashboard kit data tables sorting filter chips sidebar"
+        ],
+        "top_score": 0.7071,
+        "n_returned": 11,
+        "admitted_ge_floor": 11,
+        "empty_pack_with_floor": false,
+        "admitted_scores": [
+          0.7071,
+          0.707,
+          0.6953,
+          0.6952,
+          0.6921,
+          0.675,
+          0.6624,
+          0.6606,
+          0.6569,
+          0.6443,
+          0.6373
+        ],
+        "admitted_items": [
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.7071
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_craft_details",
+            "category": "components",
+            "score": 0.707
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_color",
+            "category": "design_dna",
+            "score": 0.6953
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_layout",
+            "category": "components",
+            "score": 0.6952
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.6921
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.675
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_skill",
+            "category": "design_dna",
+            "score": 0.6624
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/motion/refero_motion",
+            "category": "motion",
+            "score": 0.6606
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_critique",
+            "category": "design_dna",
+            "score": 0.6569
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_audit",
+            "category": "components",
+            "score": 0.6443
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_visual_workflow",
+            "category": "design_dna",
+            "score": 0.6373
+          }
+        ],
+        "latencies_s": [
+          2.867
+        ],
+        "ground_truth": {
+          "retrieval_beneficial": true,
+          "relevant_categories": [
+            "components",
+            "design_dna"
+          ],
+          "motion_relevant": false
+        }
+      },
+      {
+        "id": "H06-kit-komponen-dasbor-admin",
+        "language": "id",
+        "pair": "H06",
+        "scenario": "component selection",
+        "queries": [
+          "rancang kit dasbor admin tabel data pengurutan chip filter navigasi"
+        ],
+        "top_score": 0.644,
+        "n_returned": 11,
+        "admitted_ge_floor": 6,
+        "empty_pack_with_floor": false,
+        "admitted_scores": [
+          0.644,
+          0.6413,
+          0.6385,
+          0.6366,
+          0.6275,
+          0.6232
+        ],
+        "admitted_items": [
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.644
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.6413
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_craft_details",
+            "category": "components",
+            "score": 0.6385
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_layout",
+            "category": "components",
+            "score": 0.6366
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_color",
+            "category": "design_dna",
+            "score": 0.6275
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.6232
+          }
+        ],
+        "latencies_s": [
+          3.2381
+        ],
+        "ground_truth": {
+          "retrieval_beneficial": true,
+          "relevant_categories": [
+            "components",
+            "design_dna"
+          ],
+          "motion_relevant": false
+        }
+      },
+      {
+        "id": "H07-design-dna-craft-brand",
+        "language": "en",
+        "pair": "H07",
+        "scenario": "design DNA",
+        "queries": [
+          "define distinctive design dna boutique law firm custom type scale",
+          "type define distinctive design dna"
+        ],
+        "top_score": 0.7463,
+        "n_returned": 22,
+        "admitted_ge_floor": 20,
+        "empty_pack_with_floor": false,
+        "admitted_scores": [
+          0.7126,
+          0.703,
+          0.698,
+          0.6823,
+          0.6785,
+          0.6604,
+          0.6536,
+          0.6529,
+          0.649,
+          0.6415,
+          0.7463,
+          0.7308,
+          0.7223,
+          0.7151,
+          0.7102,
+          0.6871,
+          0.6759,
+          0.6661,
+          0.6642,
+          0.647
+        ],
+        "admitted_items": [
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_skill",
+            "category": "design_dna",
+            "score": 0.7126
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.703
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_critique",
+            "category": "design_dna",
+            "score": 0.698
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_color",
+            "category": "design_dna",
+            "score": 0.6823
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.6785
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_craft_details",
+            "category": "components",
+            "score": 0.6604
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.6536
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_visual_workflow",
+            "category": "design_dna",
+            "score": 0.6529
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_layout",
+            "category": "components",
+            "score": 0.649
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/motion/refero_motion",
+            "category": "motion",
+            "score": 0.6415
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_skill",
+            "category": "design_dna",
+            "score": 0.7463
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.7308
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_critique",
+            "category": "design_dna",
+            "score": 0.7223
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_color",
+            "category": "design_dna",
+            "score": 0.7151
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.7102
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_visual_workflow",
+            "category": "design_dna",
+            "score": 0.6871
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_craft_details",
+            "category": "components",
+            "score": 0.6759
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/motion/refero_motion",
+            "category": "motion",
+            "score": 0.6661
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.6642
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_layout",
+            "category": "components",
+            "score": 0.647
+          }
+        ],
+        "latencies_s": [
+          2.8053,
+          2.779
+        ],
+        "ground_truth": {
+          "retrieval_beneficial": true,
+          "relevant_categories": [
+            "design_dna"
+          ],
+          "motion_relevant": false
+        }
+      },
+      {
+        "id": "H07-dna-desain-firma-hukum",
+        "language": "id",
+        "pair": "H07",
+        "scenario": "design DNA",
+        "queries": [
+          "tetapkan dna desain khas firma hukum butik skala tipografi khusus"
+        ],
+        "top_score": 0.672,
+        "n_returned": 11,
+        "admitted_ge_floor": 5,
+        "empty_pack_with_floor": false,
+        "admitted_scores": [
+          0.672,
+          0.6451,
+          0.6402,
+          0.6317,
+          0.6266
+        ],
+        "admitted_items": [
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.672
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_skill",
+            "category": "design_dna",
+            "score": 0.6451
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_color",
+            "category": "design_dna",
+            "score": 0.6402
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.6317
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_critique",
+            "category": "design_dna",
+            "score": 0.6266
+          }
+        ],
+        "latencies_s": [
+          2.8872
+        ],
+        "ground_truth": {
+          "retrieval_beneficial": true,
+          "relevant_categories": [
+            "design_dna"
+          ],
+          "motion_relevant": false
+        }
+      },
+      {
+        "id": "H08-out-of-scope-climate-model",
+        "language": "en",
+        "pair": "H08",
+        "scenario": "irrelevant references / out of scope",
+        "queries": [
+          "write python script trains regional climate model netcdf data reports"
+        ],
+        "top_score": 0.5899,
+        "n_returned": 11,
+        "admitted_ge_floor": 0,
+        "empty_pack_with_floor": true,
+        "admitted_scores": [],
+        "admitted_items": [],
+        "latencies_s": [
+          2.748
+        ],
+        "ground_truth": {
+          "retrieval_beneficial": false,
+          "relevant_categories": [],
+          "motion_relevant": false
+        }
+      },
+      {
+        "id": "H08-di-luar-cakupan-model-iklim",
+        "language": "id",
+        "pair": "H08",
+        "scenario": "irrelevant references / out of scope",
+        "queries": [
+          "tulis skrip python melatih model iklim regional pada data netcdf"
+        ],
+        "top_score": 0.5745,
+        "n_returned": 11,
+        "admitted_ge_floor": 0,
+        "empty_pack_with_floor": true,
+        "admitted_scores": [],
+        "admitted_items": [],
+        "latencies_s": [
+          2.9374
+        ],
+        "ground_truth": {
+          "retrieval_beneficial": false,
+          "relevant_categories": [],
+          "motion_relevant": false
+        }
+      }
+    ],
+    "D": [
+      {
+        "id": "H01-editorial-travel-journal",
+        "language": "en",
+        "pair": "H01",
+        "scenario": "editorial website design",
+        "queries": [
+          "design editorial travel journal long form destination essays serif led",
+          "editorial design editorial travel journal",
+          "form design editorial travel journal"
+        ],
+        "top_score": 0.7176,
+        "n_returned": 33,
+        "admitted_ge_floor": 33,
+        "empty_pack_with_floor": false,
+        "admitted_scores": [
+          0.7176,
+          0.7106,
+          0.6961,
+          0.6937,
+          0.6786,
+          0.6777,
+          0.6721,
+          0.6698,
+          0.6684,
+          0.6545,
+          0.6244,
+          0.691,
+          0.6834,
+          0.6805,
+          0.6758,
+          0.6748,
+          0.6743,
+          0.6677,
+          0.6643,
+          0.6591,
+          0.6499,
+          0.6365,
+          0.6865,
+          0.6816,
+          0.6794,
+          0.6698,
+          0.6643,
+          0.663,
+          0.6579,
+          0.6575,
+          0.6539,
+          0.6535,
+          0.6217
+        ],
+        "admitted_items": [
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.7176
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.7106
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_layout",
+            "category": "components",
+            "score": 0.6961
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.6937
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_craft_details",
+            "category": "components",
+            "score": 0.6786
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_skill",
+            "category": "design_dna",
+            "score": 0.6777
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_visual_workflow",
+            "category": "design_dna",
+            "score": 0.6721
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/motion/refero_motion",
+            "category": "motion",
+            "score": 0.6698
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_color",
+            "category": "design_dna",
+            "score": 0.6684
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_critique",
+            "category": "design_dna",
+            "score": 0.6545
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_audit",
+            "category": "components",
+            "score": 0.6244
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_layout",
+            "category": "components",
+            "score": 0.691
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.6834
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.6805
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_skill",
+            "category": "design_dna",
+            "score": 0.6758
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_craft_details",
+            "category": "components",
+            "score": 0.6748
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_visual_workflow",
+            "category": "design_dna",
+            "score": 0.6743
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_critique",
+            "category": "design_dna",
+            "score": 0.6677
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.6643
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/motion/refero_motion",
+            "category": "motion",
+            "score": 0.6591
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_color",
+            "category": "design_dna",
+            "score": 0.6499
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_audit",
+            "category": "components",
+            "score": 0.6365
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_craft_details",
+            "category": "components",
+            "score": 0.6865
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_layout",
+            "category": "components",
+            "score": 0.6816
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.6794
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.6698
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_skill",
+            "category": "design_dna",
+            "score": 0.6643
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/motion/refero_motion",
+            "category": "motion",
+            "score": 0.663
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.6579
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_visual_workflow",
+            "category": "design_dna",
+            "score": 0.6575
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_color",
+            "category": "design_dna",
+            "score": 0.6539
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_critique",
+            "category": "design_dna",
+            "score": 0.6535
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_audit",
+            "category": "components",
+            "score": 0.6217
+          }
+        ],
+        "latencies_s": [
+          2.9298,
+          2.7692,
+          2.8723
+        ],
+        "ground_truth": {
+          "retrieval_beneficial": true,
+          "relevant_categories": [
+            "design_dna",
+            "components"
+          ],
+          "motion_relevant": false
+        }
+      },
+      {
+        "id": "H01-jurnal-perjalanan-editorial",
+        "language": "id",
+        "pair": "H01",
+        "scenario": "editorial website design",
+        "queries": [
+          "rancang jurnal perjalanan editorial esai destinasi panjang hierarki tipografi berbasis",
+          "editorial rancang jurnal perjalanan editorial",
+          "hierarchy typography"
+        ],
+        "top_score": 0.739,
+        "n_returned": 33,
+        "admitted_ge_floor": 15,
+        "empty_pack_with_floor": false,
+        "admitted_scores": [
+          0.6764,
+          0.652,
+          0.6505,
+          0.6389,
+          0.6341,
+          0.6236,
+          0.6206,
+          0.739,
+          0.7082,
+          0.7066,
+          0.6845,
+          0.6716,
+          0.6651,
+          0.6637,
+          0.6317
+        ],
+        "admitted_items": [
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.6764
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.652
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_layout",
+            "category": "components",
+            "score": 0.6505
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.6389
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/motion/refero_motion",
+            "category": "motion",
+            "score": 0.6341
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_visual_workflow",
+            "category": "design_dna",
+            "score": 0.6236
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_craft_details",
+            "category": "components",
+            "score": 0.6206
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.739
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.7082
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_color",
+            "category": "design_dna",
+            "score": 0.7066
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_layout",
+            "category": "components",
+            "score": 0.6845
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.6716
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/motion/refero_motion",
+            "category": "motion",
+            "score": 0.6651
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_craft_details",
+            "category": "components",
+            "score": 0.6637
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_skill",
+            "category": "design_dna",
+            "score": 0.6317
+          }
+        ],
+        "latencies_s": [
+          2.754,
+          2.907,
+          3.0293
+        ],
+        "ground_truth": {
+          "retrieval_beneficial": true,
+          "relevant_categories": [
+            "design_dna",
+            "components"
+          ],
+          "motion_relevant": false
+        }
+      },
+      {
+        "id": "H02-saas-landing-ai-notetaker",
+        "language": "en",
+        "pair": "H02",
+        "scenario": "landing page",
+        "queries": [
+          "saas meeting notetaker hero product screenshot three tier pricing table"
+        ],
+        "top_score": 0.6437,
+        "n_returned": 11,
+        "admitted_ge_floor": 3,
+        "empty_pack_with_floor": false,
+        "admitted_scores": [
+          0.6437,
+          0.6222,
+          0.62
+        ],
+        "admitted_items": [
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.6437
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.6222
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.62
+          }
+        ],
+        "latencies_s": [
+          2.8457
+        ],
+        "ground_truth": {
+          "retrieval_beneficial": true,
+          "relevant_categories": [
+            "design_dna",
+            "components"
+          ],
+          "motion_relevant": false
+        }
+      },
+      {
+        "id": "H02-landing-saas-notulen-ai",
+        "language": "id",
+        "pair": "H02",
+        "scenario": "landing page",
+        "queries": [
+          "saas pencatat rapat berbasis hero tangkapan layar produk tabel harga",
+          "product products table pricing price"
+        ],
+        "top_score": 0.61,
+        "n_returned": 22,
+        "admitted_ge_floor": 0,
+        "empty_pack_with_floor": true,
+        "admitted_scores": [],
+        "admitted_items": [],
+        "latencies_s": [
+          2.9841,
+          2.8039
+        ],
+        "ground_truth": {
+          "retrieval_beneficial": true,
+          "relevant_categories": [
+            "design_dna",
+            "components"
+          ],
+          "motion_relevant": false
+        }
+      },
+      {
+        "id": "H03-portfolio-illustrator",
+        "language": "en",
+        "pair": "H03",
+        "scenario": "portfolio site",
+        "queries": [
+          "portfolio freelance illustrator bold gallery first layout individual project pages",
+          "layout portfolio freelance illustrator bold"
+        ],
+        "top_score": 0.7045,
+        "n_returned": 22,
+        "admitted_ge_floor": 20,
+        "empty_pack_with_floor": false,
+        "admitted_scores": [
+          0.6952,
+          0.6909,
+          0.677,
+          0.6753,
+          0.675,
+          0.672,
+          0.6712,
+          0.6673,
+          0.6649,
+          0.6384,
+          0.7045,
+          0.7037,
+          0.6935,
+          0.6778,
+          0.6731,
+          0.6708,
+          0.6683,
+          0.6645,
+          0.6607,
+          0.6351
+        ],
+        "admitted_items": [
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.6952
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_layout",
+            "category": "components",
+            "score": 0.6909
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_craft_details",
+            "category": "components",
+            "score": 0.677
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.6753
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.675
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_visual_workflow",
+            "category": "design_dna",
+            "score": 0.672
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_skill",
+            "category": "design_dna",
+            "score": 0.6712
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/motion/refero_motion",
+            "category": "motion",
+            "score": 0.6673
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_color",
+            "category": "design_dna",
+            "score": 0.6649
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_critique",
+            "category": "design_dna",
+            "score": 0.6384
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.7045
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.7037
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.6935
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_color",
+            "category": "design_dna",
+            "score": 0.6778
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_layout",
+            "category": "components",
+            "score": 0.6731
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_skill",
+            "category": "design_dna",
+            "score": 0.6708
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_craft_details",
+            "category": "components",
+            "score": 0.6683
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/motion/refero_motion",
+            "category": "motion",
+            "score": 0.6645
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_visual_workflow",
+            "category": "design_dna",
+            "score": 0.6607
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_critique",
+            "category": "design_dna",
+            "score": 0.6351
+          }
+        ],
+        "latencies_s": [
+          2.9145,
+          2.7668
+        ],
+        "ground_truth": {
+          "retrieval_beneficial": true,
+          "relevant_categories": [
+            "design_dna",
+            "components"
+          ],
+          "motion_relevant": false
+        }
+      },
+      {
+        "id": "H03-portofolio-ilustrator",
+        "language": "id",
+        "pair": "H03",
+        "scenario": "portfolio site",
+        "queries": [
+          "portofolio ilustrator lepas tata letak mengutamakan galeri berani proyek tersendiri",
+          "portfolio layout gallery bold"
+        ],
+        "top_score": 0.6996,
+        "n_returned": 22,
+        "admitted_ge_floor": 19,
+        "empty_pack_with_floor": false,
+        "admitted_scores": [
+          0.6755,
+          0.6401,
+          0.639,
+          0.6376,
+          0.6357,
+          0.632,
+          0.6298,
+          0.6293,
+          0.6278,
+          0.6996,
+          0.6709,
+          0.6656,
+          0.6602,
+          0.6589,
+          0.655,
+          0.6445,
+          0.64,
+          0.638,
+          0.6257
+        ],
+        "admitted_items": [
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.6755
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_craft_details",
+            "category": "components",
+            "score": 0.6401
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_visual_workflow",
+            "category": "design_dna",
+            "score": 0.639
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_layout",
+            "category": "components",
+            "score": 0.6376
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_color",
+            "category": "design_dna",
+            "score": 0.6357
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.632
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_skill",
+            "category": "design_dna",
+            "score": 0.6298
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.6293
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/motion/refero_motion",
+            "category": "motion",
+            "score": 0.6278
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_layout",
+            "category": "components",
+            "score": 0.6996
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.6709
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.6656
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_skill",
+            "category": "design_dna",
+            "score": 0.6602
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.6589
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_craft_details",
+            "category": "components",
+            "score": 0.655
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_color",
+            "category": "design_dna",
+            "score": 0.6445
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/motion/refero_motion",
+            "category": "motion",
+            "score": 0.64
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_visual_workflow",
+            "category": "design_dna",
+            "score": 0.638
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_critique",
+            "category": "design_dna",
+            "score": 0.6257
+          }
+        ],
+        "latencies_s": [
+          2.6995,
+          2.7022
+        ],
+        "ground_truth": {
+          "retrieval_beneficial": true,
+          "relevant_categories": [
+            "design_dna",
+            "components"
+          ],
+          "motion_relevant": false
+        }
+      },
+      {
+        "id": "H04-product-showcase-headphones",
+        "language": "en",
+        "pair": "H04",
+        "scenario": "product showcase website",
+        "queries": [
+          "product showcase premium wireless headphones large hero imagery feature comparison"
+        ],
+        "top_score": 0.6503,
+        "n_returned": 11,
+        "admitted_ge_floor": 4,
+        "empty_pack_with_floor": false,
+        "admitted_scores": [
+          0.6503,
+          0.6456,
+          0.633,
+          0.6269
+        ],
+        "admitted_items": [
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.6503
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.6456
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.633
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_color",
+            "category": "design_dna",
+            "score": 0.6269
+          }
+        ],
+        "latencies_s": [
+          2.808
+        ],
+        "ground_truth": {
+          "retrieval_beneficial": true,
+          "relevant_categories": [
+            "design_dna",
+            "components"
+          ],
+          "motion_relevant": false
+        }
+      },
+      {
+        "id": "H04-pameran-produk-headphone",
+        "language": "id",
+        "pair": "H04",
+        "scenario": "product showcase website",
+        "queries": [
+          "pameran produk headphone nirkabel premium gambar hero besar tabel perbandingan",
+          "product products table"
+        ],
+        "top_score": 0.654,
+        "n_returned": 22,
+        "admitted_ge_floor": 3,
+        "empty_pack_with_floor": false,
+        "admitted_scores": [
+          0.654,
+          0.644,
+          0.6394
+        ],
+        "admitted_items": [
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_layout",
+            "category": "components",
+            "score": 0.654
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.644
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_craft_details",
+            "category": "components",
+            "score": 0.6394
+          }
+        ],
+        "latencies_s": [
+          2.7942,
+          2.8049
+        ],
+        "ground_truth": {
+          "retrieval_beneficial": true,
+          "relevant_categories": [
+            "design_dna",
+            "components"
+          ],
+          "motion_relevant": false
+        }
+      },
+      {
+        "id": "H05-motion-brand-launch",
+        "language": "en",
+        "pair": "H05",
+        "scenario": "motion and animation",
+        "queries": [
+          "motion led brand launch microsite scroll triggered reveals hero video",
+          "brand motion led brand launch",
+          "motion scroll motion led brand launch"
+        ],
+        "top_score": 0.713,
+        "n_returned": 33,
+        "admitted_ge_floor": 19,
+        "empty_pack_with_floor": false,
+        "admitted_scores": [
+          0.713,
+          0.6674,
+          0.6586,
+          0.6455,
+          0.6423,
+          0.6422,
+          0.6404,
+          0.6371,
+          0.637,
+          0.6615,
+          0.6488,
+          0.6295,
+          0.628,
+          0.6998,
+          0.6393,
+          0.6341,
+          0.6302,
+          0.6282,
+          0.6206
+        ],
+        "admitted_items": [
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/motion/refero_motion",
+            "category": "motion",
+            "score": 0.713
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.6674
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.6586
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_craft_details",
+            "category": "components",
+            "score": 0.6455
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_visual_workflow",
+            "category": "design_dna",
+            "score": 0.6423
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_layout",
+            "category": "components",
+            "score": 0.6422
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_color",
+            "category": "design_dna",
+            "score": 0.6404
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.6371
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_skill",
+            "category": "design_dna",
+            "score": 0.637
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/motion/refero_motion",
+            "category": "motion",
+            "score": 0.6615
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.6488
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.6295
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_visual_workflow",
+            "category": "design_dna",
+            "score": 0.628
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/motion/refero_motion",
+            "category": "motion",
+            "score": 0.6998
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_layout",
+            "category": "components",
+            "score": 0.6393
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_visual_workflow",
+            "category": "design_dna",
+            "score": 0.6341
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.6302
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_craft_details",
+            "category": "components",
+            "score": 0.6282
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.6206
+          }
+        ],
+        "latencies_s": [
+          2.7776,
+          2.7762,
+          2.7885
+        ],
+        "ground_truth": {
+          "retrieval_beneficial": true,
+          "relevant_categories": [
+            "design_dna",
+            "motion",
+            "components"
+          ],
+          "motion_relevant": true
+        }
+      },
+      {
+        "id": "H05-peluncuran-merek-beranimasi",
+        "language": "id",
+        "pair": "H05",
+        "scenario": "motion and animation",
+        "queries": [
+          "microsite peluncuran merek dipimpin animasi muncul saat digulir transisi video",
+          "brand branding animation motion transition"
+        ],
+        "top_score": 0.749,
+        "n_returned": 22,
+        "admitted_ge_floor": 16,
+        "empty_pack_with_floor": false,
+        "admitted_scores": [
+          0.6674,
+          0.6526,
+          0.6372,
+          0.6344,
+          0.6272,
+          0.6266,
+          0.6264,
+          0.749,
+          0.6928,
+          0.6752,
+          0.6716,
+          0.671,
+          0.6595,
+          0.6455,
+          0.6311,
+          0.631
+        ],
+        "admitted_items": [
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/motion/refero_motion",
+            "category": "motion",
+            "score": 0.6674
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.6526
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.6372
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_craft_details",
+            "category": "components",
+            "score": 0.6344
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_color",
+            "category": "design_dna",
+            "score": 0.6272
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.6266
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_skill",
+            "category": "design_dna",
+            "score": 0.6264
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/motion/refero_motion",
+            "category": "motion",
+            "score": 0.749
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.6928
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.6752
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_visual_workflow",
+            "category": "design_dna",
+            "score": 0.6716
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_color",
+            "category": "design_dna",
+            "score": 0.671
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.6595
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_craft_details",
+            "category": "components",
+            "score": 0.6455
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_skill",
+            "category": "design_dna",
+            "score": 0.6311
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_layout",
+            "category": "components",
+            "score": 0.631
+          }
+        ],
+        "latencies_s": [
+          2.7285,
+          2.8647
+        ],
+        "ground_truth": {
+          "retrieval_beneficial": true,
+          "relevant_categories": [
+            "design_dna",
+            "motion",
+            "components"
+          ],
+          "motion_relevant": true
+        }
+      },
+      {
+        "id": "H06-component-dashboard-admin",
+        "language": "en",
+        "pair": "H06",
+        "scenario": "component selection",
+        "queries": [
+          "design admin dashboard kit data tables sorting filter chips sidebar"
+        ],
+        "top_score": 0.7071,
+        "n_returned": 11,
+        "admitted_ge_floor": 11,
+        "empty_pack_with_floor": false,
+        "admitted_scores": [
+          0.7071,
+          0.707,
+          0.6953,
+          0.6952,
+          0.6921,
+          0.675,
+          0.6624,
+          0.6606,
+          0.6569,
+          0.6443,
+          0.6372
+        ],
+        "admitted_items": [
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.7071
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_craft_details",
+            "category": "components",
+            "score": 0.707
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_color",
+            "category": "design_dna",
+            "score": 0.6953
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_layout",
+            "category": "components",
+            "score": 0.6952
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.6921
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.675
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_skill",
+            "category": "design_dna",
+            "score": 0.6624
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/motion/refero_motion",
+            "category": "motion",
+            "score": 0.6606
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_critique",
+            "category": "design_dna",
+            "score": 0.6569
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_audit",
+            "category": "components",
+            "score": 0.6443
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_visual_workflow",
+            "category": "design_dna",
+            "score": 0.6372
+          }
+        ],
+        "latencies_s": [
+          2.8045
+        ],
+        "ground_truth": {
+          "retrieval_beneficial": true,
+          "relevant_categories": [
+            "components",
+            "design_dna"
+          ],
+          "motion_relevant": false
+        }
+      },
+      {
+        "id": "H06-kit-komponen-dasbor-admin",
+        "language": "id",
+        "pair": "H06",
+        "scenario": "component selection",
+        "queries": [
+          "rancang kit dasbor admin tabel data pengurutan chip filter navigasi",
+          "dashboard table navigation nav"
+        ],
+        "top_score": 0.6708,
+        "n_returned": 22,
+        "admitted_ge_floor": 16,
+        "empty_pack_with_floor": false,
+        "admitted_scores": [
+          0.644,
+          0.6413,
+          0.6385,
+          0.6366,
+          0.6275,
+          0.6232,
+          0.6708,
+          0.6496,
+          0.6472,
+          0.6453,
+          0.6447,
+          0.6409,
+          0.6403,
+          0.6345,
+          0.6273,
+          0.626
+        ],
+        "admitted_items": [
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.644
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.6413
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_craft_details",
+            "category": "components",
+            "score": 0.6385
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_layout",
+            "category": "components",
+            "score": 0.6366
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_color",
+            "category": "design_dna",
+            "score": 0.6275
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.6232
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_craft_details",
+            "category": "components",
+            "score": 0.6708
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_layout",
+            "category": "components",
+            "score": 0.6496
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/motion/refero_motion",
+            "category": "motion",
+            "score": 0.6472
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.6453
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_color",
+            "category": "design_dna",
+            "score": 0.6447
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.6409
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_visual_workflow",
+            "category": "design_dna",
+            "score": 0.6403
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_audit",
+            "category": "components",
+            "score": 0.6345
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.6273
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_skill",
+            "category": "design_dna",
+            "score": 0.626
+          }
+        ],
+        "latencies_s": [
+          2.7991,
+          2.7459
+        ],
+        "ground_truth": {
+          "retrieval_beneficial": true,
+          "relevant_categories": [
+            "components",
+            "design_dna"
+          ],
+          "motion_relevant": false
+        }
+      },
+      {
+        "id": "H07-design-dna-craft-brand",
+        "language": "en",
+        "pair": "H07",
+        "scenario": "design DNA",
+        "queries": [
+          "define distinctive design dna boutique law firm custom type scale",
+          "type define distinctive design dna"
+        ],
+        "top_score": 0.7463,
+        "n_returned": 22,
+        "admitted_ge_floor": 20,
+        "empty_pack_with_floor": false,
+        "admitted_scores": [
+          0.7126,
+          0.703,
+          0.698,
+          0.6823,
+          0.6785,
+          0.6604,
+          0.6536,
+          0.6529,
+          0.649,
+          0.6415,
+          0.7463,
+          0.7307,
+          0.7223,
+          0.7151,
+          0.7101,
+          0.6871,
+          0.6759,
+          0.666,
+          0.6642,
+          0.6471
+        ],
+        "admitted_items": [
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_skill",
+            "category": "design_dna",
+            "score": 0.7126
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.703
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_critique",
+            "category": "design_dna",
+            "score": 0.698
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_color",
+            "category": "design_dna",
+            "score": 0.6823
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.6785
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_craft_details",
+            "category": "components",
+            "score": 0.6604
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.6536
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_visual_workflow",
+            "category": "design_dna",
+            "score": 0.6529
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_layout",
+            "category": "components",
+            "score": 0.649
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/motion/refero_motion",
+            "category": "motion",
+            "score": 0.6415
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_skill",
+            "category": "design_dna",
+            "score": 0.7463
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.7307
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_critique",
+            "category": "design_dna",
+            "score": 0.7223
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_color",
+            "category": "design_dna",
+            "score": 0.7151
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.7101
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_visual_workflow",
+            "category": "design_dna",
+            "score": 0.6871
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_craft_details",
+            "category": "components",
+            "score": 0.6759
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/motion/refero_motion",
+            "category": "motion",
+            "score": 0.666
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.6642
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_layout",
+            "category": "components",
+            "score": 0.6471
+          }
+        ],
+        "latencies_s": [
+          2.6886,
+          2.7527
+        ],
+        "ground_truth": {
+          "retrieval_beneficial": true,
+          "relevant_categories": [
+            "design_dna"
+          ],
+          "motion_relevant": false
+        }
+      },
+      {
+        "id": "H07-dna-desain-firma-hukum",
+        "language": "id",
+        "pair": "H07",
+        "scenario": "design DNA",
+        "queries": [
+          "tetapkan dna desain khas firma hukum butik skala tipografi khusus",
+          "firm typography"
+        ],
+        "top_score": 0.7578,
+        "n_returned": 22,
+        "admitted_ge_floor": 14,
+        "empty_pack_with_floor": false,
+        "admitted_scores": [
+          0.672,
+          0.6451,
+          0.6402,
+          0.6317,
+          0.6266,
+          0.7578,
+          0.705,
+          0.684,
+          0.6733,
+          0.6619,
+          0.6573,
+          0.6521,
+          0.6431,
+          0.6205
+        ],
+        "admitted_items": [
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.672
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_skill",
+            "category": "design_dna",
+            "score": 0.6451
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_color",
+            "category": "design_dna",
+            "score": 0.6402
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.6317
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_critique",
+            "category": "design_dna",
+            "score": 0.6266
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            "category": "design_dna",
+            "score": 0.7578
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_icons",
+            "category": "components",
+            "score": 0.705
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_anti_ai_slop",
+            "category": "design_dna",
+            "score": 0.684
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_color",
+            "category": "design_dna",
+            "score": 0.6733
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/motion/refero_motion",
+            "category": "motion",
+            "score": 0.6619
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/refero_craft_details",
+            "category": "components",
+            "score": 0.6573
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/components/impeccable_layout",
+            "category": "components",
+            "score": 0.6521
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/impeccable_skill",
+            "category": "design_dna",
+            "score": 0.6431
+          },
+          {
+            "uri": "viking://resources/website-builder/projects/wb-design/design_dna/refero_visual_workflow",
+            "category": "design_dna",
+            "score": 0.6205
+          }
+        ],
+        "latencies_s": [
+          2.7678,
+          2.8262
+        ],
+        "ground_truth": {
+          "retrieval_beneficial": true,
+          "relevant_categories": [
+            "design_dna"
+          ],
+          "motion_relevant": false
+        }
+      },
+      {
+        "id": "H08-out-of-scope-climate-model",
+        "language": "en",
+        "pair": "H08",
+        "scenario": "irrelevant references / out of scope",
+        "queries": [
+          "write python script trains regional climate model netcdf data reports"
+        ],
+        "top_score": 0.59,
+        "n_returned": 11,
+        "admitted_ge_floor": 0,
+        "empty_pack_with_floor": true,
+        "admitted_scores": [],
+        "admitted_items": [],
+        "latencies_s": [
+          2.7463
+        ],
+        "ground_truth": {
+          "retrieval_beneficial": false,
+          "relevant_categories": [],
+          "motion_relevant": false
+        }
+      },
+      {
+        "id": "H08-di-luar-cakupan-model-iklim",
+        "language": "id",
+        "pair": "H08",
+        "scenario": "irrelevant references / out of scope",
+        "queries": [
+          "tulis skrip python melatih model iklim regional pada data netcdf"
+        ],
+        "top_score": 0.5745,
+        "n_returned": 11,
+        "admitted_ge_floor": 0,
+        "empty_pack_with_floor": true,
+        "admitted_scores": [],
+        "admitted_items": [],
+        "latencies_s": [
+          2.7927
+        ],
+        "ground_truth": {
+          "retrieval_beneficial": false,
+          "relevant_categories": [],
+          "motion_relevant": false
+        }
+      }
+    ]
+  }
+}

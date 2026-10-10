@@ -175,6 +175,157 @@ DEFAULT_CATEGORIES: Tuple[str, ...] = ("design_dna", "components", "motion")
 RELEVANCE_HIGH = 0.68
 RELEVANCE_MEDIUM = 0.55
 
+# ---------------------------------------------------------------------------
+# D4b.2: multilingual (Indonesian) query expansion
+# ---------------------------------------------------------------------------
+# The reviewed wb-design corpus is ENGLISH, and the embedding model is
+# English-centric, so an Indonesian brief scores systematically ~0.05 lower than
+# its English equivalent (measured: D4b.2 root-cause probe). The remedy is a
+# SMALL, deterministic Indonesian->English design glossary used to append ONE
+# bounded English query for an Indonesian brief. It adds NO model call and is
+# DISABLED by default (``LayaConfig.multilingual_expansion``); when disabled the
+# planner is byte-identical to the accepted D4b planner.
+#
+# The glossary is a general design lexicon. It is NOT derived from any benchmark
+# brief, so enabling it leaks no evaluation ground truth.
+
+#: A SMALL, REVIEWABLE Indonesian->English design vocabulary.
+_ID_EN_GLOSSARY: Dict[str, Tuple[str, ...]] = {
+    "tipografi": ("typography",),
+    "huruf": ("typography", "font"),
+    "warna": ("color", "palette"),
+    "palet": ("palette", "color"),
+    "tata": ("layout",),
+    "letak": ("layout",),
+    "kisi": ("grid", "layout"),
+    "jarak": ("spacing",),
+    "hierarki": ("hierarchy",),
+    "gaya": ("style",),
+    "estetika": ("aesthetic",),
+    "merek": ("brand", "branding"),
+    "minimalis": ("minimalist",),
+    "animasi": ("animation", "motion"),
+    "gerak": ("motion", "animation"),
+    "transisi": ("transition", "motion"),
+    "gulir": ("scroll",),
+    "komponen": ("component", "components"),
+    "kartu": ("card", "cards"),
+    "tombol": ("button", "buttons"),
+    "formulir": ("form", "forms"),
+    "navigasi": ("navigation", "nav"),
+    "bilah": ("bar", "nav"),
+    "bagian": ("section", "sections"),
+    "seksi": ("section", "sections"),
+    "ikon": ("icon", "icons"),
+    "galeri": ("gallery",),
+    "tabel": ("table",),
+    "dasbor": ("dashboard",),
+    "pratinjau": ("preview",),
+    "keranjang": ("cart",),
+    "produk": ("product", "products"),
+    "harga": ("pricing", "price"),
+    "toko": ("store", "shop"),
+    "belanja": ("shopping", "ecommerce"),
+    "katalog": ("catalog",),
+    "portofolio": ("portfolio",),
+    "fotografer": ("photographer", "photography"),
+    "pengembang": ("developer", "engineering"),
+    "arsitektur": ("architecture", "architect"),
+    "arsitek": ("architecture", "architect"),
+    "firma": ("firm",),
+    "konsultan": ("consulting", "consultant"),
+    "korporat": ("corporate",),
+    "perusahaan": ("company", "corporate"),
+    "layanan": ("services",),
+    "profesional": ("professional",),
+    "terpercaya": ("trusted", "credible"),
+    "kredibel": ("credible",),
+    "studi": ("case",),
+    "kasus": ("study", "case"),
+    "kontak": ("contact",),
+    "reservasi": ("reservation", "booking"),
+    "restoran": ("restaurant", "dining"),
+    "kafe": ("cafe", "coffee"),
+    "kopi": ("coffee",),
+    "makanan": ("food",),
+    "bunga": ("florist", "botanical", "flower"),
+    "tanaman": ("plant", "botanical"),
+    "taman": ("garden", "botanical"),
+    "kebun": ("garden", "botanical"),
+    "nirlaba": ("nonprofit",),
+    "mode": ("fashion",),
+    "fesyen": ("fashion",),
+    "mewah": ("luxury", "premium"),
+    "elegan": ("elegant",),
+    "bersih": ("clean",),
+    "sederhana": ("simple",),
+    "berani": ("bold",),
+    "halus": ("subtle",),
+    "nyaman": ("comfortable", "cosy"),
+    "hangat": ("warm",),
+    "taktil": ("tactile",),
+    "majalah": ("magazine",),
+    "berita": ("news",),
+    "artikel": ("article",),
+    "blog": ("blog",),
+    "foto": ("photo", "photography"),
+    "peta": ("map", "maps"),
+    "lokasi": ("location", "maps"),
+    "jam": ("hours",),
+    "buka": ("opening", "hours"),
+    "berkesan": ("memorable", "impactful"),
+    "degustasi": ("tasting", "menu"),
+    "halaman": ("page",),
+    "situs": ("website",),
+}
+
+#: Indonesian function words / design-task markers (evidence of Indonesian).
+_INDONESIAN_MARKERS = frozenset({
+    "yang", "dan", "atau", "untuk", "dengan", "tanpa", "pada", "dari", "ini",
+    "itu", "adalah", "sebuah", "para", "agar", "biar", "supaya", "serta",
+    "sangat", "lebih", "juga", "akan", "tidak", "bisa", "dapat", "harus",
+    "wajib", "maupun", "namun", "tetapi", "karena", "sebagai", "oleh", "dalam",
+    "antara", "setiap", "buat", "bikin", "rancang", "tampilan", "beranda",
+    "situs", "halaman", "layanan", "pengguna", "jelas", "mudah", "ramah",
+})
+
+#: Glossary keys that are ALSO ordinary English words; never Indonesian evidence.
+_ENGLISH_COLLISIONS = frozenset({
+    "menu", "visual", "editorial", "hover", "layout", "grid", "font", "brand",
+    "landing", "header", "footer", "checkout", "data", "desain", "mode", "jam",
+})
+
+#: Indonesian-ONLY glossary keys (safe evidence of an Indonesian brief).
+_ID_ONLY_GLOSSARY_KEYS = frozenset(_ID_EN_GLOSSARY) - _ENGLISH_COLLISIONS
+
+
+def looks_indonesian(text: str) -> bool:
+    """Deterministic Indonesian detection (no model call).
+
+    True iff the brief contains an Indonesian function/marker word OR an
+    Indonesian-ONLY design term (a glossary key that is not also an English
+    word). An English brief contains neither, so detection never fires on it and
+    English query planning is unchanged.
+    """
+    tokens = set(_tokenize(text))
+    return bool(tokens & (_INDONESIAN_MARKERS | _ID_ONLY_GLOSSARY_KEYS))
+
+
+def _gloss_keywords(keywords: Sequence[str]) -> List[str]:
+    """Deterministic Indonesian->English expansion of a keyword list.
+
+    Order-preserving and deduped; an unknown keyword contributes nothing. It
+    never invents a term the glossary does not define.
+    """
+    out: List[str] = []
+    seen = set()
+    for kw in keywords:
+        for eng in _ID_EN_GLOSSARY.get(kw, ()):
+            if eng not in seen:
+                seen.add(eng)
+                out.append(eng)
+    return out
+
 #: Small English/Indonesian stopword set for the deterministic query planner.
 _STOPWORDS = frozenset({
     "a", "an", "the", "and", "or", "of", "to", "for", "with", "in", "on", "at",
@@ -230,6 +381,10 @@ class LayaConfig:
     min_score: float = 0.0
     categories: Tuple[str, ...] = DEFAULT_CATEGORIES
     max_pack_chars: int = MAX_PACK_CHARS
+    #: D4b.2: when True, append ONE deterministic English-gloss query for an
+    #: Indonesian brief (cross-lingual recall). DISABLED by default; when False
+    #: the planner is byte-identical to the accepted D4b planner.
+    multilingual_expansion: bool = False
 
     def normalized(self) -> "LayaConfig":
         """Clamp every bound to the module ceiling (never widen)."""
@@ -249,6 +404,7 @@ class LayaConfig:
             min_score=float(self.min_score),
             categories=allowed,
             max_pack_chars=max(0, min(int(self.max_pack_chars), MAX_PACK_CHARS)),
+            multilingual_expansion=bool(self.multilingual_expansion),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -261,6 +417,7 @@ class LayaConfig:
             "min_score": self.min_score,
             "categories": list(self.categories),
             "max_pack_chars": self.max_pack_chars,
+            "multilingual_expansion": self.multilingual_expansion,
         }
 
 
@@ -306,6 +463,7 @@ def config_from_mapping(data: Optional[Mapping[str, Any]]) -> LayaConfig:
         min_score=_float("min_score", 0.0),
         categories=categories,
         max_pack_chars=_int("max_pack_chars", MAX_PACK_CHARS),
+        multilingual_expansion=bool(data.get("multilingual_expansion", False)),
     ).normalized()
 
 
@@ -506,6 +664,17 @@ def plan_queries(
         if not hints:
             continue
         _add(" ".join(hints[:4] + keywords[:4]))
+
+    # D4b.2 (opt-in, disabled by default): for an INDONESIAN brief, append ONE
+    # bounded English-gloss query when the budget allows. Strictly additive and
+    # never displaces an existing query, so an English brief is byte-identical to
+    # the accepted planner. No model call.
+    if cfg.multilingual_expansion and len(queries) < cfg.max_queries:
+        combined = " ".join(parts)
+        if looks_indonesian(combined):
+            gloss = _gloss_keywords(keywords)
+            if gloss:
+                _add(" ".join(gloss))
 
     return tuple(queries)
 

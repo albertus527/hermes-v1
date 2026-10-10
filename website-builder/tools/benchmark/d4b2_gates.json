@@ -1,0 +1,66 @@
+{
+  "gates_id": "d4b2_multilingual_retrieval_gates",
+  "version": "1.0.0",
+  "created_utc": "2026-10-10",
+  "basis": "These gates are derived from (a) the D4b.2 mission's PRE-STATED objectives (reduce Indonesian empty-pack rate from 60% toward <=20%; improve Indonesian recall; do not materially regress English; do not increase false positives beyond the accepted safety limit; keep bounded context + provenance) and (b) the FROZEN D4b.1 baseline (tools/benchmark/d4b1_thresholds.json, sha256 dfa932b4...ccc51965). Both predate any candidate inference. No gate value was selected to fit a candidate's observed score; the candidate runs are reported AGAINST these gates.",
+  "frozen_dataset": {
+    "path": "tools/benchmark/d4b1_dataset.json",
+    "sha256": "9da94ae5fe609238a7e0ec28a8e2053ac3580594c516985f50af829fbbfd42cd",
+    "n": 50,
+    "indonesian": 25,
+    "english": 25
+  },
+  "heldout_dataset": {
+    "path": "tools/benchmark/d4b2_heldout.json",
+    "n": 16,
+    "indonesian": 8,
+    "english": 8,
+    "note": "Authored and frozen before final acceptance; never used for threshold tuning."
+  },
+  "relevance_floor": 0.62,
+  "baseline_reference": {
+    "empty_pack_all": 22,
+    "empty_pack_indonesian": 15,
+    "empty_pack_english": 7,
+    "indonesian_top_similarity_mean": 0.611,
+    "english_top_similarity_mean": 0.658,
+    "indonesian_category_micro_f1": 0.526,
+    "english_category_micro_f1": 0.779,
+    "retrieval_beneficial_accuracy": 0.72,
+    "false_positive_rate": 0.10,
+    "false_negative_rate": 0.325
+  },
+  "acceptance_gates": [
+    {"id": "G1", "metric": "indonesian_empty_pack_rate", "op": "<=", "value": 0.20,
+     "basis": "Mission objective: reduce Indonesian empty-pack rate from 0.60 toward <=0.20, but ONLY when relevant references genuinely exist. Measured as true-failures (rb=true & empty) / rb=true count, not raw empties."},
+    {"id": "G2", "metric": "indonesian_relevant_reference_recall", "op": ">=", "value": 0.85,
+     "basis": "Case-level recall of retrieval_beneficial=true. Baseline ID recall is 0.50; a material improvement must clear 0.85."},
+    {"id": "G3", "metric": "english_regression", "op": ">=", "value": 0.0,
+     "basis": "English metrics must NOT regress at all: the candidate must be English-neutral by construction (byte-identical query plan for an English brief)."},
+    {"id": "G4", "metric": "false_positive_retrieval_rate", "op": "<=", "value": 0.15,
+     "basis": "Inherited from the frozen D4b.1 T9 safety limit. Over-claiming retrieval is a quality risk."},
+    {"id": "G5", "metric": "false_negative_retrieval_rate", "op": "<=", "value": 0.25,
+     "basis": "Inherited from the frozen D4b.1 T10. Must improve over baseline 0.325."},
+    {"id": "G6", "metric": "heldout_indonesian_recall", "op": ">=", "value": 0.70,
+     "basis": "The improvement must GENERALISE to the held-out set, not merely fit the tuning set."},
+    {"id": "G7", "metric": "heldout_english_regression", "op": ">=", "value": 0.0,
+     "basis": "Held-out English metrics must not regress."},
+    {"id": "G8", "metric": "correct_abstention_preserved", "op": "==", "value": true,
+     "basis": "The candidate must NOT force retrieval for irrelevant/out-of-scope/adversarial briefs; correct abstentions must be preserved (no new false positives)."},
+    {"id": "G9", "metric": "additional_model_calls", "op": "<=", "value": 0,
+     "basis": "The candidate must add zero model calls (deterministic query planning only)."},
+    {"id": "G10", "metric": "additional_paid_cost_usd", "op": "<=", "value": 0.0,
+     "basis": "No paid API call may be introduced."},
+    {"id": "G11", "metric": "per_brief_latency_p95_s", "op": "<=", "value": 12.0,
+     "basis": "Bounded: at most one extra retrieval query per Indonesian brief; the adapter timeout is 10s and max_queries is 3."},
+    {"id": "G12", "metric": "security_fail_closed_regressions", "op": "==", "value": 0,
+     "basis": "Isolation, credential, provenance, and category bounds must remain fail-closed."},
+    {"id": "G13", "metric": "bounded_context_and_provenance_preserved", "op": "==", "value": true,
+     "basis": "The pack size bound (6000 chars) and provenance guarantees must be unchanged."}
+  ],
+  "decision_rule": {
+    "PASS_requires_all_of": ["G1","G2","G3","G4","G5","G6","G7","G8","G9","G10","G11","G12","G13"],
+    "INCONCLUSIVE_is_not_PASS": true,
+    "if_no_candidate_passes": "Preserve the accepted D4b implementation unchanged."
+  }
+}

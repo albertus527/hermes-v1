@@ -68,6 +68,13 @@ website_builder:
   # 0.62 cleanly drops irrelevant references (honest-empty) rather than presenting
   # them as relevant. The module transport default is 0.0 (predictable), but the
   # operational floor is this config value.
+  #
+  # ``multilingual_expansion`` (D4b.2) is DISABLED BY DEFAULT. When enabled, an
+  # INDONESIAN brief gains ONE bounded, deterministic Indonesian->English gloss
+  # query appended to the accepted D4b query plan (the base queries are preserved
+  # as a prefix -- strictly additive). It adds NO model call. An English brief is
+  # byte-identical to the accepted planner, so English retrieval cannot change.
+  # See docs/D4B2_MULTILINGUAL_RETRIEVAL_ACCEPTANCE.md.
   laya:
     enabled: false
     library_project_id: 'wb-design'
@@ -77,6 +84,7 @@ website_builder:
     min_score: 0.62
     categories: ['design_dna', 'components', 'motion']
     max_pack_chars: 6000
+    multilingual_expansion: false
 
   # Workspace root for generated projects
   workspace_root: '~/website-workspaces'

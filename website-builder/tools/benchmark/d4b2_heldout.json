@@ -1,0 +1,180 @@
+{
+  "dataset_id": "d4b2_heldout_multilingual",
+  "version": "1.0.0",
+  "frozen": true,
+  "created_utc": "2026-10-10",
+  "language_split": {"indonesian": 8, "english": 8, "total": 16},
+  "purpose": "HELD-OUT evaluation of multilingual (Indonesian/English) context retrieval for D4b.2. This set is authored and FROZEN before any candidate threshold tuning and is NEVER used for threshold selection; it is used only for final acceptance. It is deliberately disjoint from the frozen D4b.1 50-brief tuning benchmark (tools/benchmark/d4b1_dataset.json).",
+  "label_leakage_control": "Ground-truth labels below are authored from the rubric BEFORE any candidate inference on this set, grounded in the ACTUAL wb-design corpus references (11 reviewed sources across design_dna/components/motion). No candidate (D4b baseline, bilingual expansion, English-only, translated query) output was used to set any label. Only the brief text is passed to a candidate; labels are never passed to a candidate.",
+  "corpus_grounding": {
+    "design_dna": ["refero_typography", "refero_color", "refero_anti_ai_slop", "refero_visual_workflow", "impeccable_skill", "impeccable_critique"],
+    "components": ["refero_craft_details", "refero_icons", "impeccable_layout", "impeccable_audit"],
+    "motion": ["refero_motion"],
+    "note": "All 11 sources are English-language design references. relevant_categories labels are TRUE when at least one reviewed source in that category would give genuinely useful guidance for the brief."
+  },
+  "rubric": {
+    "retrieval_beneficial": {
+      "description": "True when reviewed design references would materially help prepare context for this brief.",
+      "rules": [
+        "False for out-of-scope requests, purely functional/no-design briefs, too-vague briefs, and adversarial/prompt-injection briefs that carry no real design task.",
+        "True otherwise (a genuine design task exists that reviewed references can inform)."
+      ]
+    },
+    "relevant_categories": {
+      "description": "Which corpus categories contain at least one genuinely useful reference for this brief.",
+      "vocabulary": ["design_dna", "components", "motion"],
+      "rules": [
+        "design_dna: include when the brief concerns visual style, typography, colour, layout, brand feel, or anti-generic craft.",
+        "motion: include only when the brief asks for or strongly implies animation, transitions, or motion.",
+        "components: include when the brief implies concrete UI building blocks (cards, nav, forms, galleries, pricing, tables, dashboards)."
+      ]
+    },
+    "language_pair_note": "Cases with the same 'pair' id are semantic equivalents across Indonesian (id) and English (en). Their retrieval_beneficial and relevant_categories labels are IDENTICAL by construction, so a language-fair system should score both languages alike."
+  },
+  "cases": [
+    {
+      "id": "H01-editorial-travel-journal",
+      "pair": "H01",
+      "language": "en",
+      "scenario": "editorial website design",
+      "brief": "Design an editorial travel journal website. Long-form destination essays, a serif-led typographic hierarchy, generous whitespace, and a curated photo index. No animation needed.",
+      "ground_truth": {"retrieval_beneficial": true, "relevant_categories": ["design_dna", "components"], "motion_relevant": false},
+      "rationale": "Visual/typographic craft (design_dna) and article/photo index building blocks (components) are directly covered by refero_typography, refero_visual_workflow, impeccable_layout. No motion requested."
+    },
+    {
+      "id": "H01-jurnal-perjalanan-editorial",
+      "pair": "H01",
+      "language": "id",
+      "scenario": "editorial website design",
+      "brief": "Rancang situs jurnal perjalanan editorial. Esai destinasi panjang, hierarki tipografi berbasis serif, ruang putih lega, dan indeks foto terkurasi. Tidak perlu animasi.",
+      "ground_truth": {"retrieval_beneficial": true, "relevant_categories": ["design_dna", "components"], "motion_relevant": false},
+      "rationale": "Semantic equivalent of H01-en; same labels by construction."
+    },
+    {
+      "id": "H02-saas-landing-ai-notetaker",
+      "pair": "H02",
+      "language": "en",
+      "scenario": "landing page",
+      "brief": "Build a SaaS landing page for an AI meeting notetaker. Hero with a product screenshot, a three-tier pricing table, feature cards, testimonial strip, and a sign-up call to action.",
+      "ground_truth": {"retrieval_beneficial": true, "relevant_categories": ["design_dna", "components"], "motion_relevant": false},
+      "rationale": "Pricing table / feature cards / CTA are concrete components (impeccable_layout, refero_craft_details); brand/pricing presentation is design_dna."
+    },
+    {
+      "id": "H02-landing-saas-notulen-ai",
+      "pair": "H02",
+      "language": "id",
+      "scenario": "landing page",
+      "brief": "Buat halaman landing SaaS untuk pencatat rapat berbasis AI. Hero dengan tangkapan layar produk, tabel harga tiga tingkatan, kartu fitur, deretan testimoni, dan ajakan mendaftar.",
+      "ground_truth": {"retrieval_beneficial": true, "relevant_categories": ["design_dna", "components"], "motion_relevant": false},
+      "rationale": "Semantic equivalent of H02-en."
+    },
+    {
+      "id": "H03-portfolio-illustrator",
+      "pair": "H03",
+      "language": "en",
+      "scenario": "portfolio site",
+      "brief": "Portfolio site for a freelance illustrator. A bold gallery-first layout, individual project pages, an about section, and a contact form. Playful but restrained.",
+      "ground_truth": {"retrieval_beneficial": true, "relevant_categories": ["design_dna", "components"], "motion_relevant": false},
+      "rationale": "Gallery-first layout + project pages + form are components; 'bold but restrained' aesthetic is design_dna."
+    },
+    {
+      "id": "H03-portofolio-ilustrator",
+      "pair": "H03",
+      "language": "id",
+      "scenario": "portfolio site",
+      "brief": "Situs portofolio untuk ilustrator lepas. Tata letak mengutamakan galeri yang berani, halaman proyek tersendiri, bagian tentang, dan formulir kontak. Playful tapi tertahan.",
+      "ground_truth": {"retrieval_beneficial": true, "relevant_categories": ["design_dna", "components"], "motion_relevant": false},
+      "rationale": "Semantic equivalent of H03-en."
+    },
+    {
+      "id": "H04-product-showcase-headphones",
+      "pair": "H04",
+      "language": "en",
+      "scenario": "product showcase website",
+      "brief": "Product showcase site for premium wireless headphones. Large hero imagery, a feature-comparison table, colour swatch selector, spec accordion, and a sticky buy bar.",
+      "ground_truth": {"retrieval_beneficial": true, "relevant_categories": ["design_dna", "components"], "motion_relevant": false},
+      "rationale": "Comparison table, swatches, accordion, sticky bar are components; premium product presentation is design_dna (colour, brand)."
+    },
+    {
+      "id": "H04-pameran-produk-headphone",
+      "pair": "H04",
+      "language": "id",
+      "scenario": "product showcase website",
+      "brief": "Situs pameran produk untuk headphone nirkabel premium. Gambar hero besar, tabel perbandingan fitur, pemilih warna, akordeon spesifikasi, dan bilah beli yang menempel.",
+      "ground_truth": {"retrieval_beneficial": true, "relevant_categories": ["design_dna", "components"], "motion_relevant": false},
+      "rationale": "Semantic equivalent of H04-en."
+    },
+    {
+      "id": "H05-motion-brand-launch",
+      "pair": "H05",
+      "language": "en",
+      "scenario": "motion and animation",
+      "brief": "Create a motion-led brand launch microsite. Scroll-triggered reveals, a hero video transition, animated counters, and a parallax product sequence. Reduced-motion support is required.",
+      "ground_truth": {"retrieval_beneficial": true, "relevant_categories": ["design_dna", "motion", "components"], "motion_relevant": true},
+      "rationale": "Motion is the stated primary device (refero_motion); brand craft is design_dna; parallax/counters are components."
+    },
+    {
+      "id": "H05-peluncuran-merek-beranimasi",
+      "pair": "H05",
+      "language": "id",
+      "scenario": "motion and animation",
+      "brief": "Buat microsite peluncuran merek yang dipimpin animasi. Muncul saat digulir, transisi video hero, penghitung beranimasi, dan urutan produk parallax. Wajib mendukung reduced-motion.",
+      "ground_truth": {"retrieval_beneficial": true, "relevant_categories": ["design_dna", "motion", "components"], "motion_relevant": true},
+      "rationale": "Semantic equivalent of H05-en."
+    },
+    {
+      "id": "H06-component-dashboard-admin",
+      "pair": "H06",
+      "language": "en",
+      "scenario": "component selection",
+      "brief": "Design an admin dashboard UI kit: data tables with sorting, filter chips, a sidebar nav, modal dialogs, toast notifications, and accessible form controls.",
+      "ground_truth": {"retrieval_beneficial": true, "relevant_categories": ["components", "design_dna"], "motion_relevant": false},
+      "rationale": "Component-heavy (tables, nav, dialogs, form controls) with accessibility craft; impeccable_audit/craft-details and design_dna layout apply."
+    },
+    {
+      "id": "H06-kit-komponen-dasbor-admin",
+      "pair": "H06",
+      "language": "id",
+      "scenario": "component selection",
+      "brief": "Rancang kit UI dasbor admin: tabel data dengan pengurutan, chip filter, navigasi samping, dialog modal, notifikasi toast, dan kontrol formulir yang aksesibel.",
+      "ground_truth": {"retrieval_beneficial": true, "relevant_categories": ["components", "design_dna"], "motion_relevant": false},
+      "rationale": "Semantic equivalent of H06-en."
+    },
+    {
+      "id": "H07-design-dna-craft-brand",
+      "pair": "H07",
+      "language": "en",
+      "scenario": "design DNA",
+      "brief": "Define a distinctive design DNA for a boutique law firm: a custom type scale, a restrained neutral palette, precise spacing rhythm, and deliberate anti-generic craft. Content is plain.",
+      "ground_truth": {"retrieval_beneficial": true, "relevant_categories": ["design_dna"], "motion_relevant": false},
+      "rationale": "Purely visual/typographic/colour craft → design_dna only (typography, color, anti-ai-slop)."
+    },
+    {
+      "id": "H07-dna-desain-firma-hukum",
+      "pair": "H07",
+      "language": "id",
+      "scenario": "design DNA",
+      "brief": "Tetapkan DNA desain yang khas untuk firma hukum butik: skala tipografi khusus, palet netral yang tertahan, irama jarak yang presisi, dan keahlian anti-generik yang disengaja. Konten sederhana.",
+      "ground_truth": {"retrieval_beneficial": true, "relevant_categories": ["design_dna"], "motion_relevant": false},
+      "rationale": "Semantic equivalent of H07-en."
+    },
+    {
+      "id": "H08-out-of-scope-climate-model",
+      "pair": "H08",
+      "language": "en",
+      "scenario": "irrelevant references / out of scope",
+      "brief": "Write a Python script that trains a regional climate model on NetCDF data and reports RMSE. This is a numerical computing task, not a website.",
+      "ground_truth": {"retrieval_beneficial": false, "relevant_categories": [], "motion_relevant": false},
+      "rationale": "No design task exists; no reviewed design reference is relevant. Correct behaviour is an honest empty pack."
+    },
+    {
+      "id": "H08-di-luar-cakupan-model-iklim",
+      "pair": "H08",
+      "language": "id",
+      "scenario": "irrelevant references / out of scope",
+      "brief": "Tulis skrip Python yang melatih model iklim regional pada data NetCDF dan melaporkan RMSE. Ini tugas komputasi numerik, bukan situs web.",
+      "ground_truth": {"retrieval_beneficial": false, "relevant_categories": [], "motion_relevant": false},
+      "rationale": "Semantic equivalent of H08-en; correct behaviour is an honest empty pack."
+    }
+  ]
+}
