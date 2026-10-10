@@ -65,6 +65,12 @@ log "installing pinned CPU stack + laya==${PKG_VERSION} (isolated)"
     --index-url https://download.pytorch.org/whl/cpu torch
 "${VENV}/bin/python" -m pip install --quiet \
     "transformers>=4.48.0" "safetensors>=0.4.0" "huggingface_hub>=0.20.0" "numpy>=1.20.0"
+# ``httpx`` is NOT a laya dependency, but the D4b OpenViking adapter imports it
+# lazily at call time. Newer ``huggingface_hub`` (>=2.x) depends on ``httpx2``
+# instead, so without this the isolated interpreter cannot drive the real
+# OpenViking retrieval path (Candidate B) and reports BACKEND_FAILURE. Install
+# the real client explicitly so the venv can run Candidates B and C together.
+"${VENV}/bin/python" -m pip install --quiet "httpx>=0.27"
 "${VENV}/bin/python" -m pip install --quiet "laya==${PKG_VERSION}"
 
 log "downloading ONLY the multilingual checkpoint @ ${CHECKPOINT_REV}"
