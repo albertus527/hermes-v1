@@ -328,16 +328,27 @@ class IntakeProcessor:
     def _prepare_reference_context(
         self, text: str, project_id: Optional[str], persisted: Dict[str, Any]
     ) -> Optional[str]:
-        """Prepare an optional Laya reference block for FAST (D4b).
+        """Prepare an optional Laya reference block for FAST (D4b/D4c).
 
-        Returns the rendered lower-trust reference block, or ``None`` when Laya
-        is absent/disabled or produced no usable context. This is a pure
-        enrichment step: it NEVER raises (any Laya failure degrades to ``None``,
-        so the original FAST path runs unchanged) and it NEVER mutates state.
-        The block is reference DATA appended to the FAST prompt; it is not an
-        instruction and it cannot override the user's brief.
+        Returns the rendered lower-trust reference block, or ``None`` when the
+        D4c hand-off flag is off, Laya is absent/disabled, or no usable context
+        was produced. This is a pure enrichment step: it NEVER raises (any Laya
+        failure degrades to ``None``, so the original FAST path runs unchanged)
+        and it NEVER mutates state. The block is reference DATA appended to the
+        FAST prompt; it is not an instruction and it cannot override the user's
+        brief.
+
+        D4c: the hand-off is gated by the SEPARATE, INDEPENDENT
+        ``laya.fast_context_injection`` opt-in. When it is off (the default) no
+        retrieval is performed at all, so FAST receives exactly the accepted
+        baseline inputs even if Laya preparation itself is enabled.
         """
         if self.laya is None or self.hermes_adapter is None:
+            return None
+        # D4c fail-closed gate: injection must be EXPLICITLY enabled. A preparer
+        # without the flag (e.g. a legacy/test double) is treated as OFF rather
+        # than assumed on -- never promote context without an explicit opt-in.
+        if not bool(getattr(self.laya, "fast_context_injection_enabled", False)):
             return None
         try:
             result = self.laya.prepare_context(

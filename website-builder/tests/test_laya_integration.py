@@ -79,8 +79,14 @@ class RecordingFast:
 
 def _enabled_preparer(backend, **cfg):
     adapter = OpenVikingRetrievalAdapter(OpenVikingConfig(enabled=True), backend)
+    # D4c: the FAST hand-off is a SEPARATE, INDEPENDENT opt-in; these D4b tests
+    # exercise the hand-off, so they enable it explicitly here.
     return laya.LayaContextPreparer(
-        laya.LayaConfig(enabled=True, library_project_id="wb-design", **cfg), adapter
+        laya.LayaConfig(
+            enabled=True, fast_context_injection=True,
+            library_project_id="wb-design", **cfg,
+        ),
+        adapter,
     )
 
 
@@ -188,6 +194,10 @@ def test_a_laya_internal_exception_does_not_block_fast():
     fast = RecordingFast()
 
     class ExplodingLaya:
+        # D4c: injection is explicitly on, so the hand-off IS attempted and the
+        # internal exception must still degrade to None without blocking FAST.
+        fast_context_injection_enabled = True
+
         def prepare_context(self, *a, **k):
             raise RuntimeError("laya exploded")
 
@@ -315,6 +325,9 @@ def test_revision_intake_passes_project_context_to_laya():
     seen = {}
 
     class RecordingLaya:
+        # D4c: the D4b hand-off is opt-in; enable it so Laya is actually consulted.
+        fast_context_injection_enabled = True
+
         def prepare_context(self, brief, project_id=None, project_context=None, budget=None):
             seen["brief"] = brief
             seen["project_context"] = project_context

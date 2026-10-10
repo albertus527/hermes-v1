@@ -385,6 +385,13 @@ class LayaConfig:
     #: Indonesian brief (cross-lingual recall). DISABLED by default; when False
     #: the planner is byte-identical to the accepted D4b planner.
     multilingual_expansion: bool = False
+    #: D4c: whether a PREPARED context pack may be handed to FAST. This is a
+    #: SEPARATE, INDEPENDENT opt-in from ``enabled``: enabling Laya preparation
+    #: never enables injection, and enabling injection never enables
+    #: preparation. DISABLED by default, so FAST receives no reference block
+    #: unless an operator explicitly turns this on (in addition to ``enabled``
+    #: and the OpenViking adapter being enabled).
+    fast_context_injection: bool = False
 
     def normalized(self) -> "LayaConfig":
         """Clamp every bound to the module ceiling (never widen)."""
@@ -405,6 +412,7 @@ class LayaConfig:
             categories=allowed,
             max_pack_chars=max(0, min(int(self.max_pack_chars), MAX_PACK_CHARS)),
             multilingual_expansion=bool(self.multilingual_expansion),
+            fast_context_injection=bool(self.fast_context_injection),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -418,6 +426,7 @@ class LayaConfig:
             "categories": list(self.categories),
             "max_pack_chars": self.max_pack_chars,
             "multilingual_expansion": self.multilingual_expansion,
+            "fast_context_injection": self.fast_context_injection,
         }
 
 
@@ -464,6 +473,7 @@ def config_from_mapping(data: Optional[Mapping[str, Any]]) -> LayaConfig:
         categories=categories,
         max_pack_chars=_int("max_pack_chars", MAX_PACK_CHARS),
         multilingual_expansion=bool(data.get("multilingual_expansion", False)),
+        fast_context_injection=bool(data.get("fast_context_injection", False)),
     ).normalized()
 
 
@@ -820,6 +830,18 @@ class LayaContextPreparer:
             and self._adapter is not None
             and self._adapter.enabled
         )
+
+    @property
+    def fast_context_injection_enabled(self) -> bool:
+        """True only when the D4c hand-off flag is EXPLICITLY on.
+
+        D4c: this is a SEPARATE, INDEPENDENT opt-in from :attr:`enabled`.
+        Preparing a context pack never implies handing it to FAST, and enabling
+        the hand-off never enables preparation -- a caller must satisfy BOTH.
+        Defaults to False, so the FAST seam is unchanged unless an operator
+        turns this on (and also enables preparation + the OpenViking adapter).
+        """
+        return bool(self._config.fast_context_injection and self.enabled)
 
     # -- helpers -----------------------------------------------------------
 

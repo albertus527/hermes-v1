@@ -85,6 +85,11 @@ website_builder:
     categories: ['design_dna', 'components', 'motion']
     max_pack_chars: 6000
     multilingual_expansion: false
+    # D4c: SEPARATE, INDEPENDENT opt-in for handing a prepared context pack to
+    # FAST. DISABLED by default; enabling `enabled` above does NOT enable this,
+    # so FAST receives no reference block unless an operator turns this on too.
+    # See docs/D4C_FAST_CONTEXT_INTEGRATION_ACCEPTANCE.md.
+    fast_context_injection: false
 
   # Workspace root for generated projects
   workspace_root: '~/website-workspaces'
