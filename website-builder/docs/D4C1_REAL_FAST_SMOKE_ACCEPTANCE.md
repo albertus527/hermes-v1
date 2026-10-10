@@ -477,6 +477,6 @@ No production code path was modified; no new dependency or model was installed.
 |---|---|
 | Baseline commit | `da316ef5813cf442f9c3f040adbb59a1f82b84a2` |
 | `feature/website` | untouched at `868ed00e3f24e06f1dcf9944d6d031105dff0646` |
-| Commit SHA | _D4c.1 implementation commit — SHA recorded in the follow-up docs commit (repo convention, as for D4c/D4b.2)_ |
+| Commit SHA | `8a1a7ef45b1a99d823be1e5cfb627ce2bc9d91eb` (D4c.1 implementation: acceptance + test-only tooling) |
 | Push | `origin/web-design` (fast-forward, **no force-push**) |
 | Excluded | caches (`__pycache__`), `~/.website-builder/openviking/d4c1_*.json` (evidence lives outside the tree), secrets/keys, checkpoint weights |
