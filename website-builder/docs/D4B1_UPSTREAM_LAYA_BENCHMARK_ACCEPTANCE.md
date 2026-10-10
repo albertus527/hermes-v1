@@ -587,5 +587,8 @@ permanent runtime is installed.
 
 ## 19. Commit and push status
 
-Recorded at commit time — see the commit that adds this revision of the file to
-`origin/web-design`.
+* Implementation commit: **`240b798d7b1214b4ee5dd527f81cae9f31374b92`**
+  (`feat(design): D4b.1 resume — real upstream Laya benchmark, measured, gate FAILS`)
+* Push: `origin/web-design` (fast-forward, no force-push).
+* `feature/website` **not** merged or modified; Hermes Trade **not** modified;
+  Laya **not** enabled in production; D4c **not** started.
