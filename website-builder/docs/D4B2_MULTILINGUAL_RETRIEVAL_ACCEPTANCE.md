@@ -353,7 +353,19 @@ required — the change touches no persistent state.
 
 ---
 
-## 16. Final verdict
+## 16. Final commit record
+
+| Item | Value |
+|---|---|
+| Batch commit | `c66ce2da6` (see the commit for the exact SHA) |
+| Baseline commit | `b203c20f425c412818a4fae1acb81efdb14e9ae8` |
+| `feature/website` | untouched at `868ed00e3f24e06f1dcf9944d6d031105dff0646` |
+| Push | `origin/web-design` (fast-forward, no force) |
+| Proof | `tools/d4b2_final_proof.py` → **23/23 checks passed, VERDICT: PASS** |
+
+---
+
+## 17. Final verdict
 
 ```
 D4B2_READY_FOR_D4C
