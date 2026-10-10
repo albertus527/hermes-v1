@@ -322,7 +322,7 @@ path is byte-identical to the accepted baseline.
 |---|---|
 | Baseline commit | `7925a4ba0361d51832799c59a49ba1750d204588` |
 | `feature/website` | untouched at `868ed00e3f24e06f1dcf9944d6d031105dff0646` |
-| Commit SHA | _set at commit time_ (see the D4c commit) |
+| Commit SHA | `c34cff862` (D4c implementation commit) |
 | Push | `origin/web-design` (fast-forward, **no force-push**) |
 | Excluded from the commit | caches (`__pycache__`), `~/.website-builder/openviking/d4c_live_smoke.json` (evidence lives outside the tree), secrets/keys, checkpoint weights, temp bench artifacts |
 
