@@ -1,0 +1,40 @@
+{
+  "n": 50,
+  "labels": {
+    "scope_class": {
+      "accuracy": {
+        "A": 1.0
+      }
+    },
+    "ambiguous": {
+      "accuracy": {
+        "A": 0.4
+      }
+    },
+    "clarification_required": {
+      "accuracy": {
+        "A": 0.84
+      }
+    },
+    "relevant_categories": {
+      "accuracy": {
+        "B": 0.44
+      }
+    },
+    "retrieval_beneficial": {
+      "accuracy": {
+        "B": 0.72
+      }
+    },
+    "motion_relevant": {
+      "accuracy": {
+        "B": 0.94
+      }
+    },
+    "component_relevant": {
+      "accuracy": {
+        "B": 0.58
+      }
+    }
+  }
+}

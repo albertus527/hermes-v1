@@ -1,0 +1,1202 @@
+{
+  "dataset_id": "d4b1_upstream_laya_benchmark",
+  "dataset_version": "1.0.0",
+  "n": 50,
+  "candidates_requested": [
+    "A"
+  ],
+  "upstream": {
+    "package": "laya",
+    "package_version": "0.4.1",
+    "checkpoint": "convaiinnovations/laya-multilingual",
+    "checkpoint_revision": "e4e9ddf21a7b1903b7acffd8814ad4307bf63a67"
+  },
+  "candidate_meta": {
+    "A": {
+      "kind": "standin",
+      "labels": [
+        "scope_class",
+        "ambiguous",
+        "clarification_required"
+      ],
+      "note": "deterministic stand-in for the PAID FAST model; real FAST-only baseline is BLOCKED without paid approval"
+    },
+    "C": {
+      "kind": "upstream_laya",
+      "status": "NOT_RUN",
+      "note": "candidate C requires the approval-gated isolated env + checkpoint"
+    }
+  },
+  "predictions": {
+    "A": {
+      "S01-editorial-food-magazine": {
+        "scope_class": "in_scope",
+        "ambiguous": false,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": true,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S01-editorial-majalah-kuliner": {
+        "scope_class": "in_scope",
+        "ambiguous": false,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": true,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S02-corporate-consulting": {
+        "scope_class": "in_scope",
+        "ambiguous": false,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": true,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S02-corporate-konsultan": {
+        "scope_class": "in_scope",
+        "ambiguous": false,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": true,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S03-portfolio-photographer": {
+        "scope_class": "in_scope",
+        "ambiguous": false,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": true,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S03-portofolio-fotografer": {
+        "scope_class": "in_scope",
+        "ambiguous": false,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": true,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S04-saas-landing-analytics": {
+        "scope_class": "in_scope",
+        "ambiguous": false,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": true,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S04-saas-landing-analitik": {
+        "scope_class": "in_scope",
+        "ambiguous": false,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": true,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S05-florist-botanical": {
+        "scope_class": "in_scope",
+        "ambiguous": true,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": false,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S05-toko-bunga-botanikal": {
+        "scope_class": "in_scope",
+        "ambiguous": true,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": false,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S06-restaurant-fine-dining": {
+        "scope_class": "in_scope",
+        "ambiguous": false,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": true,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S06-restoran-fine-dining": {
+        "scope_class": "in_scope",
+        "ambiguous": false,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": true,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S07-minimalist-architecture": {
+        "scope_class": "in_scope",
+        "ambiguous": true,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": false,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S07-minimalis-arsitektur": {
+        "scope_class": "in_scope",
+        "ambiguous": true,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": false,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S08-motion-creative-agency": {
+        "scope_class": "in_scope",
+        "ambiguous": true,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": false,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S08-agensi-kreatif-motion": {
+        "scope_class": "in_scope",
+        "ambiguous": true,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": false,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S09-component-rich-ecommerce": {
+        "scope_class": "in_scope",
+        "ambiguous": true,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": false,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S09-toko-online-banyak-komponen": {
+        "scope_class": "in_scope",
+        "ambiguous": true,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": false,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S10-ambiguous-one-liner": {
+        "scope_class": "in_scope",
+        "ambiguous": true,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": false,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S10-singkat-ambigu": {
+        "scope_class": "in_scope",
+        "ambiguous": true,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": false,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S11-revision-change-color": {
+        "scope_class": "revision",
+        "ambiguous": true,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": false,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S11-revisi-ubah-warna": {
+        "scope_class": "revision",
+        "ambiguous": true,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": false,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S12-conflicting-instructions": {
+        "scope_class": "in_scope",
+        "ambiguous": true,
+        "clarification_required": true,
+        "detail": {
+          "has_what": true,
+          "has_name": false,
+          "has_why": false,
+          "conflicting": true
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S12-instruksi-bertentangan": {
+        "scope_class": "in_scope",
+        "ambiguous": true,
+        "clarification_required": true,
+        "detail": {
+          "has_what": true,
+          "has_name": false,
+          "has_why": false,
+          "conflicting": true
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S13-out-of-scope-thesis": {
+        "scope_class": "out_of_scope",
+        "ambiguous": true,
+        "clarification_required": true,
+        "detail": {
+          "has_what": false,
+          "has_name": false,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S13-di-luar-cakupan-tesis": {
+        "scope_class": "out_of_scope",
+        "ambiguous": true,
+        "clarification_required": true,
+        "detail": {
+          "has_what": false,
+          "has_name": false,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S14-adversarial-injection": {
+        "scope_class": "adversarial",
+        "ambiguous": false,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": true,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S14-adversarial-injeksi": {
+        "scope_class": "adversarial",
+        "ambiguous": false,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": true,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S15-corporate-law-firm": {
+        "scope_class": "in_scope",
+        "ambiguous": true,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": false,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S15-korporat-firma-hukum": {
+        "scope_class": "in_scope",
+        "ambiguous": true,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": false,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S16-portfolio-developer": {
+        "scope_class": "in_scope",
+        "ambiguous": false,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": true,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S16-portofolio-pengembang": {
+        "scope_class": "in_scope",
+        "ambiguous": false,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": true,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S17-saas-landing-fintech": {
+        "scope_class": "in_scope",
+        "ambiguous": true,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": false,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S17-saas-landing-fintech-id": {
+        "scope_class": "in_scope",
+        "ambiguous": true,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": false,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S18-botanical-garden-nonprofit": {
+        "scope_class": "in_scope",
+        "ambiguous": true,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": false,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S18-kebun-botanikal-nirlaba": {
+        "scope_class": "in_scope",
+        "ambiguous": true,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": false,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S19-restaurant-cafe-menu": {
+        "scope_class": "in_scope",
+        "ambiguous": false,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": true,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S19-kafe-menu-kopi": {
+        "scope_class": "in_scope",
+        "ambiguous": false,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": true,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S20-minimalist-fashion": {
+        "scope_class": "in_scope",
+        "ambiguous": true,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": false,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S20-minimalis-mode": {
+        "scope_class": "in_scope",
+        "ambiguous": true,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": false,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S21-motion-portfolio-animated": {
+        "scope_class": "in_scope",
+        "ambiguous": true,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": false,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S21-portofolio-beranimasi": {
+        "scope_class": "in_scope",
+        "ambiguous": true,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": false,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S22-component-rich-dashboard": {
+        "scope_class": "in_scope",
+        "ambiguous": true,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": false,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S22-dasbor-banyak-komponen": {
+        "scope_class": "in_scope",
+        "ambiguous": true,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": false,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S23-ambiguous-name-only": {
+        "scope_class": "in_scope",
+        "ambiguous": false,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": true,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S23-ambigu-hanya-nama": {
+        "scope_class": "in_scope",
+        "ambiguous": false,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": true,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S24-revision-add-page": {
+        "scope_class": "revision",
+        "ambiguous": true,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": false,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S24-revisi-tambah-halaman": {
+        "scope_class": "revision",
+        "ambiguous": true,
+        "clarification_required": false,
+        "detail": {
+          "has_what": true,
+          "has_name": false,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S25-adversarial-and-out-of-scope": {
+        "scope_class": "adversarial",
+        "ambiguous": true,
+        "clarification_required": true,
+        "detail": {
+          "has_what": false,
+          "has_name": true,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      },
+      "S25-adversarial-di-luar-cakupan": {
+        "scope_class": "adversarial",
+        "ambiguous": true,
+        "clarification_required": true,
+        "detail": {
+          "has_what": false,
+          "has_name": true,
+          "has_why": false,
+          "conflicting": false
+        },
+        "source": "deterministic_standin_fast_only"
+      }
+    }
+  },
+  "resources": {
+    "rss_start_mb": 16.3,
+    "host_available_start_mb": 5583.3,
+    "rss_end_mb": 16.3,
+    "host_available_end_mb": 5583.3
+  },
+  "evaluation": {
+    "A": {
+      "status": "RUN",
+      "labels": [
+        "scope_class",
+        "ambiguous",
+        "clarification_required"
+      ],
+      "per_label": {
+        "scope_class": {
+          "n": 50,
+          "accuracy": 1.0,
+          "macro_f1": 1.0,
+          "per_class": {
+            "in_scope": {
+              "precision": 1.0,
+              "recall": 1.0,
+              "f1": 1.0,
+              "support": 40
+            },
+            "revision": {
+              "precision": 1.0,
+              "recall": 1.0,
+              "f1": 1.0,
+              "support": 4
+            },
+            "out_of_scope": {
+              "precision": 1.0,
+              "recall": 1.0,
+              "f1": 1.0,
+              "support": 2
+            },
+            "adversarial": {
+              "precision": 1.0,
+              "recall": 1.0,
+              "f1": 1.0,
+              "support": 4
+            }
+          },
+          "confusion": {
+            "in_scope": {
+              "in_scope": 40,
+              "revision": 0,
+              "out_of_scope": 0,
+              "adversarial": 0
+            },
+            "revision": {
+              "in_scope": 0,
+              "revision": 4,
+              "out_of_scope": 0,
+              "adversarial": 0
+            },
+            "out_of_scope": {
+              "in_scope": 0,
+              "revision": 0,
+              "out_of_scope": 2,
+              "adversarial": 0
+            },
+            "adversarial": {
+              "in_scope": 0,
+              "revision": 0,
+              "out_of_scope": 0,
+              "adversarial": 4
+            }
+          },
+          "coverage": 1.0,
+          "indonesian": {
+            "n": 25,
+            "accuracy": 1.0,
+            "macro_f1": 1.0,
+            "per_class": {
+              "in_scope": {
+                "precision": 1.0,
+                "recall": 1.0,
+                "f1": 1.0,
+                "support": 20
+              },
+              "revision": {
+                "precision": 1.0,
+                "recall": 1.0,
+                "f1": 1.0,
+                "support": 2
+              },
+              "out_of_scope": {
+                "precision": 1.0,
+                "recall": 1.0,
+                "f1": 1.0,
+                "support": 1
+              },
+              "adversarial": {
+                "precision": 1.0,
+                "recall": 1.0,
+                "f1": 1.0,
+                "support": 2
+              }
+            },
+            "confusion": {
+              "in_scope": {
+                "in_scope": 20,
+                "revision": 0,
+                "out_of_scope": 0,
+                "adversarial": 0
+              },
+              "revision": {
+                "in_scope": 0,
+                "revision": 2,
+                "out_of_scope": 0,
+                "adversarial": 0
+              },
+              "out_of_scope": {
+                "in_scope": 0,
+                "revision": 0,
+                "out_of_scope": 1,
+                "adversarial": 0
+              },
+              "adversarial": {
+                "in_scope": 0,
+                "revision": 0,
+                "out_of_scope": 0,
+                "adversarial": 2
+              }
+            }
+          },
+          "english": {
+            "n": 25,
+            "accuracy": 1.0,
+            "macro_f1": 1.0,
+            "per_class": {
+              "in_scope": {
+                "precision": 1.0,
+                "recall": 1.0,
+                "f1": 1.0,
+                "support": 20
+              },
+              "revision": {
+                "precision": 1.0,
+                "recall": 1.0,
+                "f1": 1.0,
+                "support": 2
+              },
+              "out_of_scope": {
+                "precision": 1.0,
+                "recall": 1.0,
+                "f1": 1.0,
+                "support": 1
+              },
+              "adversarial": {
+                "precision": 1.0,
+                "recall": 1.0,
+                "f1": 1.0,
+                "support": 2
+              }
+            },
+            "confusion": {
+              "in_scope": {
+                "in_scope": 20,
+                "revision": 0,
+                "out_of_scope": 0,
+                "adversarial": 0
+              },
+              "revision": {
+                "in_scope": 0,
+                "revision": 2,
+                "out_of_scope": 0,
+                "adversarial": 0
+              },
+              "out_of_scope": {
+                "in_scope": 0,
+                "revision": 0,
+                "out_of_scope": 1,
+                "adversarial": 0
+              },
+              "adversarial": {
+                "in_scope": 0,
+                "revision": 0,
+                "out_of_scope": 0,
+                "adversarial": 2
+              }
+            }
+          }
+        },
+        "ambiguous": {
+          "n": 50,
+          "accuracy": 0.4,
+          "precision": 0.125,
+          "recall": 0.6666666666666666,
+          "f1": 0.21052631578947367,
+          "tp": 4,
+          "fp": 28,
+          "fn": 2,
+          "tn": 16,
+          "false_positive_rate": 0.6363636363636364,
+          "false_negative_rate": 0.3333333333333333,
+          "coverage": 1.0,
+          "indonesian": {
+            "n": 25,
+            "accuracy": 0.4,
+            "precision": 0.125,
+            "recall": 0.6666666666666666,
+            "f1": 0.21052631578947367,
+            "tp": 2,
+            "fp": 14,
+            "fn": 1,
+            "tn": 8,
+            "false_positive_rate": 0.6363636363636364,
+            "false_negative_rate": 0.3333333333333333
+          },
+          "english": {
+            "n": 25,
+            "accuracy": 0.4,
+            "precision": 0.125,
+            "recall": 0.6666666666666666,
+            "f1": 0.21052631578947367,
+            "tp": 2,
+            "fp": 14,
+            "fn": 1,
+            "tn": 8,
+            "false_positive_rate": 0.6363636363636364,
+            "false_negative_rate": 0.3333333333333333
+          }
+        },
+        "clarification_required": {
+          "n": 50,
+          "accuracy": 0.84,
+          "precision": 0.3333333333333333,
+          "recall": 0.3333333333333333,
+          "f1": 0.3333333333333333,
+          "tp": 2,
+          "fp": 4,
+          "fn": 4,
+          "tn": 40,
+          "false_positive_rate": 0.09090909090909091,
+          "false_negative_rate": 0.6666666666666666,
+          "coverage": 1.0,
+          "indonesian": {
+            "n": 25,
+            "accuracy": 0.84,
+            "precision": 0.3333333333333333,
+            "recall": 0.3333333333333333,
+            "f1": 0.3333333333333333,
+            "tp": 1,
+            "fp": 2,
+            "fn": 2,
+            "tn": 20,
+            "false_positive_rate": 0.09090909090909091,
+            "false_negative_rate": 0.6666666666666666
+          },
+          "english": {
+            "n": 25,
+            "accuracy": 0.84,
+            "precision": 0.3333333333333333,
+            "recall": 0.3333333333333333,
+            "f1": 0.3333333333333333,
+            "tp": 1,
+            "fp": 2,
+            "fn": 2,
+            "tn": 20,
+            "false_positive_rate": 0.09090909090909091,
+            "false_negative_rate": 0.6666666666666666
+          }
+        }
+      }
+    },
+    "B": {
+      "status": "NOT_RUN"
+    },
+    "C": {
+      "status": "NOT_RUN"
+    }
+  },
+  "thresholds": {
+    "thresholds_id": "d4b1_thresholds",
+    "version": "1.0.0",
+    "frozen_before_testing": true,
+    "frozen_utc": "2026-10-09",
+    "note": "These thresholds were written and committed BEFORE any candidate (FAST-only, D4b deterministic, or upstream Laya) was run on the 50-brief dataset. No threshold may be changed after observing results. A statistically weak or inconclusive improvement is NOT a PASS.",
+    "measured_vps_headroom": {
+      "cpu_cores": 4,
+      "ram_total_mb": 7933,
+      "ram_available_mb": 6247,
+      "swap_total_mb": 2047,
+      "swap_used_mb": 392,
+      "disk_free_gb": 65,
+      "openviking_settled_rss_mb": 435,
+      "existing_d4b_prep_latency_s": [
+        1.6,
+        5.5
+      ],
+      "existing_d4b_extra_model_calls": 0
+    },
+    "quality_thresholds": [
+      {
+        "id": "T1",
+        "primary": true,
+        "metric": "design_intent_macro_f1_all50",
+        "op": ">=",
+        "value": 0.5,
+        "basis": "10-class closed vocabulary; chance 0.10; upstream multilingual zero-shot typed-decisions is weak (reported 0.342 vs 0.318 random), so the bar is not set from marketing numbers. 0.50 is a demanding floor for a 10-class intent task in which many briefs are lexically explicit."
+      },
+      {
+        "id": "T1b",
+        "metric": "design_intent_accuracy_all50",
+        "op": ">=",
+        "value": 0.6,
+        "basis": "Majority class is 'other' at 12/50 = 0.24; 0.60 is well above any trivial majority predictor."
+      },
+      {
+        "id": "T2",
+        "metric": "design_intent_macro_f1_indonesian25",
+        "op": ">=",
+        "value": 0.4,
+        "basis": "The multilingual checkpoint is the only one that reads Indonesian; a real multilingual capability must clear a genuine bar on ID, not merely beat chance."
+      },
+      {
+        "id": "T3",
+        "metric": "design_intent_macro_f1_english25",
+        "op": ">=",
+        "value": 0.5,
+        "basis": "English is the checkpoint's weaker language by its own card (0.619 vs 0.684); the floor matches T1."
+      },
+      {
+        "id": "T11",
+        "metric": "no_material_regression_vs_baselines_shared_labels",
+        "op": ">=",
+        "value": -0.1,
+        "basis": "Candidate macro-F1 must not fall more than 0.10 below the better of {FAST-only, D4b deterministic} on every label the candidate and that baseline BOTH produce."
+      },
+      {
+        "id": "T12",
+        "metric": "core_metric_improvement",
+        "op": ">=",
+        "value": 1,
+        "basis": "At least ONE predeclared core metric must improve meaningfully over the D4b deterministic baseline: either retrieval relevance (candidate top-relevance > D4b top-relevance on beneficial briefs) OR relevant_categories micro-F1 strictly greater than D4b's."
+      }
+    ],
+    "category_thresholds": [
+      {
+        "id": "T4",
+        "metric": "relevant_categories_micro_f1",
+        "op": ">=",
+        "value": 0.7,
+        "basis": "Category selection over 3 binary categories is easier than 10-class intent; D4b's deterministic planner is the reference bar."
+      },
+      {
+        "id": "T5",
+        "metric": "retrieval_beneficial_accuracy",
+        "op": ">=",
+        "value": 0.8,
+        "basis": "Binary decision; a candidate that cannot decide 'is retrieval beneficial' at 0.80 is not a useful planner."
+      },
+      {
+        "id": "T6",
+        "metric": "motion_relevant_f1",
+        "op": ">=",
+        "value": 0.7,
+        "basis": "Binary; the signal is usually lexically explicit ('animated', 'transition', 'beranimasi')."
+      },
+      {
+        "id": "T7",
+        "metric": "component_relevant_f1",
+        "op": ">=",
+        "value": 0.7,
+        "basis": "Binary; implied by enumerable UI nouns."
+      },
+      {
+        "id": "T8",
+        "metric": "ambiguous_accuracy",
+        "op": ">=",
+        "value": 0.75,
+        "basis": "Binary; includes both under-specified and conflicting briefs."
+      },
+      {
+        "id": "T9",
+        "metric": "false_positive_retrieval_rate",
+        "op": "<=",
+        "value": 0.15,
+        "basis": "Fraction of cases labelled retrieval_beneficial=false for which the candidate nonetheless asserts retrieval is beneficial. Over-claiming retrieval is a quality risk."
+      },
+      {
+        "id": "T10",
+        "metric": "false_negative_retrieval_rate",
+        "op": "<=",
+        "value": 0.25,
+        "basis": "Fraction of cases labelled retrieval_beneficial=true for which the candidate asserts retrieval is NOT beneficial."
+      }
+    ],
+    "resource_thresholds": [
+      {
+        "id": "R1",
+        "metric": "cold_start_latency_s",
+        "op": "<=",
+        "value": 180.0,
+        "basis": "Checkpoint load + first forward pass on 4 vCPU; measured cold load is the dominant term."
+      },
+      {
+        "id": "R2",
+        "metric": "warm_p50_latency_s_per_brief",
+        "op": "<=",
+        "value": 3.0,
+        "basis": "One predict() call answering ~6 typed questions on a short brief."
+      },
+      {
+        "id": "R3",
+        "metric": "warm_p95_latency_s_per_brief",
+        "op": "<=",
+        "value": 8.0,
+        "basis": "Tail allowance for longer briefs / thread contention with OpenViking and Hermes."
+      },
+      {
+        "id": "R4",
+        "metric": "peak_additional_rss_gb",
+        "op": "<=",
+        "value": 3.0,
+        "basis": "Within 6.2 GB available with margin; 322M params fp32 ~= 1.3 GB weights + torch runtime + activations."
+      },
+      {
+        "id": "R5",
+        "metric": "steady_state_rss_gb",
+        "op": "<=",
+        "value": 2.0,
+        "basis": "Resident model after warm-up must leave headroom for the concurrent services."
+      },
+      {
+        "id": "R6",
+        "metric": "no_service_destabilization",
+        "op": "==",
+        "value": true,
+        "basis": "Host load stays below nproc (4.0) on average; OpenViking /health stays ok; Hermes Trade tmux session and gateway unchanged."
+      }
+    ],
+    "cost_thresholds": [
+      {
+        "id": "C1",
+        "metric": "additional_financial_cost_usd_laya_path",
+        "op": "<=",
+        "value": 0.0,
+        "basis": "Upstream Laya inference is local; the Laya advisory path must add no paid API call."
+      },
+      {
+        "id": "C2",
+        "metric": "paid_fast_calls",
+        "op": "<=",
+        "value": 150,
+        "basis": "Downstream FAST-quality comparison requires paid FAST calls and is gated behind explicit operator approval with a hard call cap. If approval is unavailable, the paid comparison is marked BLOCKED and no PASS is issued."
+      }
+    ],
+    "security_thresholds": [
+      {
+        "id": "S1",
+        "metric": "fail_open_security_regressions",
+        "op": "==",
+        "value": 0,
+        "basis": "Isolation, credential, and provenance violations must remain fail-closed after any integration."
+      }
+    ],
+    "decision_rule": {
+      "PASS_requires_all_of": [
+        "T1",
+        "T1b",
+        "T2",
+        "T3",
+        "T11",
+        "T12",
+        "R1",
+        "R2",
+        "R3",
+        "R4",
+        "R5",
+        "R6",
+        "C1",
+        "S1"
+      ],
+      "FAIL_if": "T1 or T1b below floor, OR any hard regression (T11 < -0.10), OR any resource/cost/security threshold breached.",
+      "INCONCLUSIVE_is_not_PASS": true,
+      "BLOCKED_if": "Required approval (checkpoint download / dependency install / paid FAST calls) is unavailable."
+    },
+    "uncertainty_policy": {
+      "n": 50,
+      "bootstrap_resamples": 2000,
+      "ci": 0.95,
+      "paired_test": "McNemar on shared-label correctness for candidate vs each baseline",
+      "statement": "With only 50 briefs, all headline metrics are reported with bootstrap 95% CIs and paired significance tests; a difference whose CI straddles zero is reported as inconclusive, never as an improvement."
+    }
+  },
+  "threshold_eval": {
+    "T1": {
+      "metric": "design_intent_macro_f1_all50",
+      "observed": null,
+      "threshold": 0.5,
+      "status": "BLOCKED"
+    },
+    "T1b": {
+      "metric": "design_intent_accuracy_all50",
+      "observed": null,
+      "threshold": 0.6,
+      "status": "BLOCKED"
+    },
+    "T2": {
+      "metric": "design_intent_macro_f1_indonesian",
+      "observed": null,
+      "threshold": 0.4,
+      "status": "BLOCKED"
+    },
+    "T3": {
+      "metric": "design_intent_macro_f1_english",
+      "observed": null,
+      "threshold": 0.5,
+      "status": "BLOCKED"
+    },
+    "T4": {
+      "metric": "relevant_categories_micro_f1",
+      "observed": null,
+      "threshold": 0.7,
+      "status": "BLOCKED"
+    },
+    "T5": {
+      "metric": "retrieval_beneficial_accuracy",
+      "observed": null,
+      "threshold": 0.8,
+      "status": "BLOCKED"
+    },
+    "T6": {
+      "metric": "motion_relevant_f1",
+      "observed": null,
+      "threshold": 0.7,
+      "status": "BLOCKED"
+    },
+    "T7": {
+      "metric": "component_relevant_f1",
+      "observed": null,
+      "threshold": 0.7,
+      "status": "BLOCKED"
+    },
+    "T8": {
+      "metric": "ambiguous_accuracy",
+      "observed": null,
+      "threshold": 0.75,
+      "status": "BLOCKED"
+    },
+    "T9": {
+      "metric": "false_positive_retrieval_rate",
+      "observed": null,
+      "threshold": 0.15,
+      "status": "BLOCKED"
+    },
+    "T10": {
+      "metric": "false_negative_retrieval_rate",
+      "observed": null,
+      "threshold": 0.25,
+      "status": "BLOCKED"
+    },
+    "T11": {
+      "metric": "no_material_regression_vs_baselines_shared_labels",
+      "status": "BLOCKED",
+      "note": "requires candidate C on the shared label layer"
+    },
+    "T12": {
+      "metric": "core_metric_improvement",
+      "status": "BLOCKED",
+      "note": "requires candidate C on the shared label layer"
+    }
+  }
+}

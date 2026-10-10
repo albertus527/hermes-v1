@@ -1,0 +1,85 @@
+{
+  "thresholds_id": "d4b1_thresholds",
+  "version": "1.0.0",
+  "frozen_before_testing": true,
+  "frozen_utc": "2026-10-09",
+  "note": "These thresholds were written and committed BEFORE any candidate (FAST-only, D4b deterministic, or upstream Laya) was run on the 50-brief dataset. No threshold may be changed after observing results. A statistically weak or inconclusive improvement is NOT a PASS.",
+  "measured_vps_headroom": {
+    "cpu_cores": 4,
+    "ram_total_mb": 7933,
+    "ram_available_mb": 6247,
+    "swap_total_mb": 2047,
+    "swap_used_mb": 392,
+    "disk_free_gb": 65,
+    "openviking_settled_rss_mb": 435,
+    "existing_d4b_prep_latency_s": [1.6, 5.5],
+    "existing_d4b_extra_model_calls": 0
+  },
+  "quality_thresholds": [
+    {"id": "T1", "primary": true, "metric": "design_intent_macro_f1_all50", "op": ">=", "value": 0.50,
+     "basis": "10-class closed vocabulary; chance 0.10; upstream multilingual zero-shot typed-decisions is weak (reported 0.342 vs 0.318 random), so the bar is not set from marketing numbers. 0.50 is a demanding floor for a 10-class intent task in which many briefs are lexically explicit."},
+    {"id": "T1b", "metric": "design_intent_accuracy_all50", "op": ">=", "value": 0.60,
+     "basis": "Majority class is 'other' at 12/50 = 0.24; 0.60 is well above any trivial majority predictor."},
+    {"id": "T2", "metric": "design_intent_macro_f1_indonesian25", "op": ">=", "value": 0.40,
+     "basis": "The multilingual checkpoint is the only one that reads Indonesian; a real multilingual capability must clear a genuine bar on ID, not merely beat chance."},
+    {"id": "T3", "metric": "design_intent_macro_f1_english25", "op": ">=", "value": 0.50,
+     "basis": "English is the checkpoint's weaker language by its own card (0.619 vs 0.684); the floor matches T1."},
+    {"id": "T11", "metric": "no_material_regression_vs_baselines_shared_labels", "op": ">=", "value": -0.10,
+     "basis": "Candidate macro-F1 must not fall more than 0.10 below the better of {FAST-only, D4b deterministic} on every label the candidate and that baseline BOTH produce."},
+    {"id": "T12", "metric": "core_metric_improvement", "op": ">=", "value": 1,
+     "basis": "At least ONE predeclared core metric must improve meaningfully over the D4b deterministic baseline: either retrieval relevance (candidate top-relevance > D4b top-relevance on beneficial briefs) OR relevant_categories micro-F1 strictly greater than D4b's."}
+  ],
+  "category_thresholds": [
+    {"id": "T4", "metric": "relevant_categories_micro_f1", "op": ">=", "value": 0.70,
+     "basis": "Category selection over 3 binary categories is easier than 10-class intent; D4b's deterministic planner is the reference bar."},
+    {"id": "T5", "metric": "retrieval_beneficial_accuracy", "op": ">=", "value": 0.80,
+     "basis": "Binary decision; a candidate that cannot decide 'is retrieval beneficial' at 0.80 is not a useful planner."},
+    {"id": "T6", "metric": "motion_relevant_f1", "op": ">=", "value": 0.70,
+     "basis": "Binary; the signal is usually lexically explicit ('animated', 'transition', 'beranimasi')."},
+    {"id": "T7", "metric": "component_relevant_f1", "op": ">=", "value": 0.70,
+     "basis": "Binary; implied by enumerable UI nouns."},
+    {"id": "T8", "metric": "ambiguous_accuracy", "op": ">=", "value": 0.75,
+     "basis": "Binary; includes both under-specified and conflicting briefs."},
+    {"id": "T9", "metric": "false_positive_retrieval_rate", "op": "<=", "value": 0.15,
+     "basis": "Fraction of cases labelled retrieval_beneficial=false for which the candidate nonetheless asserts retrieval is beneficial. Over-claiming retrieval is a quality risk."},
+    {"id": "T10", "metric": "false_negative_retrieval_rate", "op": "<=", "value": 0.25,
+     "basis": "Fraction of cases labelled retrieval_beneficial=true for which the candidate asserts retrieval is NOT beneficial."}
+  ],
+  "resource_thresholds": [
+    {"id": "R1", "metric": "cold_start_latency_s", "op": "<=", "value": 180.0,
+     "basis": "Checkpoint load + first forward pass on 4 vCPU; measured cold load is the dominant term."},
+    {"id": "R2", "metric": "warm_p50_latency_s_per_brief", "op": "<=", "value": 3.0,
+     "basis": "One predict() call answering ~6 typed questions on a short brief."},
+    {"id": "R3", "metric": "warm_p95_latency_s_per_brief", "op": "<=", "value": 8.0,
+     "basis": "Tail allowance for longer briefs / thread contention with OpenViking and Hermes."},
+    {"id": "R4", "metric": "peak_additional_rss_gb", "op": "<=", "value": 3.0,
+     "basis": "Within 6.2 GB available with margin; 322M params fp32 ~= 1.3 GB weights + torch runtime + activations."},
+    {"id": "R5", "metric": "steady_state_rss_gb", "op": "<=", "value": 2.0,
+     "basis": "Resident model after warm-up must leave headroom for the concurrent services."},
+    {"id": "R6", "metric": "no_service_destabilization", "op": "==", "value": true,
+     "basis": "Host load stays below nproc (4.0) on average; OpenViking /health stays ok; Hermes Trade tmux session and gateway unchanged."}
+  ],
+  "cost_thresholds": [
+    {"id": "C1", "metric": "additional_financial_cost_usd_laya_path", "op": "<=", "value": 0.0,
+     "basis": "Upstream Laya inference is local; the Laya advisory path must add no paid API call."},
+    {"id": "C2", "metric": "paid_fast_calls", "op": "<=", "value": 150,
+     "basis": "Downstream FAST-quality comparison requires paid FAST calls and is gated behind explicit operator approval with a hard call cap. If approval is unavailable, the paid comparison is marked BLOCKED and no PASS is issued."}
+  ],
+  "security_thresholds": [
+    {"id": "S1", "metric": "fail_open_security_regressions", "op": "==", "value": 0,
+     "basis": "Isolation, credential, and provenance violations must remain fail-closed after any integration."}
+  ],
+  "decision_rule": {
+    "PASS_requires_all_of": ["T1", "T1b", "T2", "T3", "T11", "T12", "R1", "R2", "R3", "R4", "R5", "R6", "C1", "S1"],
+    "FAIL_if": "T1 or T1b below floor, OR any hard regression (T11 < -0.10), OR any resource/cost/security threshold breached.",
+    "INCONCLUSIVE_is_not_PASS": true,
+    "BLOCKED_if": "Required approval (checkpoint download / dependency install / paid FAST calls) is unavailable."
+  },
+  "uncertainty_policy": {
+    "n": 50,
+    "bootstrap_resamples": 2000,
+    "ci": 0.95,
+    "paired_test": "McNemar on shared-label correctness for candidate vs each baseline",
+    "statement": "With only 50 briefs, all headline metrics are reported with bootstrap 95% CIs and paired significance tests; a difference whose CI straddles zero is reported as inconclusive, never as an improvement."
+  }
+}
