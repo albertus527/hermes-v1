@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>R2.8.1 Human Calibration Reviewer</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <!-- Pairing gate: shown until a session exists. -->
+  <section id="pairing" class="card gate" hidden>
+    <h1>Hermes R2.8.1 — Human Calibration Reviewer</h1>
+    <p class="muted">Local, loopback-only review tool. Enter the one-time
+       pairing code printed in the server terminal.</p>
+    <label for="paircode">Pairing code</label>
+    <input id="paircode" type="password" autocomplete="off" spellcheck="false">
+    <button id="pairbtn">Pair</button>
+    <p id="pairmsg" class="error" hidden></p>
+  </section>
+
+  <main id="app" hidden>
+    <header class="topbar">
+      <div class="left">
+        <strong id="ds-name">—</strong>
+        <span id="ds-role" class="pill"></span>
+      </div>
+      <div class="right">
+        <span class="counter">Sample <b id="pos-n">0</b> / <b id="pos-total">0</b></span>
+        <button id="btn-progress" class="ghost">Progress</button>
+        <button id="btn-rubric" class="ghost">Rubric</button>
+      </div>
+    </header>
+
+    <div id="banner" class="banner" hidden></div>
+
+    <section id="progress-panel" class="card" hidden>
+      <h2>Progress — <span id="pg-ds"></span></h2>
+      <div class="progressgrid">
+        <div><span id="pg-locked" class="big">0</span><br>locked</div>
+        <div><span id="pg-canonical" class="big">0</span><br>canonical (approved rubric)</div>
+        <div><span id="pg-draft" class="big">0</span><br>draft</div>
+        <div><span id="pg-flagged" class="big">0</span><br>flagged</div>
+        <div><span id="pg-remaining" class="big">0</span><br>remaining</div>
+      </div>
+      <p class="muted">Only rubric-approved, explicitly locked labels count toward
+         §11.4. Nothing here claims HUMAN_ACCEPTED or PHASE_2_PASS.</p>
+      <div class="exports">
+        <button class="ghost" data-export="labels_csv">Export labels CSV</button>
+        <button class="ghost" data-export="progress_json">Export progress JSON</button>
+        <button class="ghost" data-export="provenance_json">Export provenance JSON</button>
+        <button class="ghost" data-export="integrity_json">Export integrity JSON</button>
+      </div>
+      <p class="muted">Exports stream deterministic bytes; they do not write files
+         or change reviewer state.</p>
+    </section>
+
+    <section id="rubric-panel" class="card" hidden>
+      <h2>Draft labeling rubric <span class="warn" id="rubric-status"></span></h2>
+      <div id="rubric-body"></div>
+      <div class="rubric-approve">
+        <p id="rubric-approve-state" class="muted"></p>
+        <label for="rubric-note">Approval note (recorded in audit ledger)</label>
+        <input id="rubric-note" type="text" autocomplete="off">
+        <button id="btn-approve-rubric">Approve this rubric version</button>
+      </div>
+    </section>
+
+    <section class="card sample">
+      <div class="meta">
+        <span class="ticker" id="s-ticker">—</span>
+        <span class="muted" id="s-time">—</span>
+        <span class="muted" id="s-source">—</span>
+      </div>
+      <p class="headline" id="s-headline">—</p>
+
+      <div class="fields">
+        <fieldset class="field" data-field="category">
+          <legend>Category</legend>
+          <div class="opts" id="opts-category"></div>
+        </fieldset>
+        <fieldset class="field" data-field="direction">
+          <legend>Direction</legend>
+          <div class="opts" id="opts-direction"></div>
+        </fieldset>
+        <fieldset class="field" data-field="severity">
+          <legend>Severity</legend>
+          <div class="opts" id="opts-severity"></div>
+        </fieldset>
+        <fieldset class="field" data-field="ma_role" id="field-ma_role">
+          <legend>M&amp;A role <span class="muted">(NEITHER for non-M&amp;A)</span></legend>
+          <div class="opts" id="opts-ma_role"></div>
+        </fieldset>
+      </div>
+
+      <div class="certainty">
+        <span>Certainty:</span>
+        <div class="opts" id="opts-certainty"></div>
+      </div>
+
+      <label for="notes">Reviewer notes (optional)</label>
+      <textarea id="notes" rows="2" maxlength="4000"></textarea>
+
+      <div class="actions">
+        <button id="btn-prev" class="ghost">◀ Previous</button>
+        <button id="btn-flag" class="ghost">⚑ Flag</button>
+        <button id="btn-draft" class="ghost">Save draft</button>
+        <button id="btn-next" class="primary">Save &amp; next</button>
+        <button id="btn-lock" class="lock">🔒 Lock label</button>
+      </div>
+      <p class="muted small" id="statusline"></p>
+    </section>
+
+    <section id="reveal-panel" class="card" hidden>
+      <h2>Post-lock reveal (optional, opt-in)</h2>
+      <p class="muted">Available only after a label is locked. Revealing does not
+         overwrite your decision; revisions after reveal are tagged.</p>
+      <div class="reveal-actions">
+        <button id="btn-reveal-consensus" class="ghost">Reveal prior LLM consensus</button>
+        <button id="btn-reveal-model" class="ghost">Reveal pinned GPT-6 Luna prediction</button>
+      </div>
+      <div id="consensus-box" class="revealbox" hidden></div>
+      <div id="model-box" class="revealbox" hidden></div>
+    </section>
+
+    <section id="revise-panel" class="card" hidden>
+      <h2>Revise locked label</h2>
+      <p class="muted">Revision requires a reason and is recorded append-only.</p>
+      <label for="revise-reason">Reason (required)</label>
+      <input id="revise-reason" type="text" autocomplete="off">
+      <button id="btn-revise" class="lock">Revise label</button>
+    </section>
+
+    <footer class="keys muted small">
+      Keys: <b>←/→</b> prev/next · <b>s</b> save draft · <b>f</b> flag ·
+      <b>?</b> rubric · lock requires the <b>Lock label</b> button (never a
+      single key).
+    </footer>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
