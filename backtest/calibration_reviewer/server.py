@@ -15,6 +15,8 @@ Security invariants enforced here (not in CSS/JS):
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import sqlite3
 import sys
@@ -28,6 +30,7 @@ from backtest.calibration_reviewer import rubric as rubric_mod
 from backtest.calibration_reviewer.datasets import DATASET_SPECS, load_all
 from backtest.calibration_reviewer.labels import ENUMS, InvalidHumanLabelError
 from backtest.calibration_reviewer.reveal import consensus_reveal, model_reveal
+from backtest.calibration_reviewer.rubric import rubric_sha256
 from backtest.calibration_reviewer.schema import open_reviewer_db
 from backtest.calibration_reviewer.security import (
     MAX_BODY_BYTES,
@@ -178,8 +181,9 @@ class Handler(BaseHTTPRequestHandler):
     def _require_csrf(self, session: dict, body: dict):
         # CSRF token from header only — never from a URL query string.
         presented = self.headers.get("X-CSRF-Token")
-        if presented is None:
-            presented = body.get("csrf_token")
+        # Header-only by contract (see security.py): a JSON-body fallback would
+        # let form posts and content-type confusions smuggle the token, so it
+        # is deliberately not supported.
         self.app.security.require_csrf(session, presented)
 
     # -- routing ---------------------------------------------------------
@@ -299,7 +303,9 @@ class Handler(BaseHTTPRequestHandler):
     # -- read APIs -------------------------------------------------------
 
     def _api_rubric(self):
-        self._json(200, rubric_mod.rubric_help())
+        doc = dict(rubric_mod.rubric_help())
+        doc["sha256"] = rubric_sha256()
+        self._json(200, doc)
 
     def _api_datasets(self):
         self._json(200, {
@@ -405,17 +411,18 @@ class Handler(BaseHTTPRequestHandler):
         label = body.get("label")
         if not isinstance(label, dict):
             return self._error(422, "a complete four-field label is required")
-        rubric_approved = self.app.store.is_rubric_approved(
-            rubric_mod.RUBRIC_VERSION)
+        # The gate digest is the LIVE rubric content digest, never a
+        # client-supplied value: the store then verifies it against the
+        # recorded approval and fails closed to provisional on any mismatch.
         v = self.app.store.lock(
             dataset_id, sample_id, label=label,
             certainty=body.get("certainty"), notes=notes,
             expected_version=self._expected_version(body),
             rubric_version=rubric_mod.RUBRIC_VERSION,
-            rubric_approved=rubric_approved)
-        return self._json(200, {
-            "version": v, "status": "LOCKED",
-            "rubric_approved": rubric_approved})
+            rubric_sha256=rubric_sha256(),
+            rubric_approved=self.app.store.is_rubric_approved(
+                rubric_mod.RUBRIC_VERSION))
+        return self._json(200, {"version": v, "status": "LOCKED"})
 
     def _api_flag(self, session, body):
         dataset_id = body.get("dataset_id")
@@ -448,24 +455,30 @@ class Handler(BaseHTTPRequestHandler):
         label = body.get("label")
         if not isinstance(label, dict):
             return self._error(422, "a complete four-field label is required")
-        rubric_approved = self.app.store.is_rubric_approved(
-            rubric_mod.RUBRIC_VERSION)
         v = self.app.store.revise(
             dataset_id, sample_id, label=label,
             certainty=body.get("certainty"), notes=notes,
             reason=body.get("reason", ""),
             expected_version=self._expected_version(body),
             rubric_version=rubric_mod.RUBRIC_VERSION,
-            rubric_approved=rubric_approved)
+            rubric_sha256=rubric_sha256(),
+            rubric_approved=self.app.store.is_rubric_approved(
+                rubric_mod.RUBRIC_VERSION))
         return self._json(200, {"version": v, "status": "LOCKED"})
 
     def _api_rubric_approve(self, session, body):
         version = body.get("rubric_version")
+        digest = body.get("rubric_sha256")
         if version != rubric_mod.RUBRIC_VERSION:
             return self._error(400, "unknown rubric_version")
-        self.app.store.approve_rubric(version,
-                                             note=body.get("note", ""))
-        return self._json(200, {"approved": version})
+        if not isinstance(digest, str) or not hmac.compare_digest(
+                str(digest).lower(), rubric_mod.rubric_sha256()):
+            return self._error(400, "rubric_sha256 mismatch; refusing to "
+                               "approve unseen content")
+        self.app.store.approve_rubric(version, rubric_sha256=digest.lower(),
+                                      note=body.get("note", ""))
+        return self._json(200, {"approved": version,
+                                "rubric_sha256": digest.lower()})
 
     def _check_dataset(self, dataset_id):
         if dataset_id not in self.app.loaded:

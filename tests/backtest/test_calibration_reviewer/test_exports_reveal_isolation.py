@@ -50,10 +50,11 @@ def test_labels_csv_has_one_row_per_sample(tmp_path):
 
 def test_export_states_and_counts(tmp_path):
     store, loaded = _store_and_loaded(tmp_path)
-    store.approve_rubric("r")
+    store.approve_rubric("r", rubric_sha256="0" * 64)
     ids = store.ordered_sample_ids("A_CANONICAL_240")
     store.lock("A_CANONICAL_240", ids[0], label=LABEL, expected_version=0,
-               rubric_version="r", rubric_approved=True)
+               rubric_version="r", rubric_sha256="0" * 64,
+                   rubric_approved=True)
     store.save_draft("A_CANONICAL_240", ids[1], label={"category": "EARNINGS"},
                      expected_version=0)
     rows = exports.build_rows(store, "A_CANONICAL_240", loaded)
@@ -67,14 +68,15 @@ def test_export_states_and_counts(tmp_path):
 
 def test_export_post_reveal_revision_tagged(tmp_path):
     store, loaded = _store_and_loaded(tmp_path)
-    store.approve_rubric("r")
+    store.approve_rubric("r", rubric_sha256="0" * 64)
     ids = store.ordered_sample_ids("A_CANONICAL_240")
     v = store.lock("A_CANONICAL_240", ids[0], label=LABEL, expected_version=0,
-                   rubric_version="r", rubric_approved=True)
+                   rubric_version="r", rubric_sha256="0" * 64,
+                   rubric_approved=True)
     v = store.reveal("A_CANONICAL_240", ids[0], kind="consensus",
                      expected_version=v)
     store.revise("A_CANONICAL_240", ids[0], label={**LABEL, "severity": "HIGH"},
-                 reason="post-reveal", expected_version=v, rubric_version="r",
+                 reason="post-reveal", expected_version=v, rubric_version="r", rubric_sha256="0" * 64,
                  rubric_approved=True)
     rows = exports.build_rows(store, "A_CANONICAL_240", loaded)
     row = [r for r in rows if r["sample_id"] == ids[0]][0]
@@ -167,5 +169,6 @@ def test_production_db_untouched_by_reviewer(tmp_path):
     loaded = load_dataset(spec)
     store.initialize_from_datasets({"A_CANONICAL_240": loaded})
     store.lock("A_CANONICAL_240", "A_CANONICAL_240-0000", label=LABEL,
-               expected_version=0, rubric_version="r", rubric_approved=True)
+               expected_version=0, rubric_version="r", rubric_sha256="0" * 64,
+                   rubric_approved=False)
     assert PRODUCTION_DB.read_bytes() == before

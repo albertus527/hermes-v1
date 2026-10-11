@@ -328,9 +328,12 @@ def test_rubric_approve_gate(live):
     _, body, _, _ = _lock(c)
     _, prog, _, _ = c.request("GET", "/api/progress?dataset=A_CANONICAL_240")
     assert prog["locked"] == 1 and prog["canonical_locked"] == 0
-    # Approve rubric, then lock a second sample -> canonical.
+    # Approve rubric (digest comes from the served rubric document), then lock
+    # a second sample -> canonical.
+    _, rub, _, _ = c.request("GET", "/api/rubric")
     status, _, _, _ = c.request("POST", "/api/rubric/approve", {
-        "rubric_version": "r281-reviewer-rubric-0.1", "note": "approved"})
+        "rubric_version": "r281-reviewer-rubric-0.1",
+        "rubric_sha256": rub["sha256"], "note": "approved"})
     assert status == 200
     _lock(c, sid="A_CANONICAL_240-0001")
     _, prog2, _, _ = c.request("GET", "/api/progress?dataset=A_CANONICAL_240")
@@ -390,3 +393,126 @@ def test_integrity_export_all_datasets(live):
     doc = json.loads(raw)
     assert len(doc["datasets"]) == 2  # A and B fixtures
     assert "combined_note" in doc
+
+
+# ---- pairing one-time reuse (regression) ---------------------------------
+
+def test_pairing_code_single_use_http(live):
+    app, host, port = live
+    code = app.security.pairing_code
+    c1 = Client(host, port, code)
+    status, body, _, _ = c1.request("POST", "/api/pair", {"code": code})
+    assert status == 200 and body["paired"] is True
+    # Second use of the SAME code must fail even though it is correct.
+    c2 = Client(host, port, code)
+    status, _, _, _ = c2.request("POST", "/api/pair", {"code": code})
+    assert status == 409
+    # Rotation re-opens pairing for a new client.
+    app.security.rotate_pairing_code()
+    c3 = Client(host, port, app.security.pairing_code)
+    status, _, _, _ = c3.request("POST", "/api/pair",
+                                 {"code": app.security.pairing_code})
+    assert status == 200
+
+
+def test_first_session_survives_pairing_reuse_attempt(live):
+    app, host, port = live
+    code = app.security.pairing_code
+    c1 = Client(host, port, code).pair()
+    Client(host, port, code).request("POST", "/api/pair", {"code": code})
+    status, body, _, _ = c1.request("GET", "/api/datasets")
+    assert status == 200 and "enums" in body
+
+
+# ---- CSRF is header-only (regression) -------------------------------------
+
+def test_csrf_token_in_body_rejected(live):
+    """The old JSON-body fallback must stay dead: header or nothing."""
+    c = _client(live).pair()
+    status, _, _, _ = c.request(
+        "POST", "/api/draft",
+        {"dataset_id": "A_CANONICAL_240", "sample_id": "A_CANONICAL_240-0000",
+         "expected_version": 0, "label": {"category": "EARNINGS"},
+         "csrf_token": c.csrf},
+        use_csrf=False)
+    assert status == 403
+
+
+# ---- rubric digest-bound approval (regression) -----------------------------
+
+def test_rubric_payload_carries_sha256(live):
+    c = _client(live).pair()
+    _, rub, _, _ = c.request("GET", "/api/rubric")
+    import hashlib
+    assert rub["sha256"] == hashlib.sha256(
+        repr(sorted(
+            __import__("backtest.calibration_reviewer.rubric",
+                       fromlist=["RUBRIC"]).RUBRIC.items())).encode()
+    ).hexdigest()
+
+
+def test_rubric_approve_requires_matching_digest(live):
+    c = _client(live).pair()
+    status, _, _, _ = c.request("POST", "/api/rubric/approve", {
+        "rubric_version": "r281-reviewer-rubric-0.1",
+        "rubric_sha256": "0" * 64, "note": "blind guess"})
+    assert status == 400
+
+
+def test_rubric_approve_without_digest_rejected(live):
+    c = _client(live).pair()
+    status, _, _, _ = c.request("POST", "/api/rubric/approve", {
+        "rubric_version": "r281-reviewer-rubric-0.1", "note": "no digest"})
+    assert status == 400
+
+
+def test_locked_row_stores_rubric_digest(live):
+    c = _client(live).pair()
+    _, rub, _, _ = c.request("GET", "/api/rubric")
+    c.request("POST", "/api/rubric/approve", {
+        "rubric_version": "r281-reviewer-rubric-0.1",
+        "rubric_sha256": rub["sha256"], "note": ""})
+    _, body, _, _ = _lock(c)
+    assert body["status"] == "LOCKED"
+    app, _, _ = live
+    row = app.store.get_sample("A_CANONICAL_240", "A_CANONICAL_240-0000")
+    assert row["rubric_sha256"] == rub["sha256"]
+    assert row["rubric_approved"] == 1
+
+
+def test_lock_after_rubric_content_change_is_provisional(live):
+    """Content drift without renewed approval must fail closed."""
+    c = _client(live).pair()
+    _, rub, _, _ = c.request("GET", "/api/rubric")
+    c.request("POST", "/api/rubric/approve", {
+        "rubric_version": "r281-reviewer-rubric-0.1",
+        "rubric_sha256": rub["sha256"], "note": ""})
+    # Simulate an edit of the rubric content (digest changes, version string
+    # unchanged) after approval.
+    from backtest.calibration_reviewer import rubric as rubric_mod
+    original = rubric_mod.RUBRIC["severity"]
+    rubric_mod.RUBRIC["severity"] = original + " EDITED"
+    try:
+        # The server computes the gate digest from the EDITED content; the
+        # recorded approval no longer matches, so the lock is refused outright
+        # rather than silently counting as canonical.
+        status, body, _, _ = _lock(c)
+        assert status == 400, body
+        assert "rubric gate" in body["error"]
+        app, _, _ = live
+        _, prog, _, _ = c.request("GET", "/api/progress?dataset=A_CANONICAL_240")
+        assert prog["canonical_locked"] == 0
+    finally:
+        rubric_mod.RUBRIC["severity"] = original
+
+
+def test_lock_claiming_canonical_without_approval_is_refused(live):
+    """A client cannot assert rubric_approved through /api/lock pre-approval."""
+    c = _client(live).pair()
+    status, body, _, _ = _lock(c)
+    assert status == 200 and body["status"] == "LOCKED"
+    app, _, _ = live
+    row = app.store.get_sample("A_CANONICAL_240", "A_CANONICAL_240-0000")
+    assert row["rubric_approved"] == 0
+    _, prog, _, _ = c.request("GET", "/api/progress?dataset=A_CANONICAL_240")
+    assert prog["canonical_locked"] == 0

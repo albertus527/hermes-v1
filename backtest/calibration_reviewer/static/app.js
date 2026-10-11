@@ -142,11 +142,13 @@ async function refreshRubricApproval() {
 
 async function selectDataset(datasetId) {
   state.datasetId = datasetId;
+  // Per-dataset caches and navigation state must NEVER leak across datasets:
+  // the ordered-id cache is dataset-scoped, so reset it before any load.
+  state._orderedIds = null;
+  state.idx = 0;
   const d = state.datasets.find((x) => x.dataset_id === datasetId);
   $("ds-name").textContent = d ? d.display_name : datasetId;
   $("ds-role").textContent = d ? d.role : "";
-  const prog = await api(`/api/progress?dataset=${encodeURIComponent(datasetId)}`);
-  state.order = Array.from({ length: prog.total }, (_, i) => i); // placeholder count
   await loadFirst();
 }
 
@@ -186,6 +188,14 @@ async function loadSampleById(sampleId) {
   state.label = { ...s.draft };
   state.certainty = s.draft.certainty;
   state.flagged = s.draft.flagged;
+  // Restore THIS sample's saved draft notes. The textarea is re-hydrated on
+  // every sample load so a previous sample's notes (typed or stale) can
+  // never bleed into a different headline; unsaved edits are intentionally
+  // replaced by the server-confirmed draft (save first to keep them).
+  $("notes").value = s.draft.notes || "";
+  // Clear sample-specific transient state (revision reason belongs to the
+  // sample it was typed for).
+  $("revise-reason").value = "";
   if (!state._orderedIds) await cacheOrder();
   state.idx = state._orderedIds.indexOf(sampleId);
   renderSample();
@@ -300,6 +310,8 @@ function baseBody() {
 }
 
 async function saveDraft() {
+  // Returns true ONLY when the server confirmed persistence. Navigation and
+  // other dependent flows must key off this, never assume success.
   try {
     const r = await api("/api/draft", {
       method: "POST",
@@ -309,11 +321,19 @@ async function saveDraft() {
     state.version = r.version;
     flash("Draft saved.");
     await refreshProgress();
-  } catch (e) { flash(e.message, true); }
+    return true;
+  } catch (e) {
+    flash(`Draft NOT saved: ${e.message}`, true);
+    return false;
+  }
 }
 
 async function saveAndNext() {
-  await saveDraft();
+  // Navigate ONLY after the server confirms the draft persisted. On failure
+  // stay on the current headline with all input intact (the textarea and
+  // option selections are untouched; state.version unchanged on error).
+  const ok = await saveDraft();
+  if (!ok) return;
   await next();
 }
 
@@ -396,10 +416,17 @@ async function revise() {
 
 async function approveRubric() {
   try {
+    // Fetch the rubric live and approve its CURRENT content digest, so the
+    // recorded approval is bound to exactly what the reviewer just read.
+    const rub = await api("/api/rubric");
     const r = await api("/api/rubric/approve", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ rubric_version: "r281-reviewer-rubric-0.1", note: $("rubric-note").value }),
+      body: JSON.stringify({
+        rubric_version: rub.version,
+        rubric_sha256: rub.sha256,
+        note: $("rubric-note").value,
+      }),
     });
     flash(`Rubric approved: ${r.approved}`);
     await refreshProgress();

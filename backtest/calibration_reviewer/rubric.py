@@ -16,6 +16,8 @@ count.
 
 from __future__ import annotations
 
+import hashlib
+
 RUBRIC_VERSION = "r281-reviewer-rubric-0.1"
 RUBRIC_STATUS = "PROPOSED — PENDING HUMAN APPROVAL"
 
@@ -92,3 +94,15 @@ RUBRIC = {
 def rubric_help() -> dict:
     """The rubric payload served to the browser (no sample data)."""
     return RUBRIC
+
+
+def rubric_sha256() -> str:
+    """SHA-256 of the exact rubric content behind ``RUBRIC_VERSION``.
+
+    Approvals are bound to (version, digest): if a later edit changes any
+    wording, the digest changes and the old approval no longer matches —
+    the reviewer must approve the new content explicitly. Version strings
+    alone cannot detect an unversioned content edit; the digest can.
+    """
+    return hashlib.sha256(
+        repr(sorted(RUBRIC.items())).encode("utf-8")).hexdigest()

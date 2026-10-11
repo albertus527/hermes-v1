@@ -176,6 +176,7 @@ class Store:
             "r.category, r.direction, r.severity, r.ma_role, "
             "r.certainty, COALESCE(r.notes, '') AS notes, "
             "COALESCE(r.flagged, 0) AS flagged, r.rubric_version, "
+            "r.rubric_sha256, "
             "COALESCE(r.rubric_approved, 0) AS rubric_approved, "
             "COALESCE(r.revealed_consensus, 0) AS revealed_consensus, "
             "COALESCE(r.revealed_model, 0) AS revealed_model, "
@@ -235,15 +236,59 @@ class Store:
 
     # -- rubric approval -------------------------------------------------
 
-    def approve_rubric(self, rubric_version: str, *, note: str = "") -> None:
+    def approve_rubric(self, rubric_version: str, *, rubric_sha256: str = "",
+                       note: str = "") -> None:
+        """Record an approval bound to (version, content digest).
+
+        The digest is stored in the meta row and in every subsequent audit
+        detail, so approval provenance names the exact rubric content the
+        human saw. Locks verify BOTH values; a content edit without renewed
+        approval fails closed (see :meth:`_rubric_gate`).
+        """
+        if not rubric_sha256:
+            raise StoreError(
+                "rubric approval requires the rubric_sha256 content digest")
         self._conn.execute(
             "INSERT INTO meta(key, value) VALUES (?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (f"rubric_approved:{rubric_version}", _utcnow()))
+        self._conn.execute(
+            "INSERT INTO meta(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (f"rubric_sha256:{rubric_version}", rubric_sha256))
         self._audit(dataset_id="*", sample_id=None, event="RUBRIC_APPROVED",
                     reason=note or None,
-                    detail={"rubric_version": rubric_version})
+                    detail={"rubric_version": rubric_version,
+                            "rubric_sha256": rubric_sha256})
         self._conn.commit()
+
+    def _rubric_gate(self, rubric_version: str, rubric_sha256: str) -> tuple[bool, str]:
+        """Fail-closed rubric gate: (approved_for_this_content, detail).
+
+        A lock counts as rubric-approved ONLY when a recorded approval matches
+        BOTH the rubric version AND the SHA-256 of the exact rubric content
+        being locked under. If the rubric content changed without renewed
+        approval, or no approval exists, the label is still recorded but
+        carries ``rubric_approved=0`` (provisional), so it can never silently
+        count toward canonical §11.4 progress under unseen wording.
+        """
+        approved_at = self._conn.execute(
+            "SELECT value FROM meta WHERE key=?",
+            (f"rubric_approved:{rubric_version}",)).fetchone()
+        if approved_at is None:
+            return False, "no approval recorded for this rubric version"
+        approved_digest = self._conn.execute(
+            "SELECT value FROM meta WHERE key=?",
+            (f"rubric_sha256:{rubric_version}",)).fetchone()
+        if approved_digest is None or not approved_digest["value"]:
+            return False, ("approval predates digest binding; renew approval "
+                           "to bind it to the rubric content")
+        import hmac as _hmac
+        if not _hmac.compare_digest(str(approved_digest["value"]).lower(),
+                                    str(rubric_sha256).lower()):
+            return False, ("rubric content changed since approval; renewed "
+                           "approval required")
+        return True, "approved for this rubric version and content digest"
 
     def is_rubric_approved(self, rubric_version: str) -> bool:
         row = self._conn.execute(
@@ -338,10 +383,23 @@ class Store:
         return new_version
 
     def lock(self, dataset_id, sample_id, *, label, certainty=None, notes="",
-             expected_version, rubric_version, rubric_approved) -> int:
-        """Explicitly lock a label. Requires all four valid fields."""
+             expected_version, rubric_version, rubric_sha256="",
+             rubric_approved=False) -> int:
+        """Explicitly lock a label. Requires all four valid fields.
+
+        ``rubric_approved`` is the *claimed* canonical flag; the store verifies
+        it against the recorded approval (version + content digest) and fails
+        closed to provisional (0) on any mismatch, so a lock can never count
+        toward §11.4 under rubric content the reviewer has not approved.
+        """
         validated = validate_human_label(label)  # raises on invalid/incomplete
         self._validate_certainty(certainty)
+        gate_ok, gate_detail = self._rubric_gate(rubric_version, rubric_sha256)
+        if rubric_approved and not gate_ok:
+            raise StoreError(
+                f"rubric gate refused canonical lock for version "
+                f"{rubric_version!r}: {gate_detail}")
+        rubric_approved = rubric_approved and gate_ok
         row = self._ensure_review_row(dataset_id, sample_id)
         if row["status"] == STATUS_LOCKED:
             raise LockedLabelError(
@@ -350,12 +408,13 @@ class Store:
         lock_seq = int(row["lock_seq"]) + 1
         assignments = [
             "status=?", "category=?", "direction=?", "severity=?", "ma_role=?",
-            "certainty=?", "notes=?", "rubric_version=?", "rubric_approved=?",
-            "lock_seq=?",
+            "certainty=?", "notes=?", "rubric_version=?", "rubric_sha256=?",
+            "rubric_approved=?", "lock_seq=?",
         ]
         params = [STATUS_LOCKED, validated.category, validated.direction,
                   validated.severity, validated.ma_role, certainty,
-                  notes or "", rubric_version, 1 if rubric_approved else 0,
+                  notes or "", rubric_version, str(rubric_sha256) or None,
+                  1 if rubric_approved else 0,
                   lock_seq]
         new_version = self._cas_update(
             dataset_id, sample_id, expected_version, assignments, params)
@@ -363,6 +422,7 @@ class Store:
                     prev_status=row["status"], new_status=STATUS_LOCKED,
                     prev_label=prev_label, new_label=validated.as_dict(),
                     detail={"rubric_version": rubric_version,
+                            "rubric_sha256": rubric_sha256,
                             "rubric_approved": bool(rubric_approved)})
         self._conn.commit()
         return new_version
@@ -398,12 +458,24 @@ class Store:
         return new_version
 
     def revise(self, dataset_id, sample_id, *, label, certainty=None, notes="",
-               reason, expected_version, rubric_version, rubric_approved) -> int:
-        """Revise a LOCKED label. Requires an explicit reason (append-only)."""
+               reason, expected_version, rubric_version, rubric_sha256="",
+               rubric_approved=False) -> int:
+        """Revise a LOCKED label. Requires an explicit reason (append-only).
+
+        Same fail-closed rubric gate as :meth:`lock`: the canonical flag is
+        only honored when the recorded approval matches both the rubric
+        version and the content digest.
+        """
         if not reason or not str(reason).strip():
             raise InvalidStateError("revision requires a non-empty reason")
         validated = validate_human_label(label)
         self._validate_certainty(certainty)
+        gate_ok, gate_detail = self._rubric_gate(rubric_version, rubric_sha256)
+        if rubric_approved and not gate_ok:
+            raise StoreError(
+                f"rubric gate refused canonical revision for version "
+                f"{rubric_version!r}: {gate_detail}")
+        rubric_approved = rubric_approved and gate_ok
         row = self._conn.execute(
             "SELECT * FROM review WHERE dataset_id=? AND sample_id=?",
             (dataset_id, sample_id)).fetchone()
@@ -415,18 +487,22 @@ class Store:
         lock_seq = int(row["lock_seq"]) + 1
         assignments = [
             "category=?", "direction=?", "severity=?", "ma_role=?", "certainty=?",
-            "notes=?", "rubric_version=?", "rubric_approved=?", "revision_no=?",
-            "lock_seq=?",
+            "notes=?", "rubric_version=?", "rubric_sha256=?", "rubric_approved=?",
+            "revision_no=?", "lock_seq=?",
         ]
         params = [validated.category, validated.direction, validated.severity,
                   validated.ma_role, certainty, notes or "", rubric_version,
+                  str(rubric_sha256) or None,
                   1 if rubric_approved else 0, revision_no, lock_seq]
         new_version = self._cas_update(
             dataset_id, sample_id, expected_version, assignments, params)
         self._audit(dataset_id=dataset_id, sample_id=sample_id, event="REVISE",
                     prev_status=STATUS_LOCKED, new_status=STATUS_LOCKED,
                     prev_label=prev_label, new_label=validated.as_dict(),
-                    reason=str(reason).strip(), post_reveal=post_reveal)
+                    reason=str(reason).strip(), post_reveal=post_reveal,
+                    detail={"rubric_version": rubric_version,
+                            "rubric_sha256": rubric_sha256,
+                            "rubric_approved": bool(rubric_approved)})
         self._conn.commit()
         return new_version
 

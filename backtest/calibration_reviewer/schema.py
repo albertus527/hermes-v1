@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS review (
     notes          TEXT NOT NULL DEFAULT '',
     flagged        INTEGER NOT NULL DEFAULT 0,
     rubric_version TEXT,
+    rubric_sha256  TEXT,
     rubric_approved INTEGER NOT NULL DEFAULT 0,
     revealed_consensus INTEGER NOT NULL DEFAULT 0,
     revealed_model     INTEGER NOT NULL DEFAULT 0,
@@ -143,9 +144,23 @@ def open_reviewer_db(db_path: str | Path) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(_DDL)
+    _migrate(conn)
     conn.execute(
         "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)",
         (str(SCHEMA_VERSION),),
     )
     conn.commit()
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Lightweight additive migrations for DBs created by older code.
+
+    The review table gained ``rubric_sha256`` when approvals started being
+    bound to the rubric content digest; existing reviewer DBs simply get the
+    nullable column added. Existing rows keep NULL (their provenance predates
+    digest binding and is not silently rewritten).
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(review)")}
+    if "rubric_sha256" not in cols:
+        conn.execute("ALTER TABLE review ADD COLUMN rubric_sha256 TEXT")

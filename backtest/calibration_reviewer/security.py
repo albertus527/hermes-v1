@@ -88,7 +88,14 @@ class SecurityManager:
         """Exchange a valid pairing code for a new session token.
 
         Returns the opaque cookie token (the caller sets it HttpOnly).
+        The code is strictly one-time: the first successful use burns it and
+        any later reuse fails until the operator explicitly rotates it.
+        Existing (already-issued) sessions are unaffected either way.
         """
+        if self._pairing_used:
+            raise SecurityError(
+                "pairing code already used; rotate the code to pair again",
+                status=409)
         if not self._pairing_rate_ok():
             raise SecurityError("too many pairing attempts", status=429)
         self._attempts.append(time.monotonic())
