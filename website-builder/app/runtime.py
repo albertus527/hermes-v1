@@ -2908,8 +2908,36 @@ def main(argv: Optional[List[str]] = None) -> int:
     # valid. Values are never logged.
     from app.core import app_env as _app_env
 
+    # Explicit deployment config; default repository configuration stays OFF.
+    config_override = os.environ.get(
+        "WEBSITE_BUILDER_CONFIG_PATH", ""
+    ).strip()
+    config_path = (
+        Path(config_override).expanduser()
+        if config_override else None
+    )
+    if config_path is not None:
+        if not config_path.is_file():
+            logger.error(
+                "Website Builder configuration file is missing or not a file"
+            )
+            return 1
+        try:
+            with config_path.open("r", encoding="utf-8") as handle:
+                selected_yaml = yaml.safe_load(handle)
+            if not isinstance(selected_yaml, dict) or not isinstance(
+                selected_yaml.get("website_builder"), dict
+            ):
+                raise ValueError("Invalid Website Builder configuration structure")
+        except (OSError, yaml.YAMLError, ValueError):
+            logger.error("Website Builder configuration file is invalid")
+            return 1
+
     try:
-        _loaded = _app_env.load_application_env()
+        _loaded = _app_env.load_application_env(
+            state_root=_app_env.resolve_state_root(config_path),
+            profile_home=_app_env.resolve_profile_home(config_path),
+        )
     except ValueError as exc:
         logger.error(
             "Website Builder refused to load its operational env file: %s", exc
@@ -2929,7 +2957,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _run_provision_impeccable_parser()
 
     try:
-        config = load_runtime_config()
+        config = load_runtime_config(config_path=config_path)
     except ConfigurationError as exc:
         logger.error("Configuration error: %s", exc)
         return 1
