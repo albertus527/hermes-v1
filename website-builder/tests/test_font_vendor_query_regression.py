@@ -113,3 +113,12 @@ def test_google_fonts_url_without_query_remains_valid(monkeypatch):
     )
 
     assert observed["target"] == "/css2"
+
+
+def test_font_vendor_requests_modern_woff2_capable_user_agent():
+    from app.core import selfcontained as sc
+
+    assert "Mozilla/5.0" in sc._UA_FONT
+    assert "Chrome/" in sc._UA_FONT
+    assert "Safari/" in sc._UA_FONT
+    assert sc._FONT_MAGIC["woff2"] == b"wOF2"

@@ -662,7 +662,11 @@ _EXPECTED_FONT_TYPES = ("font/woff2", "font/woff", "application/font-woff2",
                         "application/font-woff", "application/octet-stream",
                         "binary/octet-stream")
 _FONT_MAGIC = {"woff2": b"wOF2", "woff": b"wOFF"}
-_UA_FONT = "WebsiteBuilderFontVendor/1.0"
+_UA_FONT = (
+    "Mozilla/5.0 (X11; Linux x86_64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
 
 # Fixture seam (tests only): a pre-resolved stylesheet body + font payloads
 # keyed by URL. ``None`` (production) always fetches from the trusted source.
