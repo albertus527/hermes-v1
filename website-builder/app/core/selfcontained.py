@@ -785,7 +785,10 @@ def _fetch(url: str, *, hosts: Iterable[str], allowed_types: Iterable[str],
         conn = (connection_factory or PinnedFontHTTPSConnection)(
             host, addresses[0], timeout=_FETCH_TIMEOUT)
         deadline = time.monotonic() + _FETCH_TIMEOUT
-        conn.request("GET", parts.path or "/", headers={
+        request_target = parts.path or "/"
+        if parts.query:
+            request_target += "?" + parts.query
+        conn.request("GET", request_target, headers={
             "Accept": ",".join(allowed_types) if allowed_types else "*/*",
             "Accept-Encoding": "identity",
             "User-Agent": _UA_FONT,
