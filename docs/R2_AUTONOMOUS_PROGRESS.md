@@ -34,12 +34,13 @@ If either hash differs, **STOP** and escalate — the approved roadmap has chang
 
 | Field | Value |
 |---|---|
-| Current batch | **N2 — Requirement Creator & Git Documents** |
-| Phase | N1 pushed & verified; starting N2 |
-| Batch status | N1 **DONE (pushed)** · N2 IN PROGRESS |
+| Current batch | **N3 — Decision Engine & OpenViking** |
+| Phase | N1, N2 pushed & verified; starting N3 |
+| Batch status | N1 **DONE** · N2 **DONE** · N3 IN PROGRESS |
 | Last verified Git SHA (pre-N1 baseline) | `d0016be5a0cb7a860251f338d84e00ac688242f6` |
 | N1 commit | `1e4f488023befa22c26a427929562e08cdb4c46c` |
-| Remote SHA | `1e4f488023befa22c26a427929562e08cdb4c46c` — **matches local, verified** |
+| N2 commit | `830fd83b114eef0fe461fe7aa368ca9eae3f94af` |
+| Remote SHA | `830fd83b114eef0fe461fe7aa368ca9eae3f94af` — **matches local, verified** |
 | Working tree | clean except untracked `autodev/` and `tests/autodev/` (preserved, never staged) |
 
 ## Latest tests
@@ -49,8 +50,12 @@ If either hash differs, **STOP** and escalate — the approved roadmap has chang
 | N1 focused | `python -m pytest website-builder/tests/test_document_contracts.py -q` | **31 passed, 8 subtests passed** |
 | N1 mutation | `python website-builder/tools/mutation_check_n1.py` | **13/13 guards killed** |
 | N1 gate | `scripts/run_tests.sh website-builder/tests` | **126 files, 4118 passed, 20 failed, 2 skipped** (exit 1) |
+| N2 focused | `pytest tests/test_requirement_creator.py` + `tests/test_requirement_creator_build.py` | **30 + 7 passed** |
+| N2 mutation | `python tools/mutation_check_n2.py` | **11/11 guards killed** |
+| N2 gate | `scripts/run_tests.sh website-builder/tests` | **128 files, 4155 passed, 20 failed, 2 skipped** (exit 1) |
+| N2 vs baseline | failure node-id set diff | **IDENTICAL** ⇒ no new failures |
 | N1 gate — pristine-HEAD baseline | same command on `git archive HEAD` copy | **125 files, 4087 passed, 20 failed, 2 skipped** (exit 1) |
-| **Delta** | — | **+1 file, +31 passed, +0 failed** ⇒ no regressions |
+| **Delta (N1→N2)** | — | **+2 files, +37 passed, +0 failed** ⇒ no regressions |
 
 The 20 failures are **pre-existing and environmental**, proven by reproducing the
 identical failure set on a pristine `HEAD` copy with **zero N1 files present**:
@@ -113,11 +118,12 @@ node ids, same causes) and **no new** failure.
 
 ## Next action
 
-1. **N1 is pushed** — remote `origin/feature/website-r2-redesign` = `1e4f488023befa22c26a427929562e08cdb4c46c` (verified).
-2. Begin **N2 — Requirement Creator & Git Documents** (deliverables: PRD + Design
-   Guidance compilers, validated generation, document identity in the revision
-   flow, legacy preserved, no new publication state machine).
-3. After N2: run the full suite, compare to the fingerprint above, then commit +
+1. **N1 + N2 are pushed.** Remote = `830fd83b114eef0fe461fe7aa368ca9eae3f94af` (verified).
+2. Begin **N3 — Decision Engine & OpenViking** (deliverables: replaceable
+   DecisionProvider interface; Decision Intake classification; OpenViking
+   candidate retrieval + Decision Design ranking; bounded retrieval, provenance,
+   score validation, abstention, fallback; Laya retirement gated on parity).
+3. After N3: run the full suite, compare to the fingerprint above, then commit +
    push + verify remote SHA.
 
 ## Batch log
@@ -125,8 +131,8 @@ node ids, same causes) and **no new** failure.
 | Batch | Depends on | Status | Gate | Commit SHA | Remote SHA |
 |---|---|---|---|---|---|
 | N1 | — | **DONE (pushed)** | `scripts/run_tests.sh website-builder/tests` → 20 baseline failures (documented exception) | `1e4f48802` | `1e4f48802` ✓ verified |
-| N2 | N1 | IN PROGRESS | `scripts/run_tests.sh website-builder/tests` | — | — |
-| N3 | N1,N2 | NOT STARTED | `scripts/run_tests.sh website-builder/tests` | — | — |
+| N2 | N1 | **DONE (pushed)** | `scripts/run_tests.sh website-builder/tests` → +37 passed, 20 baseline failures (identical set) | `830fd83b1` | `830fd83b1` ✓ verified |
+| N3 | N1,N2 | IN PROGRESS | `scripts/run_tests.sh website-builder/tests` | — | — |
 | N4 | N1,N2,N3 | NOT STARTED | `scripts/run_tests.sh website-builder/tests` | — | — |
 | N5 | N1,N2,N3,N4 | NOT STARTED | `scripts/run_tests.sh website-builder/tests` | — | — |
 
