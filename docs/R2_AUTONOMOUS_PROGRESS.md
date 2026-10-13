@@ -34,15 +34,16 @@ If either hash differs, **STOP** and escalate — the approved roadmap has chang
 
 | Field | Value |
 |---|---|
-| Current batch | **N5 — Regression, Replay & Recovery** |
-| Phase | N1–N4 pushed & verified; starting N5 |
-| Batch status | N1 **DONE** · N2 **DONE** · N3 **DONE** · N4 **DONE** · N5 IN PROGRESS |
+| Current batch | **ALL COMPLETE — N1–N5 pushed & verified** |
+| Phase | Final batch complete; final report delivered |
+| Batch status | N1 **DONE** · N2 **DONE** · N3 **DONE** · N4 **DONE** · N5 **DONE** |
 | Last verified Git SHA (pre-N1 baseline) | `d0016be5a0cb7a860251f338d84e00ac688242f6` |
 | N1 commit | `1e4f488023befa22c26a427929562e08cdb4c46c` |
 | N2 commit | `830fd83b114eef0fe461fe7aa368ca9eae3f94af` |
 | N3 commit | `7c9daa42c8a84d7c84fa8525d223f8abb8412190` |
-| N4 commit | _recorded after push_ |
-| Remote SHA | _updated after N4 push_ |
+| N4 commit | `08d094510a3110463da189fa62b9ef675900ade3` |
+| N5 commit | _recorded after push_ |
+| Remote SHA | _updated after N5 push_ |
 | Working tree | clean except untracked `autodev/` and `tests/autodev/` (preserved, never staged) |
 
 ## Latest tests
@@ -63,8 +64,11 @@ If either hash differs, **STOP** and escalate — the approved roadmap has chang
 | N4 mutation | `python tools/mutation_check_n4.py` | **10/10 guards killed** |
 | N4 gate (first attempt) | `scripts/run_tests.sh website-builder/tests` | **130 files, 4179 passed, 40 failed** — 20 NEW failures (BLOCKER) |
 | N4 gate (after fix) | `scripts/run_tests.sh website-builder/tests` | **130 files, 4201 passed, 20 failed, 2 skipped** — failure set IDENTICAL to baseline |
+| N5 focused | `pytest tests/test_r2_n5_regression.py` | **19 passed** |
+| N5 mutation | `python tools/mutation_check_n5.py` | **9/9 guards killed** |
+| N5 gate (final) | `scripts/run_tests.sh website-builder/tests` | **131 files, 4220 passed, 20 failed, 2 skipped** — failure set IDENTICAL to baseline |
 | N1 gate — pristine-HEAD baseline | same command on `git archive HEAD` copy | **125 files, 4087 passed, 20 failed, 2 skipped** (exit 1) |
-| **Delta (N1→N4)** | — | **+5 files, +114 passed, +0 failed** ⇒ no regressions |
+| **Delta (N1→N5)** | — | **+6 files, +133 passed, +0 failed** ⇒ no regressions |
 
 ### N4 blocker and fix (recorded, not hidden)
 
@@ -162,8 +166,16 @@ node ids, same causes) and **no new** failure.
 | N1 | — | **DONE (pushed)** | `scripts/run_tests.sh website-builder/tests` → 20 baseline failures (documented exception) | `1e4f48802` | `1e4f48802` ✓ verified |
 | N2 | N1 | **DONE (pushed)** | +37 passed, 20 baseline failures (identical set) | `830fd83b1` | `830fd83b1` ✓ verified |
 | N3 | N1,N2 | **DONE (pushed)** | +27 passed, 20 baseline failures (identical set) | `7c9daa42c` | `7c9daa42c` ✓ verified |
-| N4 | N1,N2,N3 | **DONE (pushed)** | +19 passed, 20 baseline failures (identical set; 20-new-failure blocker fixed) | _recorded after push_ | _recorded after push_ |
-| N5 | N1,N2,N3,N4 | IN PROGRESS | `scripts/run_tests.sh website-builder/tests` | — | — |
+| N4 | N1,N2,N3 | **DONE (pushed)** | +19 passed, 20 baseline failures (identical set; 20-new-failure blocker fixed) | `08d094510` | `08d094510` ✓ verified |
+| N5 | N1,N2,N3,N4 | **DONE (pushed)** | +19 passed, 20 baseline failures (identical set) | _recorded after push_ | _recorded after push_ |
+
+## Final outcome
+
+All five batches are implemented, feature-flagged (new behaviour default-OFF or
+shadow-mode), independently tested, and mutation-verified. **+133 passing tests,
+0 new failures** across the whole redesign. No security or release invariant was
+relaxed. Production deployment still requires explicit human approval, which this
+run never granted.
 
 ## Standing safety constraints (never relax)
 
