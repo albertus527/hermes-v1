@@ -1556,6 +1556,27 @@ Respond in this exact JSON format:
             document_guidance=document_guidance,
         )
 
+        # N6-E: record the EXACT guidance snapshot this invocation is given, at
+        # the moment of the invocation and BEFORE the model runs. This is the one
+        # FRONTEND choke point, so the initial build, the Phase-7 compile repair,
+        # the QA repairs, and the revisions are all captured. The record is what
+        # QA/VISION verify against; parity is never inferred from the workspace.
+        try:
+            from app.core.guidance_snapshot import record_invocation
+
+            record_invocation(
+                self.store,
+                project_id,
+                workspace,
+                invocation_id=(
+                    f"{project_id}:r{build_operation_id}"
+                    if build_operation_id is not None
+                    else f"{project_id}:adhoc"
+                ),
+            )
+        except Exception:  # noqa: BLE001 - evidence recording must never break a build
+            logger.warning("N6-E: guidance snapshot recording failed", exc_info=True)
+
         # FRONTEND uses explicit toolsets: file, terminal, skills
         # It does NOT silently inherit the broader default hermes-cli toolset.
         # These three toolsets and the three profile skills are unchanged: this
@@ -1774,6 +1795,7 @@ Respond with a JSON summary:
         mobile_screenshot: Path,
         brief: Dict[str, Any],
         design_dna: Optional[Dict[str, Any]] = None,
+        design_guidance: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Use Hermes VISION role to inspect QA screenshots. Evidence only.
 
@@ -1802,7 +1824,7 @@ Respond with a JSON summary:
                 "error": f"Failed to import Hermes image routing: {exc}",
             }
 
-        prompt_text = self._build_vision_prompt(brief, design_dna)
+        prompt_text = self._build_vision_prompt(brief, design_dna, design_guidance)
 
         image_paths = [str(desktop_screenshot), str(mobile_screenshot)]
         parts, skipped = build_native_content_parts(prompt_text, image_paths)
@@ -1848,6 +1870,7 @@ Respond with a JSON summary:
         self,
         brief: Dict[str, Any],
         design_dna: Optional[Dict[str, Any]],
+        design_guidance: Optional[str] = None,
     ) -> str:
         """Build the VISION inspection prompt. Evidence-only — no edit authority.
 
@@ -1855,11 +1878,31 @@ Respond with a JSON summary:
         the rendered result is visibly healthy and reasonably aligned with the
         supplied intent. It is NOT a designer, NOT a requirements author, and
         must never invent new product/design/implementation requirements.
+
+        ``design_guidance`` is the N6 pre-build DesignGuidance.md: the design
+        DIRECTION the application decided before FRONTEND ran. Supplying it lets
+        VISION report whether the output visually follows that direction — which
+        is a *design-compliance* judgement, kept explicitly separate from
+        specification parity (the PRD/requirements check). It is context, never a
+        new requirements source, and its absence leaves the prompt unchanged.
         """
         name = brief.get("name", "Website")
         what = brief.get("what", "")
         why = brief.get("why", "")
         dna_summary = json.dumps(design_dna, indent=2) if design_dna else "(none)"
+        guidance_block = ""
+        if design_guidance:
+            guidance_block = (
+                "\nDesign direction (PRE-BUILD DesignGuidance, application-decided; "
+                "context for a design-COMPLIANCE judgement, NOT a requirements "
+                "source):\n"
+                f"{design_guidance}\n"
+                "\nWhen answering, keep two judgements SEPARATE and report both:\n"
+                "- specification parity: does the result contradict an explicit "
+                "requirement in the brief?\n"
+                "- design compliance: does the result visibly follow the design "
+                "direction above?\n"
+            )
 
         return f"""You are VISION, the evidence-only visual acceptance reviewer for Website Builder R1.
 
@@ -1874,7 +1917,7 @@ Brief:
 
 Design DNA (declarative design intent / context, NOT a requirements source):
 {dna_summary}
-
+{guidance_block}
 FRONTEND owns design, structure, copy, and implementation. You are NOT a
 second designer and NOT a requirements author. Do NOT invent new product,
 design, or implementation requirements. Absence of a specification is NOT a

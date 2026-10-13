@@ -200,6 +200,29 @@ class QAOrchestrator:
                     state = self.store.load(project_id)
                     checked = state.deployment.get('checked') or {}
                     tested_snapshot = None
+
+                    # N6-E: verify the RECORDED guidance snapshot the last
+                    # FRONTEND invocation was actually given. This runs
+                    # UNCONDITIONALLY at acceptance, independently of the
+                    # ``checked`` source binding: parity of the specification
+                    # version is a distinct property. A document that was used
+                    # and has since changed (or vanished) is a true mismatch and
+                    # fails closed. Parity is proven against the RECORD, never
+                    # inferred from whatever the workspace currently holds. A
+                    # legacy project (no recorded invocation) verifies trivially.
+                    from app.core.guidance_snapshot import (
+                        latest_invocation, verify_invocation,
+                    )
+
+                    _recorded = latest_invocation(state)
+                    _mismatch = verify_invocation(workspace, _recorded)
+                    if _mismatch:
+                        logger.warning(
+                            "N6-E guidance parity rejected for %s: %s",
+                            project_id, _mismatch,
+                        )
+                        raise QABlockingError('GUIDANCE_VERSION_MISMATCH')
+
                     if checked:
                         try:
                             snapshot = TestedSnapshot.capture(workspace, checked['source_sha256'],
@@ -391,8 +414,17 @@ class QAOrchestrator:
         vision_findings: Optional[VisionFindings] = None
         if not infra_error and screenshots.complete and self.hermes_adapter is not None:
             try:
+                # N6-E: hand VISION the pre-build DesignGuidance (when present) so
+                # it can judge design COMPLIANCE alongside specification parity.
+                # Absent documents leave the prompt unchanged.
+                from app.core.document_store import read_design_guidance
+
+                _guidance_doc = read_design_guidance(workspace)
                 vision_raw = self.hermes_adapter.vision_inspect(
-                    screenshots.desktop, screenshots.mobile, brief, design_dna
+                    screenshots.desktop, screenshots.mobile, brief, design_dna,
+                    design_guidance=(
+                        _guidance_doc.text if _guidance_doc is not None else None
+                    ),
                 )
             except Exception as exc:
                 infra_error = f"INFRASTRUCTURE_ERROR:vision_failed:{exc}"

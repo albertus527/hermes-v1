@@ -167,8 +167,13 @@ class FakeHermes:
     def validate_role_configuration(self):
         return {}
 
-    def vision_inspect(self, desktop_path, mobile_path, brief, design_dna=None):
-        """Deterministic VISION QA boundary. Defaults to a clean pass."""
+    def vision_inspect(self, desktop_path, mobile_path, brief, design_dna=None,
+                       design_guidance=None):
+        """Deterministic VISION QA boundary. Defaults to a clean pass.
+
+        ``design_guidance`` is accepted for signature parity with the real
+        adapter (N6-E); the fake does not build a prompt.
+        """
         if self.vision_result is None:
             return {"pass": True, "blocking": [], "observations": [],
                     "summary": "ok"}
