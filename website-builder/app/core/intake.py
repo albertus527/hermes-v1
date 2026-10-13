@@ -119,10 +119,20 @@ class IntakeProcessor:
     provider only -- it never decides scope, requirements, or actions.
     """
 
-    def __init__(self, store: ProjectStateStore, hermes_adapter=None, laya=None):
+    def __init__(self, store: ProjectStateStore, hermes_adapter=None, laya=None,
+                 decision_engine=None):
         self.store = store
         self.hermes_adapter = hermes_adapter
         self.laya = laya
+        # N3: an OPTIONAL, SHADOW-ONLY decision engine. When set, the intake
+        # path asks it to classify the request and records the answer for
+        # observability — but the returned IntakeResult is UNCHANGED. FAST
+        # remains authoritative; the Decision Engine is observed, never obeyed.
+        # Default None ⇒ the intake path is byte-identical to pre-N3.
+        self.decision_engine = decision_engine
+        #: The most recent shadow decision, for tests/observability. Never read
+        #: by any decision path.
+        self.last_shadow_decision = None
 
     # Brief fields the multi-turn merge accumulates. Order matters: the
     # smallest sufficient website brief is NAME + WHAT + WHY.
@@ -550,6 +560,24 @@ class IntakeProcessor:
         if clarification_question is None:
             clarification_reason = None
             clarification_field = None
+
+        # N3 SHADOW MODE: observe the Decision Engine's intake classification
+        # for this turn. Purely observational — the result below is NOT derived
+        # from it, so FAST's authority and every existing behaviour are
+        # unchanged. Disabled (None) by default.
+        if self.decision_engine is not None:
+            try:
+                self.last_shadow_decision = self.decision_engine.decide_intake(
+                    text,
+                    {
+                        "has_source": bool(
+                            self._persisted_brief(project_id)
+                        ) or bool(self._persisted_pause_state(project_id)),
+                        "project_id": project_id,
+                    },
+                )
+            except Exception:  # pragma: no cover - shadow must never break intake
+                self.last_shadow_decision = None
 
         return IntakeResult(
             readiness=readiness,
