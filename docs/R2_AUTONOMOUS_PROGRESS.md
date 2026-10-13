@@ -188,14 +188,20 @@ existing metadata for versions; reuse D2 selector; activate
 
 | Checkpoint | Status | Tests | Commit SHA | Remote SHA |
 |---|---|---|---|---|
-| N6-A config/modes | **DONE (pushed)** | 17 passed; mutation n/a | `196525f03` | `196525f03` ✓ |
+| N6-A config/modes | **DONE (pushed)** | 17 passed | `196525f03` | `196525f03` ✓ |
 | N6-B intake modes | **DONE (pushed)** | 16 passed; 5/5 killed | `2a4fd3694` | `2a4fd3694` ✓ |
-| N6-C DesignGuidance | IN PROGRESS | — | — | — |
-| N6-D FRONTEND handoff + pack | PENDING | — | — | — |
-| N6-E snapshot + QA/VISION parity | PENDING | — | — | — |
+| N6-C DesignGuidance | **DONE (pushed)** | 17+5 passed; 6/6 killed | `5b3e8f84e` | `5b3e8f84e` ✓ |
+| N6-D FRONTEND handoff + pack | **DONE (pushed)** | 13 passed; 6/6 killed | `3a971ebf6` | `3a971ebf6` ✓ |
+| N6-E snapshot + QA/VISION parity | **DONE (pushed)** | 17+2 passed; 6/6 killed | `a3840adf6` | `a3840adf6` ✓ |
+
+**N6 gate:** `scripts/run_tests.sh website-builder/tests` → **137 files, 4307
+passed, 20 failed, 2 skipped**; failure set IDENTICAL to the baseline
+fingerprint (18 hydration + 1 design_resources + 1 suite_hygiene). N6 as a whole:
+**+87 passed, +0 new failures**. Docs: `website-builder/docs/N6_ARCHITECTURE_COMPLETION.md`.
 
 N6 safety posture: both modes default `disabled`; active mode is NOT enabled on
-production and must not be until a separate live E2E qualification passes.
+production and must not be until a separate live E2E qualification passes
+(plan in the N6 report). Mocked tests are not production readiness.
 
 ## Standing safety constraints (never relax)
 
