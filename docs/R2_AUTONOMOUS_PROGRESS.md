@@ -177,6 +177,26 @@ shadow-mode), independently tested, and mutation-verified. **+133 passing tests,
 relaxed. Production deployment still requires explicit human approval, which this
 run never granted.
 
+## N6 — Architecture Completion (AUDIT → DESIGN → IMPLEMENT)
+
+N6 completes the roadmap's intended architecture: pre-build Design Guidance,
+Decision Engine modes, per-invocation guidance snapshots, and QA/VISION parity.
+Approved decisions: D-N6-1..6 (one `decision_engine` block; separate
+`DesignGuidance.md`; active intake affects routing only; `RevisionState` +
+existing metadata for versions; reuse D2 selector; activate
+`build_design_context_pack` behind active-mode gating).
+
+| Checkpoint | Status | Tests | Commit SHA | Remote SHA |
+|---|---|---|---|---|
+| N6-A config/modes | **DONE (pushed)** | 17 passed; mutation n/a | `196525f03` | `196525f03` ✓ |
+| N6-B intake modes | **DONE (pushed)** | 16 passed; 5/5 killed | `2a4fd3694` | `2a4fd3694` ✓ |
+| N6-C DesignGuidance | IN PROGRESS | — | — | — |
+| N6-D FRONTEND handoff + pack | PENDING | — | — | — |
+| N6-E snapshot + QA/VISION parity | PENDING | — | — | — |
+
+N6 safety posture: both modes default `disabled`; active mode is NOT enabled on
+production and must not be until a separate live E2E qualification passes.
+
 ## Standing safety constraints (never relax)
 
 - Never modify `/home/albertus527/hermes-website` (original worktree) or Hermes Trade.
