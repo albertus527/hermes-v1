@@ -560,48 +560,49 @@ class FrontendBuilder:
             return
         self._record_documents(project_id, revision, prd=prd)
 
-    def _compile_and_store_design_guidance(
+    def _prepare_prebuild_design(
         self,
         project_id: str,
         workspace: Path,
         brief: Dict[str, Any],
-    ) -> Optional[str]:
-        """Compile the pre-build ``DesignGuidance.md`` and write it (N6).
+    ):
+        """Prepare the pre-build design artefacts (N6-C + N6-D).
 
-        Called BEFORE the initial FRONTEND invocation. It runs the Decision
-        Engine's Design job (bounded, provenance-validated candidates) and
-        compiles the selected evidence into a grounded guidance document.
+        Runs the Decision Engine's Design job once, then:
 
-        Gated: only when ``decision_engine_config.design_mode`` is ACTIVE. In
-        ``disabled`` and ``shadow`` modes this is a no-op, so the initial build
-        is byte-identical to pre-N6. A Decision Engine abstention or outage is
-        NOT an error: the guidance is compiled from the brief alone, honestly
-        marked UNRESOLVED where the evidence does not reach. A compile failure
-        never fails the build.
+        * compiles and stores ``DesignGuidance.md`` (N6-C), and
+        * builds the bounded D2/D3a design context pack (N6-D), reusing the
+          existing selector + retrieval against the same evidence.
 
-        Returns the guidance text written, or ``None`` when nothing was written.
+        Returns ``(guidance_text_or_None, pack_or_None)``. Both are ``None`` when
+        design mode is not ACTIVE, so the initial build is byte-identical to
+        pre-N6 in ``disabled``/``shadow``. A Decision Engine abstention or outage
+        degrades to brief-only guidance (honestly UNRESOLVED) rather than failing
+        the build; a pack/compile failure never fails the build.
         """
         if not self.decision_engine_config.design_active:
-            return None
+            return None, None
         if not self.requirement_creator_config.enabled:
             # The guidance is a canonical document; without the Requirement
             # Creator enabled there is no document pipeline to carry it.
-            return None
+            return None, None
 
         with self.store.acquire_writer(project_id) as state:
             revision = state.revisions.source_revision
             guidance_version = state.revisions.design_guidance_version
+
+        query = " ".join(
+            str(brief.get(k) or "").strip()
+            for k in ("name", "what", "why")
+            if str(brief.get(k) or "").strip()
+        )
 
         decision = None
         if self.decision_engine is not None:
             try:
                 decision = self.decision_engine.decide_design(
                     {
-                        "query": " ".join(
-                            str(brief.get(k) or "").strip()
-                            for k in ("name", "what", "why")
-                            if str(brief.get(k) or "").strip()
-                        ),
+                        "query": query,
                         "design_dna": {},  # pre-build: no DNA exists yet
                         "source_revision": revision,
                     }
@@ -623,9 +624,47 @@ class FrontendBuilder:
             self._record_document_failure(
                 project_id, revision, exc, kind="design_guidance"
             )
+            text = None
+        else:
+            self._record_documents(project_id, revision, design_guidance=stored)
+
+        pack = self._build_design_context_pack(brief, decision, query)
+        return text, pack
+
+    def _build_design_context_pack(self, brief, decision, query):
+        """Build the bounded D2/D3a design context pack (N6-D).
+
+        Reuses the EXISTING selector + retrieval (``build_design_context_pack``)
+        against the pre-build evidence (brief + the selected, provenance-validated
+        candidate). The pack's ``design_dna`` input is the bounded evidence
+        mapping, so the selector runs on exactly what the application supplied and
+        never on anything it did not.
+
+        Returns the pack, or ``None`` when it cannot be built (no hermes_home on
+        the adapter, or any failure). A pack is an ENHANCEMENT: its absence never
+        blocks or changes a build.
+        """
+        hermes_home = getattr(self.hermes_adapter, "hermes_home", None)
+        if hermes_home is None:
             return None
-        self._record_documents(project_id, revision, design_guidance=stored)
-        return text
+        try:
+            from app.core.design_context import build_design_context_pack
+            from app.core.design_guidance import (
+                guidance_evidence,
+                guidance_selection_input,
+            )
+
+            evidence = guidance_evidence(brief, decision)
+            selection_input = guidance_selection_input(evidence)
+            return build_design_context_pack(
+                hermes_home,
+                design_dna=selection_input,
+                query=query,
+                include_guidance=True,
+                retrieve=True,
+            )
+        except Exception:  # noqa: BLE001 - a pack failure never blocks a build
+            return None
 
     def _compile_and_store_design(
         self,
@@ -1038,24 +1077,29 @@ Respond with a JSON summary:
                 # bounded guidance. No-op unless the Requirement Creator is
                 # enabled; a compile failure never fails the build.
                 self._compile_and_store_prd(project_id, workspace, brief)
-                # N6: compile the pre-build DesignGuidance.md from the brief plus
-                # the Decision Engine's selected, provenance-validated candidates.
-                # ACTIVE design mode only; a no-op in disabled/shadow, and a
-                # Decision Engine abstention/outage degrades to brief-only
-                # guidance (honestly UNRESOLVED) rather than failing the build.
-                self._compile_and_store_design_guidance(project_id, workspace, brief)
-                # N4: the adapter derives the bounded PRD/Design guidance from
-                # the workspace itself, so the PRD written just above reaches
-                # FRONTEND with no extra plumbing. Design.md is compiled AFTER
-                # FRONTEND has produced the Design DNA and therefore is not
-                # available to the initial build's own FRONTEND call — a real,
-                # documented ordering constraint, not an omission.
+                # N6: prepare the pre-build design artefacts — DesignGuidance.md
+                # (N6-C) and the bounded D2/D3a design context pack (N6-D) — from
+                # the brief plus the Decision Engine's selected,
+                # provenance-validated candidates. ACTIVE design mode only; a
+                # no-op in disabled/shadow, and a Decision Engine
+                # abstention/outage degrades to brief-only guidance (honestly
+                # UNRESOLVED) rather than failing the build.
+                _prebuild_guidance, _design_pack = self._prepare_prebuild_design(
+                    project_id, workspace, brief
+                )
+                # N4/N6: the adapter derives the bounded PRD/DesignGuidance
+                # guidance from the workspace itself, so the documents written
+                # just above reach FRONTEND with no extra plumbing. Design.md is
+                # compiled AFTER FRONTEND has produced the Design DNA and
+                # therefore is not available to the initial build's own FRONTEND
+                # call — a real, documented ordering constraint, not an omission.
                 frontend_result = self.hermes_adapter.frontend_build(
                     project_id=project_id,
                     brief=brief,
                     workspace=workspace,
                     design_dna_instructions=combined_instructions,
                     build_operation_id=frontend_operation_id,
+                    design_context=_design_pack,
                 )
 
                 # MEDIUM-5: verify the protected starter/toolchain identity

@@ -136,7 +136,7 @@ def guidance_evidence(
     }
 
 
-def _requirements_mapping(evidence: Mapping[str, Any]) -> dict:
+def guidance_selection_input(evidence: Mapping[str, Any]) -> dict:
     """Build the D2 selector's requirement input from the evidence.
 
     The selector's requirement derivation keys off a ``design_dna``-shaped
@@ -159,6 +159,10 @@ def _requirements_mapping(evidence: Mapping[str, Any]) -> dict:
     if palette:
         mapping["palette"] = {f"color_{i}": v for i, v in enumerate(palette)}
     return mapping
+
+
+def _requirements_mapping(evidence: Mapping[str, Any]) -> dict:
+    return guidance_selection_input(evidence)
 
 
 def _select_resources(evidence: Mapping[str, Any], *, requested_resources):
@@ -283,6 +287,7 @@ __all__ = [
     "UNRESOLVED_MARKER",
     "DesignGuidanceError",
     "guidance_evidence",
+    "guidance_selection_input",
     "compile_design_guidance",
     "guidance_digest",
 ]

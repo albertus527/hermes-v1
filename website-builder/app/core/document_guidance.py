@@ -41,15 +41,24 @@ GUIDANCE_FOOTER = "=== END PRD & DESIGN GUIDANCE ==="
 def guidance_digest(
     prd_text: Optional[str],
     design_text: Optional[str],
+    guidance_text: Optional[str] = None,
 ) -> str:
     """Return a stable digest over the document versions FRONTEND was given.
 
     The digest is a SHA-256 over each document's own SHA-256, in a fixed order,
-    so it changes if *either* document changes and is independent of rendering
-    or truncation. QA uses this to prove it evaluated the same version.
+    so it changes if *any* document changes and is independent of rendering or
+    truncation. QA uses this to prove it evaluated the same version.
+
+    ``guidance_text`` is the N6 pre-build ``DesignGuidance.md``. It is folded in
+    so the recorded snapshot distinguishes the pre-build guidance from the
+    post-build Design DNA document.
     """
     h = hashlib.sha256()
-    for label, text in (("prd", prd_text), ("design", design_text)):
+    for label, text in (
+        ("prd", prd_text),
+        ("design", design_text),
+        ("design_guidance", guidance_text),
+    ):
         h.update(label.encode("utf-8"))
         h.update(b"\x00")
         if text:
@@ -61,23 +70,33 @@ def guidance_digest(
 def build_document_guidance(
     prd_text: Optional[str],
     design_text: Optional[str],
+    guidance_text: Optional[str] = None,
     *,
     max_chars: int = MAX_GUIDANCE_CHARS,
 ) -> str:
     """Render the bounded guidance block, or ``""`` when there are no documents.
 
-    An empty string is returned when neither document is present, so a caller
-    that has no documents produces a prompt byte-identical to pre-N4 — the
-    legacy path is preserved exactly.
+    An empty string is returned when no document is present, so a caller that has
+    no documents produces a prompt byte-identical to pre-N4 — the legacy path is
+    preserved exactly.
+
+    ``guidance_text`` is the N6 pre-build ``DesignGuidance.md``. When present it
+    is labelled as the PRE-BUILD design guidance so FRONTEND can never confuse it
+    with the post-build Design DNA document.
     """
-    if not prd_text and not design_text:
+    if not prd_text and not design_text and not guidance_text:
         return ""
 
     sections = []
     if prd_text:
         sections.append("## PRD\n\n" + prd_text.strip())
+    if guidance_text:
+        sections.append(
+            "## Design Guidance (pre-build, application-decided)\n\n"
+            + guidance_text.strip()
+        )
     if design_text:
-        sections.append("## Design\n\n" + design_text.strip())
+        sections.append("## Design (post-build DNA)\n\n" + design_text.strip())
     body = "\n\n".join(sections)
 
     intro = (
@@ -137,6 +156,10 @@ def guidance_for_workspace(workspace):
     carries no documents — so a legacy workspace (and the whole pre-N4 path)
     produces an empty block and a prompt byte-identical to before N4.
 
+    N6: the pre-build ``DesignGuidance.md`` is included when present. It is
+    distinct from the post-build ``Design.md`` (the DNA document) and both may
+    coexist on a revision.
+
     This is the single derivation used by BOTH the build path and the QA/repair
     path, so the digest each records is provably the same version.
     """
@@ -146,14 +169,43 @@ def guidance_for_workspace(workspace):
 
     prd = read_document(workspace, "prd")
     design = read_document(workspace, "design")
+    guidance = read_document(workspace, "design_guidance")
     prd_text = prd.text if prd else None
     design_text = design.text if design else None
-    if not prd_text and not design_text:
+    guidance_text = guidance.text if guidance else None
+    if not prd_text and not design_text and not guidance_text:
         return None, None
     return (
-        build_document_guidance(prd_text, design_text),
-        guidance_digest(prd_text, design_text),
+        build_document_guidance(prd_text, design_text, guidance_text),
+        guidance_digest(prd_text, design_text, guidance_text),
     )
+
+
+def guidance_snapshot(workspace) -> Optional[dict]:
+    """Return the exact guidance snapshot for ``workspace``, or ``None``.
+
+    N6-E records this AT THE MOMENT of each FRONTEND invocation. It carries the
+    per-document digests and the combined digest, so QA/VISION can verify against
+    the version that was actually used rather than recomputing one from whatever
+    happens to be on disk now.
+    """
+    from app.core.document_store import read_document
+
+    prd = read_document(workspace, "prd")
+    design = read_document(workspace, "design")
+    guidance = read_document(workspace, "design_guidance")
+    if prd is None and design is None and guidance is None:
+        return None
+    return {
+        "prd_digest": prd.digest if prd else None,
+        "design_digest": design.digest if design else None,
+        "design_guidance_digest": guidance.digest if guidance else None,
+        "combined_digest": guidance_digest(
+            prd.text if prd else None,
+            design.text if design else None,
+            guidance.text if guidance else None,
+        ),
+    }
 
 
 __all__ = [
@@ -164,4 +216,5 @@ __all__ = [
     "build_document_guidance",
     "guidance_versions",
     "guidance_for_workspace",
+    "guidance_snapshot",
 ]

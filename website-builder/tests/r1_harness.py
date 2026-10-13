@@ -144,9 +144,12 @@ class FakeHermes:
         }
 
     def frontend_build(self, project_id, brief, workspace,
-                       design_dna_instructions=None, build_operation_id=None):
+                       design_dna_instructions=None, build_operation_id=None,
+                       design_context=None):
         # build_operation_id is the caller's operation identity, recorded by the
         # orchestrator for diagnostics; this boundary only needs to accept it.
+        # design_context is the N6 bounded D2/D3a pack; accepted for signature
+        # parity with the real adapter (the fake does not render a prompt).
         self.frontend_calls += 1
         self.frontend_operation_ids.append(build_operation_id)
         if self.frontend_results:
