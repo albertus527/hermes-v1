@@ -42,8 +42,8 @@ If either hash differs, **STOP** and escalate — the approved roadmap has chang
 | N2 commit | `830fd83b114eef0fe461fe7aa368ca9eae3f94af` |
 | N3 commit | `7c9daa42c8a84d7c84fa8525d223f8abb8412190` |
 | N4 commit | `08d094510a3110463da189fa62b9ef675900ade3` |
-| N5 commit | _recorded after push_ |
-| Remote SHA | _updated after N5 push_ |
+| N5 commit | `c2c36849fd46111fcdefb1c71117da648345e03b` |
+| Remote SHA | `c2c36849fd46111fcdefb1c71117da648345e03b` — **matches local, verified** |
 | Working tree | clean except untracked `autodev/` and `tests/autodev/` (preserved, never staged) |
 
 ## Latest tests
@@ -167,7 +167,7 @@ node ids, same causes) and **no new** failure.
 | N2 | N1 | **DONE (pushed)** | +37 passed, 20 baseline failures (identical set) | `830fd83b1` | `830fd83b1` ✓ verified |
 | N3 | N1,N2 | **DONE (pushed)** | +27 passed, 20 baseline failures (identical set) | `7c9daa42c` | `7c9daa42c` ✓ verified |
 | N4 | N1,N2,N3 | **DONE (pushed)** | +19 passed, 20 baseline failures (identical set; 20-new-failure blocker fixed) | `08d094510` | `08d094510` ✓ verified |
-| N5 | N1,N2,N3,N4 | **DONE (pushed)** | +19 passed, 20 baseline failures (identical set) | _recorded after push_ | _recorded after push_ |
+| N5 | N1,N2,N3,N4 | **DONE (pushed)** | +19 passed, 20 baseline failures (identical set) | `c2c36849f` | `c2c36849f` ✓ verified |
 
 ## Final outcome
 
