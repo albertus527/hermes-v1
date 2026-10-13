@@ -91,6 +91,20 @@ website_builder:
     # See docs/D4C_FAST_CONTEXT_INTEGRATION_ACCEPTANCE.md.
     fast_context_injection: false
 
+  # N2: Requirement Creator. Compiles FAST's authoritative brief into PRD.md
+  # and the accepted Design DNA into Design.md, storing both beside the
+  # generated website source so they share one Git release commit.
+  #
+  # DISABLED BY DEFAULT. When disabled no document is compiled, written, or
+  # read, and the build path (and therefore the release bytes) is identical to
+  # the pre-N2 path. Enabling it is an explicit operator decision; it never
+  # changes FAST's authority and never authors business facts.
+  requirement_creator:
+    enabled: false
+    # Bumped when the compilation rules change, so a document records which
+    # generator produced it. Must be >= 1.
+    generator_version: 1
+
   # Workspace root for generated projects
   workspace_root: '~/website-workspaces'
 

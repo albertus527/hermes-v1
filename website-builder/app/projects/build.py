@@ -43,6 +43,16 @@ from app.core.selfcontained import (
     normalize_artifact,
 )
 from app.core.state import ProjectStateStore
+from app.core.requirement_creator import (
+    RequirementCreatorConfig,
+    compile_design,
+    compile_prd,
+)
+from app.core.document_store import (
+    DEPLOYMENT_DOCUMENTS_KEY,
+    document_records,
+    store_documents,
+)
 from app.qa.orchestrator import QAOrchestrator
 from app.sandbox.runner import ProjectRunner, WorkspaceError
 
@@ -439,6 +449,7 @@ class FrontendBuilder:
         preview_orchestrator=None,
         web3forms_access_key: Optional[str] = None,
         critic_scanner=None,
+        requirement_creator_config: Optional[RequirementCreatorConfig] = None,
     ):
         self.preview_orchestrator = preview_orchestrator
         self.runner = runner
@@ -452,6 +463,12 @@ class FrontendBuilder:
         # QAOrchestrator this builder constructs so the bounded critic repair
         # stage runs on the real production path.
         self.critic_scanner = critic_scanner
+        # N2: Requirement Creator feature config. DISABLED by default, so a
+        # builder constructed without it compiles and writes no documents and
+        # the build path is byte-identical to pre-N2.
+        self.requirement_creator_config = (
+            requirement_creator_config or RequirementCreatorConfig()
+        )
 
     def _copy_starter(self, workspace: Path) -> None:
         """Copy the fixed frontend starter into the project workspace."""
@@ -466,6 +483,88 @@ class FrontendBuilder:
                 shutil.copytree(item, dest, dirs_exist_ok=True)
             else:
                 shutil.copy2(item, dest)
+
+    def _compile_and_store_documents(
+        self,
+        project_id: str,
+        workspace: Path,
+        brief: Dict[str, Any],
+        design_dna: Optional[Dict[str, Any]],
+        *,
+        scope: Optional[str] = None,
+        readiness: Optional[str] = None,
+    ) -> None:
+        """Compile PRD.md / Design.md and write them into the workspace (N2).
+
+        Feature-flagged and DISABLED by default. When disabled this is a no-op,
+        so the workspace (and therefore the source snapshot and release commit)
+        is byte-identical to pre-N2.
+
+        Documents are written BEFORE the caller takes the source fingerprint, so
+        they are part of the checked/published bytes — the roadmap requires
+        PRD.md, Design.md, and generated source to share one release commit.
+
+        A compilation failure never fails the build: the documents are an
+        additive artifact, and losing them must not lose a website. The failure
+        is recorded in state for an operator, and no partial document is written
+        (``write_document`` validates before touching disk).
+        """
+        if not self.requirement_creator_config.enabled:
+            return
+
+        with self.store.acquire_writer(project_id) as state:
+            revision = state.revisions.source_revision
+            requirements_version = state.revisions.requirements_version
+            design_dna_version = state.revisions.design_dna_version
+            if not scope:
+                scope = state.brief.get("scope")
+            if not readiness:
+                readiness = state.brief.get("readiness")
+
+        generator_version = self.requirement_creator_config.generator_version
+        try:
+            prd_text = compile_prd(
+                brief,
+                project_id=project_id,
+                source_revision=revision,
+                requirements_version=requirements_version,
+                generator_version=generator_version,
+                scope=scope,
+                readiness=readiness,
+            )
+            design_text = compile_design(
+                design_dna or {},
+                project_id=project_id,
+                source_revision=revision,
+                design_dna_version=design_dna_version,
+                generator_version=generator_version,
+                brief=brief,
+            )
+            prd, design = store_documents(
+                workspace, prd_text=prd_text, design_text=design_text
+            )
+        except (ValueError, OSError) as exc:
+            logger.warning(
+                "Requirement Creator: document compilation for %s failed (%s); "
+                "continuing without documents",
+                project_id,
+                type(exc).__name__,
+            )
+            with self.store.acquire_writer(project_id) as state:
+                state.deployment[DEPLOYMENT_DOCUMENTS_KEY] = {
+                    "error": type(exc).__name__,
+                    "source_revision": revision,
+                }
+                self.store.save(state)
+            return
+
+        records = document_records(prd, design)
+        with self.store.acquire_writer(project_id) as state:
+            if records is None:
+                state.deployment.pop(DEPLOYMENT_DOCUMENTS_KEY, None)
+            else:
+                state.deployment[DEPLOYMENT_DOCUMENTS_KEY] = records
+            self.store.save(state)
 
     def _run_fixed_checks(self, project_id: str, workspace: Path) -> Dict[str, Any]:
         """Run the fixed cheap checks that belong to Phase 7.
@@ -838,6 +937,10 @@ Respond with a JSON summary:
 
             # Run fixed cheap checks (deterministic, application-owned)
             # FRONTEND does NOT run these. Application code does.
+            # N2: compile + write PRD.md / Design.md BEFORE the source
+            # fingerprint is taken, so the documents are part of the checked
+            # and (later) published bytes. No-op unless the feature is enabled.
+            self._compile_and_store_documents(project_id, workspace, brief, design_dna)
             before = source_fingerprint(workspace)
             checks = self._run_fixed_checks(project_id, workspace)
             build_success = all(r.get("success", False) for r in checks.values())

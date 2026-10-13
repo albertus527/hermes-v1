@@ -83,6 +83,10 @@ from app.core.openviking_retrieval import (
     build_adapter as build_openviking_adapter,
     config_from_mapping as openviking_config_from_mapping,
 )
+from app.core.requirement_creator import (
+    RequirementCreatorConfig,
+    config_from_mapping as requirement_creator_config_from_mapping,
+)
 from app.core.state import ProjectStateStore, reconcile_stranded_projects
 from app.core.registry import ConversationRegistryStore, DuplicateProjectName, slugify_display_name
 from app.core.secrets import BYPASS_STORE_DIRNAME, BypassSecretStore, migrate_legacy_bypass_secrets
@@ -157,6 +161,11 @@ class RuntimeConfig:
     # FAST intake path is byte-identical to the pre-D4b path unless an operator
     # explicitly enables it (which also requires OpenViking to be enabled).
     laya_config: "LayaConfig" = field(default_factory=LayaConfig)
+    # N2: Requirement Creator configuration. DISABLED by default, so the build
+    # path compiles and writes no PRD.md/Design.md unless an operator enables it.
+    requirement_creator_config: RequirementCreatorConfig = field(
+        default_factory=RequirementCreatorConfig
+    )
 
     def __post_init__(self):
         # Expand ~ in paths
@@ -265,6 +274,12 @@ def load_runtime_config(config_path: Optional[Path] = None) -> RuntimeConfig:
     # also enabled, so enabling Laya alone cannot contact a backend.
     laya_config = laya_config_from_mapping(dict(wb.get("laya") or {}))
 
+    # N2: Requirement Creator configuration. DISABLED by default; a missing or
+    # malformed block yields the disabled default, so no documents are compiled.
+    requirement_creator_config = requirement_creator_config_from_mapping(
+        dict(wb.get("requirement_creator") or {})
+    )
+
     return RuntimeConfig(
         telegram_bot_token=telegram_bot_token,
         hermes_home=hermes_home,
@@ -280,6 +295,7 @@ def load_runtime_config(config_path: Optional[Path] = None) -> RuntimeConfig:
         github_ssh_key=github_ssh_key,
         openviking_config=openviking_config,
         laya_config=laya_config,
+        requirement_creator_config=requirement_creator_config,
     )
 
 
@@ -977,6 +993,7 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
         preview_orchestrator=preview,
         web3forms_access_key=config.web3forms_access_key,
         critic_scanner=critic_scanner,
+        requirement_creator_config=config.requirement_creator_config,
     )
 
     # Revision orchestrator.
