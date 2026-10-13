@@ -40,6 +40,7 @@ from typing import Any, Dict, List, Optional
 from app.core import credentials
 from app.core.design_dna import load_persisted_design_dna
 from app.core.design_context_render import render_design_context_block
+from app.core.document_guidance import build_document_guidance, guidance_for_workspace
 from app.core.design_resources import design_profile_skills_dir
 from app.core.state import ProjectStateStore
 # Stdlib-only by design (see that module's docstring): importing it at module
@@ -1541,12 +1542,18 @@ Respond in this exact JSON format:
         *build_operation_id* distinguishes two invocations of the SAME project so
         neither can refresh the other's watchdog.
         """
-        # Build the FRONTEND prompt
+        # Build the FRONTEND prompt. N4: the adapter derives the bounded PRD/
+        # Design guidance from the workspace it is handed, so EVERY caller
+        # (initial build, compile repair, QA repair, revision) gets consistent
+        # guidance without each having to thread it — and a caller that predates
+        # N4 keeps working unchanged. Empty when the workspace has no documents.
+        document_guidance, _ = guidance_for_workspace(workspace)
         prompt = self._build_frontend_prompt(
             brief,
             workspace,
             design_dna_instructions,
             design_context=design_context,
+            document_guidance=document_guidance,
         )
 
         # FRONTEND uses explicit toolsets: file, terminal, skills
@@ -1681,6 +1688,7 @@ Respond in this exact JSON format:
         workspace: Path,
         extra_instructions: Optional[str] = None,
         design_context=None,
+        document_guidance: Optional[str] = None,
     ) -> str:
         """Build the FRONTEND build prompt.
 
@@ -1689,6 +1697,10 @@ Respond in this exact JSON format:
         ``design_context`` is the D2/D3a :class:`DesignContextPack`. It is
         rendered as ONE bounded DATA block. FRONTEND never selects, installs, or
         re-derives anything: it consumes the decisions this pack already carries.
+
+        ``document_guidance`` is the N4 bounded DATA block built from the
+        validated ``PRD.md`` / ``Design.md``. When it is empty (no documents, or
+        the feature is off) the prompt is byte-identical to pre-N4.
         """
         name = brief.get("name", "Website")
         what = brief.get("what", "")
@@ -1703,6 +1715,7 @@ Respond in this exact JSON format:
 
         instructions = extra_instructions or ""
         design_context_block = render_design_context_block(design_context)
+        document_guidance_block = document_guidance or ""
 
         return f"""You are FRONTEND, the website designer and builder for Website Builder R1.
 
@@ -1736,7 +1749,7 @@ Rules:
   exclusivity rules (e.g. "exactly one CTA"), and no per-element QA or
   acceptance contracts. Design DNA describes intent (palette, typography,
   personality, layout character); it is not a test specification.
-{design_context_block}- Keep the build sequential.
+{design_context_block}{document_guidance_block}- Keep the build sequential.
 - Keep design discovery bounded. Choose a coherent direction quickly rather
   than exhaustively exploring alternatives. Once Design DNA is written,
   immediately implement the website. Creating design-dna.json alone does

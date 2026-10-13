@@ -196,9 +196,110 @@ class EnabledTests(_Base):
         state = self.store.load("proj-on5")
         assert state is not None
         # The failure is recorded for an operator, not silently dropped.
-        self.assertEqual(
-            state.deployment[DEPLOYMENT_DOCUMENTS_KEY].get("error"), "ValueError"
+        record = state.deployment[DEPLOYMENT_DOCUMENTS_KEY]
+        self.assertEqual(record.get("error"), "ValueError")
+        self.assertEqual(record.get("errors", {}).get("prd"), "ValueError")
+
+    def test_prd_failure_is_not_erased_by_a_successful_design_compile(self):
+        """A later successful Design compile must not erase a recorded PRD
+        failure (the N4 merge bug). The two documents' evidence is independent."""
+        builder = self._enabled_builder()
+        with patch(
+            "app.projects.build.compile_prd",
+            side_effect=ValueError("prd boom"),
+        ):
+            result = self._build(
+                builder, "proj-on6", {"name": "N", "what": "w", "why": "y"}
+            )
+        self.assertTrue(result.success)
+        state = self.store.load("proj-on6")
+        assert state is not None
+        record = state.deployment[DEPLOYMENT_DOCUMENTS_KEY]
+        # Design compiled fine; its entry exists...
+        self.assertIn("design", record.get("digests", {}))
+        # ...and the PRD failure is STILL recorded, not overwritten.
+        self.assertEqual(record.get("errors", {}).get("prd"), "ValueError")
+
+    def test_initial_build_feeds_prd_guidance_to_frontend(self):
+        """N4: the PRD (available pre-FRONTEND) reaches FRONTEND as guidance.
+
+        The adapter derives guidance from the workspace it is handed, so the
+        check is that the PRD exists in the workspace when FRONTEND is called
+        and that the adapter's prompt builder would include it.
+        """
+        builder = self._enabled_builder()
+        captured = {}
+
+        real_frontend_build = self.mock_adapter.frontend_build
+
+        def spy(*args, **kwargs):
+            from app.core.document_guidance import guidance_for_workspace
+            captured["guidance"] = guidance_for_workspace(kwargs["workspace"])[0]
+            return real_frontend_build(*args, **kwargs)
+
+        self.mock_adapter.frontend_build.side_effect = spy
+        self._build(builder, "proj-on7", {"name": "N", "what": "w", "why": "y"})
+        self.assertIsNotNone(captured.get("guidance"))
+        self.assertIn("PRD & DESIGN GUIDANCE", captured["guidance"])
+
+    def test_initial_build_records_guidance_digest(self):
+        builder = self._enabled_builder()
+        self._build(builder, "proj-on8", {"name": "N", "what": "w", "why": "y"})
+        state = self.store.load("proj-on8")
+        assert state is not None
+        self.assertIn("guidance_digest", state.deployment)
+
+    def test_flag_off_records_no_guidance_digest(self):
+        """With the feature OFF, no documents exist and no digest is recorded."""
+        builder = FrontendBuilder(
+            self.runner, self.store, hermes_adapter=self.mock_adapter
         )
+        self._build(builder, "proj-off3", {"name": "N", "what": "w", "why": "y"})
+        state = self.store.load("proj-off3")
+        assert state is not None
+        self.assertNotIn("guidance_digest", state.deployment)
+
+
+class AdapterGuidanceTests(unittest.TestCase):
+    """The adapter derives guidance from the workspace and puts it in the prompt."""
+
+    def _adapter(self):
+        from app.hermes.adapter import HermesAdapter
+
+        return HermesAdapter.__new__(HermesAdapter)
+
+    def test_prompt_is_byte_identical_without_documents(self):
+        import tempfile
+        from pathlib import Path
+
+        adapter = self._adapter()
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp)
+            prompt = adapter._build_frontend_prompt(
+                {"name": "N", "what": "w", "why": "y"}, ws
+            )
+            self.assertNotIn("PRD & DESIGN GUIDANCE", prompt)
+
+    def test_prompt_includes_guidance_when_documents_present(self):
+        import tempfile
+        from pathlib import Path
+        from app.core.document_guidance import guidance_for_workspace
+        from app.core.requirement_creator import compile_prd
+        from app.core.document_store import store_documents
+
+        adapter = self._adapter()
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp)
+            prd = compile_prd(
+                {"name": "N", "what": "w", "why": "y"},
+                project_id="p", source_revision=1,
+            )
+            store_documents(ws, prd_text=prd)
+            block, _ = guidance_for_workspace(ws)
+            prompt = adapter._build_frontend_prompt(
+                {"name": "N", "what": "w", "why": "y"}, ws, document_guidance=block
+            )
+            self.assertIn("PRD & DESIGN GUIDANCE", prompt)
 
 
 if __name__ == "__main__":  # pragma: no cover

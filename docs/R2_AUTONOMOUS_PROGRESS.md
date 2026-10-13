@@ -34,13 +34,15 @@ If either hash differs, **STOP** and escalate — the approved roadmap has chang
 
 | Field | Value |
 |---|---|
-| Current batch | **N3 — Decision Engine & OpenViking** |
-| Phase | N1, N2 pushed & verified; starting N3 |
-| Batch status | N1 **DONE** · N2 **DONE** · N3 IN PROGRESS |
+| Current batch | **N5 — Regression, Replay & Recovery** |
+| Phase | N1–N4 pushed & verified; starting N5 |
+| Batch status | N1 **DONE** · N2 **DONE** · N3 **DONE** · N4 **DONE** · N5 IN PROGRESS |
 | Last verified Git SHA (pre-N1 baseline) | `d0016be5a0cb7a860251f338d84e00ac688242f6` |
 | N1 commit | `1e4f488023befa22c26a427929562e08cdb4c46c` |
 | N2 commit | `830fd83b114eef0fe461fe7aa368ca9eae3f94af` |
-| Remote SHA | `830fd83b114eef0fe461fe7aa368ca9eae3f94af` — **matches local, verified** |
+| N3 commit | `7c9daa42c8a84d7c84fa8525d223f8abb8412190` |
+| N4 commit | _recorded after push_ |
+| Remote SHA | _updated after N4 push_ |
 | Working tree | clean except untracked `autodev/` and `tests/autodev/` (preserved, never staged) |
 
 ## Latest tests
@@ -54,8 +56,34 @@ If either hash differs, **STOP** and escalate — the approved roadmap has chang
 | N2 mutation | `python tools/mutation_check_n2.py` | **11/11 guards killed** |
 | N2 gate | `scripts/run_tests.sh website-builder/tests` | **128 files, 4155 passed, 20 failed, 2 skipped** (exit 1) |
 | N2 vs baseline | failure node-id set diff | **IDENTICAL** ⇒ no new failures |
+| N3 focused | `pytest tests/test_decision_engine.py` | **27 passed, 4 subtests** |
+| N3 mutation | `python tools/mutation_check_n3.py` | **12/12 guards killed** |
+| N3 gate | `scripts/run_tests.sh website-builder/tests` | **129 files, 4182 passed, 20 failed, 2 skipped** (exit 1) |
+| N4 focused | `pytest tests/test_document_guidance.py` + `tests/test_requirement_creator_build.py` | **13 + 13 passed** |
+| N4 mutation | `python tools/mutation_check_n4.py` | **10/10 guards killed** |
+| N4 gate (first attempt) | `scripts/run_tests.sh website-builder/tests` | **130 files, 4179 passed, 40 failed** — 20 NEW failures (BLOCKER) |
+| N4 gate (after fix) | `scripts/run_tests.sh website-builder/tests` | **130 files, 4201 passed, 20 failed, 2 skipped** — failure set IDENTICAL to baseline |
 | N1 gate — pristine-HEAD baseline | same command on `git archive HEAD` copy | **125 files, 4087 passed, 20 failed, 2 skipped** (exit 1) |
-| **Delta (N1→N2)** | — | **+2 files, +37 passed, +0 failed** ⇒ no regressions |
+| **Delta (N1→N4)** | — | **+5 files, +114 passed, +0 failed** ⇒ no regressions |
+
+### N4 blocker and fix (recorded, not hidden)
+
+The first N4 gate produced **20 NEW failures** (`test_r1_full_story`,
+`test_r1_phase_g_full_story`, `test_bypass_leakage`, `test_self_contained`,
+`test_r1_failure_matrix`, `test_r1_revision_crash`, `test_r1_simulation_baseline`,
+`test_r1_smoke_failure_recovery`). Root cause: the N4 design threaded a new
+`document_guidance=` kwarg through five `frontend_build` call sites, and the R1
+test harness's fake adapter
+(`tests/r1_harness.py::frontend_build`) does not accept it → `TypeError` inside
+the Phase-7 build, which the build's outer handler converted to a FAILED
+lifecycle.
+
+Fix (a genuine design improvement, not a test edit): the adapter **derives**
+guidance from the `workspace` it is already handed
+(`guidance_for_workspace(workspace)` inside `HermesAdapter.frontend_build`), so
+no call site changes and every caller — including the pre-N4 harness — gets
+consistent guidance. The call-site kwargs were reverted; `revise.py` is pristine.
+Re-run: failure set **identical** to baseline.
 
 The 20 failures are **pre-existing and environmental**, proven by reproducing the
 identical failure set on a pristine `HEAD` copy with **zero N1 files present**:
@@ -118,12 +146,13 @@ node ids, same causes) and **no new** failure.
 
 ## Next action
 
-1. **N1 + N2 are pushed.** Remote = `830fd83b114eef0fe461fe7aa368ca9eae3f94af` (verified).
-2. Begin **N3 — Decision Engine & OpenViking** (deliverables: replaceable
-   DecisionProvider interface; Decision Intake classification; OpenViking
-   candidate retrieval + Decision Design ranking; bounded retrieval, provenance,
-   score validation, abstention, fallback; Laya retirement gated on parity).
-3. After N3: run the full suite, compare to the fingerprint above, then commit +
+1. **N1–N4 pushed.** N4 commit + remote SHA recorded after push.
+2. Begin **N5 — Regression, Replay & Recovery** (deliverables: full new-website
+   and revision lifecycle tests; Forma Atelier baseline replay; failure-injection
+   coverage — provider, document, retrieval, candidate, Git, crash, QA; exact
+   release identity + user approval verification; final engineering/quality
+   report).
+3. After N5: run the full suite, compare to the fingerprint above, then commit +
    push + verify remote SHA.
 
 ## Batch log
@@ -131,10 +160,10 @@ node ids, same causes) and **no new** failure.
 | Batch | Depends on | Status | Gate | Commit SHA | Remote SHA |
 |---|---|---|---|---|---|
 | N1 | — | **DONE (pushed)** | `scripts/run_tests.sh website-builder/tests` → 20 baseline failures (documented exception) | `1e4f48802` | `1e4f48802` ✓ verified |
-| N2 | N1 | **DONE (pushed)** | `scripts/run_tests.sh website-builder/tests` → +37 passed, 20 baseline failures (identical set) | `830fd83b1` | `830fd83b1` ✓ verified |
-| N3 | N1,N2 | IN PROGRESS | `scripts/run_tests.sh website-builder/tests` | — | — |
-| N4 | N1,N2,N3 | NOT STARTED | `scripts/run_tests.sh website-builder/tests` | — | — |
-| N5 | N1,N2,N3,N4 | NOT STARTED | `scripts/run_tests.sh website-builder/tests` | — | — |
+| N2 | N1 | **DONE (pushed)** | +37 passed, 20 baseline failures (identical set) | `830fd83b1` | `830fd83b1` ✓ verified |
+| N3 | N1,N2 | **DONE (pushed)** | +27 passed, 20 baseline failures (identical set) | `7c9daa42c` | `7c9daa42c` ✓ verified |
+| N4 | N1,N2,N3 | **DONE (pushed)** | +19 passed, 20 baseline failures (identical set; 20-new-failure blocker fixed) | _recorded after push_ | _recorded after push_ |
+| N5 | N1,N2,N3,N4 | IN PROGRESS | `scripts/run_tests.sh website-builder/tests` | — | — |
 
 ## Standing safety constraints (never relax)
 

@@ -51,8 +51,10 @@ from app.core.requirement_creator import (
 from app.core.document_store import (
     DEPLOYMENT_DOCUMENTS_KEY,
     document_records,
+    read_document,
     store_documents,
 )
+from app.core.document_guidance import guidance_for_workspace
 from app.qa.orchestrator import QAOrchestrator
 from app.sandbox.runner import ProjectRunner, WorkspaceError
 
@@ -494,20 +496,31 @@ class FrontendBuilder:
         scope: Optional[str] = None,
         readiness: Optional[str] = None,
     ) -> None:
-        """Compile PRD.md / Design.md and write them into the workspace (N2).
+        """Compile BOTH documents and write them into the workspace (N2).
 
-        Feature-flagged and DISABLED by default. When disabled this is a no-op,
-        so the workspace (and therefore the source snapshot and release commit)
-        is byte-identical to pre-N2.
+        Convenience wrapper used where both the brief and the accepted Design DNA
+        are already available (revisions, repairs). The initial build uses the
+        two split methods instead, because the Design DNA does not exist until
+        FRONTEND has produced it.
+        """
+        self._compile_and_store_prd(project_id, workspace, brief, scope=scope, readiness=readiness)
+        self._compile_and_store_design(project_id, workspace, brief, design_dna)
 
-        Documents are written BEFORE the caller takes the source fingerprint, so
-        they are part of the checked/published bytes — the roadmap requires
-        PRD.md, Design.md, and generated source to share one release commit.
+    def _compile_and_store_prd(
+        self,
+        project_id: str,
+        workspace: Path,
+        brief: Dict[str, Any],
+        *,
+        scope: Optional[str] = None,
+        readiness: Optional[str] = None,
+    ) -> None:
+        """Compile ``PRD.md`` from FAST's brief and write it (N2).
 
-        A compilation failure never fails the build: the documents are an
-        additive artifact, and losing them must not lose a website. The failure
-        is recorded in state for an operator, and no partial document is written
-        (``write_document`` validates before touching disk).
+        Called BEFORE the FRONTEND invocation, so the PRD is available to be
+        handed to FRONTEND as guidance (N4). Feature-flagged and DISABLED by
+        default: a no-op unless enabled, so the workspace is byte-identical to
+        pre-N2.
         """
         if not self.requirement_creator_config.enabled:
             return
@@ -515,55 +528,150 @@ class FrontendBuilder:
         with self.store.acquire_writer(project_id) as state:
             revision = state.revisions.source_revision
             requirements_version = state.revisions.requirements_version
-            design_dna_version = state.revisions.design_dna_version
             if not scope:
                 scope = state.brief.get("scope")
             if not readiness:
                 readiness = state.brief.get("readiness")
 
-        generator_version = self.requirement_creator_config.generator_version
         try:
             prd_text = compile_prd(
                 brief,
                 project_id=project_id,
                 source_revision=revision,
                 requirements_version=requirements_version,
-                generator_version=generator_version,
+                generator_version=self.requirement_creator_config.generator_version,
                 scope=scope,
                 readiness=readiness,
             )
+            prd, _ = store_documents(workspace, prd_text=prd_text)
+        except (ValueError, OSError) as exc:
+            self._record_document_failure(project_id, revision, exc, kind="prd")
+            return
+        self._record_documents(project_id, revision, prd=prd)
+
+    def _compile_and_store_design(
+        self,
+        project_id: str,
+        workspace: Path,
+        brief: Dict[str, Any],
+        design_dna: Optional[Dict[str, Any]],
+    ) -> None:
+        """Compile ``Design.md`` from the accepted Design DNA and write it (N2).
+
+        Called AFTER FRONTEND has produced the Design DNA, and BEFORE the checked
+        source fingerprint is taken, so Design.md is part of the published bytes.
+        Feature-flagged and DISABLED by default.
+        """
+        if not self.requirement_creator_config.enabled:
+            return
+
+        with self.store.acquire_writer(project_id) as state:
+            revision = state.revisions.source_revision
+            design_dna_version = state.revisions.design_dna_version
+
+        try:
             design_text = compile_design(
                 design_dna or {},
                 project_id=project_id,
                 source_revision=revision,
                 design_dna_version=design_dna_version,
-                generator_version=generator_version,
+                generator_version=self.requirement_creator_config.generator_version,
                 brief=brief,
             )
-            prd, design = store_documents(
-                workspace, prd_text=prd_text, design_text=design_text
-            )
+            _, design = store_documents(workspace, design_text=design_text)
         except (ValueError, OSError) as exc:
-            logger.warning(
-                "Requirement Creator: document compilation for %s failed (%s); "
-                "continuing without documents",
-                project_id,
-                type(exc).__name__,
-            )
-            with self.store.acquire_writer(project_id) as state:
-                state.deployment[DEPLOYMENT_DOCUMENTS_KEY] = {
-                    "error": type(exc).__name__,
-                    "source_revision": revision,
-                }
-                self.store.save(state)
+            self._record_document_failure(project_id, revision, exc, kind="design")
             return
+        self._record_documents(
+            project_id, revision, prd=read_document(workspace, "prd"), design=design
+        )
 
+    def _record_document_failure(
+        self, project_id: str, revision: int, exc: Exception, *, kind: str
+    ) -> None:
+        """Record a compilation failure for an operator; never fail the build.
+
+        The failure is merged into the existing per-revision record rather than
+        replacing it, so a later successful compile of the *other* document can
+        never silently erase a recorded failure (the N4 bug this method exists
+        to prevent).
+        """
+        logger.warning(
+            "Requirement Creator: %s document compilation for %s failed (%s); "
+            "continuing without that document",
+            kind,
+            project_id,
+            type(exc).__name__,
+        )
+        self._merge_document_record(
+            project_id, revision, records=None, error_kind=kind, error_code=type(exc).__name__
+        )
+
+    def _record_documents(
+        self, project_id: str, revision: int, *, prd=None, design=None
+    ) -> None:
+        """Persist the document digest record into the existing deployment map."""
         records = document_records(prd, design)
+        self._merge_document_record(project_id, revision, records=records)
+
+    def _merge_document_record(
+        self,
+        project_id: str,
+        revision: int,
+        *,
+        records: Optional[Dict[str, Any]],
+        error_kind: Optional[str] = None,
+        error_code: Optional[str] = None,
+    ) -> None:
+        """Merge the current documents/errors into ``state.deployment['documents']``.
+
+        Rules, all chosen so evidence is never lost:
+
+        * A **new revision** resets the entry set — documents from an earlier
+          revision are stale and must not be reported as this revision's.
+        * A **successful** compile for a kind replaces that kind's entry and
+          clears that kind's error (a genuine later fix).
+        * A **failure** records that kind's error and never removes an entry for
+          another kind, so PRD and Design evidence are independent.
+        """
         with self.store.acquire_writer(project_id) as state:
-            if records is None:
+            existing = state.deployment.get(DEPLOYMENT_DOCUMENTS_KEY)
+            existing = existing if isinstance(existing, dict) else {}
+            if existing.get("source_revision") != revision:
+                # A new revision: prior entries belong to a different source.
+                existing = {}
+
+            entries = {
+                e.get("kind"): e
+                for e in (existing.get("entries") or [])
+                if isinstance(e, dict) and e.get("kind")
+            }
+            errors = dict(existing.get("errors") or {})
+
+            if records:
+                for entry in records.get("entries") or []:
+                    kind = entry.get("kind")
+                    entries[kind] = entry
+                    errors.pop(kind, None)
+            if error_kind is not None:
+                errors[error_kind] = error_code
+
+            if not entries and not errors:
                 state.deployment.pop(DEPLOYMENT_DOCUMENTS_KEY, None)
-            else:
-                state.deployment[DEPLOYMENT_DOCUMENTS_KEY] = records
+                self.store.save(state)
+                return
+
+            merged: Dict[str, Any] = {
+                "entries": [entries[k] for k in sorted(entries)],
+                "digests": {k: entries[k]["digest"] for k in sorted(entries)},
+                "errors": errors,
+                "source_revision": revision,
+            }
+            if errors:
+                # Back-compat: the first failing kind's code, so an operator
+                # reading only `error` still learns a compile failed.
+                merged["error"] = errors[sorted(errors)[0]]
+            state.deployment[DEPLOYMENT_DOCUMENTS_KEY] = merged
             self.store.save(state)
 
     def _run_fixed_checks(self, project_id: str, workspace: Path) -> Dict[str, Any]:
@@ -834,6 +942,17 @@ Respond with a JSON summary:
 
             # Use Hermes FRONTEND to derive design and build
             if self.hermes_adapter is not None:
+                # N4: compile the PRD from FAST's brief BEFORE FRONTEND, so the
+                # validated requirement document can be handed to FRONTEND as
+                # bounded guidance. No-op unless the Requirement Creator is
+                # enabled; a compile failure never fails the build.
+                self._compile_and_store_prd(project_id, workspace, brief)
+                # N4: the adapter derives the bounded PRD/Design guidance from
+                # the workspace itself, so the PRD written just above reaches
+                # FRONTEND with no extra plumbing. Design.md is compiled AFTER
+                # FRONTEND has produced the Design DNA and therefore is not
+                # available to the initial build's own FRONTEND call — a real,
+                # documented ordering constraint, not an omission.
                 frontend_result = self.hermes_adapter.frontend_build(
                     project_id=project_id,
                     brief=brief,
@@ -937,10 +1056,10 @@ Respond with a JSON summary:
 
             # Run fixed cheap checks (deterministic, application-owned)
             # FRONTEND does NOT run these. Application code does.
-            # N2: compile + write PRD.md / Design.md BEFORE the source
-            # fingerprint is taken, so the documents are part of the checked
-            # and (later) published bytes. No-op unless the feature is enabled.
-            self._compile_and_store_documents(project_id, workspace, brief, design_dna)
+            # N2/N4: compile Design.md from the accepted Design DNA and write it
+            # BEFORE the source fingerprint is taken, so Design.md is part of the
+            # checked and (later) published bytes. No-op unless enabled.
+            self._compile_and_store_design(project_id, workspace, brief, design_dna)
             before = source_fingerprint(workspace)
             checks = self._run_fixed_checks(project_id, workspace)
             build_success = all(r.get("success", False) for r in checks.values())
@@ -1087,6 +1206,14 @@ Respond with a JSON summary:
                     # may advance RUNNING -> PREVIEW_READY.
                     state.revisions.design_dna_version = design_dna.get("version", 1) if design_dna else 0
                     state.design_dna = design_dna or {}
+                    # N4: record the guidance digest FRONTEND was given, so QA
+                    # and any later reader can prove they evaluate the same
+                    # document version. Absent when there are no documents.
+                    _guidance_block, guidance_digest = guidance_for_workspace(workspace)
+                    if guidance_digest:
+                        state.deployment["guidance_digest"] = guidance_digest
+                    else:
+                        state.deployment.pop("guidance_digest", None)
                 else:
                     self.store.transition_lifecycle_locked(state, ProjectLifecycle.FAILED)
                     failure: Dict[str, Any] = {
