@@ -129,6 +129,11 @@ class RevisionState:
 
     requirements_version: int = 0
     design_dna_version: int = 0
+    #: N6: the pre-build Design Guidance version (compiled from the brief +
+    #: Decision Engine decision, BEFORE FRONTEND). Deliberately SEPARATE from
+    #: ``design_dna_version`` (post-build, produced BY FRONTEND), so a reader can
+    #: always tell which document an invocation was given.
+    design_guidance_version: int = 0
     source_revision: int = 0
     qa_revision: int = 0
     preview_revision: int = 0

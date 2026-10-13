@@ -37,14 +37,18 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 
 from app.core.document_contracts import (
     DESIGN_FILE_NAME,
+    DESIGN_GUIDANCE_FILE_NAME,
     DOCUMENT_KIND_DESIGN,
+    DOCUMENT_KIND_DESIGN_GUIDANCE,
     DOCUMENT_KIND_PRD,
+    DOCUMENT_KINDS,
     PRD_FILE_NAME,
     DocumentIdentity,
     assess_presence,
     identity_from_front_matter,
     parse_front_matter,
     validate_design,
+    validate_design_guidance,
     validate_prd,
 )
 
@@ -86,6 +90,19 @@ def document_path(workspace: Path, kind: str) -> Path:
         return Path(workspace) / PRD_FILE_NAME
     if kind == DOCUMENT_KIND_DESIGN:
         return Path(workspace) / DESIGN_FILE_NAME
+    if kind == DOCUMENT_KIND_DESIGN_GUIDANCE:
+        return Path(workspace) / DESIGN_GUIDANCE_FILE_NAME
+    raise ValueError(f"unknown document kind: {kind!r}")
+
+
+def _validate(kind: str, text: str):
+    """Validate ``text`` for ``kind``, returning ``(identity, violations)``."""
+    if kind == DOCUMENT_KIND_PRD:
+        return validate_prd(text)
+    if kind == DOCUMENT_KIND_DESIGN:
+        return validate_design(text)
+    if kind == DOCUMENT_KIND_DESIGN_GUIDANCE:
+        return validate_design_guidance(text)
     raise ValueError(f"unknown document kind: {kind!r}")
 
 
@@ -99,12 +116,7 @@ def write_document(workspace: Path, kind: str, text: str) -> StoredDocument:
     The write is atomic (temp file + ``os.replace``) so a crash cannot leave a
     half-written document inside the release source.
     """
-    if kind == DOCUMENT_KIND_PRD:
-        identity, violations = validate_prd(text)
-    elif kind == DOCUMENT_KIND_DESIGN:
-        identity, violations = validate_design(text)
-    else:
-        raise ValueError(f"unknown document kind: {kind!r}")
+    identity, violations = _validate(kind, text)
 
     if violations:
         raise ValueError(
@@ -144,10 +156,7 @@ def read_document(workspace: Path, kind: str) -> Optional[StoredDocument]:
     except (OSError, UnicodeDecodeError):
         return None
 
-    if kind == DOCUMENT_KIND_PRD:
-        identity, violations = validate_prd(text)
-    else:
-        identity, violations = validate_design(text)
+    identity, violations = _validate(kind, text)
     if violations or identity is None:
         return None
     return StoredDocument(
@@ -178,6 +187,21 @@ def store_documents(
         else None
     )
     return prd, design
+
+
+def store_design_guidance(workspace: Path, guidance_text: str) -> StoredDocument:
+    """Write ``DesignGuidance.md`` (N6, pre-build) and return its record.
+
+    A dedicated function rather than a third slot in :func:`store_documents`, so
+    the existing ``(prd, design)`` contract that callers already depend on is
+    untouched.
+    """
+    return write_document(workspace, DOCUMENT_KIND_DESIGN_GUIDANCE, guidance_text)
+
+
+def read_design_guidance(workspace: Path) -> Optional[StoredDocument]:
+    """Read ``DesignGuidance.md`` (N6), or ``None`` when absent/unusable."""
+    return read_document(workspace, DOCUMENT_KIND_DESIGN_GUIDANCE)
 
 
 def read_documents(workspace: Path) -> Tuple[Optional[StoredDocument], Optional[StoredDocument]]:
@@ -242,7 +266,7 @@ def verify_records_match_workspace(
     entries = records.get("entries") or []
     for entry in entries:
         kind = entry.get("kind")
-        if kind not in (DOCUMENT_KIND_PRD, DOCUMENT_KIND_DESIGN):
+        if kind not in DOCUMENT_KINDS:
             return f"unknown document kind in records: {kind!r}"
         stored = read_document(workspace, kind)
         if stored is None:
@@ -262,6 +286,8 @@ __all__ = [
     "write_document",
     "read_document",
     "store_documents",
+    "store_design_guidance",
+    "read_design_guidance",
     "read_documents",
     "documents_present",
     "document_presence_record",

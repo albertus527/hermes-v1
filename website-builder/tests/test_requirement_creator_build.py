@@ -302,5 +302,108 @@ class AdapterGuidanceTests(unittest.TestCase):
             self.assertIn("PRD & DESIGN GUIDANCE", prompt)
 
 
+class DesignGuidanceBuildTests(_Base):
+    """N6-C: pre-build DesignGuidance.md is written only in ACTIVE design mode."""
+
+    def _builder(self, *, design_mode):
+        from app.core.decision_modes import DecisionEngineConfig, DecisionEngineMode
+        from app.core.decision_engine import DecisionEngine
+        from app.core.decision_provider import (
+            DecisionProviderRegistry, DesignCandidate,
+        )
+
+        class _Provider:
+            @property
+            def name(self):
+                return "test"
+
+            def classify_intake(self, *a, **k):
+                raise AssertionError("intake not used")
+
+            def propose_design_candidates(self, context, *, limit):
+                return (DesignCandidate(
+                    candidate_id="c1", label="Editorial",
+                    descriptor="editorial grid, smooth scroll",
+                    palette=("#101014",),
+                    source_uri="viking://design/x", source_revision="r1",
+                    score=0.9,
+                ),)
+
+        registry = DecisionProviderRegistry()
+        registry.register(_Provider())
+        engine = DecisionEngine(registry, provider_name="test")
+        return FrontendBuilder(
+            self.runner, self.store, hermes_adapter=self.mock_adapter,
+            requirement_creator_config=RequirementCreatorConfig(enabled=True),
+            decision_engine=engine,
+            decision_engine_config=DecisionEngineConfig(design_mode=design_mode),
+        )
+
+    def test_disabled_design_mode_writes_no_guidance(self):
+        from app.core.decision_modes import DecisionEngineMode
+        from app.core.document_contracts import DESIGN_GUIDANCE_FILE_NAME
+
+        builder = self._builder(design_mode=DecisionEngineMode.DISABLED)
+        result = self._build(builder, "gd-off",
+                             {"name": "N", "what": "w", "why": "y"})
+        assert result.workspace is not None
+        self.assertFalse((result.workspace / DESIGN_GUIDANCE_FILE_NAME).exists())
+
+    def test_shadow_design_mode_writes_no_guidance(self):
+        from app.core.decision_modes import DecisionEngineMode
+        from app.core.document_contracts import DESIGN_GUIDANCE_FILE_NAME
+
+        builder = self._builder(design_mode=DecisionEngineMode.SHADOW)
+        result = self._build(builder, "gd-shadow",
+                             {"name": "N", "what": "w", "why": "y"})
+        assert result.workspace is not None
+        self.assertFalse((result.workspace / DESIGN_GUIDANCE_FILE_NAME).exists())
+
+    def test_active_design_mode_writes_grounded_guidance(self):
+        from app.core.decision_modes import DecisionEngineMode
+        from app.core.document_contracts import DESIGN_GUIDANCE_FILE_NAME
+
+        builder = self._builder(design_mode=DecisionEngineMode.ACTIVE)
+        result = self._build(builder, "gd-on",
+                             {"name": "Northcut", "what": "barbershop", "why": "wa"})
+        assert result.workspace is not None
+        path = result.workspace / DESIGN_GUIDANCE_FILE_NAME
+        self.assertTrue(path.exists())
+        text = path.read_text(encoding="utf-8")
+        # Grounded in the brief and in the candidate's real provenance.
+        self.assertIn("barbershop", text)
+        self.assertIn("viking://design/x@r1", text)
+
+    def test_active_guidance_is_recorded_and_written_before_frontend(self):
+        """Guidance exists on disk when FRONTEND is invoked (pre-build)."""
+        from app.core.decision_modes import DecisionEngineMode
+        from app.core.document_contracts import DESIGN_GUIDANCE_FILE_NAME
+
+        builder = self._builder(design_mode=DecisionEngineMode.ACTIVE)
+        seen = {}
+
+        def _capture(*, workspace, **kwargs):
+            seen["guidance_at_frontend"] = (
+                workspace / DESIGN_GUIDANCE_FILE_NAME
+            ).exists()
+            return {"success": True, "design_dna": _dna()}
+
+        self.mock_adapter.frontend_build.side_effect = _capture
+        self._build(builder, "gd-order",
+                    {"name": "Northcut", "what": "barbershop", "why": "wa"})
+        self.assertTrue(seen["guidance_at_frontend"])
+
+    def test_active_guidance_digest_recorded_in_deployment(self):
+        from app.core.decision_modes import DecisionEngineMode
+
+        builder = self._builder(design_mode=DecisionEngineMode.ACTIVE)
+        self._build(builder, "gd-digest",
+                    {"name": "Northcut", "what": "barbershop", "why": "wa"})
+        state = self.store.load("gd-digest")
+        assert state is not None
+        records = state.deployment[DEPLOYMENT_DOCUMENTS_KEY]
+        self.assertIn("design_guidance", records["digests"])
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

@@ -54,19 +54,36 @@ PRD_SCHEMA_VERSION = 1
 #: Schema version of the ``Design.md`` front matter + body contract.
 DESIGN_SCHEMA_VERSION = 1
 
-#: The two canonical document kinds. A closed set: a document is one of these.
+#: Schema version of the ``DesignGuidance.md`` front matter + body contract.
+#:
+#: DesignGuidance is the **pre-build** design document (N6): it is compiled from
+#: FAST's brief plus the Decision Engine's selected, provenance-validated design
+#: candidates, and is handed to FRONTEND *before* it runs. It is deliberately a
+#: SEPARATE kind from ``Design.md`` (post-build, compiled from the Design DNA
+#: FRONTEND produces), so the two can never be confused: one is an input the
+#: application decided, the other is an output FRONTEND decided.
+DESIGN_GUIDANCE_SCHEMA_VERSION = 1
+
+#: The canonical document kinds. A closed set: a document is one of these.
 DOCUMENT_KIND_PRD = "prd"
 DOCUMENT_KIND_DESIGN = "design"
-DOCUMENT_KINDS: Tuple[str, ...] = (DOCUMENT_KIND_PRD, DOCUMENT_KIND_DESIGN)
+DOCUMENT_KIND_DESIGN_GUIDANCE = "design_guidance"
+DOCUMENT_KINDS: Tuple[str, ...] = (
+    DOCUMENT_KIND_PRD,
+    DOCUMENT_KIND_DESIGN,
+    DOCUMENT_KIND_DESIGN_GUIDANCE,
+)
 
 #: Canonical on-disk file names, relative to the generated website source.
 PRD_FILE_NAME = "PRD.md"
 DESIGN_FILE_NAME = "Design.md"
+DESIGN_GUIDANCE_FILE_NAME = "DesignGuidance.md"
 
 #: Map a document kind to its canonical file name.
 DOCUMENT_FILE_NAMES: Mapping[str, str] = {
     DOCUMENT_KIND_PRD: PRD_FILE_NAME,
     DOCUMENT_KIND_DESIGN: DESIGN_FILE_NAME,
+    DOCUMENT_KIND_DESIGN_GUIDANCE: DESIGN_GUIDANCE_FILE_NAME,
 }
 
 # ---------------------------------------------------------------------------
@@ -91,6 +108,11 @@ ERR_MISSING_SECTION = "MISSING_SECTION"
 ERR_EMPTY_SECTION = "EMPTY_SECTION"
 ERR_LEGACY_CONTRADICTION = "LEGACY_CONTRADICTION"
 
+#: N6: a recorded guidance snapshot does not match the documents actually used.
+#: Raised by the QA/VISION parity check when the recorded evidence and the
+#: workspace documents disagree — a hard inconsistency, never inferred away.
+ERR_GUIDANCE_VERSION_MISMATCH = "GUIDANCE_VERSION_MISMATCH"
+
 #: Front-matter fields every document must declare.
 REQUIRED_FRONT_MATTER_FIELDS: Tuple[str, ...] = (
     "document",
@@ -105,6 +127,7 @@ REQUIRED_FRONT_MATTER_FIELDS: Tuple[str, ...] = (
 OPTIONAL_FRONT_MATTER_FIELDS: Tuple[str, ...] = (
     "requirements_version",
     "design_dna_version",
+    "design_guidance_version",
 )
 
 #: The complete set of recognised front-matter fields. An unknown field is a
@@ -129,10 +152,26 @@ DESIGN_REQUIRED_SECTIONS: Tuple[str, ...] = (
     "typography",
     "layout",
 )
+#: N6: the pre-build Design Guidance sections. These mirror the useful, grounded
+#: visual guidance the approved design requires (composition, typography, colour,
+#: imagery, motion, brand character, and approved resources). Every section is
+#: required to be PRESENT; a section the evidence does not support carries an
+#: explicit UNRESOLVED marker rather than a fabricated value, so "present but
+#: honest" is checkable and an empty section is a violation.
+DESIGN_GUIDANCE_REQUIRED_SECTIONS: Tuple[str, ...] = (
+    "brand_character",
+    "composition",
+    "typography",
+    "color",
+    "imagery",
+    "motion",
+    "approved_resources",
+)
 
 REQUIRED_SECTIONS_BY_KIND: Mapping[str, Tuple[str, ...]] = {
     DOCUMENT_KIND_PRD: PRD_REQUIRED_SECTIONS,
     DOCUMENT_KIND_DESIGN: DESIGN_REQUIRED_SECTIONS,
+    DOCUMENT_KIND_DESIGN_GUIDANCE: DESIGN_GUIDANCE_REQUIRED_SECTIONS,
 }
 
 #: Project ids are the same slugs the sandbox runner accepts. Kept as a local
@@ -187,6 +226,9 @@ class DocumentIdentity:
     generator_version: int
     requirements_version: int = 0
     design_dna_version: int = 0
+    #: N6: the pre-build Design Guidance version this document records. Distinct
+    #: from ``design_dna_version`` (post-build) so the two can never be confused.
+    design_guidance_version: int = 0
 
     @property
     def document_id(self) -> str:
@@ -429,7 +471,11 @@ def identity_from_front_matter(
     schema_version = _parse_int(
         front_matter["schema_version"], field="schema_version", minimum=1
     )
-    expected_schema = PRD_SCHEMA_VERSION if kind == DOCUMENT_KIND_PRD else DESIGN_SCHEMA_VERSION
+    expected_schema = {
+        DOCUMENT_KIND_PRD: PRD_SCHEMA_VERSION,
+        DOCUMENT_KIND_DESIGN: DESIGN_SCHEMA_VERSION,
+        DOCUMENT_KIND_DESIGN_GUIDANCE: DESIGN_GUIDANCE_SCHEMA_VERSION,
+    }[kind]
     if schema_version != expected_schema:
         raise DocumentContractError(
             ERR_INVALID_SCHEMA_VERSION,
@@ -454,6 +500,10 @@ def identity_from_front_matter(
         design_dna_version=_parse_int(
             front_matter.get("design_dna_version", "0"),
             field="design_dna_version",
+        ),
+        design_guidance_version=_parse_int(
+            front_matter.get("design_guidance_version", "0"),
+            field="design_guidance_version",
         ),
     )
 
@@ -515,6 +565,13 @@ def validate_prd(text: str) -> Tuple[Optional[DocumentIdentity], List[DocumentVi
 def validate_design(text: str) -> Tuple[Optional[DocumentIdentity], List[DocumentViolation]]:
     """Validate a ``Design.md`` document (kind pinned to ``design``)."""
     return validate_document(text, expected_kind=DOCUMENT_KIND_DESIGN)
+
+
+def validate_design_guidance(
+    text: str,
+) -> Tuple[Optional[DocumentIdentity], List[DocumentViolation]]:
+    """Validate a ``DesignGuidance.md`` document (N6, kind pinned to ``design_guidance``)."""
+    return validate_document(text, expected_kind=DOCUMENT_KIND_DESIGN_GUIDANCE)
 
 
 def is_valid(text: str, *, expected_kind: Optional[str] = None) -> bool:
@@ -623,18 +680,23 @@ def design_dna_compatible(
 __all__ = [
     "PRD_SCHEMA_VERSION",
     "DESIGN_SCHEMA_VERSION",
+    "DESIGN_GUIDANCE_SCHEMA_VERSION",
     "DOCUMENT_KIND_PRD",
     "DOCUMENT_KIND_DESIGN",
+    "DOCUMENT_KIND_DESIGN_GUIDANCE",
     "DOCUMENT_KINDS",
     "PRD_FILE_NAME",
     "DESIGN_FILE_NAME",
+    "DESIGN_GUIDANCE_FILE_NAME",
     "DOCUMENT_FILE_NAMES",
     "REQUIRED_FRONT_MATTER_FIELDS",
     "OPTIONAL_FRONT_MATTER_FIELDS",
     "RECOGNISED_FRONT_MATTER_FIELDS",
     "PRD_REQUIRED_SECTIONS",
     "DESIGN_REQUIRED_SECTIONS",
+    "DESIGN_GUIDANCE_REQUIRED_SECTIONS",
     "REQUIRED_SECTIONS_BY_KIND",
+    "ERR_GUIDANCE_VERSION_MISMATCH",
     "DocumentViolation",
     "DocumentIdentity",
     "DocumentPresence",
@@ -648,6 +710,7 @@ __all__ = [
     "validate_document",
     "validate_prd",
     "validate_design",
+    "validate_design_guidance",
     "is_valid",
     "assess_presence",
     "design_dna_compatible",

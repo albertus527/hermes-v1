@@ -52,8 +52,11 @@ from app.core.document_store import (
     DEPLOYMENT_DOCUMENTS_KEY,
     document_records,
     read_document,
+    store_design_guidance,
     store_documents,
 )
+from app.core.design_guidance import compile_design_guidance
+from app.core.decision_modes import DecisionEngineConfig, DecisionEngineMode
 from app.core.document_guidance import guidance_for_workspace
 from app.qa.orchestrator import QAOrchestrator
 from app.sandbox.runner import ProjectRunner, WorkspaceError
@@ -452,6 +455,8 @@ class FrontendBuilder:
         web3forms_access_key: Optional[str] = None,
         critic_scanner=None,
         requirement_creator_config: Optional[RequirementCreatorConfig] = None,
+        decision_engine=None,
+        decision_engine_config: Optional[DecisionEngineConfig] = None,
     ):
         self.preview_orchestrator = preview_orchestrator
         self.runner = runner
@@ -471,6 +476,12 @@ class FrontendBuilder:
         self.requirement_creator_config = (
             requirement_creator_config or RequirementCreatorConfig()
         )
+        # N6: the optional Decision Engine + its mode config. When design mode is
+        # active the builder compiles a pre-build DesignGuidance.md before the
+        # initial FRONTEND call. Default: no engine / disabled, so the build path
+        # is byte-identical to pre-N6.
+        self.decision_engine = decision_engine
+        self.decision_engine_config = decision_engine_config or DecisionEngineConfig()
 
     def _copy_starter(self, workspace: Path) -> None:
         """Copy the fixed frontend starter into the project workspace."""
@@ -549,6 +560,73 @@ class FrontendBuilder:
             return
         self._record_documents(project_id, revision, prd=prd)
 
+    def _compile_and_store_design_guidance(
+        self,
+        project_id: str,
+        workspace: Path,
+        brief: Dict[str, Any],
+    ) -> Optional[str]:
+        """Compile the pre-build ``DesignGuidance.md`` and write it (N6).
+
+        Called BEFORE the initial FRONTEND invocation. It runs the Decision
+        Engine's Design job (bounded, provenance-validated candidates) and
+        compiles the selected evidence into a grounded guidance document.
+
+        Gated: only when ``decision_engine_config.design_mode`` is ACTIVE. In
+        ``disabled`` and ``shadow`` modes this is a no-op, so the initial build
+        is byte-identical to pre-N6. A Decision Engine abstention or outage is
+        NOT an error: the guidance is compiled from the brief alone, honestly
+        marked UNRESOLVED where the evidence does not reach. A compile failure
+        never fails the build.
+
+        Returns the guidance text written, or ``None`` when nothing was written.
+        """
+        if not self.decision_engine_config.design_active:
+            return None
+        if not self.requirement_creator_config.enabled:
+            # The guidance is a canonical document; without the Requirement
+            # Creator enabled there is no document pipeline to carry it.
+            return None
+
+        with self.store.acquire_writer(project_id) as state:
+            revision = state.revisions.source_revision
+            guidance_version = state.revisions.design_guidance_version
+
+        decision = None
+        if self.decision_engine is not None:
+            try:
+                decision = self.decision_engine.decide_design(
+                    {
+                        "query": " ".join(
+                            str(brief.get(k) or "").strip()
+                            for k in ("name", "what", "why")
+                            if str(brief.get(k) or "").strip()
+                        ),
+                        "design_dna": {},  # pre-build: no DNA exists yet
+                        "source_revision": revision,
+                    }
+                )
+            except Exception:  # noqa: BLE001 - engine never breaks the build
+                decision = None
+
+        try:
+            text = compile_design_guidance(
+                brief,
+                decision,
+                project_id=project_id,
+                source_revision=revision,
+                design_guidance_version=guidance_version,
+                generator_version=self.requirement_creator_config.generator_version,
+            )
+            stored = store_design_guidance(workspace, text)
+        except (ValueError, OSError) as exc:
+            self._record_document_failure(
+                project_id, revision, exc, kind="design_guidance"
+            )
+            return None
+        self._record_documents(project_id, revision, design_guidance=stored)
+        return text
+
     def _compile_and_store_design(
         self,
         project_id: str,
@@ -608,10 +686,23 @@ class FrontendBuilder:
         )
 
     def _record_documents(
-        self, project_id: str, revision: int, *, prd=None, design=None
+        self, project_id: str, revision: int, *, prd=None, design=None,
+        design_guidance=None,
     ) -> None:
-        """Persist the document digest record into the existing deployment map."""
+        """Persist the document digest record into the existing deployment map.
+
+        N6 adds the pre-build ``design_guidance`` document. It is recorded through
+        the SAME per-kind merge as PRD/Design, so guidance evidence can never
+        erase — or be erased by — the other documents.
+        """
         records = document_records(prd, design)
+        guidance_entry = (
+            design_guidance.to_record() if design_guidance is not None else None
+        )
+        if guidance_entry is not None:
+            if records is None:
+                records = {"entries": [], "digests": {}}
+            records["entries"] = list(records["entries"]) + [guidance_entry]
         self._merge_document_record(project_id, revision, records=records)
 
     def _merge_document_record(
@@ -947,6 +1038,12 @@ Respond with a JSON summary:
                 # bounded guidance. No-op unless the Requirement Creator is
                 # enabled; a compile failure never fails the build.
                 self._compile_and_store_prd(project_id, workspace, brief)
+                # N6: compile the pre-build DesignGuidance.md from the brief plus
+                # the Decision Engine's selected, provenance-validated candidates.
+                # ACTIVE design mode only; a no-op in disabled/shadow, and a
+                # Decision Engine abstention/outage degrades to brief-only
+                # guidance (honestly UNRESOLVED) rather than failing the build.
+                self._compile_and_store_design_guidance(project_id, workspace, brief)
                 # N4: the adapter derives the bounded PRD/Design guidance from
                 # the workspace itself, so the PRD written just above reaches
                 # FRONTEND with no extra plumbing. Design.md is compiled AFTER

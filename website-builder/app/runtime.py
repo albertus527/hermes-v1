@@ -1080,6 +1080,8 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
         web3forms_access_key=config.web3forms_access_key,
         critic_scanner=critic_scanner,
         requirement_creator_config=config.requirement_creator_config,
+        decision_engine=decision_engine,
+        decision_engine_config=config.decision_engine_config,
     )
 
     # Revision orchestrator.
