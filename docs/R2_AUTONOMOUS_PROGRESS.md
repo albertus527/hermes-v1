@@ -34,12 +34,12 @@ If either hash differs, **STOP** and escalate — the approved roadmap has chang
 
 | Field | Value |
 |---|---|
-| Current batch | **N1 — Architecture & Document Contracts** |
-| Phase | Deliverables complete; **committed locally**, push HELD pending operator approval |
-| Batch status | **COMMITTED LOCALLY — NOT PUSHED** |
+| Current batch | **N2 — Requirement Creator & Git Documents** |
+| Phase | N1 pushed & verified; starting N2 |
+| Batch status | N1 **DONE (pushed)** · N2 IN PROGRESS |
 | Last verified Git SHA (pre-N1 baseline) | `d0016be5a0cb7a860251f338d84e00ac688242f6` |
-| N1 commit (local, unpushed) | `HEAD` of `feature/website-r2-redesign` — resolve with `git -C <worktree> rev-parse HEAD` (a ledger inside a commit cannot name its own hash) |
-| Remote SHA | `d0016be5a0cb7a860251f338d84e00ac688242f6` — **unchanged; push held** |
+| N1 commit | `1e4f488023befa22c26a427929562e08cdb4c46c` |
+| Remote SHA | `1e4f488023befa22c26a427929562e08cdb4c46c` — **matches local, verified** |
 | Working tree | clean except untracked `autodev/` and `tests/autodev/` (preserved, never staged) |
 
 ## Latest tests
@@ -65,27 +65,67 @@ None of these files import `document_contracts`; the N1 module has **no producti
 importer** (verified: only `tests/test_document_contracts.py` and
 `tools/mutation_check_n1.py`).
 
+## Baseline failure fingerprint (MANDATORY — compare after every batch)
+
+Exact, reproducible fingerprint of the 20 pre-existing full-suite failures.
+**A new failure, a changed failure mode, or a changed count is a BLOCKER.**
+Do NOT change existing tests to hide these; do NOT silently redefine the baseline.
+
+| # | Test node id | Failure cause | Environment condition |
+|---|---|---|---|
+| 1–18 | `test_r2_hydration.py::<18 nodes>` (see below) | Git fixture builds commits via `git commit-tree <sha> …` where the referenced tree/object is **absent from this clone** (`git cat-file -t <sha>` → *"could not get object info"*); `git commit-tree` exits 128 → `subprocess.CalledProcessError` | This clone lacks the fixture's referenced objects (not shallow: `git rev-parse --is-shallow-repository` = false) |
+| 19 | `test_design_resources.py::test_runtime_does_not_start_when_a_required_capability_is_missing` | Under the hermetic test env, `app/runtime.py main()` gets `composition = None`; `reconcile_stranded_projects(composition.store)` → `AttributeError: 'NoneType' object has no attribute 'store'` before the test's expected exit path | Hermetic `env -i` test environment / runtime deps absent |
+| 20 | `test_suite_hygiene.py::test_the_escape_scanner_would_catch_a_real_one` | The canonical runner uses **Python 3.11.16**, where an invalid escape sequence emits `DeprecationWarning`; the scanner records only `SyntaxWarning` (Python 3.12 behaviour), so its self-test finds nothing | Interpreter: runner venv = CPython 3.11.16; ambient = 3.12.3 |
+
+The 18 `test_r2_hydration.py` nodes:
+```
+test_a_symlinked_staging_root_is_refused
+test_an_executable_blob_is_written_and_accepted
+test_blob_submodules_are_refused
+test_blob_symlinks_are_refused
+test_blob_unsafe_paths_are_refused[../escape.txt]
+test_blob_unsafe_paths_are_refused[..]
+test_blob_unsafe_paths_are_refused[./relative.txt]
+test_blob_unsafe_paths_are_refused[.git/config]
+test_blob_unsafe_paths_are_refused[.git]
+test_blob_unsafe_paths_are_refused[a/../../escape.txt]
+test_blob_unsafe_paths_are_refused[a/.git/hooks/pre-commit]
+test_blob_unsafe_paths_are_refused[back\\slash.txt]
+test_blob_unsafe_paths_are_refused[colon:name.txt]
+test_canonical_lfs_pointer_is_refused_before_the_bytes_hit_disk
+test_inert_instruction_files_are_ordinary_committed_bytes
+test_lfs_is_never_executed_or_filtered
+test_non_canonical_lfs_like_bytes_are_ordinary_committed_bytes
+test_ordinary_text_mentioning_lfs_is_accepted
+```
+
+**Baseline exception (documented, not a claim of green):** the full suite is
+**NOT** green on this host. Baseline = `20 failed, 2 skipped` with the fingerprint
+above. A batch is acceptable iff its run yields **the same 20 failures** (same
+node ids, same causes) and **no new** failure.
+
 ## Pending decisions / escalations
 
 | ID | Question | Options | Status |
 |---|---|---|---|
-| D1 | Gate exits 1 due to 20 pre-existing environmental failures; commit + push, or hold? | (a) commit+push · (b) commit local, hold push · (c) hold all · (d) no commit | **RESOLVED — operator chose (b): commit locally, HOLD push.** |
-| **D2** | When may the held N1 commit be pushed to `origin/feature/website-r2-redesign`? | Awaiting explicit operator "push N1" instruction | **OPEN — push HELD** |
+| D1 | Gate exits 1 due to 20 pre-existing environmental failures; commit + push, or hold? | (a) commit+push · (b) commit local, hold push · (c) hold all · (d) no commit | **RESOLVED — operator chose (b), then authorized the push under D2.** |
+| D2 | Authorize the held N1 push + autonomous N2–N5? | — | **RESOLVED — operator authorized non-force fast-forward push + autonomous continuation.** |
 
 ## Next action
 
-1. **HOLD the push.** N1 is committed locally at `5768467`; remote is untouched.
-2. On operator approval ("push N1"): `git push origin feature/website-r2-redesign`
-   (fast-forward only, no force), then verify the exact remote SHA matches `5768467`.
-3. After a verified push, update the ledger's remote SHA and proceed to N2 —
-   **only** on explicit direction.
+1. **N1 is pushed** — remote `origin/feature/website-r2-redesign` = `1e4f488023befa22c26a427929562e08cdb4c46c` (verified).
+2. Begin **N2 — Requirement Creator & Git Documents** (deliverables: PRD + Design
+   Guidance compilers, validated generation, document identity in the revision
+   flow, legacy preserved, no new publication state machine).
+3. After N2: run the full suite, compare to the fingerprint above, then commit +
+   push + verify remote SHA.
 
 ## Batch log
 
 | Batch | Depends on | Status | Gate | Commit SHA | Remote SHA |
 |---|---|---|---|---|---|
-| N1 | — | **COMMITTED LOCALLY (push held)** | `scripts/run_tests.sh website-builder/tests` (20 pre-existing failures) | `HEAD` (unpushed) | _held — remote unchanged_ |
-| N2 | N1 | NOT STARTED | `scripts/run_tests.sh website-builder/tests` | — | — |
+| N1 | — | **DONE (pushed)** | `scripts/run_tests.sh website-builder/tests` → 20 baseline failures (documented exception) | `1e4f48802` | `1e4f48802` ✓ verified |
+| N2 | N1 | IN PROGRESS | `scripts/run_tests.sh website-builder/tests` | — | — |
 | N3 | N1,N2 | NOT STARTED | `scripts/run_tests.sh website-builder/tests` | — | — |
 | N4 | N1,N2,N3 | NOT STARTED | `scripts/run_tests.sh website-builder/tests` | — | — |
 | N5 | N1,N2,N3,N4 | NOT STARTED | `scripts/run_tests.sh website-builder/tests` | — | — |
