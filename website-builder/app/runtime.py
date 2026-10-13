@@ -91,6 +91,9 @@ from app.core.decision_modes import (
     DecisionEngineConfig,
     config_from_mapping as decision_engine_config_from_mapping,
 )
+from app.core.decision_engine import DecisionEngine
+from app.core.decision_provider import DecisionProviderRegistry
+from app.core.openviking_decision import OpenVikingDecisionProvider
 from app.core.state import ProjectStateStore, reconcile_stranded_projects
 from app.core.registry import ConversationRegistryStore, DuplicateProjectName, slugify_display_name
 from app.core.secrets import BYPASS_STORE_DIRNAME, BypassSecretStore, migrate_legacy_bypass_secrets
@@ -314,6 +317,46 @@ def load_runtime_config(config_path: Optional[Path] = None) -> RuntimeConfig:
         laya_config=laya_config,
         requirement_creator_config=requirement_creator_config,
         decision_engine_config=decision_engine_config,
+    )
+
+
+def _build_decision_engine(
+    engine_config: DecisionEngineConfig, openviking_adapter
+) -> Optional[DecisionEngine]:
+    """Construct a Decision Engine, or ``None`` when both modes are disabled.
+
+    Returning ``None`` when disabled is deliberate: a disabled deployment then
+    builds no engine and injects ``None`` into the intake processor, so the
+    intake path is provably byte-identical to pre-N6.
+
+    The registry always contains the deterministic provider (the safe fallback).
+    The OpenViking candidate provider is registered only when an OpenViking
+    adapter is present and enabled, so a disabled retrieval backend can never be
+    consulted. ``score_floor`` and ``max_candidates`` come from configuration and
+    are themselves clamped inside the config parser.
+    """
+    if not engine_config.intake_enabled and not engine_config.design_enabled:
+        return None
+
+    registry = DecisionProviderRegistry()
+    if openviking_adapter is not None:
+        provider = OpenVikingDecisionProvider(openviking_adapter)
+        if provider.enabled:
+            registry.register(provider)
+
+    # The intake and design jobs may use different providers. When a mode names
+    # one, that name is resolved by the engine; an unknown name falls back to the
+    # deterministic provider rather than failing.
+    provider_name = (
+        engine_config.design_provider
+        if engine_config.design_enabled
+        else engine_config.intake_provider
+    )
+    return DecisionEngine(
+        registry,
+        provider_name=provider_name,
+        score_floor=engine_config.score_floor,
+        max_candidates=engine_config.max_candidates,
     )
 
 
@@ -839,9 +882,34 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
     laya = LayaContextPreparer(config.laya_config, openviking)
     logger.info("D4b laya preparer: %s", config.laya_config.to_dict())
 
+    # N6: the Decision Engine. Constructed ONLY when at least one mode is
+    # enabled, so a default (disabled) deployment builds no engine and the
+    # intake/build paths are byte-identical to pre-N6. The OpenViking candidate
+    # provider is registered only when OpenViking is enabled; the deterministic
+    # provider is always the registry's fallback.
+    decision_engine = _build_decision_engine(
+        config.decision_engine_config, openviking
+    )
+    logger.info(
+        "N6 decision engine: %s",
+        {
+            "intake_mode": config.decision_engine_config.intake_mode.value,
+            "design_mode": config.decision_engine_config.design_mode.value,
+            "constructed": decision_engine is not None,
+        },
+    )
+
     # Intake processor. D4b: the optional Laya context preparer is injected; it
     # never decides scope/requirements/actions and never mutates state.
-    intake = IntakeProcessor(store, hermes_adapter=hermes, laya=laya)
+    # N6: the optional Decision Engine + its mode config are injected; by default
+    # both modes are disabled so intake is unchanged.
+    intake = IntakeProcessor(
+        store,
+        hermes_adapter=hermes,
+        laya=laya,
+        decision_engine=decision_engine,
+        decision_engine_config=config.decision_engine_config,
+    )
 
     # Reference intake
     references = ReferenceIntake(store, hermes_adapter=hermes)

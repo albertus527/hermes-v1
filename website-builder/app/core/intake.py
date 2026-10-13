@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 
 from app.channels.telegram import NormalizedMessage
 from app.core.authz import require_mutating_role
+from app.core.decision_modes import DecisionEngineConfig, DecisionEngineMode
 from app.core.lifecycle import ProjectLifecycle
 from app.core.state import ProjectStateStore
 
@@ -120,19 +121,47 @@ class IntakeProcessor:
     """
 
     def __init__(self, store: ProjectStateStore, hermes_adapter=None, laya=None,
-                 decision_engine=None):
+                 decision_engine=None, decision_engine_config=None):
         self.store = store
         self.hermes_adapter = hermes_adapter
         self.laya = laya
-        # N3: an OPTIONAL, SHADOW-ONLY decision engine. When set, the intake
-        # path asks it to classify the request and records the answer for
-        # observability — but the returned IntakeResult is UNCHANGED. FAST
-        # remains authoritative; the Decision Engine is observed, never obeyed.
-        # Default None ⇒ the intake path is byte-identical to pre-N3.
+        # N3/N6: an OPTIONAL Decision Engine for intake classification.
+        #
+        #   decision_engine_config.intake_mode governs HOW its answer is used:
+        #     * disabled — never consulted (equivalent to decision_engine=None).
+        #     * shadow   — consulted and RECORDED for observability only; the
+        #                  returned IntakeResult is UNCHANGED. FAST remains
+        #                  authoritative; the Decision Engine is observed, never
+        #                  obeyed.
+        #     * active   — the answer may influence ONLY new/revision routing and
+        #                  reference detection (see ``intake_routing_hint``).
+        #                  FAST remains authoritative for scope, facts,
+        #                  requirements, and readiness, which this class computes
+        #                  exactly as before.
+        #
+        # Default (no engine, or disabled config) ⇒ the intake path is
+        # byte-identical to pre-N6.
         self.decision_engine = decision_engine
+        # When an explicit config is supplied it governs exactly. When it is
+        # omitted (the pre-N6 call shape, e.g. an injected engine for
+        # observability) an injected engine is treated as SHADOW — the N3
+        # contract — and no engine means disabled. Production always passes an
+        # explicit config, so its mode is never inferred.
+        if decision_engine_config is not None:
+            self.decision_engine_config = decision_engine_config
+        elif decision_engine is not None:
+            self.decision_engine_config = DecisionEngineConfig(
+                intake_mode=DecisionEngineMode.SHADOW
+            )
+        else:
+            self.decision_engine_config = DecisionEngineConfig()
         #: The most recent shadow decision, for tests/observability. Never read
-        #: by any decision path.
+        #: by any decision path that produces the IntakeResult.
         self.last_shadow_decision = None
+        #: The most recent ACTIVE intake routing hint (new/revision), or None.
+        #: Set only in active mode; purely advisory to the caller's routing and
+        #: never able to change scope, brief, requirements, or readiness.
+        self.last_intake_routing_hint = None
 
     # Brief fields the multi-turn merge accumulates. Order matters: the
     # smallest sufficient website brief is NAME + WHAT + WHY.
@@ -561,13 +590,27 @@ class IntakeProcessor:
             clarification_reason = None
             clarification_field = None
 
-        # N3 SHADOW MODE: observe the Decision Engine's intake classification
-        # for this turn. Purely observational — the result below is NOT derived
-        # from it, so FAST's authority and every existing behaviour are
-        # unchanged. Disabled (None) by default.
-        if self.decision_engine is not None:
+        # N6 DECISION ENGINE (intake). Three modes, all of which leave the
+        # IntakeResult below byte-identical in `disabled` and `shadow`:
+        #
+        #   * disabled — the engine is never consulted.
+        #   * shadow   — consulted and RECORDED for observability only. The
+        #                IntakeResult is NOT derived from it.
+        #   * active   — the answer may set an ADVISORY routing hint
+        #                (new vs revision) and reference detection. It can never
+        #                change scope, brief, requirements, or readiness, which
+        #                are computed above from FAST + the accumulated brief.
+        #
+        # In every mode a provider failure is swallowed: the Decision Engine
+        # must never break intake (the safe FAST fallback is authoritative).
+        self.last_intake_routing_hint = None
+        self.last_shadow_decision = None
+        if (
+            self.decision_engine is not None
+            and self.decision_engine_config.intake_enabled
+        ):
             try:
-                self.last_shadow_decision = self.decision_engine.decide_intake(
+                decision = self.decision_engine.decide_intake(
                     text,
                     {
                         "has_source": bool(
@@ -576,8 +619,23 @@ class IntakeProcessor:
                         "project_id": project_id,
                     },
                 )
-            except Exception:  # pragma: no cover - shadow must never break intake
-                self.last_shadow_decision = None
+            except Exception:  # pragma: no cover - a shadow/active engine must never break intake
+                decision = None
+
+            if decision is not None:
+                if self.decision_engine_config.intake_active:
+                    # ACTIVE: expose the classification as an ADVISORY routing
+                    # hint only. The IntakeResult below is still built from FAST.
+                    self.last_intake_routing_hint = {
+                        "kind": decision.kind,
+                        "has_reference": bool(decision.has_reference),
+                        "source": decision.source,
+                        "provider": decision.provider,
+                        "degraded": bool(decision.degraded),
+                    }
+                else:
+                    # SHADOW: record for observability only. Nothing below reads it.
+                    self.last_shadow_decision = decision
 
         return IntakeResult(
             readiness=readiness,
