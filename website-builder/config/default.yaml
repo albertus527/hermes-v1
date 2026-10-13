@@ -105,6 +105,40 @@ website_builder:
     # generator produced it. Must be >= 1.
     generator_version: 1
 
+  # N6: Decision Engine. TWO INDEPENDENT modes, one per job.
+  #
+  #   intake_mode: how the Decision Engine's intake classification is used.
+  #   design_mode: whether the engine selects bounded, provenance-validated
+  #                design candidates BEFORE the initial FRONTEND build.
+  #
+  # Each mode is one of:
+  #   disabled  (DEFAULT) the engine is not consulted; pre-N6 behaviour exactly.
+  #   shadow              the engine is consulted and RECORDED for observability
+  #                       only; it never changes output, prompt, published
+  #                       bytes, or an approval decision.
+  #   active              the engine's answer is USED. For intake this affects
+  #                       ONLY new/revision routing and reference detection --
+  #                       FAST remains authoritative for scope, facts,
+  #                       requirements, and readiness. For design, selected
+  #                       candidates are compiled into pre-build Design
+  #                       Guidance.
+  #
+  # DISABLED BY DEFAULT in both modes. A missing, malformed, or unrecognised
+  # value always yields disabled, so a typo can never turn the engine on.
+  # Active mode must not be enabled on production until a separate live E2E
+  # qualification has passed.
+  decision_engine:
+    intake_mode: 'disabled'
+    design_mode: 'disabled'
+    # Provider names in the registry. Empty selects the deterministic provider,
+    # which is always available and never contacts a backend.
+    intake_provider: ''
+    design_provider: ''
+    # Design candidate ranking floor (0.0-1.0). Out-of-range falls back to 0.5.
+    score_floor: 0.5
+    # Hard cap on candidates considered (0-8). Clamped; never widened by config.
+    max_candidates: 4
+
   # Workspace root for generated projects
   workspace_root: '~/website-workspaces'
 

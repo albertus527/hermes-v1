@@ -87,6 +87,10 @@ from app.core.requirement_creator import (
     RequirementCreatorConfig,
     config_from_mapping as requirement_creator_config_from_mapping,
 )
+from app.core.decision_modes import (
+    DecisionEngineConfig,
+    config_from_mapping as decision_engine_config_from_mapping,
+)
 from app.core.state import ProjectStateStore, reconcile_stranded_projects
 from app.core.registry import ConversationRegistryStore, DuplicateProjectName, slugify_display_name
 from app.core.secrets import BYPASS_STORE_DIRNAME, BypassSecretStore, migrate_legacy_bypass_secrets
@@ -165,6 +169,12 @@ class RuntimeConfig:
     # path compiles and writes no PRD.md/Design.md unless an operator enables it.
     requirement_creator_config: RequirementCreatorConfig = field(
         default_factory=RequirementCreatorConfig
+    )
+    # N6: Decision Engine configuration. BOTH modes DISABLED by default, so the
+    # intake and build paths are byte-identical to pre-N6 unless an operator
+    # explicitly selects shadow or active.
+    decision_engine_config: DecisionEngineConfig = field(
+        default_factory=DecisionEngineConfig
     )
 
     def __post_init__(self):
@@ -280,6 +290,13 @@ def load_runtime_config(config_path: Optional[Path] = None) -> RuntimeConfig:
         dict(wb.get("requirement_creator") or {})
     )
 
+    # N6: Decision Engine configuration. BOTH modes DISABLED by default; a
+    # missing or malformed block yields the disabled default, so the engine is
+    # never consulted unless an operator explicitly opts in.
+    decision_engine_config = decision_engine_config_from_mapping(
+        dict(wb.get("decision_engine") or {})
+    )
+
     return RuntimeConfig(
         telegram_bot_token=telegram_bot_token,
         hermes_home=hermes_home,
@@ -296,6 +313,7 @@ def load_runtime_config(config_path: Optional[Path] = None) -> RuntimeConfig:
         openviking_config=openviking_config,
         laya_config=laya_config,
         requirement_creator_config=requirement_creator_config,
+        decision_engine_config=decision_engine_config,
     )
 
 
