@@ -135,6 +135,39 @@ def test_foreign_accountid_rejected():
     assert not res.success
 
 
+# --- 4b. project creation confined to the staging namespace -----------------
+
+def test_project_creation_in_staging_namespace_permitted():
+    tr = RecordingTransport({("POST", "/v11/projects"): (200, {"id": "prj_new"})})
+    g = _guard(tr)
+    status, _ = g._call("POST", "/v11/projects",
+                        {"name": PROJECT_NAME, "framework": None})
+    assert status == 200
+    assert any(m == "POST" and "/v11/projects" in u for m, u, _ in tr.calls)
+
+
+def test_project_creation_foreign_name_rejected():
+    """A name outside the derived staging-namespace shape is refused pre-I/O."""
+    tr = RecordingTransport({("POST", "/v11/projects"): (200, {"id": "prj"})})
+    g = _guard(tr)
+    status, body = g._call("POST", "/v11/projects", {"name": "my-production-app"})
+    assert status == 403
+    assert body["error"]["reason"] == "project_name_not_in_staging_namespace"
+    assert tr.calls == []          # denied BEFORE any network I/O
+
+
+def test_project_creation_wrong_staging_name_rejected_when_pinned_name():
+    from app.deploy.staging_guard import StagingVercelGuard
+    tr = RecordingTransport({("POST", "/v11/projects"): (200, {"id": "prj"})})
+    g = StagingVercelGuard(token="t", team_id=TEAM_ID,
+                           ownership_namespace="wb-e2e-staging",
+                           staging_project_name=PROJECT_NAME, transport=tr)
+    other = "wb-" + "0" * 40
+    status, body = g._call("POST", "/v11/projects", {"name": other})
+    assert status == 403 and body["error"]["reason"] == "project_name_not_allowlisted"
+    assert tr.calls == []
+
+
 # --- 5. production deployment target rejected -------------------------------
 
 def test_production_target_rejected():

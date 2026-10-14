@@ -49,8 +49,14 @@ from app.deploy.adapters import UrllibHttpTransport, VercelAdapter
 
 GUARD_ENV = "WEBSITE_BUILDER_STAGING_GUARD"
 PINNED_PROJECT_ENV = "VERCEL_STAGING_PROJECT_ID"
+# Optional: the exact staging project name the runtime may create. When set, a
+# project-creation payload must match it, so creation is confined to the unique
+# staging namespace rather than any name the caller happens to send.
+STAGING_PROJECT_NAME_ENV = "VERCEL_STAGING_PROJECT_NAME"
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _CANONICAL_TEAM_RE = re.compile(r"^team_[A-Za-z0-9]{16,}$")
+# Names the app derives are always 'wb-' + 40 hex chars from the namespace.
+_STAGING_NAME_RE = re.compile(r"^wb-[0-9a-f]{40}$")
 _VERCEL_API = "https://api.vercel.com"
 
 
@@ -125,13 +131,15 @@ class StagingVercelGuard(VercelAdapter):
     """Allowlist broker for staging Vercel operations (see module docstring)."""
 
     def __init__(self, token, team_id, ownership_namespace, *,
-                 pinned_project_id: Optional[str] = None, transport=None):
+                 pinned_project_id: Optional[str] = None,
+                 staging_project_name: Optional[str] = None, transport=None):
         if not (isinstance(team_id, str) and _CANONICAL_TEAM_RE.match(team_id)):
             raise ValueError(
                 "staging guard requires a canonical team_* id (got slug/empty)")
         super().__init__(token=token, team_id=team_id,
                          ownership_namespace=ownership_namespace, transport=transport)
         self.pinned_project_id = pinned_project_id or None
+        self.staging_project_name = staging_project_name or None
         self.denials: List[Tuple[str, str, str]] = []
 
     @staticmethod
@@ -143,6 +151,15 @@ class StagingVercelGuard(VercelAdapter):
             return "denied_operation"
         if not self._matches(_ALLOWED_RULES, method, path):
             return "not_allowlisted"
+        if method == "POST" and path == "/v11/projects":
+            # Project creation is confined to the unique staging namespace:
+            # the name must be the derived 'wb-<40 hex>' shape and, when the
+            # exact expected name is known, must equal it.
+            name = payload.get("name") if isinstance(payload, dict) else None
+            if not (isinstance(name, str) and _STAGING_NAME_RE.match(name)):
+                return "project_name_not_in_staging_namespace"
+            if self.staging_project_name and name != self.staging_project_name:
+                return "project_name_not_allowlisted"
         if method == "POST" and path == "/v13/deployments" and isinstance(payload, dict):
             if payload.get("target") == "production":
                 return "production_target"
@@ -192,6 +209,9 @@ def build_vercel_adapter(*, token, team_id, ownership_namespace,
     if not canonical:
         raise ValueError("staging guard: unresolved canonical team id (fail closed)")
     pinned = str(raw.get(PINNED_PROJECT_ENV, "")).strip() or None
+    staging_name = str(raw.get(STAGING_PROJECT_NAME_ENV, "")).strip() or None
     return StagingVercelGuard(token=token, team_id=canonical,
                               ownership_namespace=ownership_namespace,
-                              pinned_project_id=pinned, transport=transport)
+                              pinned_project_id=pinned,
+                              staging_project_name=staging_name,
+                              transport=transport)
