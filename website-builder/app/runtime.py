@@ -108,6 +108,7 @@ from app.deploy.bypass import BypassProvisioner
 from app.deploy.git_output import OutputGitRepository
 from app.deploy.hydrate import WorkspaceHydrator
 from app.deploy.preview import PreviewDeps, PreviewOrchestrator
+from app.deploy.staging_guard import build_vercel_adapter, staging_guard_enabled
 from app.hermes.adapter import HermesAdapter
 from app.projects.build import FrontendBuilder
 from app.projects.directions import DirectionsOrchestrator
@@ -202,6 +203,30 @@ def _optional_env(name: str) -> Optional[str]:
     return value if value else None
 
 
+def _make_vercel_adapter(config) -> "VercelAdapter":
+    """Construct the Vercel adapter, honouring the staging guard seam.
+
+    Production behaviour is unchanged: with no staging guard/broker env the
+    plain ``VercelAdapter`` is constructed here, so tests that patch
+    ``app.runtime.VercelAdapter`` keep working. In staging the same seam
+    returns the allowlist guard (optionally broker-backed).
+    """
+    staging = staging_guard_enabled() or bool(
+        os.environ.get("WEBSITE_BUILDER_VERCEL_BROKER", "").strip()
+    )
+    if staging:
+        return build_vercel_adapter(
+            token=config.vercel_token,
+            team_id=config.vercel_team_id,
+            ownership_namespace=config.vercel_ownership_namespace,
+        )
+    return VercelAdapter(
+        token=config.vercel_token,
+        team_id=config.vercel_team_id,
+        ownership_namespace=config.vercel_ownership_namespace,
+    )
+
+
 def load_runtime_config(config_path: Optional[Path] = None) -> RuntimeConfig:
     """Load and validate runtime configuration from config.yaml + environment.
 
@@ -218,9 +243,16 @@ def load_runtime_config(config_path: Optional[Path] = None) -> RuntimeConfig:
 
     wb = cfg.get("website_builder", {})
 
-    # Required secrets from environment
+    # Required secrets from environment. In broker mode the real Vercel token
+    # lives ONLY in the privileged broker process (root-owned file), never in
+    # this runtime's environment; the adapter talks to the broker over a UNIX
+    # socket, so VERCEL_TOKEN is optional and a sentinel is used.
     telegram_bot_token = _required_env("TELEGRAM_BOT_TOKEN")
-    vercel_token = _required_env("VERCEL_TOKEN")
+    vercel_broker = os.environ.get("WEBSITE_BUILDER_VERCEL_BROKER", "").strip()
+    if vercel_broker:
+        vercel_token = os.environ.get("VERCEL_TOKEN", "").strip() or "broker-managed"
+    else:
+        vercel_token = _required_env("VERCEL_TOKEN")
     vercel_team_id = _required_env("VERCEL_TEAM_ID")
 
     # Optional secrets
@@ -920,12 +952,11 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
     # Telegram outbound adapter (reuse existing from deploy/adapters.py)
     telegram_out = TelegramAdapter(config.telegram_bot_token)
 
-    # Vercel adapter
-    vercel = VercelAdapter(
-        token=config.vercel_token,
-        team_id=config.vercel_team_id,
-        ownership_namespace=config.vercel_ownership_namespace,
-    )
+    # Vercel adapter. Routed through a runtime-local factory so the staging
+    # allowlist broker can be installed without changing any caller, while
+    # tests that patch ``app.runtime.VercelAdapter`` keep working (production
+    # behaviour is byte-for-byte unchanged).
+    vercel = _make_vercel_adapter(config)
 
     # Output Git repository
     output_repo = OutputGitRepository(
@@ -1222,11 +1253,7 @@ def compose_read_only(config: RuntimeConfig) -> ReadOnlyComposition:
     """
     store = ProjectStateStore(config.state_root)
     registry_store = ConversationRegistryStore(config.state_root / "conversations")
-    vercel = VercelAdapter(
-        token=config.vercel_token,
-        team_id=config.vercel_team_id,
-        ownership_namespace=config.vercel_ownership_namespace,
-    )
+    vercel = _make_vercel_adapter(config)
     return ReadOnlyComposition(
         config=config,
         store=store,
