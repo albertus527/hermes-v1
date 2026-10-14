@@ -203,6 +203,30 @@ N6 safety posture: both modes default `disabled`; active mode is NOT enabled on
 production and must not be until a separate live E2E qualification passes
 (plan in the N6 report). Mocked tests are not production readiness.
 
+## N6 live-integration fix (OpenViking design leg) — DONE (pushed)
+
+The N6 design leg was verified against a LIVE OpenViking and found to deliver
+**zero** candidates (silent abstention). Four independent defects were confirmed
+and fixed on `feature/website-r2-redesign`:
+
+| # | Defect | Fix |
+|---|--------|-----|
+| A | `openviking_decision` passed the library **project id** as the retrieval **scope**; `normalize_scope` refused it (expects category names) and the provider swallowed the error | pass `DESIGN_RETRIEVAL_CATEGORIES` (validated subset of the library's closed category set); project id goes to `project_id` |
+| B | `_to_candidate` read `item.source_uri`; the real `ContextItem` field is **`uri`**, so every item mapped to `None` | map `uri`→`source_uri`, preserve genuine `source_revision`/`source_id`; no fabrication |
+| C | `library_project_id` was never supplied to the pre-build design context | new config `decision_engine.design_library_project_id` (application constant, grammar-validated, never user input) passed into `decide_design` |
+| D | a configured-but-unavailable provider silently resolved to the deterministic fallback and was reported as a clean success | engine reports it as a **degraded fallback** (`source=fallback`, `degraded=True`), for both intake and design |
+
+**Verification (live):** real retrieval returned 6 provenance-bearing candidates;
+`refero_typography@5c2211d3e432` reached `decide_design`, the `DesignGuidance.md`
+reference line, and the FRONTEND pre-build pack. Mode matrix (disabled/shadow/
+active, outage, invalid provenance, scoring bounds, fallback) PASS.
+
+**Gate:** `scripts/run_tests.sh website-builder/tests` → **138 files, 4323
+passed, 20 failed, 2 skipped**; failure set byte-identical to the baseline
+(18 hydration + 1 design_resources + 1 suite_hygiene). Delta: +1 file, +16
+passed, **+0 new failures**. Mutation: N3 11/12 killed (1 pre-existing anchor
+drift in `intake.py`, not modified), N6-C/D/E 18/18 killed.
+
 ## Standing safety constraints (never relax)
 
 - Never modify `/home/albertus527/hermes-website` (original worktree) or Hermes Trade.

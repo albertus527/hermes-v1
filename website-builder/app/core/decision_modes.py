@@ -46,6 +46,11 @@ MAX_CONFIGURED_CANDIDATES = 8
 _MIN_SCORE_FLOOR = 0.0
 _MAX_SCORE_FLOOR = 1.0
 
+#: The application-owned default REVIEWED design-library project id. A fixed
+#: application constant, never derived from user input. Validated against the
+#: library's own project-id grammar before use (see ``_parse_library_project_id``).
+DEFAULT_DESIGN_LIBRARY_PROJECT_ID = "wb-design"
+
 
 class DecisionEngineMode(str, Enum):
     """A Decision Engine mode. A closed set.
@@ -101,6 +106,11 @@ class DecisionEngineConfig:
     design_provider: Optional[str] = None
     score_floor: float = 0.5
     max_candidates: int = 4
+    #: The application-owned REVIEWED design-library project scope. This is a
+    #: fixed application constant (or operator configuration), NEVER derived from
+    #: user input, so a user can never redirect design retrieval to an unrelated
+    #: project. Mirrors :attr:`app.core.laya_context.LayaConfig.library_project_id`.
+    design_library_project_id: str = DEFAULT_DESIGN_LIBRARY_PROJECT_ID
 
     @property
     def intake_enabled(self) -> bool:
@@ -127,6 +137,24 @@ def _parse_provider(value: Any) -> Optional[str]:
         name = value.strip()
         return name or None
     return None
+
+
+def _parse_library_project_id(value: Any) -> str:
+    """Return a validated library project id, or the application default.
+
+    The value is operator configuration (never user input), but it is still
+    validated against the library's own project-id grammar so a typo cannot
+    point retrieval at an out-of-grammar or unsafe scope. Anything unusable
+    falls back to the fixed application default.
+    """
+    candidate = value.strip() if isinstance(value, str) else ""
+    if not candidate:
+        return DEFAULT_DESIGN_LIBRARY_PROJECT_ID
+    try:
+        from app.core.openviking_library import is_valid_project_id
+    except Exception:  # pragma: no cover - import guard; library is always present
+        return DEFAULT_DESIGN_LIBRARY_PROJECT_ID
+    return candidate if is_valid_project_id(candidate) else DEFAULT_DESIGN_LIBRARY_PROJECT_ID
 
 
 def _parse_score_floor(value: Any) -> float:
@@ -167,11 +195,15 @@ def config_from_mapping(
         design_provider=_parse_provider(data.get("design_provider")),
         score_floor=_parse_score_floor(data.get("score_floor", 0.5)),
         max_candidates=_parse_max_candidates(data.get("max_candidates", 4)),
+        design_library_project_id=_parse_library_project_id(
+            data.get("design_library_project_id")
+        ),
     )
 
 
 __all__ = [
     "MAX_CONFIGURED_CANDIDATES",
+    "DEFAULT_DESIGN_LIBRARY_PROJECT_ID",
     "DecisionEngineMode",
     "DECISION_ENGINE_MODES",
     "DEFAULT_DECISION_ENGINE_MODE",

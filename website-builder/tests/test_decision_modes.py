@@ -108,6 +108,23 @@ class ConfigFromMappingTests(unittest.TestCase):
         self.assertEqual(cfg.intake_provider, "openviking")
         self.assertIsNone(cfg.design_provider)
 
+    def test_design_library_project_id_defaults_to_application_constant(self):
+        # Defect C: the reviewed-library scope is an APPLICATION constant, never
+        # derived from user input, and always present.
+        cfg = config_from_mapping({})
+        self.assertEqual(cfg.design_library_project_id, "wb-design")
+
+    def test_design_library_project_id_is_read_when_valid(self):
+        cfg = config_from_mapping({"design_library_project_id": "wb-design-v2"})
+        self.assertEqual(cfg.design_library_project_id, "wb-design-v2")
+
+    def test_invalid_design_library_project_id_falls_back(self):
+        # Out-of-grammar / unsafe values never widen or redirect retrieval.
+        for bad in ("", "  ", "Bad ID", "../etc", "a" * 100, 123, None):
+            with self.subTest(bad=bad):
+                cfg = config_from_mapping({"design_library_project_id": bad})
+                self.assertEqual(cfg.design_library_project_id, "wb-design")
+
 
 class DefaultYamlTests(unittest.TestCase):
     """The shipped config must default both modes to disabled."""

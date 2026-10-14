@@ -87,11 +87,17 @@ class _HostileProvider:
 
 
 class _StubAdapter:
+    """A stub adapter recording the call contract (so scope is asserted)."""
+
     def __init__(self, items, *, raise_on=None):
         self.items = items
         self.raise_on = raise_on
+        self.last_scope = None
+        self.last_project_id = None
 
     def retrieve_context(self, query, project_id, scope=None, budget=None):
+        self.last_project_id = project_id
+        self.last_scope = scope
         if self.raise_on:
             raise self.raise_on
 
@@ -105,13 +111,26 @@ class _StubAdapter:
 
 @dataclass
 class _Item:
+    """Mirrors the REAL ``app.core.openviking_library.ContextItem`` schema.
+
+    The previous fake carried ``source_uri``/``excerpt``/``relevance`` — fields
+    the real contract does NOT have — which is precisely why the live
+    integration defect (reading ``item.source_uri`` when the real field is
+    ``uri``) went undetected. Keeping this in lockstep with ``ContextItem``
+    makes the unit tests exercise the real field names.
+    """
+
+    uri: str = "viking://resources/website-builder/projects/wb-design/design_dna/s1"
     source_id: str = "s1"
-    source_uri: str = "viking://wb-design/s1"
     source_revision: str = "rev1"
-    excerpt: str = "excerpt"
+    trust: str = "reviewed"
+    category: str = "design_dna"
+    level: int = 1
+    score: float = 0.9
+    title: str = "summary"
+    body: str = "excerpt"
     summary: str = "summary"
-    relevance: float = 0.9
-    uncertainty: str = ""
+    estimated_tokens: int = 10
 
 
 class RegistryTests(unittest.TestCase):
@@ -291,9 +310,9 @@ class OpenVikingProviderTests(unittest.TestCase):
 
     def test_items_without_provenance_are_dropped(self):
         items = [
-            _Item(source_id="ok", source_uri="viking://a", source_revision="r1"),
-            _Item(source_id="nouri", source_uri="", source_revision="r1"),
-            _Item(source_id="norev", source_uri="viking://b", source_revision=""),
+            _Item(source_id="ok", uri="viking://a", source_revision="r1"),
+            _Item(source_id="nouri", uri="", source_revision="r1"),
+            _Item(source_id="norev", uri="viking://b", source_revision=""),
         ]
         provider = OpenVikingDecisionProvider(_StubAdapter(items))
         out = provider.propose_design_candidates(
@@ -309,7 +328,7 @@ class OpenVikingProviderTests(unittest.TestCase):
         self.assertEqual(out, ())
 
     def test_candidates_are_bounded(self):
-        items = [_Item(source_id=f"s{i}", source_uri=f"viking://{i}", source_revision="r") for i in range(20)]
+        items = [_Item(source_id=f"s{i}", uri=f"viking://{i}", source_revision="r") for i in range(20)]
         provider = OpenVikingDecisionProvider(_StubAdapter(items))
         out = provider.propose_design_candidates(
             {"query": "warm", "library_project_id": "wb-design"}, limit=3
@@ -322,7 +341,7 @@ class OpenVikingProviderTests(unittest.TestCase):
             provider.classify_intake("x", {})
 
     def test_openviking_candidates_reach_the_engine(self):
-        items = [_Item(source_id="s1", relevance=0.95)]
+        items = [_Item(source_id="s1", score=0.95)]
         provider = OpenVikingDecisionProvider(_StubAdapter(items))
         reg = DecisionProviderRegistry()
         reg.register(provider)
@@ -334,6 +353,100 @@ class OpenVikingProviderTests(unittest.TestCase):
         assert d.selected is not None
         self.assertEqual(d.selected.candidate_id, "s1")
         self.assertEqual(d.source, SOURCE_PROVIDER)
+
+
+class OpenVikingContractRegressionTests(unittest.TestCase):
+    """Live-integration regression guards (the four corrected defects).
+
+    These pin the REAL adapter contract, so the defects that produced a silent
+    zero-candidate abstention against a live OpenViking can never return:
+
+    * scope is a set of CATEGORIES, never the library project id;
+    * provenance maps from the real ``ContextItem.uri`` (not ``source_uri``);
+    * a configured-but-unavailable provider is reported as a degraded fallback,
+      never as a clean provider result.
+    """
+
+    def test_scope_is_categories_not_project_id(self):
+        stub = _StubAdapter([_Item()])
+        provider = OpenVikingDecisionProvider(stub)
+        provider.propose_design_candidates(
+            {"query": "warm", "library_project_id": "wb-design"}, limit=3
+        )
+        # The project id goes to project_id; the scope is a category tuple.
+        self.assertEqual(stub.last_project_id, "wb-design")
+        self.assertIsInstance(stub.last_scope, tuple)
+        self.assertNotIn("wb-design", stub.last_scope)
+        for category in stub.last_scope:
+            from app.core.openviking_library import CATEGORIES
+            self.assertIn(category, CATEGORIES)
+
+    def test_caller_may_narrow_scope_with_design_categories(self):
+        stub = _StubAdapter([_Item()])
+        provider = OpenVikingDecisionProvider(stub)
+        provider.propose_design_candidates(
+            {
+                "query": "warm",
+                "library_project_id": "wb-design",
+                "design_categories": ["motion"],
+            },
+            limit=3,
+        )
+        self.assertEqual(stub.last_scope, ("motion",))
+
+    def test_real_context_item_maps_to_provenanced_candidate(self):
+        # The REAL ContextItem, not a bespoke fake.
+        from app.core.openviking_library import ContextItem
+
+        item = ContextItem(
+            uri="viking://resources/website-builder/projects/wb-design/design_dna/refero_typography",
+            source_id="refero_typography",
+            source_revision="1dcbd16676c3",
+            trust="reviewed",
+            category="design_dna",
+            level=1,
+            score=0.75,
+            title="Typography guide",
+            body="type scale, pairing rules",
+            summary="Typography reference",
+            estimated_tokens=42,
+        )
+        provider = OpenVikingDecisionProvider(_StubAdapter([item]))
+        reg = DecisionProviderRegistry()
+        reg.register(provider)
+        engine = DecisionEngine(reg, provider_name="openviking")
+        d = engine.decide_design(
+            {"query": "typography", "library_project_id": "wb-design"}
+        )
+        self.assertFalse(d.abstained)
+        assert d.selected is not None
+        # Provenance is the REAL item's, mapped verbatim.
+        self.assertEqual(d.selected.source_uri, item.uri)
+        self.assertEqual(d.selected.source_revision, item.source_revision)
+        self.assertEqual(d.selected.candidate_id, item.source_id)
+
+    def test_configured_but_unavailable_provider_degrades_honestly(self):
+        # design_provider names "openviking" but no such provider is registered,
+        # so the registry resolves the fallback. That MUST be reported as a
+        # degraded fallback — never as a clean provider selection.
+        engine = DecisionEngine(
+            DecisionProviderRegistry(), provider_name="openviking"
+        )
+        d = engine.decide_design(
+            {"design_dna": {"brand_personality": "warm"}}
+        )
+        self.assertEqual(d.source, SOURCE_FALLBACK)
+        self.assertTrue(d.degraded)
+        self.assertEqual(d.provider, DETERMINISTIC_PROVIDER_NAME)
+
+    def test_configured_but_unavailable_provider_degrades_intake(self):
+        engine = DecisionEngine(
+            DecisionProviderRegistry(), provider_name="openviking"
+        )
+        d = engine.decide_intake("build a new website", {})
+        self.assertEqual(d.source, SOURCE_FALLBACK)
+        self.assertTrue(d.degraded)
+        self.assertEqual(d.provider, DETERMINISTIC_PROVIDER_NAME)
 
 
 class ShadowModeIntakeTests(unittest.TestCase):

@@ -208,6 +208,17 @@ class DecisionEngine:
         """Classify intake, falling back safely on any provider failure."""
         ctx = context or {}
         provider = self.provider
+        if bool(self.provider_name) and provider.name != self.provider_name:
+            # The named provider is not available (disabled/unregistered), so the
+            # registry resolved the safe fallback. Report that honestly as a
+            # degraded fallback rather than as a clean provider result.
+            return self._fallback_intake(
+                request_text,
+                ctx,
+                DecisionProviderError(
+                    PROVIDER_UNAVAILABLE, "requested provider unavailable"
+                ),
+            )
         try:
             classification = provider.classify_intake(request_text, ctx)
             if not isinstance(classification, IntakeClassification):
@@ -281,6 +292,19 @@ class DecisionEngine:
     def _gather(
         self, provider: DecisionProvider, ctx: Mapping[str, Any], cap: int
     ) -> Tuple[Sequence[Any], str, str, bool, str]:
+        # If a provider was explicitly configured but the registry could not
+        # supply it (disabled, unregistered, or absent), it resolved the safe
+        # fallback. That is a DEGRADED outcome, and must be reported as such —
+        # never as a clean provider result — so an unavailable OpenViking can
+        # never look like a successful selection.
+        if bool(self.provider_name) and provider.name != self.provider_name:
+            logger.warning(
+                "Decision design provider %r unavailable; using deterministic fallback",
+                self.provider_name,
+            )
+            fallback = self.registry.fallback
+            raw = fallback.propose_design_candidates(ctx, limit=cap)
+            return (raw, SOURCE_FALLBACK, fallback.name, True, PROVIDER_UNAVAILABLE)
         try:
             raw = provider.propose_design_candidates(ctx, limit=cap)
             return raw, SOURCE_PROVIDER, provider.name, False, ""

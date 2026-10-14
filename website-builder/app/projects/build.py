@@ -605,6 +605,12 @@ class FrontendBuilder:
                         "query": query,
                         "design_dna": {},  # pre-build: no DNA exists yet
                         "source_revision": revision,
+                        # The application-owned REVIEWED design-library scope,
+                        # from configuration only — never from the brief or any
+                        # user input, so a request can never redirect retrieval.
+                        "library_project_id": (
+                            self.decision_engine_config.design_library_project_id
+                        ),
                     }
                 )
             except Exception:  # noqa: BLE001 - engine never breaks the build

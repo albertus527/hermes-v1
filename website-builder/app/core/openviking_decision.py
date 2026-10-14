@@ -25,9 +25,10 @@ are never overridden.
 from __future__ import annotations
 
 import logging
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Sequence, Tuple
 
 from app.core.decision_provider import DesignCandidate
+from app.core.openviking_library import CATEGORIES as _LIBRARY_CATEGORIES
 from app.core.openviking_retrieval import (
     OpenVikingConfig,
     OpenVikingRetrievalAdapter,
@@ -40,6 +41,19 @@ OPENVIKING_PROVIDER_NAME = "openviking"
 
 #: Hard cap on candidates this provider will ever return.
 MAX_OPENVIKING_CANDIDATES = 6
+
+#: The design-relevant retrieval CATEGORIES this provider asks for.
+#:
+#: Retrieval scope is a set of *category names* (see
+#: :func:`app.core.openviking_retrieval.normalize_scope`), NOT the library
+#: project id. Passing the project id as the scope was the live-integration
+#: defect this provider corrects: ``normalize_scope`` refused it as an unknown
+#: category, the provider swallowed the error, and it silently abstained.
+#: The set is a subset of the library's closed category set and is validated
+#: below, so it can never name a category the library does not define.
+DESIGN_RETRIEVAL_CATEGORIES: Tuple[str, ...] = tuple(
+    c for c in ("design_dna", "components", "motion") if c in _LIBRARY_CATEGORIES
+) or _LIBRARY_CATEGORIES
 
 
 class OpenVikingDecisionProvider:
@@ -113,9 +127,19 @@ class OpenVikingDecisionProvider:
         # ``library_project_id`` is the application-owned reviewed-library scope
         # (never user input). The D4a adapter requires a valid project id, so a
         # missing one means there is nothing safe to retrieve.
-        scope = str((context or {}).get("library_project_id") or "").strip()
-        if not scope:
+        project_id = str((context or {}).get("library_project_id") or "").strip()
+        if not project_id:
             return ()
+
+        # Scope is a set of CATEGORY names, NOT the project id. The caller may
+        # narrow it via ``design_categories``; the value is validated by the
+        # adapter's ``normalize_scope`` (an unknown category is refused there),
+        # so a typo can neither widen nor silently narrow retrieval.
+        raw_categories = (context or {}).get("design_categories")
+        if isinstance(raw_categories, (list, tuple)) and raw_categories:
+            scope: Any = tuple(str(c).strip() for c in raw_categories if str(c).strip())
+        else:
+            scope = DESIGN_RETRIEVAL_CATEGORIES
 
         adapter = self.adapter
         if adapter is None:
@@ -123,8 +147,8 @@ class OpenVikingDecisionProvider:
         try:
             result = adapter.retrieve_context(
                 query,
-                project_id=scope,
-                scope=(scope,),
+                project_id=project_id,
+                scope=scope,
             )
         except Exception as exc:  # noqa: BLE001 - fail closed, never raise
             logger.warning(
@@ -150,26 +174,41 @@ class OpenVikingDecisionProvider:
         A drop happens when provenance is incomplete. The retrieved item is
         DATA; it carries no authority, and this conversion deliberately copies
         only presentation fields plus provenance — never any instruction.
+
+        Field mapping is against the REAL D4a ``ContextItem`` contract
+        (``uri`` / ``source_id`` / ``source_revision`` / ``title`` / ``summary``
+        / ``body`` / ``score`` / ``trust``). ``uri`` maps to
+        ``DesignCandidate.source_uri``; the genuine ``source_revision`` and
+        ``source_id`` are preserved verbatim. Nothing is synthesised: an item
+        missing any provenance anchor is dropped rather than repaired.
         """
-        source_uri = str(getattr(item, "source_uri", "") or "").strip()
+        source_uri = str(getattr(item, "uri", "") or "").strip()
         source_revision = str(getattr(item, "source_revision", "") or "").strip()
         if not source_uri or not source_revision:
             return None
         source_id = str(getattr(item, "source_id", "") or "").strip()
         if not source_id:
             return None
-        excerpt = str(getattr(item, "excerpt", "") or "").strip()
+        title = str(getattr(item, "title", "") or "").strip()
         summary = str(getattr(item, "summary", "") or "").strip()
-        relevance = getattr(item, "relevance", 0.0)
+        body = str(getattr(item, "body", "") or "").strip()
+        score = getattr(item, "score", 0.0)
+        trust = str(getattr(item, "trust", "") or "").strip()
+        # Presentation only: a bounded label + descriptor, never an instruction.
+        label = title[:120] or summary[:120] or source_id
+        descriptor = (summary or body)[:600]
+        # Honest, non-fabricated annotation: reviewed content carries none;
+        # anything lower-trust is labelled so the engine/caller can see it.
+        uncertainty = "" if trust in ("", "reviewed") else f"trust={trust}"
         return DesignCandidate(
             candidate_id=source_id,
-            label=summary[:120] or source_id,
-            descriptor=excerpt[:600],
+            label=label,
+            descriptor=descriptor,
             palette=(),
             source_uri=source_uri,
             source_revision=source_revision,
-            score=relevance if isinstance(relevance, (int, float)) else 0.0,
-            uncertainty=str(getattr(item, "uncertainty", "") or ""),
+            score=score if isinstance(score, (int, float)) else 0.0,
+            uncertainty=uncertainty,
         )
 
 
