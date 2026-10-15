@@ -41,6 +41,22 @@ STAGING_HOSTS=/etc/wb-e2e/staging-hosts
 # OpenViking allowlist proxy (separate unit) that the runtime must use.
 OV_PROXY_PORT=1934
 
+# --detach: start the unit and return immediately (for the long-running poller).
+# The flag is OURS, not the app's, so strip it before forwarding.
+DETACH=0
+FORWARD=()
+for a in "$@"; do
+  if [ "$a" = "--detach" ]; then DETACH=1; else FORWARD+=("$a"); fi
+done
+
+# systemd-run wait/attach flags depend on the mode.
+if [ "$DETACH" = "1" ]; then
+  RUN_MODE=(--no-block)
+else
+  RUN_MODE=(--pty --wait --collect)
+fi
+
+
 if [ ! -x "$GUARD" ]; then
   echo "REFUSING: missing egress guard $GUARD" >&2
   exit 1
@@ -85,5 +101,5 @@ exec sudo -n systemd-run \
   --setenv=WEBSITE_BUILDER_STAGING_GUARD=1 \
   --setenv=WEBSITE_BUILDER_VERCEL_BROKER=/run/wb-e2e/vercel.sock \
   --setenv=PLAYWRIGHT_BROWSERS_PATH=/home/wbe2e/.cache/ms-playwright \
-  --pty --wait --collect \
-  /bin/bash "$GUARD" "$@"
+  "${RUN_MODE[@]}" \
+  /bin/bash "$GUARD" "${FORWARD[@]}"
