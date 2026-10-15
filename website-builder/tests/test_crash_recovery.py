@@ -880,6 +880,44 @@ def test_prefixed_and_unknown_codes_render_safely():
     assert render_error_message("") == _FALLBACK_ERROR_TEXT
 
 
+def test_output_commit_failed_with_suffix_maps_to_actionable_copy():
+    """Live incident: the orchestrator wraps the local-packaging failure as
+    "OUTPUT_COMMIT_FAILED: <errno/path>". The user must get the actionable
+    message, and the raw path/errno must NEVER reach them."""
+    from app.runtime import ERROR_MESSAGES, render_error_message
+
+    actionable = ERROR_MESSAGES["OUTPUT_COMMIT_FAILED"]
+    # Bare code (exact match) still wins.
+    assert render_error_message("OUTPUT_COMMIT_FAILED") == actionable
+    # Suffixed code maps to the SAME actionable copy, discarding the detail.
+    suffixed = render_error_message(
+        "OUTPUT_COMMIT_FAILED: [Errno 13] Permission denied: "
+        "'/home/wbe2e/wb-e2e-r2/tmpeiuldh7x'")
+    assert suffixed == actionable
+    # No filesystem path, errno, or code token leaks through.
+    for leak in ("Errno", "Permission denied", "/home/wbe2e", "tmp", "OUTPUT_COMMIT_FAILED"):
+        assert leak not in suffixed, f"leaked {leak!r} to the user"
+
+
+def test_exact_match_still_wins_for_other_codes():
+    """The prefix fallback must not shadow exact-match copy for other codes."""
+    from app.runtime import ERROR_MESSAGES, render_error_message
+
+    for code in ("PREVIEW_BUSY", "WORKER_BUSY", "VISION_REQUIRED",
+                 "PROJECT_NOT_ACCEPTING_INPUT"):
+        assert render_error_message(code) == ERROR_MESSAGES[code]
+
+
+def test_suffixed_unknown_code_stays_generic_without_leaking():
+    """An UNKNOWN suffixed code must fall back, never echo the suffix."""
+    from app.runtime import _FALLBACK_ERROR_TEXT, render_error_message
+
+    rendered = render_error_message(
+        "SOME_FUTURE_CODE: secret-ish detail /etc/passwd")
+    assert rendered == _FALLBACK_ERROR_TEXT
+    assert "secret-ish" not in rendered and "/etc/passwd" not in rendered
+
+
 def test_error_reply_is_dropped_rather_than_sent_to_a_fake_chat(tmp_path):
     """An unresolvable chat id must not send to a placeholder like "unknown":
     the transport rejects it, so the user silently gets nothing."""

@@ -337,7 +337,20 @@ class OutputGitRepository:
         files = dict(snapshot.source)
         files.update({'dist/' + name: value for name, value in snapshot.dist.items()})
         # Private index; never checkout, add, filters, hooks, or Hermes index.
-        with tempfile.TemporaryDirectory(dir=self.path.parent) as tmp:
+        #
+        # The scratch index lives INSIDE the output repository (``self.path``),
+        # never in its parent. The repository is the one workspace path this
+        # process is guaranteed to own and be able to write; the parent may be
+        # deliberately non-writable (e.g. the staging root is root-owned 0755)
+        # and ``TemporaryDirectory(dir=...)`` would then raise EACCES before a
+        # single object is written. Atomicity is preserved: git writes
+        # ``index.lock`` next to ``GIT_INDEX_FILE`` and renames it within the
+        # same directory, so the atomic replace never crosses a filesystem
+        # boundary and needs no write access to the parent. The bare repository
+        # ignores unknown top-level entries, so a transient scratch directory
+        # never affects refs, objects, or recovery; ``TemporaryDirectory``
+        # removes it on both success and failure.
+        with tempfile.TemporaryDirectory(dir=self.path) as tmp:
             extra = {'GIT_INDEX_FILE': str(Path(tmp) / 'index')}
             self._run(['read-tree', '--empty'], extra=extra)
             entries = []

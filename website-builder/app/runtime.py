@@ -1741,10 +1741,18 @@ _INTENTIONALLY_GENERIC_CODES = frozenset({
 _GENERIC_ERROR_TEXT = "An unexpected error occurred. Please try again."
 _FALLBACK_ERROR_TEXT = "Something went wrong. Please try again."
 
-# Prefixed codes carry a detail suffix after ':'.
+# Prefixed codes carry a detail suffix after ':'. A renderer MUST NOT echo the
+# suffix back to the user: the detail can carry a local filesystem path or a
+# raw exception string (e.g. "OUTPUT_COMMIT_FAILED: [Errno 13] Permission
+# denied: '/…/tmpxxxx'"). Where the base code already has deliberate copy, the
+# renderer returns exactly that copy and discards the detail.
 _PREFIXED_ERROR_RENDERERS = (
     ("CHEAP_CHECKS_FAILED:", lambda detail: f"Build verification failed ({detail}). Please try again."),
     ("INFRASTRUCTURE_ERROR:", lambda detail: "An infrastructure error occurred during verification. Please try again."),
+    # The orchestrator wraps the local-packaging failure as
+    # "OUTPUT_COMMIT_FAILED: <detail>"; the user must see the actionable copy,
+    # never the raw errno/path. Exact-match still wins for the bare code above.
+    ("OUTPUT_COMMIT_FAILED:", lambda detail: ERROR_MESSAGES["OUTPUT_COMMIT_FAILED"]),
 )
 
 
