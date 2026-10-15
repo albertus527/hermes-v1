@@ -241,5 +241,97 @@ class ManifestSanityTests(unittest.TestCase):
         self.assertEqual(manifest.get(GUIDANCE).kind, "skill")
 
 
+# ---------------------------------------------------------------------------
+# Defect 2c — the renderer bounds CONTENT, not pretty-print whitespace
+# ---------------------------------------------------------------------------
+
+class RenderKeepsContentWhenItFitsTests(unittest.TestCase):
+    def _pack_with_real_entry(self):
+        """A pack whose compact content fits well under the render ceiling."""
+        result = DesignResourceResult(
+            resource_id="ui_ux_pro_max",
+            resource_kind="skill",
+            status=STATUS_AVAILABLE,
+            available=True,
+            degraded=False,
+            entries=(
+                DesignEntry(
+                    entry_id="ui_ux_pro_max:0",
+                    kind="guidance",
+                    title="Minimalism & Swiss Style",
+                    body="",
+                    fields={
+                        "Keywords": "Clean, simple, spacious, functional, white space",
+                        "Primary Colors": "Black #000000, White #FFFFFF",
+                        "Best For": "Enterprise, editorial, portfolio",
+                    },
+                    provenance=_provenance("ui_ux_pro_max"),
+                ),
+            ),
+            warnings=(),
+            truncated=False,
+            dropped_entries=0,
+        )
+        return DesignContextPack(
+            version=1, design_dna={}, decisions={"selected_resources": []},
+            resources={"ui_ux_pro_max": result.to_dict()},
+            truncation={}, limits={}, degraded=False, warnings=(),
+        )
+
+    def test_a_fitting_pack_keeps_its_resources(self):
+        from app.core.design_context_render import (
+            MAX_RENDERED_CHARS,
+            render_design_context_block,
+        )
+
+        pack = self._pack_with_real_entry()
+        block = render_design_context_block(pack)
+
+        # The real content must be present, not just the decision skeleton.
+        self.assertIn("Minimalism & Swiss Style", block)
+        self.assertIn("Clean, simple, spacious", block)
+        self.assertNotIn(
+            "rendered_truncated", block,
+            "a pack whose content fits must NOT be trimmed to an empty resources map",
+        )
+        self.assertLessEqual(len(block), MAX_RENDERED_CHARS + 2_000)
+
+    def test_an_oversized_pack_still_drops_resources_but_keeps_decisions(self):
+        from app.core.design_context_render import render_design_context_block
+
+        huge = {
+            "ui_ux_pro_max": {
+                "resource_id": "ui_ux_pro_max",
+                "entries": [
+                    {
+                        "entry_id": f"x{i}", "kind": "guidance",
+                        "title": "t" * 400, "body": "b" * 2000,
+                        "fields": {"k": "v" * 400},
+                        "provenance": {"resource_id": "ui_ux_pro_max",
+                                       "resource_kind": "skill", "adapter": "guidance",
+                                       "locator": "data/styles.csv", "entry_index": i},
+                        "truncated": False,
+                    }
+                    for i in range(50)
+                ],
+                "warnings": [], "truncated": True, "dropped_entries": 0,
+            }
+        }
+
+        class _HugePack:
+            def to_dict(self):
+                return {
+                    "version": 1, "design_dna": {},
+                    "decisions": {"selected_resources": [{"resource_id": "shadcn"}]},
+                    "resources": huge, "truncation": {}, "limits": {},
+                    "degraded": False, "warnings": [],
+                }
+
+        block = render_design_context_block(_HugePack())
+        self.assertIn("shadcn", block, "decisions must survive the render bound")
+        self.assertIn("rendered_truncated", block)
+        self.assertLess(len(block), 20_000)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -26,17 +26,36 @@ from typing import Any, Optional
 MAX_RENDERED_CHARS = 12_000
 
 
+def _serialize(payload: Any) -> str:
+    """Compact, deterministic JSON for the rendered block.
+
+    Compact (no indentation) so ``MAX_RENDERED_CHARS`` bounds real content
+    rather than whitespace, and ``sort_keys`` so the output is byte-stable for
+    a given pack (a prompt is a cache-sensitive input).
+    """
+    return json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), default=str
+    )
+
+
 def render_design_context_block(pack: Optional[Any]) -> str:
     """Render ``pack`` as a bounded DATA block, or ``""`` when there is none.
 
     Returns an empty string for ``None`` so a caller that has not built a pack
     produces byte-identical prompts to before D3a.
+
+    The ceiling bounds the CONTENT, not pretty-print whitespace. The payload is
+    serialized compactly (``separators=(",", ":")``) so ``MAX_RENDERED_CHARS``
+    measures what FRONTEND actually reads: a pack whose canonical content fits
+    (``pack.total_chars`` well under the ceiling) must not lose its resources to
+    indentation overhead. Only a pack whose compact form genuinely exceeds the
+    ceiling drops resource content, and then the DECISIONS always survive.
     """
     if pack is None:
         return ""
 
     payload = pack.to_dict() if hasattr(pack, "to_dict") else dict(pack)
-    text = json.dumps(payload, indent=2, sort_keys=True, default=str)
+    text = _serialize(payload)
     if len(text) > MAX_RENDERED_CHARS:
         # Bound by dropping the RESOURCE CONTENT first, keeping the decisions.
         # The decisions are what FRONTEND is allowed to act on; the corpus text
@@ -46,7 +65,7 @@ def render_design_context_block(pack: Optional[Any]) -> str:
         truncation = dict(payload.get("truncation", {}))
         truncation["rendered_truncated"] = True
         trimmed["truncation"] = truncation
-        text = json.dumps(trimmed, indent=2, sort_keys=True, default=str)
+        text = _serialize(trimmed)
 
     return (
         "\n"
