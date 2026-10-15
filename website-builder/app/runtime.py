@@ -715,6 +715,81 @@ def preflight_smoke_support(browser_factory: Optional[Any]) -> None:
     logger.info("Preview smoke preflight OK: browser factory produced a usable browser")
 
 
+def preflight_screenshot_support() -> None:
+    """Prove the QA screenshot capture CLI (``agent-browser``) is installed.
+
+    QA Phase 8 captures the desktop + mobile evidence PNGs through the
+    ``agent-browser`` CLI (see :mod:`app.qa.screenshot`), which is a SEPARATE
+    tool from the Playwright browser used by preview smoke. A runtime that
+    passes the Playwright smoke check but lacks ``agent-browser`` still fails
+    the FIRST build at QA with ``capture_failed: agent-browser CLI is not
+    installed`` — an infrastructure error the user sees only AFTER a full
+    FRONTEND build. This gate fails closed BEFORE polling so that condition is
+    caught at startup instead.
+
+    It checks two things, matching exactly what the capture path needs:
+
+    * ``shutil.which("agent-browser")`` resolves the CLI on PATH; and
+    * the CLI is executable and reports a version (``agent-browser --version``)
+      within a short bound, proving it is not a broken/stub shim.
+
+    It deliberately does NOT launch a browser here: that is the slower, more
+    environment-sensitive check, and the capture path already fails closed on a
+    launch error. Never navigates, never touches the network, never logs
+    secrets. Raises RuntimeError with an actionable, sanitized reason.
+    """
+    import shutil
+    import subprocess
+
+    from app.core import credentials
+
+    cli = shutil.which("agent-browser")
+    if not cli:
+        logger.error(
+            "QA screenshot preflight failed: 'agent-browser' CLI not found on PATH. "
+            "QA Phase 8 requires it to capture evidence screenshots."
+        )
+        raise RuntimeError(
+            "QA screenshot capture requires the 'agent-browser' CLI, which is not on "
+            "PATH. Install it into the active Node prefix: "
+            "npm install -g agent-browser"
+        )
+
+    try:
+        result = subprocess.run(
+            [cli, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+            env=credentials.shell_env(),
+        )
+    except Exception as exc:
+        logger.error(
+            "QA screenshot preflight failed: unable to execute '%s --version': %s",
+            cli,
+            exc,
+        )
+        raise RuntimeError(
+            f"Unable to execute '{cli} --version'. Reinstall agent-browser."
+        ) from exc
+
+    version = (result.stdout or "").strip() or (result.stderr or "").strip()
+    if result.returncode != 0 or not version:
+        logger.error(
+            "QA screenshot preflight failed: '%s --version' exited %s with no version "
+            "output.",
+            cli,
+            result.returncode,
+        )
+        raise RuntimeError(
+            "The 'agent-browser' CLI is present but not runnable "
+            f"(exit {result.returncode}). Reinstall agent-browser."
+        )
+
+    logger.info("QA screenshot preflight OK: agent-browser at %s (%s)", cli, version)
+
+
 def preflight_role_validation(config: RuntimeConfig) -> bool:
     """Fail-closed startup validation of all Website Builder model roles.
 
@@ -3116,11 +3191,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Fail closed BEFORE any polling or composition:
     # 1. Local Node toolchain must satisfy the starter contract.
     # 2. Preview smoke support (Playwright/Chromium) must actually work.
-    #    (Both raise RuntimeError with an actionable sanitized reason; the
+    # 3. QA screenshot capture CLI (agent-browser) must be installed and runnable.
+    #    (All raise RuntimeError with an actionable sanitized reason; the
     #    detail was already logged by the preflight itself.)
     try:
         preflight_node_toolchain()
         preflight_smoke_support(config.smoke_browser_factory)
+        preflight_screenshot_support()
     except RuntimeError:
         return 1
 

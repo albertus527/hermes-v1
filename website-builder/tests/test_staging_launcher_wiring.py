@@ -35,8 +35,13 @@ STAGING_HOSTS = LIB / "staging-hosts"
 
 def test_sandboxed_launcher_forwards_positional_args_to_guard():
     text = SANDBOXED.read_text(encoding="utf-8")
-    assert re.search(r'/bin/bash\s+"\$GUARD"\s+"\$@"', text), (
-        "sandboxed launcher must forward positional args to the guard")
+    # The launcher strips its own ``--detach`` control flag, then forwards the
+    # remaining operator args (FORWARD[@]) to the guard. This is what makes
+    # ``--preflight`` reach the runtime instead of being dropped.
+    assert re.search(r'/bin/bash\s+"\$GUARD"\s+"\$\{FORWARD\[@\]\}"', text), (
+        "sandboxed launcher must forward operator args to the guard")
+    assert "FORWARD" in text and "--detach" in text, (
+        "launcher must strip its own --detach flag before forwarding")
 
 
 def test_guard_forwards_positional_args_to_inner_launcher():
@@ -101,6 +106,7 @@ def test_preflight_returns_before_compose_and_polling():
     with _patch_config_ok(), \
          patch("app.runtime.preflight_node_toolchain") as node, \
          patch("app.runtime.preflight_smoke_support") as smoke, \
+         patch("app.runtime.preflight_screenshot_support") as shot, \
          patch("app.runtime.compose") as compose, \
          patch("app.runtime.TelegramReceiveLoop") as loop:
         from app.runtime import main
@@ -108,6 +114,7 @@ def test_preflight_returns_before_compose_and_polling():
     assert rc == 0
     node.assert_called_once()
     smoke.assert_called_once()
+    shot.assert_called_once()
     compose.assert_not_called()
     loop.assert_not_called()
 
@@ -117,6 +124,7 @@ def test_preflight_does_not_touch_telegram_transport():
     with _patch_config_ok(), \
          patch("app.runtime.preflight_node_toolchain"), \
          patch("app.runtime.preflight_smoke_support"), \
+         patch("app.runtime.preflight_screenshot_support"), \
          patch("app.runtime.compose") as compose, \
          patch("app.runtime.TelegramReceiveLoop") as loop:
         from app.runtime import main
@@ -143,6 +151,84 @@ def test_preflight_flag_is_known():
 
 
 # ---------------------------------------------------------------------------
+# QA screenshot preflight gate (agent-browser) — pins the first-live-E2E defect.
+# A runtime that passes the Playwright smoke check but lacks agent-browser must
+# FAIL CLOSED at startup, not after a full FRONTEND build.
+# ---------------------------------------------------------------------------
+
+def test_screenshot_preflight_missing_cli_raises():
+    with patch("shutil.which", return_value=None):
+        from app.runtime import preflight_screenshot_support
+        with pytest.raises(RuntimeError, match="agent-browser"):
+            preflight_screenshot_support()
+
+
+def test_screenshot_preflight_nonzero_exit_raises():
+    fake = MagicMock(returncode=1, stdout="", stderr="boom")
+    with patch("shutil.which", return_value="/usr/bin/agent-browser"), \
+         patch("subprocess.run", return_value=fake):
+        from app.runtime import preflight_screenshot_support
+        with pytest.raises(RuntimeError):
+            preflight_screenshot_support()
+
+
+def test_screenshot_preflight_empty_version_raises():
+    fake = MagicMock(returncode=0, stdout="   ", stderr="")
+    with patch("shutil.which", return_value="/usr/bin/agent-browser"), \
+         patch("subprocess.run", return_value=fake):
+        from app.runtime import preflight_screenshot_support
+        with pytest.raises(RuntimeError):
+            preflight_screenshot_support()
+
+
+def test_screenshot_preflight_ok():
+    fake = MagicMock(returncode=0, stdout="agent-browser 0.37.1\n", stderr="")
+    with patch("shutil.which", return_value="/usr/bin/agent-browser"), \
+         patch("subprocess.run", return_value=fake) as run:
+        from app.runtime import preflight_screenshot_support
+        preflight_screenshot_support()  # must not raise
+    # The CLI is invoked with --version only; no browser launch, no network.
+    argv = run.call_args[0][0]
+    assert argv[0] == "/usr/bin/agent-browser"
+    assert argv[1] == "--version"
+
+
+def test_main_fails_closed_when_screenshot_preflight_raises():
+    """If agent-browser is missing, main() returns 1 BEFORE polling/compose."""
+    with _patch_config_ok(), \
+         patch("app.runtime.preflight_node_toolchain"), \
+         patch("app.runtime.preflight_smoke_support"), \
+         patch("app.runtime.preflight_screenshot_support",
+               side_effect=RuntimeError("agent-browser missing")), \
+         patch("app.runtime.compose") as compose, \
+         patch("app.runtime.TelegramReceiveLoop") as loop:
+        from app.runtime import main
+        rc = main([])
+    assert rc == 1
+    compose.assert_not_called()
+    loop.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Launcher wiring: AGENT_BROWSER_ARGS must be exported for the capture path.
+# ---------------------------------------------------------------------------
+
+LAUNCH_INNER = LIB / "launch-staging.sh"
+
+
+def test_launcher_exports_agent_browser_args():
+    text = LAUNCH_INNER.read_text(encoding="utf-8")
+    assert "AGENT_BROWSER_ARGS" in text
+    assert "--no-sandbox" in text
+
+
+def test_launcher_node_bin_precedes_system_path():
+    """agent-browser must resolve from the STAGING node prefix, not system."""
+    text = LAUNCH_INNER.read_text(encoding="utf-8")
+    assert 'export PATH="$NODE_BIN:$VENV/bin:/usr/bin:/bin"' in text
+
+
+# ---------------------------------------------------------------------------
 # Root-owned artifact deployment parity (the repo copy must be installable).
 # ---------------------------------------------------------------------------
 
@@ -150,5 +236,7 @@ def test_lib_files_exist_and_are_scripts():
     assert SANDBOXED.is_file()
     assert GUARD.is_file()
     assert STAGING_HOSTS.is_file()
+    assert LAUNCH_INNER.is_file()
     assert SANDBOXED.read_text(encoding="utf-8").startswith("#!/usr/bin/env bash")
     assert GUARD.read_text(encoding="utf-8").startswith("#!/usr/bin/env bash")
+    assert LAUNCH_INNER.read_text(encoding="utf-8").startswith("#!/usr/bin/env bash")
