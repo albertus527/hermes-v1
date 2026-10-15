@@ -1,0 +1,27 @@
+[Unit]
+Description=WB-E2E staging OpenViking allowlist proxy (read-only, staging-only)
+Documentation=file:/home/wbe2e/wb-e2e-r2/STAGING_SECURITY.md
+# Forwards ONLY the read routes the retrieval path needs to the real OpenViking
+# server; every other method/path (write/admin) is refused with 403 BEFORE any
+# upstream connection is made. Holds NO credential (forwards the caller's own
+# X-API-Key). Runs in its OWN cgroup so the staging unit's nft rule dropping
+# direct :1933 does not affect it.
+
+[Service]
+Type=simple
+User=wbe2e
+Group=wbe2e
+ExecStart=/usr/bin/python3 /home/wbe2e/wb-e2e-r2/bin/ov_allowlist_proxy.py
+Restart=on-failure
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/tmp
+
+[Install]
+WantedBy=multi-user.target

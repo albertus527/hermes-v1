@@ -1,0 +1,13 @@
+127.0.0.1 localhost
+::1 localhost ip6-localhost ip6-loopback
+
+# Staging egress policy (L1, domain-based): sinkhole the Vercel MANAGEMENT API
+# hostnames to the loopback, where nothing listens. This defeats hostname-based
+# access to the Vercel control plane and survives Vercel IP changes.
+#
+# DO NOT add *.vercel.app here: preview deployments (<project>.vercel.app) live
+# in a DIFFERENT address range and MUST stay reachable for the preview smoke
+# test.
+127.0.0.1 api.vercel.com
+127.0.0.1 vercel.com
+127.0.0.1 www.vercel.com
