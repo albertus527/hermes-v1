@@ -18,8 +18,10 @@ import hashlib
 import inspect
 import json
 import logging
+import os
 import re
 import shutil
+import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -404,6 +406,134 @@ def _verify_toolchain_untouched(workspace: Path, expected_hashes: Dict[str, str]
     return None
 
 
+# ---------------------------------------------------------------------------
+# Rebuild-safe starter merge (Phase 7 workspace provisioning)
+#
+# The starter is copied into the project workspace with MERGE semantics: every
+# starter entry overwrites the same-named entry already present and unrelated
+# generated files (PRD.md, Design.md, FRONTEND components, ...) are left in
+# place. ``shutil.copytree(..., dirs_exist_ok=True)`` / ``shutil.copy2`` alone
+# are not safe for a REBUILD: ``copy2`` opens the destination with ``'wb'`` and
+# raises ``PermissionError`` when a previously copied starter file is read-only
+# (e.g. the staging source refresh left the source ``chmod a-w``, so the first
+# build's copy inherited read-only modes), and both follow a symlink planted at
+# the destination -- which would let a link redirect the write outside the
+# workspace. The helpers below replace the destination safely instead.
+# ---------------------------------------------------------------------------
+
+#: Entries the starter merge never propagates (build output / VCS metadata).
+_STARTER_SKIP = ("node_modules", "dist", ".git")
+
+
+def _assert_confined(path: Path, workspace: Path) -> None:
+    """Fail closed unless the write target stays inside ``workspace``.
+
+    Validates the REAL parent directory (``path.parent``), because a destination
+    entry is written by unlinking any symlink at ``path`` and creating a fresh
+    entry inside its parent -- so the parent chain is what a planted symlink
+    would have to escape through. The workspace root itself is trivially
+    confined. ``os.path.realpath`` resolves intermediate symlinks and ``..``, so
+    a redirected parent is caught here before any mutation.
+    """
+    workspace_real = Path(os.path.realpath(workspace))
+    if Path(os.path.realpath(path)) == workspace_real:
+        return
+    parent_real = Path(os.path.realpath(path.parent))
+    if parent_real != workspace_real and workspace_real not in parent_real.parents:
+        raise WorkspaceError(
+            f"Starter copy destination escapes workspace: {path}"
+        )
+
+
+def _remove_path_safely(path: Path) -> None:
+    """Remove ``path`` WITHOUT following a final symlink.
+
+    A symlink is unlinked (never dereferenced, so a planted link cannot redirect
+    the removal outside the workspace), a regular file is unlinked, and a
+    directory is emptied bottom-up. Owner-write is added ONLY to the directories
+    inside this exact subtree (scoped, additive) so a previously read-only
+    starter directory can be emptied -- the rest of the workspace is never
+    touched and there is no recursive chmod of the workspace.
+    """
+    if path.is_symlink() or not path.is_dir():
+        os.unlink(path)
+        return
+
+    # Top-down: make each directory writable enough to empty, and unlink every
+    # entry. ``files`` never contains a directory (symlinked dirs land in
+    # ``dirs``), so each entry is a regular file or a symlink to unlink, not
+    # follow.
+    for root, dirs, files in os.walk(path, topdown=True, followlinks=False):
+        root_path = Path(root)
+        mode = stat.S_IMODE(os.stat(root_path).st_mode)
+        if not mode & stat.S_IWUSR:
+            os.chmod(root_path, mode | stat.S_IRWXU)
+        for name in files:
+            os.unlink(root_path / name)
+        for name in dirs:
+            target = root_path / name
+            if target.is_symlink():
+                os.unlink(target)
+    # Bottom-up: remove now-empty directories (symlinked dirs already unlinked).
+    for root, dirs, _ in os.walk(path, topdown=False, followlinks=False):
+        for name in dirs:
+            target = Path(root) / name
+            if target.is_symlink():
+                os.unlink(target)
+            else:
+                os.rmdir(target)
+    os.rmdir(path)
+
+
+def _ensure_dir(path: Path, workspace: Path) -> None:
+    """Create ``path`` as a real directory, replacing a symlink or a file.
+
+    Never follows a symlink at ``path``. Adds owner-write to an existing
+    read-only directory so the merge can proceed (additive only -- no bits are
+    removed, and only this specific directory is touched).
+    """
+    _assert_confined(path, workspace)
+    if path.is_symlink() or (path.exists() and not path.is_dir()):
+        _remove_path_safely(path)
+    path.mkdir(parents=True, exist_ok=True)
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    if not mode & stat.S_IWUSR:
+        os.chmod(path, mode | stat.S_IWUSR | stat.S_IXUSR)
+
+
+def _replace_file(src: Path, dest: Path, workspace: Path) -> None:
+    """Copy ``src`` over ``dest``, safely replacing a read-only/symlinked dest.
+
+    The destination is unlinked first (never followed) so a read-only file is
+    replaced instead of failing ``open(..., 'wb')`` with EACCES, and a planted
+    symlink cannot redirect the write. ``shutil.copy2`` then preserves the
+    source's content AND permission bits (including any executable mode).
+    """
+    _assert_confined(dest, workspace)
+    _ensure_dir(dest.parent, workspace)
+    if dest.is_symlink() or (dest.exists() and not dest.is_dir()):
+        os.unlink(dest)
+    elif dest.is_dir():
+        _remove_path_safely(dest)
+    shutil.copy2(src, dest)
+
+
+def _copy_tree_merge(src: Path, dest: Path, workspace: Path) -> None:
+    """Recursively merge ``src`` into ``dest`` (overwrite same names, keep the
+    rest). Directories are ensured writable as needed; files are replaced via
+    :func:`_replace_file`. Every destination is confined to ``workspace``.
+    """
+    _ensure_dir(dest, workspace)
+    for entry in src.iterdir():
+        if entry.name in _STARTER_SKIP:
+            continue
+        target = dest / entry.name
+        if entry.is_dir():
+            _copy_tree_merge(entry, target, workspace)
+        else:
+            _replace_file(entry, target, workspace)
+
+
 # Canonical frontend starter location (relative to repo root)
 # Repository layout:
 #   <repo>/templates/frontend-starter/
@@ -494,18 +624,27 @@ class FrontendBuilder:
         self.design_capability_report = design_capability_report
 
     def _copy_starter(self, workspace: Path) -> None:
-        """Copy the fixed frontend starter into the project workspace."""
+        """Merge the fixed frontend starter into the project workspace.
+
+        Rebuild-safe and symlink-safe: existing read-only starter files are
+        REPLACED rather than opened for write, a planted symlink at a
+        destination is unlinked (never followed), and every write is confined
+        to ``workspace``. Unrelated generated files already in the workspace
+        (PRD.md, Design.md, FRONTEND source) are preserved -- the merge
+        overwrites only same-named starter entries.
+        """
         if not self.starter_path.exists():
             raise FileNotFoundError(f"Frontend starter not found: {self.starter_path}")
 
+        workspace = Path(workspace)
         for item in self.starter_path.iterdir():
-            if item.name in ("node_modules", "dist", ".git"):
+            if item.name in _STARTER_SKIP:
                 continue
             dest = workspace / item.name
             if item.is_dir():
-                shutil.copytree(item, dest, dirs_exist_ok=True)
+                _copy_tree_merge(item, dest, workspace)
             else:
-                shutil.copy2(item, dest)
+                _replace_file(item, dest, workspace)
 
     def _compile_and_store_documents(
         self,

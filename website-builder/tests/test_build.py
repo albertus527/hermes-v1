@@ -157,6 +157,43 @@ class TestFrontendBuilderWithHermes(unittest.TestCase):
         self.assertEqual(result.design_dna["brand_personality"], "premium, minimalist")
         self.mock_adapter.frontend_build.assert_called_once()
 
+    def test_nonempty_design_pack_reaches_frontend_invocation(self):
+        """N6-D: a non-empty DesignContextPack is forwarded to FRONTEND.
+
+        The pre-build pack built by ``_prepare_prebuild_design`` must reach
+        ``frontend_build(design_context=...)`` unchanged -- not be dropped on
+        the floor between pack construction and the FRONTEND call.
+        """
+        self.mock_adapter.frontend_build.return_value = {
+            "success": True,
+            "design_dna": _valid_dna(),
+        }
+
+        sentinel_pack = MagicMock(name="DesignContextPack")
+        sentinel_pack.resources = 1
+        sentinel_pack.payload_chars = 5819
+
+        brief = {"name": "Northcut", "what": "barbershop", "why": "booking WA"}
+        _queue_project(self.store, "proj-hermes-pack")
+
+        with patch.object(
+            self.builder,
+            "_prepare_prebuild_design",
+            return_value=("GUIDANCE", sentinel_pack),
+        ):
+            with patch.object(self.builder, "_run_fixed_checks") as mock_checks:
+                mock_checks.return_value = _passing_checks()
+                with patch("app.projects.build.QAOrchestrator") as mock_qa_cls:
+                    mock_qa = MagicMock()
+                    mock_qa.run.return_value = MagicMock(success=True, error=None)
+                    mock_qa_cls.return_value = mock_qa
+                    result = self.builder.build("proj-hermes-pack", brief)
+
+        self.assertTrue(result.success)
+        self.mock_adapter.frontend_build.assert_called_once()
+        _, kwargs = self.mock_adapter.frontend_build.call_args
+        self.assertIs(kwargs.get("design_context"), sentinel_pack)
+
     def test_build_fails_when_hermes_unavailable(self):
         """Build fails gracefully when Hermes adapter is not configured."""
         builder = FrontendBuilder(self.runner, self.store, hermes_adapter=None)
