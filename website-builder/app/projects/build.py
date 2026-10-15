@@ -457,6 +457,7 @@ class FrontendBuilder:
         requirement_creator_config: Optional[RequirementCreatorConfig] = None,
         decision_engine=None,
         decision_engine_config: Optional[DecisionEngineConfig] = None,
+        design_capability_report=None,
     ):
         self.preview_orchestrator = preview_orchestrator
         self.runner = runner
@@ -482,6 +483,15 @@ class FrontendBuilder:
         # is byte-identical to pre-N6.
         self.decision_engine = decision_engine
         self.decision_engine_config = decision_engine_config or DecisionEngineConfig()
+        # N6-D: the AUTHORITATIVE design capability report (a
+        # ``DesignCapabilityReport``), resolved once at composition and injected
+        # here. The design context pack builder needs it to prove a reference is
+        # actually reachable on THIS host; without it the selector assumes every
+        # reference is unreachable and the pack degrades to ``resources=0``.
+        # Injected (never re-resolved here) so capability truth stays
+        # single-sourced and deterministic. ``None`` keeps the pre-fix behaviour
+        # for callers that have no report (never invents availability).
+        self.design_capability_report = design_capability_report
 
     def _copy_starter(self, workspace: Path) -> None:
         """Copy the fixed frontend starter into the project workspace."""
@@ -668,6 +678,7 @@ class FrontendBuilder:
                 query=query,
                 include_guidance=True,
                 retrieve=True,
+                capability_report=self.design_capability_report,
             )
         except Exception:  # noqa: BLE001 - a pack failure never blocks a build
             return None

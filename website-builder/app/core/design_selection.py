@@ -695,7 +695,16 @@ def _is_reachable(
     report, so the pre-D3a.5 contract is unchanged for them.
     """
     if activation_report is not None:
-        capability = activation_report.resources.get(resource_id)
+        # Two shapes exist in the codebase: the real ``DesignActivationReport``
+        # exposes ``get(resource_id)``, while a duck-typed report (and the
+        # pinned D3a.5 tests) exposes a ``resources`` mapping. Read whichever
+        # accessor is present so a valid report is never silently treated as
+        # "nothing reachable" -- and never assume an attribute that a caller's
+        # report does not carry.
+        if hasattr(activation_report, "get"):
+            capability = activation_report.get(resource_id)
+        else:
+            capability = getattr(activation_report, "resources", {}).get(resource_id)
         if capability is None:
             # Present in the D0 report but absent from activation: we cannot
             # prove it, so it is NOT reachable. Never invent.

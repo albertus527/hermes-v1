@@ -69,7 +69,10 @@ from app.channels.dispatch import AuthenticatedTelegramContext, TelegramDispatch
 from app.channels.telegram import NormalizedMessage, TelegramNormalizer
 from app.core import credentials
 from app.core.critic_repair import scanner_from_config
-from app.core.design_capabilities import preflight_design_capabilities
+from app.core.design_capabilities import (
+    preflight_design_capabilities,
+    resolve_design_capabilities,
+)
 from app.core.design_resources import DesignResourceManifestError
 from app.core.intake import IntakeProcessor
 from app.core.laya_context import (
@@ -1006,6 +1009,17 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
         },
     )
 
+    # N6-D: resolve the AUTHORITATIVE design capability report ONCE, here, and
+    # inject it into the FrontendBuilder so the design context pack can prove a
+    # reference is actually reachable on THIS host. This is the SAME report the
+    # startup preflight computes (``resolve_design_capabilities`` is the pure
+    # resolver behind ``preflight_design_capabilities``); resolving it here keeps
+    # composition self-contained so a direct caller (tests, tools) gets the same
+    # behaviour, and it never logs a second time. Resolution is pure local
+    # inspection -- no network, no subprocess, no install -- and never invents
+    # availability.
+    design_capability_report = resolve_design_capabilities(config.hermes_home)
+
     # Intake processor. D4b: the optional Laya context preparer is injected; it
     # never decides scope/requirements/actions and never mutates state.
     # N6: the optional Decision Engine + its mode config are injected; by default
@@ -1188,6 +1202,7 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
         requirement_creator_config=config.requirement_creator_config,
         decision_engine=decision_engine,
         decision_engine_config=config.decision_engine_config,
+        design_capability_report=design_capability_report,
     )
 
     # Revision orchestrator.

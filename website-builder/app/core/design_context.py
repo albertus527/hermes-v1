@@ -53,6 +53,7 @@ from app.core.design_policies import DEPENDENCY_STATES, DESIGN_AUTHORITY_PRECEDE
 from app.core.design_retrieval import (
     DesignContextLimits,
     DesignEntry,
+    DesignEntryError,
     DesignRetrievalReport,
     payload_chars,
     retrieve_design_guidance,
@@ -186,9 +187,36 @@ DESIGN_CONTEXT_PACK_VERSION = 1
 
 
 def _iter_entries(resources: Mapping[str, Any]):
-    """Yield every :class:`DesignEntry` carried by the pack's resource section."""
-    for result in resources.values():
-        for entry in result.get("entries", ()):
+    """Yield every entry carried by the pack's resource section.
+
+    The pack stores each resource as the ``DesignResourceResult.to_dict()``
+    form, so its ``entries`` are dicts (not :class:`DesignEntry` dataclasses).
+    A resource value that is not a mapping, or an ``entries`` value that is not
+    a sequence, is malformed: raise :class:`DesignEntryError` rather than
+    silently yielding nothing (which would hide a corrupt pack behind a
+    plausible ``resources=0``/``chars=0`` summary) or crashing with a bare
+    ``AttributeError``.
+    """
+    if not isinstance(resources, Mapping):
+        raise DesignEntryError(
+            f"pack resources must be a mapping, got {type(resources).__name__}"
+        )
+    for resource_id, result in resources.items():
+        if not isinstance(result, Mapping):
+            raise DesignEntryError(
+                f"resource {resource_id!r} payload must be a mapping, "
+                f"got {type(result).__name__}"
+            )
+        entries = result.get("entries", ())
+        if entries is None:
+            continue
+        if isinstance(entries, (str, bytes)) or not isinstance(
+            entries, Sequence
+        ):
+            raise DesignEntryError(
+                f"resource {resource_id!r} entries must be a sequence"
+            )
+        for entry in entries:
             yield entry
 
 

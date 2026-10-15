@@ -50,6 +50,7 @@ import csv
 import io
 import logging
 import re
+from collections.abc import Mapping as AbcMapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -73,6 +74,17 @@ from app.core.design_resources import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class DesignEntryError(ValueError):
+    """A pack entry is malformed and cannot be measured or rendered.
+
+    Raised instead of an opaque ``AttributeError``/``KeyError`` so a corrupted
+    pack is a *named, catchable* condition: a caller that must not ship a
+    half-valid pack can reject it explicitly, and a real bug is never hidden
+    behind a generic attribute failure. Nothing here reads the filesystem or
+    the network -- it validates the shape of an entry that is already in hand.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +181,7 @@ class DesignContextLimits:
 DEFAULT_LIMITS = DesignContextLimits()
 
 
-def payload_chars(entry: "DesignEntry") -> int:
+def payload_chars(entry: "DesignEntry | Mapping[str, Any]") -> int:
     """Canonical size of one normalized entry.
 
     **The single definition** used by the per-entry, per-resource, and
@@ -184,16 +196,49 @@ def payload_chars(entry: "DesignEntry") -> int:
     context, and bounding a field that later reaches the model is the point.
     ``locator`` in particular originates in resource data, so it is
     attacker-shaped text.
+
+    Accepts EITHER a :class:`DesignEntry` dataclass OR its ``to_dict()`` form
+    (``Mapping``). The D2/D3a pack carries entries as dicts (``result.to_dict()``
+    nests ``entry.to_dict()``), so the same measurement must apply to both
+    shapes -- otherwise ``DesignContextPack.total_chars`` crashes with an
+    ``AttributeError`` the moment a pack is non-empty. A value that is neither
+    shape raises :class:`DesignEntryError` rather than a bare attribute error.
     """
-    total = len(entry.title or "") + len(entry.body or "")
-    for key, value in entry.fields.items():
-        total += len(key) + len(value)
-    provenance = entry.provenance
-    total += len(provenance.resource_id or "")
-    total += len(provenance.resource_kind or "")
-    total += len(provenance.adapter or "")
-    total += len(provenance.locator or "")
-    total += len(str(provenance.entry_index))
+    if isinstance(entry, AbcMapping):
+        title = entry.get("title")
+        body = entry.get("body")
+        fields = entry.get("fields")
+        provenance = entry.get("provenance")
+    elif isinstance(entry, DesignEntry):
+        title = entry.title
+        body = entry.body
+        fields = entry.fields
+        provenance = entry.provenance
+    else:
+        raise DesignEntryError(
+            f"unsupported entry shape: {type(entry).__name__}"
+        )
+
+    if not isinstance(fields, AbcMapping):
+        raise DesignEntryError("entry.fields must be a mapping")
+
+    # Provenance is an ``EntryProvenance`` dataclass on the live object and a
+    # ``Mapping`` in the serialized pack; read both through one accessor.
+    if isinstance(provenance, AbcMapping):
+        _pget = provenance.get
+    elif isinstance(provenance, EntryProvenance):
+        _pget = lambda key, default=None: getattr(provenance, key, default)
+    else:
+        raise DesignEntryError("entry.provenance must be a mapping or EntryProvenance")
+
+    total = len(title or "") + len(body or "")
+    for key, value in fields.items():
+        total += len(str(key)) + len(str(value))
+    total += len(_pget("resource_id") or "")
+    total += len(_pget("resource_kind") or "")
+    total += len(_pget("adapter") or "")
+    total += len(_pget("locator") or "")
+    total += len(str(_pget("entry_index", "")))
     return total
 
 
@@ -1641,6 +1686,7 @@ __all__ = [
     "DesignAdapterContext",
     "DesignContextLimits",
     "DesignEntry",
+    "DesignEntryError",
     "DesignResourceResult",
     "DesignRetrievalReport",
     "EntryProvenance",
