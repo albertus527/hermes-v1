@@ -184,13 +184,29 @@ class _StubPreview:
         return OperationResult.fail("NO_DELIVERY_TARGET", error_code="NO_DELIVERY_TARGET")
 
 class _SucceedingPreview:
-    """Reconcile stub that succeeds so the turn continues past the gate.
+    """Reconcile stub that succeeds AND records the shown preview.
 
-    F6 pins the distinct-claim invariant (reconcile vs intake sub-keys). Under
-    the fail-closed recovery gate a FAILED reconcile stops the turn before
-    intake, so this stub must SUCCEED for intake to be claimed at all.
+    F6 pins the distinct-claim invariant (reconcile vs intake sub-keys). Fix 1
+    makes the recovery turn TERMINAL, so the intake claim for the same event is
+    only reached on a SUBSEQUENT message -- which is exactly what proves the
+    two claims are distinct and do not collide.
     """
+    def __init__(self, store=None, project_id=None):
+        self._store = store
+        self._project_id = project_id
+
     def run_owned(self, project_id, workspace, slot_held=False):
+        if self._store is not None:
+            pid = self._project_id or project_id
+            with self._store.acquire_writer(pid) as state:
+                state.deployment["latest_shown_preview"] = {
+                    "operation_id": "op", "source_revision": 4,
+                    "preview_url": "https://x.vercel.app", "deployment_id": "dpl",
+                    "source_sha256": "s", "artifact_sha256": "a",
+                    "shown_at": 1.0, "follow_up_state": None,
+                }
+                state.revisions.preview_revision = 4
+                self._store.save(state)
         return OperationResult.ok({"preview_url": "https://x.vercel.app"})
 
 
@@ -228,7 +244,7 @@ class TestReconcileClaimSubkey(unittest.TestCase):
             dispatcher = TelegramDispatcher(
                 store, IntakeProcessor(store),
                 workspace_for=lambda pid: workdir,
-                preview=_SucceedingPreview(),
+                preview=_SucceedingPreview(store, "tg-555"),
             )
             out = _RecordingOut()
             loop = TelegramReceiveLoop(
@@ -236,10 +252,18 @@ class TestReconcileClaimSubkey(unittest.TestCase):
                 dispatcher=dispatcher, telegram_out=out, hermes=None,
                 transport=None, conversations=None,
             )
+            # Turn 1: the pre-turn reconcile runs (terminal under Fix 1).
             loop._process_update({
                 "update_id": 9001,
                 "message": {"from": {"id": 1}, "chat": {"id": 555},
                             "text": "warnanya tolong bikin hijau dong", "date": 1},
+            })
+            # Turn 2: the preview is now shown, so this event routes to intake
+            # under its OWN event-derived claim key.
+            loop._process_update({
+                "update_id": 9002,
+                "message": {"from": {"id": 1}, "chat": {"id": 555},
+                            "text": "warnanya tolong bikin hijau dong", "date": 2},
             })
 
             state = store.load("tg-555")

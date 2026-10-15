@@ -159,6 +159,22 @@ website_builder:
     max_candidates: 5
     max_alternatives: 3
 
+  # Vercel project identity.
+  #
+  # ``friendly_slug`` (DEFAULT true) keeps the existing production behaviour:
+  # a project is resolved by the human-derived friendly slug bound in the
+  # conversation registry on first successful creation.
+  #
+  # Set it to FALSE only for the isolated staging E2E, where exactly ONE Vercel
+  # project is pinned in the allowlist broker under its OPAQUE hash-derived
+  # name. With friendly slugs disabled the runtime addresses that opaque
+  # identity exclusively (and additionally uses the conversation-level app id,
+  # stripping the R2 ``-p<seq>`` sub-project suffix, so the derived name equals
+  # the pinned broker name). Production behaviour is byte-for-byte unchanged
+  # while this stays true.
+  vercel:
+    friendly_slug: true
+
   # Message debounce
   intake:
     debounce_seconds: 2.0

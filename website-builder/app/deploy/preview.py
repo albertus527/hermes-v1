@@ -154,6 +154,11 @@ class PreviewDeps:
     # slug binding EXACTLY ONCE after the first successful Vercel project
     # creation/reconciliation under that slug. No-op when slug_for is None.
     bind_slug: Any = None
+    # Fix 2a: when False (staging E2E only) the friendly-slug feature is
+    # DISABLED: a persisted friendly candidate is never resurrected and the
+    # project is addressed EXCLUSIVELY by its opaque hash-derived identity.
+    # True (DEFAULT) preserves the exact pre-fix production behaviour.
+    friendly_slug: bool = True
     # Optional callable(app_id, vercel_project, *, expected_name=None)
     # -> OperationResult. Provisions/reuses the PROJECT-SPECIFIC Vercel
     # automation-bypass secret so the smoke browser can pass Deployment
@@ -365,8 +370,16 @@ class PreviewOrchestrator:
                     on_remote_boundary()
                 remote_boundary_called = True
 
-        slug = previous.get('slug_candidate')
-        if self.deps.slug_for is not None:
+        # Fix 2a: when the friendly-slug feature is DISABLED (staging E2E), the
+        # project is addressed EXCLUSIVELY by its opaque hash-derived identity.
+        # The gate is AUTHORITATIVE: a persisted friendly candidate is not
+        # resurrected AND `slug_for` is not consulted at all. The staging broker
+        # allowlists exactly ONE opaque project name, so any slug lookup would be
+        # denied. Production (friendly_slug=True) is byte-identical to the
+        # pre-fix behaviour.
+        friendly = getattr(self.deps, 'friendly_slug', True)
+        slug = previous.get('slug_candidate') if friendly else None
+        if friendly and self.deps.slug_for is not None:
             try:
                 resolved_slug = self.deps.slug_for(project_id, state)
                 if resolved_slug:
@@ -381,7 +394,10 @@ class PreviewOrchestrator:
                 project_id, operation_id,
                 slug_candidate=slug, expected_name=slug,
             )
-        expected_name = slug if slug else previous.get('expected_name')
+        expected_name = (
+            slug if slug
+            else (previous.get('expected_name') if friendly else None)
+        )
         with self.store.acquire_writer(project_id) as locked:
             locked.deployment['project_create_attempted'] = True
             self.store.save(locked)

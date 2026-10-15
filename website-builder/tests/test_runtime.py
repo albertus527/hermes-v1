@@ -1875,8 +1875,13 @@ class TestPreviewReconciliation:
         assert store.load("tg-555-p1").lifecycle == "PREVIEW_READY"
         assert "latest_shown_preview" not in store.load("tg-555-p1").deployment
 
-    def test_reconcile_success_reloads_state_and_continues(self, tmp_path):
-        """C: successful reconcile reloads state and the turn proceeds normally."""
+    def test_reconcile_success_ends_turn_after_showing_preview(self, tmp_path):
+        """C: successful reconcile shows the preview and ENDS the turn (Fix 1).
+
+        Recovery is deterministic and terminal: the same message is NOT
+        re-interpreted as INTAKE/REVISE/APPROVE/PUBLISH. Idempotency is proven
+        by a second message routing normally (preview already shown).
+        """
         store = ProjectStateStore(tmp_path / "state")
         self._preview_ready_state(store, "tg-555")
 
@@ -1920,7 +1925,13 @@ class TestPreviewReconciliation:
         preview.run_owned.assert_called_once()
         # State was reloaded: latest_shown_preview now present.
         assert "latest_shown_preview" in store.load("tg-555").deployment
-        # Normal turn continued: intake was reached after the successful reconcile.
+        # Fix 1: the recovery turn is TERMINAL -- intake was NOT reached.
+        intake.process.assert_not_called()
+
+        # Idempotency: the NEXT message routes normally (preview already shown),
+        # so intake IS reached and reconcile does not run a second time.
+        loop._process_update(self._update(event_id=2, text="halo lagi"))
+        preview.run_owned.assert_called_once()
         intake.process.assert_called_once()
 
     def test_delivery_ambiguity_protection_unchanged(self, tmp_path):

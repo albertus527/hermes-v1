@@ -183,6 +183,12 @@ class RuntimeConfig:
     decision_engine_config: DecisionEngineConfig = field(
         default_factory=DecisionEngineConfig
     )
+    # Fix 2a: friendly Vercel project slugs. True (DEFAULT) keeps the existing
+    # production behaviour: a project is resolved by the human-derived friendly
+    # slug bound in the registry. False (staging E2E only) makes the runtime use
+    # the OPAQUE hash-derived identity exclusively, so it addresses exactly the
+    # single Vercel project pinned in the staging broker allowlist.
+    friendly_slug: bool = True
 
     def __post_init__(self):
         # Expand ~ in paths
@@ -204,6 +210,38 @@ def _required_env(name: str) -> str:
 def _optional_env(name: str) -> Optional[str]:
     value = os.environ.get(name, "").strip()
     return value if value else None
+
+
+def _coerce_bool(raw, default: bool) -> bool:
+    """Coerce a config/env value to bool, falling back to ``default``.
+
+    A missing/empty value yields ``default`` so a deployment that does not set
+    the key keeps its previous behaviour exactly.
+    """
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return bool(default)
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _conversation_app_id(project_id: str) -> str:
+    """Map an R2 internal project id to its CONVERSATION-level app id.
+
+    R2 project ids are ``tg-<conversation_id>-p<seq>`` (see
+    ``app.core.registry.project_id_for``). The staging Vercel project is
+    provisioned under the conversation-level id ``tg-<conversation_id>`` (the
+    R2 ``-p<seq>`` sub-project suffix is stripped), which is exactly the id the
+    pinned broker allowlist was derived from. A project id that does not carry
+    the R2 sub-project suffix is returned unchanged, so legacy/R1 identities are
+    unaffected.
+    """
+    if not isinstance(project_id, str):
+        return project_id
+    head, sep, tail = project_id.rpartition("-p")
+    if sep and tail.isdigit():
+        return head
+    return project_id
 
 
 def _make_vercel_adapter(config) -> "VercelAdapter":
@@ -335,6 +373,15 @@ def load_runtime_config(config_path: Optional[Path] = None) -> RuntimeConfig:
         dict(wb.get("decision_engine") or {})
     )
 
+    # Fix 2a: friendly Vercel project slugs. DEFAULT true so production is
+    # unchanged; only the staging E2E config sets it false. An env override
+    # exists for operator convenience (never required).
+    vercel_cfg = wb.get("vercel") or {}
+    friendly_slug = _coerce_bool(
+        os.environ.get("WEBSITE_BUILDER_VERCEL_FRIENDLY_SLUG"),
+        vercel_cfg.get("friendly_slug", True),
+    )
+
     return RuntimeConfig(
         telegram_bot_token=telegram_bot_token,
         hermes_home=hermes_home,
@@ -352,6 +399,7 @@ def load_runtime_config(config_path: Optional[Path] = None) -> RuntimeConfig:
         laya_config=laya_config,
         requirement_creator_config=requirement_creator_config,
         decision_engine_config=decision_engine_config,
+        friendly_slug=friendly_slug,
     )
 
 
@@ -1172,19 +1220,42 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
         keys = [remote_project_id, vercel.project_name_for(project_id)]
         return any(key and bypass_store.get(key) for key in keys)
 
+    # Fix 2a: app identity + friendly-slug gate.
+    #
+    # Production (friendly_slug=True): UNCHANGED. Each R2 sub-project is
+    # addressed by its own project id, and the friendly-slug feature is wired
+    # exactly as before.
+    #
+    # Staging (friendly_slug=False): the ONE allowlisted Vercel project is
+    # provisioned under the CONVERSATION-level app id (see
+    # /home/wbe2e/wb-e2e-r2/STAGING_SECURITY.md: app_id = `tg-6329821361`,
+    # i.e. `project_id_for` without the R2 `-p<seq>` sub-project suffix). The
+    # runtime must therefore (a) never derive/consult a friendly slug and
+    # (b) address the project by that conversation-level identity, so the
+    # opaque `project_name_for(app_id)` equals the pinned broker name exactly.
+    def _app_id_for(pid):
+        if config.friendly_slug or not isinstance(pid, str):
+            return pid
+        return _conversation_app_id(pid)
+
+    _preview_slug_for = _slug_for if config.friendly_slug else None
+    _preview_bind_slug = _bind_slug if config.friendly_slug else None
+
     preview_deps = PreviewDeps(
         vercel=vercel,
         telegram=telegram_out,
         smoke=smoke_tester,
         output_repo=output_repo,
         chat_id_for=chat_id_for,
+        app_id_for=_app_id_for,
+        friendly_slug=config.friendly_slug,
         display_name_for=lambda pid, state: (
             registry_store.display_name_for(state.conversation_id, pid)
             if state is not None and state.conversation_id
             else None
         ),
-        slug_for=_slug_for,
-        bind_slug=_bind_slug,
+        slug_for=_preview_slug_for,
+        bind_slug=_preview_bind_slug,
         ensure_bypass=_ensure_bypass,
         reprovision_bypass=_reprovision_bypass,
         bypass_is_stored=_bypass_is_stored,
@@ -2105,6 +2176,24 @@ User message:
         router = self.conversations
         conversation_id = message.conversation_id
 
+        # Fix 1: DETERMINISTIC pre-routing preview recovery.
+        #
+        # A project that is PREVIEW_READY with a tested snapshot but no shown
+        # preview must be recovered BEFORE FAST routing and BEFORE intent
+        # classification, so recovery never depends on how FAST interprets an
+        # ambiguous message ("halo", "lihat preview", "publish ya", ...). The
+        # project is resolved from the AUTHENTICATED conversation's registry --
+        # never inferred from the user's text. When recovery is needed the turn
+        # ENDS here: the same message is NEVER re-interpreted as
+        # INTAKE/REVISE/APPROVE/PUBLISH. Idempotent -- once the preview is
+        # recorded and shown, `_needs_preview_reconcile` is False and subsequent
+        # messages use normal routing again.
+        if self._pre_routing_preview_reconcile(
+            update, authenticated, message,
+            diag_tag="4.before_reconcile_preview_dispatch",
+        ):
+            return
+
         # Load bounded active-project context to enrich the FAST prompt so
         # intake answers are not mistaken for new-project requests. This is a
         # read-only operation; no mutation happens here. When there is no
@@ -2148,6 +2237,60 @@ User message:
             )
             return
         self._dispatch_project_turn(update, project_id, authenticated, message, state, route)
+
+    def _pre_routing_preview_reconcile(self, update, authenticated, message, *,
+                                       diag_tag) -> bool:
+        """Deterministic pre-routing preview recovery (Fix 1).
+
+        Returns ``True`` when the current turn was CONSUMED by a preview
+        reconciliation and the caller MUST terminate the turn; ``False`` when
+        normal routing / intent classification may proceed.
+
+        Resolution is registry-driven (the authenticated conversation's ACTIVE
+        project), never derived from arbitrary user text. When the active
+        project satisfies the existing ``_needs_preview_reconcile`` contract the
+        EXISTING guarded ``reconcile_preview`` mechanism is executed and the
+        turn ends -- the same message is never re-interpreted as
+        INTAKE/REVISE/APPROVE/PUBLISH.
+
+        All existing guarantees are preserved because the reconciliation itself
+        is unchanged: lifecycle checks, tested_snapshot verification,
+        MAX_PRE_TURN_PREVIEW_RECONCILE_ATTEMPTS, smoke_blocked handling,
+        operation identity, deployment lookup-before-create (no duplicate
+        deployment), and anti-wedge behaviour (a blocked/attempt-exhausted
+        operation makes ``_needs_preview_reconcile`` False on the next turn, so
+        the conversation is never permanently stuck behind the gate).
+        """
+        router = self.conversations
+        if router is None:
+            return False
+        conversation_id = message.conversation_id
+        try:
+            project_id = router.registry.active_project_id(conversation_id)
+        except Exception:
+            logger.exception(
+                "Failed to resolve the active project for preview recovery "
+                "(conversation %s); deferring to normal routing",
+                conversation_id,
+            )
+            return False
+        if not project_id:
+            return False
+        try:
+            state = self.dispatcher.store.load(project_id)
+        except Exception:
+            logger.exception(
+                "Failed to load project %s for preview recovery; deferring to "
+                "normal routing", project_id,
+            )
+            return False
+        if not self._needs_preview_reconcile(state):
+            return False
+        self._reconcile_preview_before_turn(
+            update, project_id, authenticated, message, state,
+            diag_tag=diag_tag,
+        )
+        return True
 
     def _needs_preview_reconcile(self, state) -> bool:
         """True when a project has a tested snapshot but no shown preview AND
@@ -2312,15 +2455,19 @@ User message:
         self, update, project_id, authenticated, message, state, route=None
     ) -> None:
         """Per-project intent routing. All existing gates stay authoritative."""
-        # Preview reconciliation check: if project is in PREVIEW_READY with a tested_snapshot
-        # but latest_shown_preview is missing, reconcile Phase 9 before dispatching the turn.
+        # Fix 1: preview reconciliation is DETERMINISTIC and TERMINAL. This is
+        # normally handled BEFORE routing (see `_pre_routing_preview_reconcile`);
+        # it is re-checked here as defense in depth for the case where routing
+        # resolves a DIFFERENT project than the conversation's active one (e.g.
+        # "revisi webbandung" targeting a non-active project). In every case the
+        # turn ENDS after the guarded reconcile -- the same message is never
+        # re-interpreted as INTAKE/REVISE/APPROVE/PUBLISH.
         if self._needs_preview_reconcile(state):
-            state = self._reconcile_preview_before_turn(
+            self._reconcile_preview_before_turn(
                 update, project_id, authenticated, message, state,
                 diag_tag="4.before_reconcile_preview_dispatch",
             )
-            if state is None:
-                return
+            return
 
         lifecycle = state.lifecycle if state else "DISCOVERING"
 
@@ -2567,15 +2714,17 @@ User message:
             self._handle_legacy_first_project(update, message, authenticated, project_id)
             state = self.dispatcher.store.load(project_id)
         if self._needs_preview_reconcile(state):
-            # Legacy path: identical bounded recovery contract to the routed
-            # path -- a reproducible artifact smoke failure must not wedge the
-            # conversation behind the old preview's mandatory reconciliation.
-            state = self._reconcile_preview_before_turn(
+            # Fix 1 (legacy path): identical DETERMINISTIC pre-intent recovery
+            # contract to the routed path. The pre-turn reconciliation runs
+            # BEFORE intent classification and the turn ENDS here -- the same
+            # message is never re-interpreted as INTAKE/REVISE/APPROVE/PUBLISH.
+            # Anti-wedge is preserved: a blocked/attempt-exhausted operation
+            # makes `_needs_preview_reconcile` False on the next turn.
+            self._reconcile_preview_before_turn(
                 update, project_id, authenticated, message, state,
                 diag_tag="4.before_reconcile_preview_legacy",
             )
-            if state is None:
-                return
+            return
 
         lifecycle = state.lifecycle if state else "DISCOVERING"
         if lifecycle == "REVISION_REQUESTED":
