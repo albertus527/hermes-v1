@@ -48,6 +48,24 @@ else
   exit 1
 fi
 
+# 1b. FAIL-CLOSED source-identity check. The marker above is TEXT ONLY and was
+#     once a lie: the executable tree ($SRC) held an OLDER commit while the
+#     marker named the new one, so un-pinned code ran silently. Verify the
+#     ACTUAL tree against the content manifest and confirm the interpreter
+#     resolves `app` from $SRC -- BEFORE any Telegram polling or build.
+VERIFY="$STAGE/bin/verify-source-identity.sh"
+if [ ! -f "$VERIFY" ]; then
+  echo "REFUSING: missing source-identity verifier $VERIFY" >&2
+  exit 1
+fi
+if ! WB_PYTHON="$VENV/bin/python" bash "$VERIFY" \
+        --src "$SRC" --pin "$STAGE/PINNED_COMMIT" \
+        --manifest "$STAGE/SOURCE_IDENTITY.json" \
+        --helper "$STAGE/bin/source_identity.py"; then
+  echo "REFUSING: runtime source identity is stale or mismatched (see above)." >&2
+  exit 1
+fi
+
 # 2. Staging app.env must exist and be outside the profile home.
 if [ ! -f "$STAGE/state/app.env" ]; then
   echo "REFUSING: missing $STAGE/state/app.env (operator must create it, 0600)." >&2
