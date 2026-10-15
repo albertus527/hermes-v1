@@ -279,6 +279,53 @@ def verify_records_match_workspace(
     return None
 
 
+def invalidate_document(workspace: Path, kind: str) -> bool:
+    """Remove a stale ``kind`` document from ``workspace``; ``True`` iff removed.
+
+    Why this exists (N6-E): a workspace is REUSED across builds. ``Design.md`` is
+    compiled AFTER FRONTEND (see ``_compile_and_store_design``), so on a rebuild
+    the workspace still holds the *previous* build's ``Design.md``. Left in
+    place, that stale copy is handed to FRONTEND and recorded as a USED guidance
+    input, and the post-FRONTEND recompile then changes its digest — a false
+    ``GUIDANCE_VERSION_MISMATCH``. Removing it at the build boundary restores the
+    fresh-build invariant (Design.md absent at the initial invocation); an
+    absent-at-invocation document is not required to stay absent, so the
+    post-build compile is unaffected and parity holds.
+
+    This is the ONLY document that may be invalidated this way, and the call is
+    scoped to the single ``kind`` requested — every other document, ``src/``,
+    ``design-dna.json`` and QA evidence are untouched.
+
+    Safety, fail-closed:
+
+    * the canonical path must NOT be a symlink (a symlink is refused, never
+      followed, never unlinked), and
+    * it must resolve INSIDE ``workspace``; anything else is refused.
+
+    A missing document is a no-op (``False``), so a fresh workspace is unchanged.
+    """
+    path = document_path(workspace, kind)
+    if path.is_symlink():
+        raise ValueError(f"refusing to invalidate symlinked {kind} document: {path}")
+    if not path.exists():
+        return False
+    root = Path(workspace).resolve()
+    real = path.resolve()
+    if real != root and root not in real.parents:
+        raise ValueError(f"refusing to invalidate {kind} outside workspace: {real}")
+    path.unlink()
+    return True
+
+
+def invalidate_design(workspace: Path) -> bool:
+    """Remove a stale post-build ``Design.md`` (N6-E). See :func:`invalidate_document`.
+
+    A dedicated wrapper mirroring :func:`store_design_guidance`, so callers do
+    not thread a document-kind constant for the one document they may invalidate.
+    """
+    return invalidate_document(workspace, DOCUMENT_KIND_DESIGN)
+
+
 __all__ = [
     "DEPLOYMENT_DOCUMENTS_KEY",
     "StoredDocument",
@@ -289,6 +336,8 @@ __all__ = [
     "store_design_guidance",
     "read_design_guidance",
     "read_documents",
+    "invalidate_document",
+    "invalidate_design",
     "documents_present",
     "document_presence_record",
     "document_records",

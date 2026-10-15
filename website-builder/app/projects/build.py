@@ -53,6 +53,7 @@ from app.core.requirement_creator import (
 from app.core.document_store import (
     DEPLOYMENT_DOCUMENTS_KEY,
     document_records,
+    invalidate_design,
     read_document,
     store_design_guidance,
     store_documents,
@@ -822,6 +823,37 @@ class FrontendBuilder:
         except Exception:  # noqa: BLE001 - a pack failure never blocks a build
             return None
 
+    def _invalidate_stale_design(self, project_id: str, workspace: Path) -> None:
+        """Remove a stale post-build ``Design.md`` before the FRONTEND snapshot (N6-E).
+
+        A workspace is REUSED across builds, and ``Design.md`` is compiled AFTER
+        FRONTEND. On a rebuild the previous build's ``Design.md`` therefore still
+        sits in the workspace; handed to FRONTEND it is recorded as a USED
+        guidance input, and the post-FRONTEND recompile then changes its digest,
+        producing a false ``GUIDANCE_VERSION_MISMATCH``. Removing it here — before
+        the FRONTEND guidance snapshot is captured — restores the fresh-build
+        invariant. Only ``Design.md`` is affected.
+
+        Fail-safe: invalidation NEVER fails a build. A refusal (symlink, escape)
+        or an OSError is logged and swallowed, exactly like the other document
+        side-effects on this path, so a workspace problem degrades to the
+        existing behaviour rather than losing the website.
+        """
+        try:
+            removed = invalidate_design(workspace)
+        except (ValueError, OSError):
+            logger.warning(
+                "N6-E: refusing to invalidate stale Design.md for %s; continuing",
+                project_id,
+                exc_info=True,
+            )
+            return
+        if removed:
+            logger.info(
+                "N6-E: invalidated stale post-build Design.md for %s before FRONTEND",
+                project_id,
+            )
+
     def _compile_and_store_design(
         self,
         project_id: str,
@@ -1228,6 +1260,19 @@ Respond with a JSON summary:
 
             # Use Hermes FRONTEND to derive design and build
             if self.hermes_adapter is not None:
+                # N6-E: a REUSED workspace still holds the PREVIOUS build's
+                # post-build ``Design.md``. Design.md is compiled AFTER FRONTEND
+                # (see ``_compile_and_store_design`` below), so that stale copy
+                # would be handed to FRONTEND and recorded as a USED guidance
+                # input, and the post-FRONTEND recompile would then change its
+                # digest — a false GUIDANCE_VERSION_MISMATCH. Invalidate it here,
+                # at the build boundary and BEFORE the FRONTEND guidance snapshot
+                # is captured, restoring the fresh-build invariant (Design.md
+                # absent at the initial invocation). Only Design.md is removed;
+                # PRD.md, DesignGuidance.md, design-dna.json, src/ and QA
+                # evidence are untouched. A fresh workspace is a no-op.
+                if self.requirement_creator_config.enabled:
+                    self._invalidate_stale_design(project_id, workspace)
                 # N4: compile the PRD from FAST's brief BEFORE FRONTEND, so the
                 # validated requirement document can be handed to FRONTEND as
                 # bounded guidance. No-op unless the Requirement Creator is

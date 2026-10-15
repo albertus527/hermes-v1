@@ -155,24 +155,24 @@ class ReusedWorkspaceParityTests(_ReusedWorkspaceBase):
     @pytest.mark.xfail(
         strict=True,
         reason=(
-            "KNOWN INDEPENDENT N6-E DEFECT (reported, fix not yet approved): a "
-            "REUSED workspace still carries the PREVIOUS build's Design.md at the "
-            "FRONTEND invocation, so it is recorded as a USED input; the "
-            "post-FRONTEND N2 recompile then changes it and parity fails closed "
-            "with a false GUIDANCE_VERSION_MISMATCH. The documented invariant is "
-            "that Design.md is ABSENT at the initial invocation (compiled after "
-            "FRONTEND). Removing the xfail once the smallest fix lands "
-            "(invalidate the stale Design.md before the initial FRONTEND call) "
-            "is the green target."
+            "Documents the PRE-FIX behaviour for the record: WITHOUT the build-"
+            "boundary invalidation, a REUSED workspace still carries the previous "
+            "build's Design.md at the FRONTEND invocation, so it is recorded as a "
+            "USED input; the post-FRONTEND N2 recompile then changes it and parity "
+            "fails closed with a false GUIDANCE_VERSION_MISMATCH. The build path "
+            "now invalidates that stale document (see "
+            "test_n6e_stale_design_invalidation.py); this raw-snapshot sequence "
+            "keeps proving the failure mode the fix removes."
         ),
     )
     def test_reused_workspace_rebuild_parity_passes(self):
-        """DESIRED: a rebuild of a REUSED workspace reaches guidance parity.
+        """PRE-FIX sequence: a rebuild of a REUSED workspace WITHOUT invalidation.
 
-        The workspace already holds the previous build's Design.md. The build
-        must not record that stale document as an input to the new FRONTEND
-        invocation, so the post-FRONTEND Design.md is the expected later
-        appearance and parity passes.
+        The workspace already holds the previous build's Design.md and nothing
+        removes it, so the raw N6-E mechanism records it as an input and the
+        post-FRONTEND Design.md changes its digest. This is the exact false
+        ``GUIDANCE_VERSION_MISMATCH`` the build boundary now prevents; kept as a
+        strict xfail so the failure mode stays pinned.
         """
         # ---- BUILD 1: fresh, then Design.md written post-FRONTEND ----
         self._store_build_inputs(1)
@@ -183,21 +183,20 @@ class ReusedWorkspaceParityTests(_ReusedWorkspaceBase):
         self._store_build_inputs(2)
         rec2 = record_invocation(self.store, "proj", self.ws, invocation_id="proj:r2")
         self._store_post_frontend_design(2, brand="editorial v2", accent="#123456")
-        # DESIRED: parity holds; currently fails (see xfail reason).
         self.assertIsNone(verify_invocation(self.ws, rec2))
 
     def test_reused_workspace_rebuild_passes_when_design_invalidated(self):
-        """Proof the proposed smallest fix is sufficient: remove the stale
-        Design.md before the FRONTEND invocation (so it is recorded ABSENT,
-        exactly like a fresh build); parity then passes."""
+        """The fix is sufficient: invalidating the stale Design.md before the
+        FRONTEND invocation (so it is recorded ABSENT, exactly like a fresh
+        build) makes parity pass."""
         self._store_build_inputs(1)
         record_invocation(self.store, "proj", self.ws, invocation_id="proj:r1")
         self._store_post_frontend_design(1, brand="editorial", accent="#a8674a")
 
-        # BUILD 2 with the stale Design.md invalidated first.
+        # BUILD 2 with the stale Design.md invalidated first, via the real helper.
         self._store_build_inputs(2)
-        from app.core.document_contracts import DESIGN_FILE_NAME
-        (self.ws / DESIGN_FILE_NAME).unlink()
+        from app.core.document_store import invalidate_design
+        self.assertTrue(invalidate_design(self.ws), "stale design must be removed")
         rec2 = record_invocation(self.store, "proj", self.ws, invocation_id="proj:r2")
         self.assertIsNone(rec2["design_digest"], "invalidated => recorded absent")
         self._store_post_frontend_design(2, brand="editorial v2", accent="#123456")
