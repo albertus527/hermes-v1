@@ -49,6 +49,11 @@ from app.core.design_intent import (
     owner_intent as _owner_intent,
     recommendations as _recommendations,
 )
+from app.core.asset_strategy import (
+    CONTENT_LAUNCH_CRITICAL,
+    CONTENT_OPTIONAL,
+    plan_assets,
+)
 
 #: Stable generator identifier written into the document front matter.
 DESIGN_GUIDANCE_GENERATOR = "requirement-creator/design-guidance"
@@ -151,6 +156,38 @@ _MOTION_LANGUAGE: Tuple[str, ...] = (
     "scroll", "motion", "animation", "transition", "timeline", "hover",
     "parallax", "easing",
 )
+
+#: The Asset Strategy section (V3-B) is emitted but NOT required by the
+#: document contract. It is optional precisely so an OLD DesignGuidance.md
+#: (compiled before V3-B) still validates and reads back unchanged.
+_ASSET_STRATEGY_HEADING = "Asset Strategy"
+_ASSET_STRATEGY_SLUG = "asset_strategy"
+
+
+def _render_asset_strategy(brief: Mapping[str, Any]) -> str:
+    """Render the V3-B Asset Strategy section for the pre-build contract.
+
+    Actionable, provenance-honest instructions derived from the brief: the
+    showcase asset state, what to do when real assets are absent, and the
+    launch-critical vs optional content still missing. It never invents a
+    project, client, service, location, award, or testimonial, and it never
+    creates an external image dependency.
+    """
+    plan = plan_assets(brief)
+    state = plan["states"].get("showcase", "")
+    lines = [f"- Showcase asset state: {state}" if state else
+             f"- {UNRESOLVED_MARKER}: no visual showcase is described"]
+    for instruction in plan["instructions"]:
+        lines.append(f"- {instruction}")
+    if plan["owner_assets"]:
+        lines.append(
+            "- Owner-supplied assets: " + ", ".join(plan["owner_assets"])
+        )
+    for item in plan["missing_launch_critical"]:
+        lines.append(f"- MISSING ({CONTENT_LAUNCH_CRITICAL}): {item}")
+    for item in plan["missing_optional"]:
+        lines.append(f"- MISSING ({CONTENT_OPTIONAL}): {item}")
+    return "\n".join(lines)
 
 
 def _intent_axes(intent: str) -> dict:
@@ -435,6 +472,7 @@ def compile_design_guidance(
         "no supporting evidence supplied",
     )
     approved = _render_approved_resources(plan, evidence)
+    asset_strategy = _render_asset_strategy(brief)
 
     rendered = {
         "brand_character": brand_line,
@@ -448,10 +486,16 @@ def compile_design_guidance(
         "motion": motion,
         "approved_resources": approved,
     }
+    # V3-B: emit the Asset Strategy section after the required sections. It is
+    # optional in the contract (not in REQUIRED_SECTIONS), so old documents stay
+    # readable.
     body_parts = [
         f"## {heading}\n\n{rendered[slug]}\n"
         for heading, slug in _GUIDANCE_SECTIONS
     ]
+    body_parts.append(
+        f"## {_ASSET_STRATEGY_HEADING}\n\n{asset_strategy}\n"
+    )
 
     front = {
         "document": DOCUMENT_KIND_DESIGN_GUIDANCE,
