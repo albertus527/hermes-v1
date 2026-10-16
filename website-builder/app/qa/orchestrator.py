@@ -108,6 +108,10 @@ class QAOrchestrator:
         # build's initial generation and compile repair. None (the production
         # default) leaves every repair path byte-identical to pre-V4-B2.
         self._frontend_budget = frontend_budget
+        # V4-B2: the honest VISION-vs-fidelity consistency classification for a
+        # blocking VISION verdict. Set only when a blocking verdict actually
+        # stops acceptance; read by :meth:`_finalize_failure`.
+        self._vision_consistency: Optional[Dict[str, Any]] = None
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -284,8 +288,18 @@ class QAOrchestrator:
                             raise
                         if checked['source_revision'] != state.revisions.source_revision:
                             raise QABlockingError('STALE_QA_BINDING')
-                        if final_attempt.vision is None or final_attempt.vision.pass_ is not True:
+                        # V4-B2: separate "VISION did not run" from "VISION ran and
+                        # returned blocking findings". The former is an
+                        # infrastructure/absence condition (retryable copy); the
+                        # latter is a genuine visual-quality block that a retry
+                        # of the same artifact cannot clear.
+                        if final_attempt.vision is None:
                             raise QABlockingError('VISION_REQUIRED')
+                        if final_attempt.vision.pass_ is not True:
+                            self._vision_consistency = self._classify_vision_consistency(
+                                attempts
+                            )
+                            raise QABlockingError('VISION_BLOCKING_FINDINGS')
                         tested_snapshot = snapshot.to_dict()
 
                     # ONE writer block commits the tested snapshot AND the
@@ -513,6 +527,64 @@ class QAOrchestrator:
             mobile_screenshot=str(screenshots.mobile) if screenshots.mobile else None,
             infrastructure_error=infra_error,
         )
+
+    @staticmethod
+    def _screenshot_digests(attempt: QAAttempt) -> Dict[str, Optional[str]]:
+        """Content digests of the screenshots VISION was shown (V4-B2).
+
+        Used ONLY to detect that two attempts were judged on byte-identical
+        evidence — the basis for the "contradictory verdicts" consistency
+        record. A missing/unreadable file yields None (never a false match).
+        """
+        import hashlib
+
+        out: Dict[str, Optional[str]] = {"desktop": None, "mobile": None}
+        for key in ("desktop", "mobile"):
+            path = getattr(attempt, f"{key}_screenshot", None)
+            if not path:
+                continue
+            try:
+                out[key] = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+            except OSError:
+                out[key] = None
+        return out
+
+    def _classify_vision_consistency(self, attempts: list) -> Optional[Dict[str, Any]]:
+        """Record an honest VISION-vs-fidelity consistency classification.
+
+        QA stays AUTHORITATIVE: this NEVER downgrades or bypasses the blocking
+        verdict — it only records, for diagnostics, whether the VISION blocking
+        finding is corroborated by the gate's OWN evidence, contradicted by an
+        identical-evidence PASS, or merely reported-but-unconfirmed.
+
+        Uses the last fidelity report when the gate ran; otherwise the gate
+        simply did not evaluate, so every blocking finding is
+        reported-but-unconfirmed (never an invented defect).
+        """
+        try:
+            from app.core.design_fidelity_runtime import build_vision_consistency
+
+            entries = [
+                {
+                    "attempt": a.attempt,
+                    "pass": (a.vision.pass_ if a.vision is not None else None),
+                    "blocking": list(a.vision.blocking_findings) if a.vision else [],
+                    "observations": list(a.vision.observations) if a.vision else [],
+                    "screenshots_sha": self._screenshot_digests(a),
+                }
+                for a in attempts
+            ]
+            record = self._design_fidelity_result
+            # The recorded fidelity record is the gate result's to_dict(); its
+            # findings live under the nested "report". The pure classifier
+            # reads findings from either a report object or its to_dict() shape.
+            report = record.get("report") if isinstance(record, dict) else record
+            return build_vision_consistency(entries, report)
+        except Exception:  # noqa: BLE001 - recording must never crash QA
+            logger.warning(
+                "V4-B2 could not classify VISION consistency", exc_info=True
+            )
+            return None
 
     # ------------------------------------------------------------------
     # D3b: the bounded critic repair stage
@@ -1222,4 +1294,21 @@ Instructions:
             if fidelity is not None:
                 # V3-C: the fidelity gate's own evidence for the failure.
                 state.failure["design_fidelity"] = fidelity
+            if self._vision_consistency is not None:
+                # V4-B2: the honest VISION-vs-fidelity consistency record. It
+                # NEVER overrides the blocking verdict — it only records whether
+                # the VISION finding was corroborated by the gate's OWN
+                # evidence, contradicted by an identical-evidence PASS, or
+                # merely reported-but-unconfirmed.
+                state.failure["vision_consistency"] = self._vision_consistency
+                if isinstance(state.failure.get("design_fidelity"), dict):
+                    state.failure["design_fidelity"]["vision_consistency"] = (
+                        self._vision_consistency
+                    )
+                # Also attach to the DURABLE fidelity diagnostic record, so the
+                # VISION findings (location/severity/evidence) and the
+                # corroboration verdict live beside the gate's own verdict.
+                dep_fid = state.deployment.get("design_fidelity")
+                if isinstance(dep_fid, dict):
+                    dep_fid["vision_consistency"] = self._vision_consistency
             self.store.save(state)

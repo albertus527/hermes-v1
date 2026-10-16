@@ -26,11 +26,17 @@ Two hard rules are enforced here:
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 from app.core.asset_strategy import plan_assets
-from app.core.design_fidelity import FidelityReport, evaluate_design_fidelity
+from app.core.design_fidelity import (
+    DIM_VISUAL_EXECUTION,
+    SEVERITY_HARD,
+    FidelityReport,
+    evaluate_design_fidelity,
+)
 from app.core.document_store import read_design_guidance, read_documents
 
 logger = logging.getLogger(__name__)
@@ -180,8 +186,196 @@ def make_fidelity_evaluate(
     return _evaluate
 
 
+# ---------------------------------------------------------------------------
+# V4-B2: VISION-vs-fidelity CONSISTENCY classification (calibration)
+# ---------------------------------------------------------------------------
+#
+# A VISION "blocking" verdict and the fidelity gate's own evidence-based
+# detectors are INDEPENDENT sources. Neither is allowed to override the other
+# here:
+#
+#   * QA stays AUTHORITATIVE — a VISION blocking finding still blocks
+#     acceptance (no tested snapshot, no preview). Nothing in this section
+#     downgrades or bypasses it.
+#   * The fidelity gate never manufactures a defect from a bare
+#     ``vision.pass_ is False``. A blocking finding is only ever treated as an
+#     independently CONFIRMED defect when the gate's OWN evidence-based
+#     detectors found a matching HARD visual finding.
+#
+# What this adds is an honest, recorded classification so an operator can tell
+# a corroborated defect from an unconfirmed (possibly model-nondeterministic)
+# one, and can see when identical evidence received contradictory verdicts.
+
+#: Classification vocabulary for a single VISION blocking finding.
+VISION_BLOCKING_REPORTED = "VISION_BLOCKING_REPORTED"
+FIDELITY_CONFIRMED_DEFECT = "FIDELITY_CONFIRMED_DEFECT"
+INCONSISTENT_OR_UNVERIFIED_FINDING = "INCONSISTENT_OR_UNVERIFIED_FINDING"
+
+VISION_CONSISTENCY_CLASSES: Tuple[str, ...] = (
+    VISION_BLOCKING_REPORTED,
+    FIDELITY_CONFIRMED_DEFECT,
+    INCONSISTENT_OR_UNVERIFIED_FINDING,
+)
+
+#: Bounded region vocabulary. A ``location`` is ONLY ever derived from words the
+#: finding ITSELF contains — never invented. No match -> "unspecified".
+_REGION_KEYWORDS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("navigation", ("navigation", "navbar", "nav", "menu")),
+    ("header", ("header",)),
+    ("hero", ("hero",)),
+    ("showcase", ("showcase", "karya", "portfolio", "project")),
+    ("services", ("service", "services", "layanan")),
+    ("contact", ("contact", "kontak")),
+    ("footer", ("footer",)),
+)
+
+_WORD_RE = re.compile(r"[a-z0-9]+")
+_STOPWORDS = frozenset({
+    "the", "and", "for", "that", "this", "with", "from", "have", "has",
+    "are", "was", "were", "not", "but", "its", "into", "onto", "than",
+    "then", "there", "their", "text", "page", "site", "which", "when",
+    "where", "what", "does", "make", "makes", "item", "items", "lacks",
+})
+
+
+def _tokens(text: Any) -> frozenset:
+    """Significant lowercase word tokens (>=4 chars, stopwords removed)."""
+    return frozenset(
+        t for t in _WORD_RE.findall(str(text or "").lower())
+        if len(t) >= 4 and t not in _STOPWORDS
+    )
+
+
+def _region_of(text: Any) -> str:
+    low = str(text or "").lower()
+    for region, keys in _REGION_KEYWORDS:
+        if any(k in low for k in keys):
+            return region
+    return "unspecified"
+
+
+def _shot_pair(entry: Mapping[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    shots = (entry or {}).get("screenshots_sha") or {}
+    return shots.get("desktop"), shots.get("mobile")
+
+
+def _same_evidence(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
+    """True only when BOTH screenshots are present and byte-identical."""
+    da, ma = _shot_pair(a)
+    db, mb = _shot_pair(b)
+    return bool(da and db and da == db and ma and ma == mb)
+
+
+def _finding_field(f: Any, key: str, default: Any = "") -> Any:
+    """Read a field from a FidelityFinding object OR its ``to_dict()`` form."""
+    if isinstance(f, Mapping):
+        return f.get(key, default)
+    return getattr(f, key, default)
+
+
+def build_vision_consistency(
+    entries: Optional[Sequence[Mapping[str, Any]]],
+    report: Any,
+) -> Dict[str, Any]:
+    """Classify VISION blocking findings. Pure, deterministic, no I/O.
+
+    ``entries`` is an ordered list (oldest first) of per-attempt dicts::
+
+        {"attempt": int, "pass": bool|None, "blocking": [str],
+         "observations": [str],
+         "screenshots_sha": {"desktop": str|None, "mobile": str|None}}
+
+    ``report`` is a :class:`FidelityReport` (or its ``to_dict()`` form). The
+    classification is:
+
+    * ``FIDELITY_CONFIRMED_DEFECT`` — the gate's OWN detectors produced a HARD
+      ``VISUAL_EXECUTION`` finding that shares >=2 significant tokens with the
+      VISION finding (independent corroboration).
+    * ``INCONSISTENT_OR_UNVERIFIED_FINDING`` — no corroboration, AND an earlier
+      attempt on byte-identical screenshots returned a PASS (the same pixels
+      got contradictory verdicts).
+    * ``VISION_BLOCKING_REPORTED`` — no corroboration and no contradiction:
+      recorded as reported-but-unconfirmed. Never silently accepted, never
+      silently dismissed.
+    """
+    entries = list(entries or [])
+    final: Mapping[str, Any] = entries[-1] if entries else {}
+    blocking = [str(b) for b in (final.get("blocking") or []) if str(b).strip()]
+
+    if isinstance(report, Mapping):
+        findings = report.get("findings") or ()
+    else:
+        findings = getattr(report, "findings", ()) or ()
+
+    hard_visual = [
+        f for f in findings
+        if _finding_field(f, "severity", None) == SEVERITY_HARD
+        and _finding_field(f, "dimension", None) == DIM_VISUAL_EXECUTION
+    ]
+    hard_tokens = [
+        (
+            _finding_field(f, "rule_id", "?"),
+            _tokens(_finding_field(f, "finding", ""))
+            | _tokens(_finding_field(f, "evidence", "")),
+        )
+        for f in hard_visual
+    ]
+
+    contradictions = []
+    for entry in entries[:-1]:
+        if (entry or {}).get("pass") is True and _same_evidence(entry, final):
+            contradictions.append({
+                "earlier_attempt": (entry or {}).get("attempt"),
+                "final_attempt": (final or {}).get("attempt"),
+                "reason": "identical_screenshots_contradictory_verdicts",
+            })
+
+    classes = []
+    for text in blocking:
+        toks = _tokens(text)
+        matched = [rid for rid, htoks in hard_tokens if len(toks & htoks) >= 2]
+        if matched:
+            klass = FIDELITY_CONFIRMED_DEFECT
+        elif contradictions:
+            klass = INCONSISTENT_OR_UNVERIFIED_FINDING
+        else:
+            klass = VISION_BLOCKING_REPORTED
+        classes.append({
+            "finding": text,
+            "severity": "blocking",
+            "location": _region_of(text),
+            "location_source": "vision_text",
+            "evidence": text,
+            "classification": klass,
+            "corroborating_fidelity_rule_ids": matched,
+        })
+
+    notes = []
+    if blocking and not hard_visual:
+        notes.append(
+            "no independent fidelity finding corroborates the VISION blocking "
+            "finding(s); recorded as reported-but-unconfirmed"
+        )
+    if contradictions:
+        notes.append(
+            "identical screenshots received contradictory VISION verdicts; "
+            "recorded as a consistency issue, not silently accepted"
+        )
+    return {
+        "classes": classes,
+        "contradiction_detected": bool(contradictions),
+        "contradictions": contradictions,
+        "notes": notes,
+    }
+
+
 __all__ = [
     "vision_to_screenshot_evidence",
     "build_fidelity_report",
     "make_fidelity_evaluate",
+    "build_vision_consistency",
+    "VISION_BLOCKING_REPORTED",
+    "FIDELITY_CONFIRMED_DEFECT",
+    "INCONSISTENT_OR_UNVERIFIED_FINDING",
+    "VISION_CONSISTENCY_CLASSES",
 ]

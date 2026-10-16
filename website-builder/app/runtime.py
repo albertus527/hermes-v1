@@ -1681,6 +1681,15 @@ ERROR_MESSAGES: Dict[str, str] = {
     # mistake, and retrying the same request will hit it again.
     "OUTPUT_COMMIT_FAILED": "The preview could not be packaged on this machine. This is a temporary problem on our side.",
     "VISION_REQUIRED": "The visual check could not be completed. Please try again.",
+    # VISION COMPLETED and returned blocking findings: a genuine
+    # visual-quality block. The copy must NOT suggest a generic retry (a retry
+    # of the same artifact cannot clear a real layout defect) and must not
+    # imply any preview was produced.
+    "VISION_BLOCKING_FINDINGS": (
+        "The visual review found a blocking layout problem on the built page, "
+        "so no preview was published. Reply with the change you want and I "
+        "will rebuild it."
+    ),
     "TOOLCHAIN_MUTATION_REJECTED": "Build failed due to toolchain policy violation. Please try again.",
     # ---- publish / promotion -------------------------------------------------
     # Internal codes stay stable for operators; these are the user-facing
