@@ -22,7 +22,7 @@ SRC=/home/wbe2e/src-r2
 WB="$SRC/website-builder"
 VENV="$STAGE/venv"
 NODE_BIN="$STAGE/node/bin"
-PINNED_COMMIT=ad79090fe555aec95800cb7aa1d03140b33333e4
+PINNED_COMMIT=310a029c5c7a0198d88c3b3fdb9a000cd929432b
 PROD_APP_ENV=/home/albertus527/.website-builder/state/app.env
 
 echo "=== staging guard ==="
