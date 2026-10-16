@@ -55,15 +55,7 @@ UNRESOLVED_MARKER = "UNRESOLVED"
 
 #: The section headings the contract requires, in a fixed order. Each is emitted
 #: even when unresolved, so "present but honest" is a checkable property.
-_GUIDANCE_SECTIONS: Tuple[Tuple[str, str], ...] = (
-    ("Brand Character", "brand_character"),
-    ("Composition", "composition"),
-    ("Typography", "typography"),
-    ("Color", "color"),
-    ("Imagery", "imagery"),
-    ("Motion", "motion"),
-    ("Approved Resources", "approved_resources"),
-)
+#: (The full, V2-B-extended table is defined below, after the marker constants.)
 
 
 class DesignGuidanceError(ValueError):
@@ -84,6 +76,116 @@ def _clean(value: Any) -> str:
 def _line(value: str) -> str:
     """Render one honest section line: the value, or an explicit UNRESOLVED note."""
     return value if value else f"{UNRESOLVED_MARKER}: no supporting evidence supplied"
+
+
+#: The section headings the contract requires, in a fixed order, followed by the
+#: V2-B additions. Each required section is emitted even when unresolved, so
+#: "present but honest" is a checkable property. The V2-B sections carry the
+#: owner's OWN design intent (separated from inferred recommendations) and the
+#: hierarchy/interaction axes the owner may have spoken to.
+_GUIDANCE_SECTIONS: Tuple[Tuple[str, str], ...] = (
+    ("Brand Character", "brand_character"),
+    ("Design Intent", "design_intent"),
+    ("Composition", "composition"),
+    ("Typography", "typography"),
+    ("Color", "color"),
+    ("Imagery", "imagery"),
+    ("Hierarchy", "hierarchy"),
+    ("Interaction", "interaction"),
+    ("Motion", "motion"),
+    ("Approved Resources", "approved_resources"),
+)
+
+#: Marker appended to a line that carries the OWNER'S OWN words verbatim, so a
+#: reader can always tell a user-specified instruction from an inferred one.
+USER_SPECIFIED = "user-specified"
+
+#: Marker appended to guidance inferred from a retrieved reference, never from
+#: the user. Kept distinct so the two can never be confused.
+REFERENCE_DERIVED = "reference-derived (not user-specified)"
+
+#: Axis vocabulary used ONLY to decide which heading the owner's OWN intent
+#: words are surfaced under. It never styles anything and is never counted: the
+#: owner's text is carried verbatim, so no keyword can add, drop, or reword a
+#: requirement. A bounded, lower-case substring table.
+_INTENT_AXES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("typography", ("tipografi", "font", "huruf", "serif", "sans-serif", "sans", "typeface", "typography")),
+    ("color", ("warna", "color", "colour", "palet", "palette", "terracotta", "aksen", "accent", "off-white", "off white", "charcoal", "monokrom", "monochrome")),
+    ("composition", ("komposisi", "composition", "layout", "tata letak", "grid", "editorial", "minimalis", "minimal", "asimetris", "asymmetric", "whitespace", "white space", "premium", "modern", "elegan", "elegant", "clean", "bersih", "kolom", "column")),
+    ("imagery", ("gambar", "foto", "photo", "imagery", "image", "visual", "ilustrasi", "illustration", "render", "3d", "video")),
+    ("hierarchy", ("hierarki", "hierarchy", "prioritas", "penekanan", "emphasis", "kontras", "contrast", "urutan")),
+    ("interaction", ("interaksi", "interaction", "hover", "klik", "click", "microinteraction", "micro-interaction", "gesture")),
+    ("motion", ("animasi", "animation", "motion", "transisi", "transition", "scroll", "gerak", "parallax", "easing")),
+)
+
+#: Descriptors that describe a DOCUMENT or DIRECTORY rather than a design. They
+#: are uninformative as composition instruction — the exact failure V2-B fixes,
+#: where an OpenViking "this directory contains a craft details guide …" string
+#: was presented as Composition guidance. Their provenance is still recorded.
+_META_DESCRIPTOR_MARKERS: Tuple[str, ...] = (
+    "this directory",
+    "this file",
+    "this document",
+    "this folder",
+    "readme",
+    "guide for",
+    "craft details guide",
+    "implementation patterns",
+    "documentation",
+    "the following file",
+)
+
+#: Language that indicates a descriptor actually carries design/composition
+#: vocabulary (so it is usable as composition guidance). A descriptor with NONE
+#: of these is treated as uninformative and excluded from Composition.
+_COMPOSITION_LANGUAGE: Tuple[str, ...] = (
+    "grid", "layout", "composition", "editorial", "asymmetric", "whitespace",
+    "white space", "bento", "mosaic", "magazine", "column", "typograph",
+    "serif", "sans", "minimal", "swiss", "brutalist", "geometric", "spacious",
+    "hierarchy", "rhythm", "alignment", "showcase", "immersive", "motion",
+    "scroll", "transition", "hover", "palette", "colour", "color", "tone",
+)
+
+#: Motion-specific language, for the Motion section's reference-derived branch.
+_MOTION_LANGUAGE: Tuple[str, ...] = (
+    "scroll", "motion", "animation", "transition", "timeline", "hover",
+    "parallax", "easing",
+)
+
+
+def _owner_intent(evidence: Mapping[str, Any]) -> str:
+    """The owner's OWN design-intent words, verbatim, or ``""``."""
+    value = evidence.get("design_intent")
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _intent_axes(intent: str) -> dict:
+    """Return ``{axis: bool}`` for which axes the OWNER's text mentions.
+
+    Bounded substring detection only. It decides WHERE the owner's verbatim
+    words are surfaced; it never authors, extends, or styles anything.
+    """
+    text = intent.lower()
+    return {
+        axis: any(term in text for term in terms)
+        for axis, terms in _INTENT_AXES
+    }
+
+
+def _is_informative_descriptor(text: str) -> bool:
+    """Whether ``text`` is usable as design/composition guidance.
+
+    ``False`` for an empty string, a document/directory meta-description, or any
+    text carrying no design vocabulary at all. This is a RELEVANCE gate on a
+    retrieved string, not a styling rule: it never changes the site, only
+    whether an uninformative reference string is quoted as guidance.
+    """
+    candidate = (text or "").strip().lower()
+    if not candidate:
+        return False
+    if any(marker in candidate for marker in _META_DESCRIPTOR_MARKERS):
+        return False
+    return any(term in candidate for term in _COMPOSITION_LANGUAGE)
 
 
 def guidance_evidence(
@@ -122,10 +224,15 @@ def guidance_evidence(
     source_uri = _clean(getattr(candidate, "source_uri", "")) if candidate else ""
     source_revision = _clean(getattr(candidate, "source_revision", "")) if candidate else ""
 
+    # V2-A/V2-B: the OWNER'S OWN design-intent words, verbatim. This is the
+    # primary, highest-authority design evidence when present.
+    design_intent = _clean(brief.get("design_intent"))
+
     return {
         "name": name,
         "what": what,
         "why": why,
+        "design_intent": design_intent,
         "brand": brand,
         "descriptor": descriptor,
         "label": label,
@@ -150,10 +257,11 @@ def guidance_selection_input(evidence: Mapping[str, Any]) -> dict:
     if brand:
         mapping["brand_personality"] = brand
     descriptor = evidence.get("descriptor")
-    if descriptor:
-        # The candidate's own descriptor is legitimate evidence for layout/motion
-        # language (e.g. "editorial grid, smooth scroll"). It is DATA, and the
-        # selector reads it exactly as it reads a DNA field.
+    # V2-B: only a descriptor that actually carries design language is offered as
+    # layout evidence. A document/directory meta-description ("this directory
+    # contains a craft details guide …") is uninformative and is EXCLUDED here,
+    # so it can never steer selection either.
+    if descriptor and _is_informative_descriptor(descriptor):
         mapping["layout"] = descriptor
     palette = evidence.get("palette")
     if palette:
@@ -206,6 +314,27 @@ def _render_approved_resources(plan, evidence: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _tag(text: str, marker: str) -> str:
+    """Append an explicit provenance tag to a guidance line.
+
+    The tag is how a reader (and a test) tells a line carrying the OWNER'S OWN
+    words from a line inferred from a retrieved reference. It never changes the
+    substance of the line.
+    """
+    return f"{text} [{marker}]"
+
+
+def _axis_line(intent: str, axes: Mapping[str, bool], axis: str) -> str:
+    """A section line built from the OWNER'S OWN words when they spoke to ``axis``.
+
+    Returns the verbatim intent (tagged ``user-specified``) or ``""`` when the
+    owner said nothing on this axis. It never paraphrases, extends, or styles.
+    """
+    if intent and axes.get(axis):
+        return _tag(intent, USER_SPECIFIED)
+    return ""
+
+
 def compile_design_guidance(
     brief: Mapping[str, Any],
     decision: Optional[Any],
@@ -225,6 +354,14 @@ def compile_design_guidance(
     The compiler is deliberately conservative: every section is present, and a
     section the evidence does not support carries an explicit ``UNRESOLVED``
     marker rather than an invented value.
+
+    V2-B: the OWNER'S OWN design intent (``brief["design_intent"]``) is the
+    highest-authority design evidence and is carried VERBATIM, tagged
+    ``user-specified``, in its own section and — where the owner's words speak to
+    an axis — in that axis's section. Guidance INFERRED from a retrieved
+    reference is tagged ``reference-derived`` and never presented as the user's
+    own instruction. A retrieved descriptor that is really a document/directory
+    description is EXCLUDED from Composition (its provenance is still recorded).
     """
     evidence = guidance_evidence(brief, decision)
     plan = _select_resources(evidence, requested_resources=requested_resources)
@@ -232,31 +369,65 @@ def compile_design_guidance(
     brand = evidence["brand"]
     descriptor = evidence["descriptor"]
     palette = evidence["palette"]
+    intent = _owner_intent(evidence)
+    axes = _intent_axes(intent)
 
     brand_line = _line(brand)
-    # Composition is grounded in the candidate descriptor (layout/motion language
-    # the decision engine actually selected) or the brief's own "what".
-    composition = _line(descriptor or evidence["what"])
-    typography = f"{UNRESOLVED_MARKER}: no typography evidence supplied (FRONTEND owns the final choice)"
-    color = _line(", ".join(palette))
-    imagery = f"{UNRESOLVED_MARKER}: no imagery evidence supplied"
-    motion = _line(descriptor if descriptor and any(
-        kw in descriptor.lower() for kw in ("scroll", "motion", "animation", "transition", "timeline")
-    ) else "")
+    # The owner's own words, verbatim, in their own section.
+    design_intent_line = (
+        _tag(intent, USER_SPECIFIED)
+        if intent
+        else f"{UNRESOLVED_MARKER}: the owner stated no explicit design preference"
+    )
+
+    # Composition: the owner's own words if they spoke to it; otherwise a
+    # retrieved descriptor ONLY when it is genuinely design language. A
+    # document/directory meta-description is never presented as composition.
+    informative_descriptor = descriptor if _is_informative_descriptor(descriptor) else ""
+    composition = (
+        _axis_line(intent, axes, "composition")
+        or (_tag(informative_descriptor, REFERENCE_DERIVED) if informative_descriptor else "")
+        or _line(evidence["what"])
+    )
+
+    # Typography / Color / Imagery / Hierarchy / Interaction: the owner's own
+    # words where stated; a retrieved palette where it exists (color); else an
+    # honest UNRESOLVED marker.
+    typography = (
+        _axis_line(intent, axes, "typography")
+        or f"{UNRESOLVED_MARKER}: no typography evidence supplied (FRONTEND owns the final choice)"
+    )
+    palette_line = _tag(", ".join(palette), REFERENCE_DERIVED) if palette else ""
+    color = _axis_line(intent, axes, "color") or palette_line or f"{UNRESOLVED_MARKER}: no supporting evidence supplied"
+    imagery = _axis_line(intent, axes, "imagery") or f"{UNRESOLVED_MARKER}: no imagery evidence supplied"
+    hierarchy = _axis_line(intent, axes, "hierarchy") or f"{UNRESOLVED_MARKER}: no supporting evidence supplied"
+    interaction = _axis_line(intent, axes, "interaction") or f"{UNRESOLVED_MARKER}: no supporting evidence supplied"
+
+    # Motion: the owner's own words, else a retrieved descriptor ONLY when it
+    # carries motion language (the pre-V2-B behaviour, now provenance-tagged).
+    motion = _axis_line(intent, axes, "motion") or _line(
+        descriptor
+        if descriptor and any(kw in descriptor.lower() for kw in _MOTION_LANGUAGE)
+        else ""
+    )
     approved = _render_approved_resources(plan, evidence)
 
-    body_parts = []
     rendered = {
         "brand_character": brand_line,
+        "design_intent": design_intent_line,
         "composition": composition,
         "typography": typography,
         "color": color,
         "imagery": imagery,
+        "hierarchy": hierarchy,
+        "interaction": interaction,
         "motion": motion,
         "approved_resources": approved,
     }
-    for heading, slug in _GUIDANCE_SECTIONS:
-        body_parts.append(f"## {heading}\n\n{rendered[slug]}\n")
+    body_parts = [
+        f"## {heading}\n\n{rendered[slug]}\n"
+        for heading, slug in _GUIDANCE_SECTIONS
+    ]
 
     front = {
         "document": DOCUMENT_KIND_DESIGN_GUIDANCE,
@@ -285,6 +456,8 @@ def guidance_digest(text: str) -> str:
 __all__ = [
     "DESIGN_GUIDANCE_GENERATOR",
     "UNRESOLVED_MARKER",
+    "USER_SPECIFIED",
+    "REFERENCE_DERIVED",
     "DesignGuidanceError",
     "guidance_evidence",
     "guidance_selection_input",

@@ -231,11 +231,26 @@ class DecisionEngine:
                 provider=provider.name,
             )
         except Exception as exc:  # noqa: BLE001 - a provider must never break intake
-            logger.warning(
-                "Decision intake provider %r failed (%s); using deterministic fallback",
-                provider.name,
-                type(exc).__name__,
-            )
+            # A retrieval-only provider (e.g. OpenViking) deliberately refuses
+            # intake with NOT_IMPLEMENTED: it has no intake authority by design,
+            # so naming it as the INTAKE provider is a configuration choice whose
+            # only correct outcome is the deterministic fallback. That is NOT an
+            # outage, so it is reported at debug — the earlier warning made an
+            # expected fallback look like a failure on every single turn. Every
+            # OTHER failure (a real outage) keeps its warning.
+            code = getattr(exc, "code", "")
+            if code == "NOT_IMPLEMENTED":
+                logger.debug(
+                    "Decision intake provider %r does not implement intake "
+                    "(retrieval-only); using deterministic fallback",
+                    provider.name,
+                )
+            else:
+                logger.warning(
+                    "Decision intake provider %r failed (%s); using deterministic fallback",
+                    provider.name,
+                    type(exc).__name__,
+                )
             return self._fallback_intake(request_text, ctx, exc)
 
     def _fallback_intake(

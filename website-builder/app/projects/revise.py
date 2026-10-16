@@ -400,6 +400,7 @@ class RevisionOrchestrator:
         principal_id: Optional[str] = None,
         reference_token: Optional[str] = None,
         on_remote_boundary=None,
+        design_intent: Optional[str] = None,
     ) -> RevisionResult:
         """Apply a previously-reserved ordered revision.
 
@@ -555,15 +556,51 @@ class RevisionOrchestrator:
                     return RevisionResult(False, project_id, seq, error="REVISION_NOT_RESERVED",
                                           error_code="REVISION_NOT_RESERVED")
                 state = locked
+                # V2-A: resolve the design intent for THIS revision. An explicit
+                # new preference stated in the revision text supersedes the
+                # stored one (newest wins); when the revision states none, the
+                # stored intent is preserved unchanged. Best-effort and bounded:
+                # a failed interpretation never blocks the revision.
+                if design_intent is None and self.hermes_adapter is not None:
+                    interpreter = getattr(
+                        self.hermes_adapter, "interpret_design_intent", None
+                    )
+                    if callable(interpreter):
+                        try:
+                            design_intent = interpreter(request_text)
+                        except Exception:  # noqa: BLE001 - never break a revision
+                            design_intent = None
+                # Accept ONLY a real, non-empty string. Anything else (None, a
+                # mock, a dict) means "no new preference this revision", so the
+                # stored intent is preserved rather than corrupted.
+                if not isinstance(design_intent, str) or not design_intent.strip():
+                    design_intent = None
+                effective_intent = (
+                    design_intent
+                    if design_intent
+                    else (
+                        locked.brief.get("design_intent")
+                        if isinstance(locked.brief.get("design_intent"), str)
+                        else None
+                    )
+                )
                 try:
                     instructions = compose_project_instructions(
                         state, access_key=self.web3forms_access_key,
-                        task=self._build_revision_instructions(state.design_dna, request_text),
+                        task=self._build_revision_instructions(
+                            state.design_dna, request_text,
+                            design_intent=effective_intent,
+                        ),
                     )
                 except (ValueError, TypeError, KeyError) as exc:
                     return RevisionResult(False, project_id, seq, error=str(exc),
                                           error_code="INVALID_PERSISTED_REFERENCES")
                 brief = dict(state.brief)
+                if design_intent:
+                    # Newest explicit user preference wins and is persisted, so
+                    # it survives subsequent revisions and any recovery.
+                    brief["design_intent"] = design_intent
+                    locked.brief["design_intent"] = design_intent
                 self.store.transition_lifecycle_locked(locked, ProjectLifecycle.QUEUED)
                 self.store.transition_lifecycle_locked(locked, ProjectLifecycle.RUNNING)
                 locked.revisions.source_revision += 1
@@ -832,15 +869,26 @@ class RevisionOrchestrator:
                               hydrated_from=hydrated_from)
 
     def _build_revision_instructions(
-        self, design_dna: Optional[Dict[str, Any]], request_text: str
+        self, design_dna: Optional[Dict[str, Any]], request_text: str,
+        design_intent: Optional[str] = None,
     ) -> str:
         dna_note = json.dumps(design_dna, indent=2) if design_dna else "(none)"
+        # V2-A: carry the owner's standing design intent (their own words) into
+        # the revision so it is preserved unless the user's requested change
+        # explicitly supersedes it. Omitted when the owner never stated one, so
+        # the instructions are byte-identical to pre-V2-A in that case.
+        intent_note = ""
+        if design_intent:
+            intent_note = (
+                "\nOwner's stated design intent (preserve unless the requested "
+                f"change explicitly supersedes it): {design_intent}\n"
+            )
         return f"""REVISION REQUEST (Phase 10 ordered natural-language revision).
 
 Existing Design DNA (preserve compatible earlier intent; do not redesign
 unrelated areas; make the smallest change satisfying the request):
 {dna_note}
-
+{intent_note}
 User requested change:
 {request_text}
 

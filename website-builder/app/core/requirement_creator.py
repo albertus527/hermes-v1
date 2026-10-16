@@ -134,6 +134,11 @@ def compile_prd(
     what = _clean(brief.get("what"))
     why = _clean(brief.get("why"))
     why_destination = _clean(brief.get("why_destination"))
+    # V2-A: the user's own explicit design/aesthetic preferences, verbatim.
+    # When present it is carried as its OWN section so FRONTEND receives the
+    # owner's stated intent; when absent the section carries the UNRESOLVED
+    # marker (honest, never inferred).
+    design_intent = _clean(brief.get("design_intent"))
 
     requirements = _bullet_block(
         [what, why], empty=f"- {UNRESOLVED_MARKER}: FAST supplied no what/why"
@@ -163,9 +168,15 @@ def compile_prd(
         "generator_version": str(generator_version),
         "requirements_version": str(requirements_version),
     }
+    design_intent_line = (
+        design_intent
+        or f"{UNRESOLVED_MARKER}: the owner stated no explicit design preference"
+    )
     body = (
         "## Requirements\n\n"
         f"{requirements}\n\n"
+        "## Design Intent\n\n"
+        f"{design_intent_line}\n\n"
         "## Scope\n\n"
         f"{chr(10).join(scope_lines)}\n\n"
         "## Acceptance Criteria\n\n"

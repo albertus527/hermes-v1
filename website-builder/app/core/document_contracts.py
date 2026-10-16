@@ -160,10 +160,13 @@ DESIGN_REQUIRED_SECTIONS: Tuple[str, ...] = (
 #: honest" is checkable and an empty section is a violation.
 DESIGN_GUIDANCE_REQUIRED_SECTIONS: Tuple[str, ...] = (
     "brand_character",
+    "design_intent",
     "composition",
     "typography",
     "color",
     "imagery",
+    "hierarchy",
+    "interaction",
     "motion",
     "approved_resources",
 )

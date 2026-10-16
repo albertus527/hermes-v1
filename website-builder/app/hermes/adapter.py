@@ -1295,6 +1295,13 @@ Your job:
    - NAME: the website/business name (if present)
    - WHAT: what the website/business is (if present)
    - WHY: what the visitor should primarily understand or do (if present)
+   - DESIGN_INTENT: the user's OWN explicit design/aesthetic preferences, if
+     they stated any (e.g. "editorial minimalis, premium, modern", "elegan",
+     "off-white, charcoal, aksen terracotta", "playful and colourful",
+     "dark mode"). Copy the user's OWN WORDS for this field, in the language
+     they used. This is a TRANSCRIPTION of what they said, never your own
+     design opinion. If the user stated no design preference, set it to null.
+     NEVER infer, embellish, or add preferences the user did not express.
 
 3. Apply the readiness rule exactly:
    - The minimum sufficient website brief is NAME + WHAT + WHY.
@@ -1318,6 +1325,11 @@ Your job:
    (unresolved). Never fabricate a number, URL, email, address, booking link,
    or any other business fact.
 
+6. DESIGN_INTENT is the user's OWN design preference words, quoted verbatim.
+   It is OPTIONAL and NEVER blocks readiness: its absence must NOT set
+   clarification_needed to true. Do NOT invent a design preference. If the
+   user did not state one, set design_intent to null.
+
 Respond in this exact JSON format:
 {{
   "scope": "WEBSITE|WEBSITE_RELATED|MIXED|OUT_OF_SCOPE|UNCLEAR",
@@ -1325,6 +1337,7 @@ Respond in this exact JSON format:
   "what": "extracted what or null",
   "why": "extracted why or null",
   "why_destination": "explicit URL/phone if provided, else null",
+  "design_intent": "the user's own design preference words, or null",
   "ambiguity": "description of any material ambiguity or null",
   "clarification_needed": true|false,
   "clarification_question": "smallest blocking question or null",
@@ -1355,6 +1368,9 @@ User text:{context_str}
                     "what": data.get("what"),
                     "why": data.get("why"),
                     "why_destination": data.get("why_destination"),
+                    # V2-A: the user's own design-preference words, verbatim.
+                    # Absent/blank → no intent recorded this turn.
+                    "design_intent": data.get("design_intent"),
                     "ambiguity": data.get("ambiguity"),
                     "clarification_needed": data.get("clarification_needed", True),
                     "clarification_question": data.get("clarification_question"),
@@ -1391,12 +1407,42 @@ User text:{context_str}
             "what": brief.get("what"),
             "why": brief.get("why"),
             "why_destination": brief.get("why_destination"),  # explicit only, never fabricated
+            # The deterministic extractor has no semantic authority to detect a
+            # design preference from free text, so it NEVER guesses one. An
+            # absent design_intent here is honest, not a loss.
+            "design_intent": None,
             "ambiguity": None,
             "clarification_needed": clarification_needed,
             "clarification_question": clarification_question,
             "readiness": readiness.value if hasattr(readiness, "value") else str(readiness),
             "source": "fallback_heuristic",
         }
+
+    def interpret_design_intent(self, text: str) -> Optional[str]:
+        """Best-effort: the user's OWN design-intent words from ``text``, or ``None``.
+
+        V2-A: used on a REVISION turn so an explicit change of design preference
+        is captured (and can supersede an older one). It reuses the EXISTING FAST
+        interpretation boundary — the same prompt, the same zero-tool programmatic
+        call — so no new prompt, tool, or model role is introduced.
+
+        It returns a non-empty string ONLY when the user actually stated a design
+        preference; an absent preference, a provider failure, or any error yields
+        ``None``. It never fabricates a preference, and the caller treats ``None``
+        as "no change" (the previously recorded intent is preserved).
+        """
+        if not isinstance(text, str) or not text.strip():
+            return None
+        try:
+            result = self.fast_interpret(text)
+        except Exception:  # noqa: BLE001 - best-effort; never break a revision
+            logger.warning("Design-intent interpretation failed; preserving stored intent")
+            return None
+        if not isinstance(result, dict):
+            return None
+        from app.core.intake import clean_design_intent
+
+        return clean_design_intent(result.get("design_intent")) or None
 
     def frontend_propose_directions(
         self,
@@ -1727,6 +1773,16 @@ Respond in this exact JSON format:
         what = brief.get("what", "")
         why = brief.get("why", "")
         why_destination = brief.get("why_destination")
+        # V2-A: the owner's OWN explicit design/aesthetic preferences, verbatim.
+        # Rendered as a distinct, clearly-labelled brief line so the intent the
+        # owner stated reaches FRONTEND. Omitted entirely when the owner stated
+        # none, so the prompt is byte-identical to pre-V2-A in that case.
+        design_intent = str(brief.get("design_intent") or "").strip()
+        design_intent_note = (
+            f"\nDesign intent (owner's own words — follow this): {design_intent}"
+            if design_intent
+            else ""
+        )
 
         cta_note = ""
         if why_destination:
@@ -1743,7 +1799,7 @@ Respond in this exact JSON format:
 Brief:
 - Name: {name}
 - What: {what}
-- Why: {why}{cta_note}
+- Why: {why}{cta_note}{design_intent_note}
 
 Workspace: {workspace}
 

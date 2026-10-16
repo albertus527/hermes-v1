@@ -38,6 +38,10 @@ from app.core.decision_provider import (  # noqa: E402
     DesignCandidate,
 )
 from app.core.document_guidance import guidance_for_workspace  # noqa: E402
+from app.core.document_contracts import (  # noqa: E402
+    extract_sections,
+    parse_front_matter,
+)
 from app.core.document_store import (  # noqa: E402
     document_records,
     read_document,
@@ -166,8 +170,16 @@ class FormaAtelierReplayTests(unittest.TestCase):
         self.assertIn("Fraunces", design)
         self.assertIn("#101014", design)
         # No fabricated UNRESOLVED markers when the facts are supplied.
-        self.assertNotIn("UNRESOLVED", prd)
         self.assertNotIn("UNRESOLVED", design)
+        # V2-A: the PRD now carries an explicit Design Intent section. This
+        # fixture brief states NO design preference, so that ONE section is
+        # honestly UNRESOLVED while every requirement fact is present — the
+        # marker is never fabricated away, and the only UNRESOLVED is the
+        # optional design-intent one.
+        sections = extract_sections(parse_front_matter(prd)[1])
+        self.assertIn("design_intent", sections)
+        self.assertIn("UNRESOLVED", sections["design_intent"])
+        self.assertNotIn("UNRESOLVED", sections["requirements"])
 
     def test_replay_marks_absent_facts_unresolved_not_invented(self):
         """A missing fact is marked UNRESOLVED, never fabricated."""

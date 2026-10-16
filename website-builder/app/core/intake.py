@@ -106,6 +106,28 @@ def _contains_phrase(text: str, phrases: set) -> bool:
     return False
 
 
+#: Hard cap on the stored user design-intent string. The value is the USER'S
+#: OWN WORDS (V2-A): it is preserved verbatim in meaning and wording, never
+#: rewritten, summarised, or inferred. The cap only bounds a pathological input
+#: so it cannot become an unbounded prompt-injection surface downstream.
+MAX_DESIGN_INTENT_CHARS = 2000
+
+
+def clean_design_intent(value: Any) -> str:
+    """Return the user's design-intent text, trimmed and bounded, or ``""``.
+
+    This is a NORMALISER, not an author: it strips surrounding whitespace,
+    collapses internal runs of whitespace/newlines to single spaces (so the
+    value stays a single bounded line), and caps the length. It never invents,
+    rephrases, or drops meaning. A non-string, empty, or whitespace-only value
+    yields ``""`` — the caller treats that as "no intent stated this turn".
+    """
+    if not isinstance(value, str):
+        return ""
+    collapsed = " ".join(value.split())
+    return collapsed[:MAX_DESIGN_INTENT_CHARS].strip()
+
+
 class IntakeProcessor:
     """Processes normalized messages through scope, pause/resume, and requirement gates.
 
@@ -164,8 +186,12 @@ class IntakeProcessor:
         self.last_intake_routing_hint = None
 
     # Brief fields the multi-turn merge accumulates. Order matters: the
-    # smallest sufficient website brief is NAME + WHAT + WHY.
-    _BRIEF_FIELDS = ("name", "what", "why", "why_destination")
+    # smallest sufficient website brief is NAME + WHAT + WHY. ``design_intent``
+    # (V2-A) is an OPTIONAL, additional field: the user's own explicit design /
+    # aesthetic preferences, verbatim. It is NOT part of the sufficiency rule
+    # (readiness is still NAME + WHAT + WHY) and its absence is never a
+    # clarification — it only records intent the user chose to state.
+    _BRIEF_FIELDS = ("name", "what", "why", "why_destination", "design_intent")
 
     def _persisted_brief(self, project_id: Optional[str]) -> Dict[str, Any]:
         """Return the brief already collected for this project.
@@ -263,6 +289,14 @@ class IntakeProcessor:
                     merged[field] = extracted[field]
         if extracted.get("why_destination"):
             merged["why_destination"] = extracted["why_destination"]
+        # V2-A: an explicit design-intent statement REPLACES the stored one —
+        # the newest user-stated preference wins. An absent/blank value never
+        # erases a previously recorded intent, so a follow-up turn that does not
+        # mention style cannot silently drop the user's earlier direction, and a
+        # stale stored value can never overwrite a newer explicit statement.
+        new_intent = clean_design_intent(extracted.get("design_intent"))
+        if new_intent:
+            merged["design_intent"] = new_intent
         return merged
 
     def _readiness_for(self, scope: Scope, brief: Dict[str, Any]) -> Readiness:
@@ -486,6 +520,9 @@ class IntakeProcessor:
                     "what": fast_result.get("what"),
                     "why": fast_result.get("why"),
                     "why_destination": fast_result.get("why_destination"),
+                    # V2-A: the user's explicit design/aesthetic preferences,
+                    # verbatim. Absent when the user stated none.
+                    "design_intent": fast_result.get("design_intent"),
                 }
                 # FAST owns ambiguity/correction semantics: when it flags a
                 # material clarification need with its own question, that
@@ -767,6 +804,12 @@ class IntakeProcessor:
                 state.brief["why"] = result.brief["why"]
             if result.brief.get("why_destination"):
                 state.brief["why_destination"] = result.brief["why_destination"]
+            # V2-A: persist an explicitly stated design intent (verbatim). Only
+            # written when the turn actually carried one, so a later turn that
+            # says nothing about style never erases the recorded intent.
+            intent = clean_design_intent(result.brief.get("design_intent"))
+            if intent:
+                state.brief["design_intent"] = intent
 
             # Handle pause/resume through lifecycle authority
             if result.pause_detected:
