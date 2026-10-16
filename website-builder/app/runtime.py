@@ -2205,7 +2205,9 @@ Intent definitions:
 - REVISE: The user requests changes to the current preview/site (e.g. "make
   the hero smaller", "change the button color", "hero kegedean").
 - APPROVE: The user clearly intends to accept the current preview (e.g.
-  "looks good", "approve", "ok"). This binds the preview but does NOT publish.
+  "looks good", "approve", "ok"). This accepts the verified current preview
+  and immediately initiates production publication, subject to all existing
+  authorization and safety checks.
 - PUBLISH: The user clearly intends to go-live / publish to production
   (e.g. "oke live", "publish", "go live", "launch"). This requires an
   existing approval and triggers production promotion.
