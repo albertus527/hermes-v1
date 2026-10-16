@@ -172,8 +172,19 @@ website_builder:
   # stripping the R2 ``-p<seq>`` sub-project suffix, so the derived name equals
   # the pinned broker name). Production behaviour is byte-for-byte unchanged
   # while this stays true.
+  #
+  # publication_enabled is the EXPLICIT publication boundary. TRUE (default)
+  # preserves production behaviour: an APPROVE records the approval AND
+  # publishes the exact approved preview (approval IS publication). FALSE
+  # (staging E2E only) makes APPROVE record the approval WITHOUT any
+  # promote/publish side effect, blocks a direct PUBLISH and the operator
+  # --reconcile-publish recovery path before any remote call, and replaces the
+  # "Publishing..." acknowledgement with copy that never claims the site is
+  # live. It does NOT weaken the Vercel broker: privileged operations remain
+  # denied there as independent defense-in-depth.
   vercel:
     friendly_slug: true
+    publication_enabled: true
 
   # Message debounce
   intake:

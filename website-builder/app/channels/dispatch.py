@@ -84,7 +84,8 @@ def dispatch_normalized(dispatcher, message, project_id, action, *, authenticate
 
 class TelegramDispatcher:
     def __init__(self, store, intake, revise=None, promote=None, workspace_for=None,
-                 reference_intake=None, directions=None, domain=None, builder=None, preview=None):
+                 reference_intake=None, directions=None, domain=None, builder=None, preview=None,
+                 publication_enabled=True):
         self.store, self.intake = store, intake
         self.revise, self.promote = revise, promote
         self.workspace_for = workspace_for
@@ -92,6 +93,16 @@ class TelegramDispatcher:
         self.reference_intake, self.directions = reference_intake, directions
         self.domain, self.builder = domain, builder
         self.preview = preview or getattr(builder, "preview_orchestrator", None)
+        # Fix B: explicit publication boundary. True (DEFAULT) preserves the
+        # existing behaviour: approve() records the approval AND promotes it.
+        # False (staging E2E) makes approve() record the approval WITHOUT any
+        # promote/publish side effect, blocks direct "publish" (and the promote
+        # fallback) before any remote call, and suppresses the "Publishing..."
+        # progress acknowledgement. This is the single mutation authority, so
+        # the guard here covers EVERY Telegram path; the operator resume path
+        # is gated separately in runtime.py. The broker's own denial of
+        # privileged operations remains as independent defense-in-depth.
+        self.publication_enabled = bool(publication_enabled)
 
     def dispatch(self, payload, project_id, action, *, authenticated=None, seq=None,
                  reference_token=None, data=None, role=None, url=None, brief=None,
@@ -473,31 +484,67 @@ class TelegramDispatcher:
                     # LIVE.
                     approval = self.promote.approve(project_id, principal_id=principal)
                     if approval.success and on_approved is not None:
-                        # Progress acknowledgement only. A failure here is
-                        # logged and swallowed: a notification must never
-                        # decide whether a confirmed approval gets published.
+                        # Progress acknowledgement. With publication ENABLED the
+                        # copy is "Publishing..."; with it DISABLED (Fix B) the
+                        # copy states the approval was recorded and the site is
+                        # NOT live. Either way this is at-most-once per approved
+                        # identity, so a repeated APPROVE stays idempotent. A
+                        # failure here is logged and swallowed: a notification
+                        # must never decide whether a confirmed approval is
+                        # published.
                         try:
                             on_approved()
                         except Exception:
                             logger.exception(
                                 "Approval acknowledgement hook raised for project %s; "
-                                "continuing to publish",
+                                "continuing",
                                 project_id,
                             )
                     if not approval.success:
                         result = approval
+                    elif not self.publication_enabled:
+                        # Fix B: the approval is DURABLY RECORDED (approve()
+                        # already wrote it), but the explicit publication
+                        # boundary forbids any promote/publish side effect in
+                        # this environment. No promotion is attempted and the
+                        # site is never reported live.
+                        result = OperationResult.ok({
+                            "approved": True,
+                            "publication_blocked": True,
+                            "state": "PUBLISH_BLOCKED",
+                        })
                     else:
                         result = self.promote.promote(project_id, self.workspace_for(project_id), principal_id=principal)
                 elif action == "publish":
-                    approval = self.promote.approve(project_id, principal_id=principal)
-                    if not approval.success:
-                        result = approval
+                    # Fix B: a direct PUBLISH is an explicit go-live. When the
+                    # publication boundary is closed it is refused BEFORE any
+                    # remote call (no approve, no promote) -- the caller renders
+                    # the PUBLISH_BLOCKED copy, which never claims the site is
+                    # live.
+                    if not self.publication_enabled:
+                        result = OperationResult.fail(
+                            "PUBLISH_BLOCKED",
+                            error_code="PUBLISH_BLOCKED",
+                        )
+                        result.data = {"publication_blocked": True}
                     else:
-                        result = self.promote.promote(project_id, self.workspace_for(project_id), principal_id=principal)
+                        approval = self.promote.approve(project_id, principal_id=principal)
+                        if not approval.success:
+                            result = approval
+                        else:
+                            result = self.promote.promote(project_id, self.workspace_for(project_id), principal_id=principal)
                 elif action == "reconcile_preview":
                     result = self.preview.run_owned(project_id, self.workspace_for(project_id))
                 else:
-                    result = self.promote.promote(project_id, self.workspace_for(project_id), principal_id=principal)
+                    # Fix B: the promote fallback is a publication path too.
+                    if not self.publication_enabled:
+                        result = OperationResult.fail(
+                            "PUBLISH_BLOCKED",
+                            error_code="PUBLISH_BLOCKED",
+                        )
+                        result.data = {"publication_blocked": True}
+                    else:
+                        result = self.promote.promote(project_id, self.workspace_for(project_id), principal_id=principal)
             except LifecycleError:
                 # A lifecycle precondition rejected this turn. No remote side
                 # effect was attempted and none can have been partially

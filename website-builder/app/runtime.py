@@ -132,6 +132,17 @@ _ACK_NOT_SENT = "NOT_SENT"
 _ACK_PENDING = "PENDING"
 _ACK_SENT = "SENT"
 
+# Fix B: the two distinct APPROVE acknowledgements. PUBLISHING is the existing
+# progress copy (publication enabled). APPROVED_ONLY is used when the explicit
+# publication boundary is closed (staging E2E): the approval IS recorded, but
+# nothing will be published, so the copy must never say "Publishing..." and must
+# never claim the site is live.
+_APPROVAL_ACK_PUBLISHING = "✅ Preview approved. Publishing..."
+_APPROVAL_ACK_APPROVED_ONLY = (
+    "✅ Preview approved. Publikasi ke production tidak diaktifkan di "
+    "lingkungan ini; preview kamu tetap di preview dan belum live."
+)
+
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +200,14 @@ class RuntimeConfig:
     # the OPAQUE hash-derived identity exclusively, so it addresses exactly the
     # single Vercel project pinned in the staging broker allowlist.
     friendly_slug: bool = True
+    # Fix B: explicit publication boundary. True (DEFAULT) preserves production
+    # behaviour exactly: an approval publishes the exact approved preview.
+    # False (staging E2E only) makes APPROVE record the approval WITHOUT any
+    # publish/promotion side effect, blocks direct PUBLISH and the operator
+    # resume/reconcile publication paths, and suppresses the "Publishing..."
+    # progress acknowledgement. The Vercel broker still denies privileged
+    # operations independently (defense-in-depth).
+    publication_enabled: bool = True
 
     def __post_init__(self):
         # Expand ~ in paths
@@ -382,6 +401,14 @@ def load_runtime_config(config_path: Optional[Path] = None) -> RuntimeConfig:
         vercel_cfg.get("friendly_slug", True),
     )
 
+    # Fix B: explicit publication boundary. DEFAULT true so production is
+    # unchanged; only the staging E2E config sets it false. An env override
+    # exists for operator convenience (never required).
+    publication_enabled = _coerce_bool(
+        os.environ.get("WEBSITE_BUILDER_VERCEL_PUBLICATION_ENABLED"),
+        vercel_cfg.get("publication_enabled", True),
+    )
+
     return RuntimeConfig(
         telegram_bot_token=telegram_bot_token,
         hermes_home=hermes_home,
@@ -400,6 +427,7 @@ def load_runtime_config(config_path: Optional[Path] = None) -> RuntimeConfig:
         requirement_creator_config=requirement_creator_config,
         decision_engine_config=decision_engine_config,
         friendly_slug=friendly_slug,
+        publication_enabled=publication_enabled,
     )
 
 
@@ -1240,6 +1268,12 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
 
     _preview_slug_for = _slug_for if config.friendly_slug else None
     _preview_bind_slug = _bind_slug if config.friendly_slug else None
+    # Fix A: post-preview flows (promotion, custom domain) previously resolved
+    # the ALREADY-BOUND friendly slug via _bound_slug_for. That must keep working
+    # byte-for-byte in production; in staging (friendly_slug=False) it is
+    # disabled for the SAME reason preview's is -- the broker allowlists exactly
+    # ONE opaque project name, so a friendly slug can only ever 403.
+    _post_preview_slug_for = _bound_slug_for if config.friendly_slug else None
 
     preview_deps = PreviewDeps(
         vercel=vercel,
@@ -1322,7 +1356,8 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
         telegram=telegram_out,
         smoke=smoke_tester,
         chat_id_for=chat_id_for,
-        slug_for=_bound_slug_for,
+        app_id_for=_app_id_for,
+        slug_for=_post_preview_slug_for,
         bypass_for=lambda vercel_project_id: bypass_store.resolve(vercel_project_id),
         output_repo=output_repo,
         source_repo_url=config.github_source_repo,
@@ -1336,7 +1371,8 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
     domain_deps = DomainDeps(
         vercel=vercel,
         smoke=smoke_tester,
-        slug_for=_bound_slug_for,
+        app_id_for=_app_id_for,
+        slug_for=_post_preview_slug_for,
     )
     domain = CustomDomainOrchestrator(runner, store, domain_deps)
 
@@ -1356,6 +1392,7 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
         domain=domain,
         builder=builder,
         preview=preview,
+        publication_enabled=config.publication_enabled,
     )
 
     return RuntimeComposition(
@@ -1636,6 +1673,13 @@ ERROR_MESSAGES: Dict[str, str] = {
     "PROJECT_RECONCILIATION_REQUIRED": (
         "Publish belum bisa dipastikan karena status proyeknya belum terverifikasi. "
         "Preview kamu tetap aman dan belum berubah."
+    ),
+    # Fix B: the explicit publication boundary is closed in this environment
+    # (staging E2E). The preview was NOT published and is unchanged. This copy
+    # must never imply the site is live.
+    "PUBLISH_BLOCKED": (
+        "Publish ke production tidak diaktifkan di lingkungan ini. "
+        "Preview kamu tetap aman dan belum live."
     ),
     "PROJECT_IDENTITY_MISMATCH": (
         "Publish belum bisa dilanjutkan karena proyeknya tidak cocok dengan "
@@ -2959,11 +3003,15 @@ User message:
     def _send_approval_ack_once(self, project_id: str, conversation_id) -> None:
         """Acknowledge a successful approval exactly once per approved identity.
 
-        This is a PROGRESS acknowledgement only: approval now immediately
+        With publication ENABLED (production default) approval immediately
         enters the existing publish flow, so the copy says "Publishing..." and
         never asks the user for a second "publish" confirmation. The final
         outcome is whatever the promotion actually did -- ``🚀 Live: <url>``
         on success, or the truthful publish-failure copy.
+
+        With publication DISABLED (Fix B, staging E2E) nothing will be
+        published, so the copy must say the approval was recorded and that the
+        site is NOT live. It never says "Publishing...".
 
         Approval is otherwise SILENT: the binding succeeded and the user got
         nothing back, which reads as "the bot is still thinking" (the p9
@@ -3005,9 +3053,12 @@ User message:
             self.dispatcher.store.save(locked)
 
         try:
-            send_result = self.telegram_out.send_text(
-                chat_id, "✅ Preview approved. Publishing..."
+            ack_text = (
+                _APPROVAL_ACK_PUBLISHING
+                if getattr(self.dispatcher, "publication_enabled", True)
+                else _APPROVAL_ACK_APPROVED_ONLY
             )
+            send_result = self.telegram_out.send_text(chat_id, ack_text)
         except Exception:
             # Ambiguous: leave PENDING. Never resend a possibly-delivered ack.
             logger.warning(
@@ -3426,6 +3477,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     # smoke, then LIVE) with ZERO promote requests. It exits without starting
     # the receive loop, so it can never race the running runtime.
     if "--reconcile-publish" in argv:
+        # Fix B: the operator resume/reconcile publication path is a publication
+        # path too. When the explicit publication boundary is closed it must be
+        # refused BEFORE any remote call, exactly like the Telegram paths.
+        if not config.publication_enabled:
+            logger.error(
+                "Refusing --reconcile-publish: publication is disabled in this "
+                "environment (publication_enabled=false)"
+            )
+            return 1
         return _run_reconcile_publish(composition, argv)
 
     loop = TelegramReceiveLoop(
