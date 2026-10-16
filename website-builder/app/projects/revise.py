@@ -148,6 +148,7 @@ class RevisionOrchestrator:
         hydrator=None,
         source_repo_url: Optional[str] = None,
         critic_scanner=None,
+        design_fidelity_enabled: bool = False,
     ):
         self.runner = runner
         self.store = store
@@ -165,6 +166,10 @@ class RevisionOrchestrator:
         # orchestrator this revision runs so the bounded critic repair stage is
         # part of the revision path too.
         self.critic_scanner = critic_scanner
+        # V4-A: the runtime design-fidelity gate switch, injected into the QA
+        # orchestrator this revision runs. FALSE (default) keeps the revision
+        # path byte-identical to pre-V4-A.
+        self.design_fidelity_enabled = bool(design_fidelity_enabled)
 
     # ------------------------------------------------------------------
     # Revision base (frozen at reservation time)
@@ -723,6 +728,8 @@ class RevisionOrchestrator:
                 self.runner, self.store, hermes_adapter=self.hermes_adapter,
                 web3forms_access_key=self.web3forms_access_key,
                 critic_scanner=self.critic_scanner,
+                # V4-A: the bounded design-fidelity gate (default off).
+                design_fidelity_enabled=self.design_fidelity_enabled,
             )
             qa_result = qa_orchestrator.run(
                 project_id=project_id,

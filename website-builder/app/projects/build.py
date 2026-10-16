@@ -589,6 +589,7 @@ class FrontendBuilder:
         decision_engine=None,
         decision_engine_config: Optional[DecisionEngineConfig] = None,
         design_capability_report=None,
+        design_fidelity_enabled: bool = False,
     ):
         self.preview_orchestrator = preview_orchestrator
         self.runner = runner
@@ -623,6 +624,10 @@ class FrontendBuilder:
         # single-sourced and deterministic. ``None`` keeps the pre-fix behaviour
         # for callers that have no report (never invents availability).
         self.design_capability_report = design_capability_report
+        # V4-A: the runtime design-fidelity gate switch, injected into every
+        # QAOrchestrator this builder constructs. FALSE (default) keeps the
+        # build path byte-identical to pre-V4-A.
+        self.design_fidelity_enabled = bool(design_fidelity_enabled)
 
     def _copy_starter(self, workspace: Path) -> None:
         """Merge the fixed frontend starter into the project workspace.
@@ -1625,6 +1630,8 @@ Respond with a JSON summary:
                 toolchain_verify=lambda ws: _verify_toolchain_untouched(ws, toolchain_hashes),
                 # D3b: the bounded Impeccable critic repair stage.
                 critic_scanner=self.critic_scanner,
+                # V4-A: the bounded design-fidelity gate (default off).
+                design_fidelity_enabled=self.design_fidelity_enabled,
             )
             qa_result = qa_orchestrator.run(
                 project_id=project_id,

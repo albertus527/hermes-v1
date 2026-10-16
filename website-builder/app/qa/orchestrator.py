@@ -72,7 +72,7 @@ class QAOrchestrator:
         web3forms_access_key: Optional[str] = None,
         toolchain_verify=None,
         critic_scanner=None,
-        design_fidelity_fn=None,
+        design_fidelity_enabled: bool = False,
     ):
         self.runner = runner
         self.store = store
@@ -96,15 +96,12 @@ class QAOrchestrator:
         # Set by the critic stage so the caller can persist an honest degraded
         # record instead of claiming full verification.
         self._critic_stage_result = None
-        # V3-C: an OPTIONAL, injected design-fidelity gate. When None (the
-        # default) the QA path is byte-identical to pre-V3-C: no extra model
-        # call, no extra repair. When provided, it is a callable
-        # ``(workspace, brief, design_dna, technical_ok) -> object`` that runs
-        # the bounded fidelity gate (evaluate + at most ONE repair) and returns
-        # a result exposing ``to_dict()`` and ``failed``. The orchestrator only
-        # RECORDS its verdict as honest evidence; the gate itself owns the
-        # evaluate/repair/verify policy (app.core.design_fidelity).
-        self._design_fidelity_fn = design_fidelity_fn
+        # V4-A: the runtime design-fidelity gate switch. FALSE (the DEFAULT)
+        # keeps the QA path byte-identical to pre-V4-A -- the gate never runs,
+        # no extra read, no repair, no model call. TRUE (staging E2E) enables
+        # the bounded evaluate + AT-MOST-ONE-repair + re-verify stage in
+        # :meth:`_run_design_fidelity_stage`.
+        self._design_fidelity_enabled = bool(design_fidelity_enabled)
         self._design_fidelity_result = None
 
     # ------------------------------------------------------------------
@@ -203,31 +200,37 @@ class QAOrchestrator:
                                 error=critic_stage["error"],
                             )
 
-                    # --- V3-C: the OPTIONAL bounded design-fidelity gate ------
+                    # --- V3-C/V4-A: the bounded design-fidelity gate ---------
                     # Runs after the browser/VISION QA (and after the critic
                     # stage) and BEFORE the tested snapshot, so a fidelity
                     # repair invalidates nothing that has already been bound.
-                    # When unconfigured this is a no-op and the QA path is
-                    # byte-identical to pre-V3-C.
+                    # DISABLED by default: byte-identical to pre-V4-A.
                     fidelity = self._run_design_fidelity_stage(
                         project_id=project_id,
                         workspace=workspace,
                         brief=brief,
                         design_dna=design_dna,
+                        attempts=attempts,
+                        next_attempt_num=next_attempt_num,
+                        qa_dir=qa_dir,
                     )
-                    if fidelity is not None and fidelity.get("failed"):
-                        self._finalize_failure(
-                            project_id, attempts, repair_count,
-                            error=fidelity.get("error"),
-                            fidelity=fidelity.get("record"),
-                        )
-                        return QAResult(
-                            project_id=project_id,
-                            success=False,
-                            attempts=attempts,
-                            repair_attempts=repair_count,
-                            error=fidelity.get("error"),
-                        )
+                    if fidelity is not None:
+                        attempts = fidelity["attempts"]
+                        next_attempt_num = fidelity["next_attempt_num"]
+                        repair_count += fidelity["extra_repairs"]
+                        if fidelity["failed"]:
+                            self._finalize_failure(
+                                project_id, attempts, repair_count,
+                                error=fidelity["error"],
+                                fidelity=fidelity["record"],
+                            )
+                            return QAResult(
+                                project_id=project_id,
+                                success=False,
+                                attempts=attempts,
+                                repair_attempts=repair_count,
+                                error=fidelity["error"],
+                            )
 
                     # The attempt that FINALLY passed QA. After a critic repair
                     # this is the stage's fresh browser/VISION attempt; without
@@ -703,33 +706,120 @@ class QAOrchestrator:
         workspace: Path,
         brief: Dict[str, Any],
         design_dna: Optional[Dict[str, Any]],
+        attempts: list,
+        next_attempt_num: int,
+        qa_dir: Path,
     ) -> Optional[Dict[str, Any]]:
-        """Run the OPTIONAL V3-C design-fidelity gate; return bookkeeping.
+        """Run the bounded V4-A design-fidelity gate; return bookkeeping.
 
-        Returns ``None`` when no gate is configured (the default), so the QA
-        path is byte-identical to pre-V3-C. When a gate IS configured it is
-        invoked with the real workspace and brief; its honest verdict is
-        RECORDED (never fabricated) and its ``failed`` flag is surfaced so the
-        caller can refuse acceptance. The gate owns the bounded evaluate +
-        repair + verify policy in :mod:`app.core.design_fidelity`; this method
-        only supplies evidence and records the outcome.
+        Returns ``None`` when the gate is DISABLED (the default), so the QA path
+        is byte-identical to pre-V4-A. When enabled it:
 
-        The gate is an ENHANCEMENT: an unexpected gate error is recorded as a
-        degraded (non-blocking) note rather than crashing a passing QA run,
-        exactly like the design-context pack. A HARD fidelity failure the gate
-        itself reports is honoured and blocks acceptance.
+        1. builds evidence from the SAME workspace/revision (persisted brief,
+           PRD, DesignGuidance + Asset Strategy, generated source, VISION),
+        2. runs the bounded gate: evaluate, AT MOST ONE repair through the
+           EXISTING validated FRONTEND repair executor, then re-verify,
+        3. records the honest verdict durably (tied to the source revision) and
+           surfaces ``failed`` so the caller refuses acceptance.
+
+        Post-repair it re-runs the required checks (build/typecheck,
+        self-contained, screenshot/VISION, deterministic, and the re-evaluated
+        fidelity) before acceptance (C4). It never creates a tested snapshot for
+        an unverified artifact and never triggers publication (C5/C6).
         """
-        if self._design_fidelity_fn is None:
+        if not self._design_fidelity_enabled:
             return None
-        try:
-            result = self._design_fidelity_fn(
+
+        from app.core.design_fidelity import (
+            FidelityRepairBudget,
+            run_bounded_fidelity_gate,
+        )
+        from app.core.design_fidelity_runtime import make_fidelity_evaluate
+
+        # --- evidence bound to the CURRENT source revision (A3) -------------
+        persisted = self.store.load(project_id)
+        if persisted is None:
+            return None
+        revision = int(persisted.revisions.source_revision)
+        persisted_brief = dict(persisted.brief or {}) or dict(brief or {})
+
+        # Mutable evidence state the gate re-reads on its post-repair pass.
+        evidence: Dict[str, Any] = {
+            "vision": attempts[-1].vision if attempts else None,
+            "technical_ok": True,
+        }
+        captured: Dict[str, Any] = {
+            "attempts": attempts,
+            "next": next_attempt_num,
+            "repaired": False,
+        }
+
+        # A validated FRONTEND repair executor exists (self._repair). When no
+        # adapter is available there is NO executor, so we run detection-only
+        # and report repair_unavailable rather than simulating a repair (C3).
+        repair_fn = None
+        if self.hermes_adapter is not None:
+            repair_fn = lambda findings: self._fidelity_repair(  # noqa: E731
+                project_id=project_id,
                 workspace=workspace,
-                brief=brief,
+                brief=persisted_brief,
                 design_dna=design_dna,
+                findings=findings,
+                evidence=evidence,
+                captured=captured,
+                qa_dir=qa_dir,
+            )
+
+        evaluate = make_fidelity_evaluate(
+            workspace,
+            persisted_brief,
+            vision_provider=lambda: evidence["vision"],
+            technical_ok_provider=lambda: evidence["technical_ok"],
+        )
+
+        # --- NO validated executor -> DETECTION-ONLY (C3) -------------------
+        # We never simulate a repair or claim repair success. The gate runs its
+        # evaluation, records the honest verdict, and reports repair_unavailable.
+        if repair_fn is None:
+            from app.core.design_fidelity import overall_terminal_outcome
+
+            report = evaluate()
+            outcome = overall_terminal_outcome(
+                report, repair_used=False, repair_verified=False
+            )
+            record = {
+                "outcome": outcome,
+                "attempts_used": 0,
+                "repair_used": False,
+                "repair_verified": False,
+                "reason": "repair_unavailable_no_executor",
+                "failed": outcome in ("FIDELITY_FAILED", "TECHNICAL_FAILED"),
+                "history": [],
+                "report": report.to_dict(),
+                "source_revision": revision,
+            }
+            self._design_fidelity_result = record
+            self._record_fidelity_record(project_id, record)
+            failed = bool(record["failed"])
+            return {
+                "attempts": captured["attempts"],
+                "next_attempt_num": captured["next"],
+                "extra_repairs": 0,
+                "failed": failed,
+                "error": f"DESIGN_FIDELITY_{outcome}" if failed else None,
+                "record": record,
+            }
+
+        try:
+            result = run_bounded_fidelity_gate(
+                evaluate=evaluate,
+                repair=repair_fn,
+                budget=FidelityRepairBudget(),
+                technical_ok=True,
             )
         except Exception:  # noqa: BLE001 - a gate error never crashes QA
             logger.warning(
-                "V3-C design-fidelity gate raised for %s; recording degraded",
+                "V4-A design-fidelity gate raised for %s; recording degraded",
                 project_id, exc_info=True,
             )
             record = {
@@ -737,19 +827,109 @@ class QAOrchestrator:
                 "failed": False,
                 "degraded": True,
                 "error": "design_fidelity_gate_raised",
+                "source_revision": revision,
             }
             self._design_fidelity_result = record
             self._record_fidelity_record(project_id, record)
-            return {"failed": False, "error": None, "record": record}
+            return {
+                "attempts": captured["attempts"],
+                "next_attempt_num": captured["next"],
+                "extra_repairs": 1 if captured["repaired"] else 0,
+                "failed": False,
+                "error": None,
+                "record": record,
+            }
 
-        record = result.to_dict() if hasattr(result, "to_dict") else dict(result)
-        failed = bool(getattr(result, "failed", record.get("failed", False)))
+        record = result.to_dict()
+        # A4: bind the verdict to the EXACT source revision it judged. A repair
+        # bumps the source revision (and invalidates the old verdict), so read
+        # the revision FRESH here — the verdict describes the FINAL artifacts.
+        current = self.store.load(project_id)
+        if current is not None:
+            revision = int(current.revisions.source_revision)
+        record["source_revision"] = revision
         self._design_fidelity_result = record
         self._record_fidelity_record(project_id, record)
+
+        failed = bool(result.failed)
         error = None
         if failed:
-            error = f"DESIGN_FIDELITY_{record.get('outcome', 'FAILED')}"
-        return {"failed": failed, "error": error, "record": record}
+            error = f"DESIGN_FIDELITY_{result.outcome}"
+        return {
+            "attempts": captured["attempts"],
+            "next_attempt_num": captured["next"],
+            "extra_repairs": int(result.attempts_used),
+            "failed": failed,
+            "error": error,
+            "record": record,
+        }
+
+    def _fidelity_repair(
+        self,
+        *,
+        project_id: str,
+        workspace: Path,
+        brief: Dict[str, Any],
+        design_dna: Optional[Dict[str, Any]],
+        findings: list,
+        evidence: Dict[str, Any],
+        captured: Dict[str, Any],
+        qa_dir: Path,
+    ) -> bool:
+        """One fidelity-driven repair through the EXISTING validated executor.
+
+        Reuses :meth:`_repair` (same writer lock, same FRONTEND adapter call,
+        same toolchain verification, same Design DNA validation) — no second
+        pipeline, no second lock manager. Afterwards it re-runs the required
+        post-repair checks and a fresh browser/VISION attempt, updating
+        ``evidence`` so the gate's re-evaluation reflects the ACTUAL repaired
+        artifacts (B5/B6/C4). Returns True only when the repair call itself ran.
+        """
+        # The fidelity findings are handed to FRONTEND as VISION BLOCKING
+        # findings, which is exactly the channel _build_repair_instructions
+        # renders as mandatory. Subjective observations stay non-blocking.
+        blockers = [
+            f"{f.get('rule_id')}: {f.get('finding')} @ {f.get('location')} "
+            f"-> {f.get('suggested_action')}"
+            for f in findings
+        ]
+        synthetic = QAAttempt(
+            attempt=captured["next"],
+            deterministic=DeterministicFindings(
+                render_ok=True, desktop_screenshot_ok=True, mobile_screenshot_ok=True,
+                design_dna_valid=True, source_present=True,
+                build_ok=True, typecheck_ok=True,
+            ),
+            vision=VisionFindings(pass_=False, blocking_findings=blockers),
+        )
+        repaired = self._repair(project_id, workspace, brief, design_dna, synthetic)
+        if not repaired:
+            return False
+        captured["repaired"] = True
+
+        # C4: rebuild + self-contained checks on the changed artifacts.
+        build_ok, typecheck_ok, self_contained_ok = self._run_rebuild_checks(
+            project_id, workspace
+        )
+        if not (build_ok and typecheck_ok and self_contained_ok):
+            # Honest: the repair broke the build. The gate's re-evaluation will
+            # see DIM_TECHNICAL = FAIL and refuse to verify the repair.
+            evidence["technical_ok"] = False
+            return True
+
+        # C4: a fresh browser/VISION attempt so the re-evaluation reflects the
+        # repaired pixels, not the pre-repair evidence.
+        fresh = self._run_one_attempt(
+            project_id, workspace, qa_dir, captured["next"], brief, design_dna
+        )
+        captured["next"] += 1
+        captured["attempts"].append(fresh)
+        evidence["vision"] = fresh.vision
+        evidence["technical_ok"] = (
+            not bool(fresh.infrastructure_error)
+            and not bool(fresh.deterministic.failures)
+        )
+        return True
 
     def _record_fidelity_record(self, project_id: str, record: Dict[str, Any]) -> None:
         """Persist the fidelity verdict as honest evidence (never as a claim)."""

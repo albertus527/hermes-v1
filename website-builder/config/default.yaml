@@ -186,6 +186,21 @@ website_builder:
     friendly_slug: true
     publication_enabled: true
 
+  # V4-A: the bounded design-fidelity gate.
+  #
+  # DISABLED by default, so every build/revision path is byte-identical to
+  # pre-V4-A: the QA orchestrator runs no gate, reads no extra evidence, and
+  # performs no extra repair or model call. When enabled (staging E2E only) the
+  # QA orchestrator runs the bounded gate AFTER browser/VISION QA and BEFORE
+  # acceptance: it evaluates the rendered site against the owner's design_intent,
+  # the PRD, the DesignGuidance + Asset Strategy, and the VISION evidence; it may
+  # perform AT MOST ONE repair through the existing validated FRONTEND repair
+  # executor; and it re-verifies the repaired artifacts before acceptance. A HARD
+  # finding blocks acceptance (no tested snapshot, no preview, no publication).
+  # It never changes publication or lifecycle authority.
+  design_fidelity:
+    enabled: false
+
   # Message debounce
   intake:
     debounce_seconds: 2.0

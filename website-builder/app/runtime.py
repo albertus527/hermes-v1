@@ -208,6 +208,12 @@ class RuntimeConfig:
     # progress acknowledgement. The Vercel broker still denies privileged
     # operations independently (defense-in-depth).
     publication_enabled: bool = True
+    # V4-A: the design-fidelity gate. FALSE (DEFAULT) keeps every path
+    # byte-identical to pre-V4-A: the QA orchestrator never runs the gate, so
+    # there is no extra evidence read, no repair, and no extra model call.
+    # TRUE (staging E2E) enables the bounded evaluate + AT-MOST-ONE-repair +
+    # re-verify stage. It never changes publication or lifecycle authority.
+    design_fidelity_enabled: bool = False
 
     def __post_init__(self):
         # Expand ~ in paths
@@ -409,6 +415,14 @@ def load_runtime_config(config_path: Optional[Path] = None) -> RuntimeConfig:
         vercel_cfg.get("publication_enabled", True),
     )
 
+    # V4-A: the design-fidelity gate. DEFAULT false so production is unchanged;
+    # only the staging E2E config turns it on. An env override exists for
+    # operator convenience (never required).
+    design_fidelity_enabled = _coerce_bool(
+        os.environ.get("WEBSITE_BUILDER_DESIGN_FIDELITY_ENABLED"),
+        wb.get("design_fidelity", {}).get("enabled", False),
+    )
+
     return RuntimeConfig(
         telegram_bot_token=telegram_bot_token,
         hermes_home=hermes_home,
@@ -428,6 +442,7 @@ def load_runtime_config(config_path: Optional[Path] = None) -> RuntimeConfig:
         decision_engine_config=decision_engine_config,
         friendly_slug=friendly_slug,
         publication_enabled=publication_enabled,
+        design_fidelity_enabled=design_fidelity_enabled,
     )
 
 
@@ -1308,6 +1323,8 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
         decision_engine=decision_engine,
         decision_engine_config=config.decision_engine_config,
         design_capability_report=design_capability_report,
+        # V4-A: the bounded design-fidelity gate (default off).
+        design_fidelity_enabled=config.design_fidelity_enabled,
     )
 
     # Revision orchestrator.
@@ -1333,6 +1350,8 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
         hydrator=hydrator,
         source_repo_url=config.github_source_repo,
         critic_scanner=critic_scanner,
+        # V4-A: the bounded design-fidelity gate (default off).
+        design_fidelity_enabled=config.design_fidelity_enabled,
     )
 
     # LIVE source publication (R1). The friendly branch name is the project's

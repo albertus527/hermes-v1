@@ -668,6 +668,9 @@ class TestPhase8Handoff(unittest.TestCase):
             # handoff. This builder was constructed without a scanner, so the
             # stage records an explicit NOT_RUN degraded outcome.
             critic_scanner=None,
+            # V4-A: the bounded design-fidelity gate is wired into every QA
+            # handoff. Default FALSE, so production is byte-identical.
+            design_fidelity_enabled=False,
         )
         # MEDIUM-5: the toolchain verifier closes over this build's hashes.
         verify_fn = mock_qa_cls.call_args.kwargs["toolchain_verify"]
@@ -1851,13 +1854,15 @@ class TestPhase7CompileRepair(unittest.TestCase):
         # constructor/handoff surface — no compile-repair budget or state is
         # threaded into it, so its own bounded repair budget is untouched.
         # D3b adds ONLY the injected critic scanner; the QA repair budget
-        # (MAX_REPAIR_ATTEMPTS) is a separate, untouched constant.
+        # (MAX_REPAIR_ATTEMPTS) is a separate, untouched constant. V4-A adds
+        # ONLY the design-fidelity gate switch (default off).
         self.assertEqual(
             set(mock_qa_cls.call_args.kwargs.keys()),
             {"hermes_adapter", "web3forms_access_key", "toolchain_verify",
-             "critic_scanner"},
+             "critic_scanner", "design_fidelity_enabled"},
         )
         self.assertIsNone(mock_qa_cls.call_args.kwargs["critic_scanner"])
+        self.assertFalse(mock_qa_cls.call_args.kwargs["design_fidelity_enabled"])
         mock_qa.run.assert_called_once_with(
             project_id="proj-repair-g",
             workspace=result.workspace,

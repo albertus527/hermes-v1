@@ -67,5 +67,9 @@ def invalidate_artifact(state):
     state.revisions.preview_revision = 0
     state.revisions.approved_revision = 0
     for key in ("qa", "approval", "checked", "tested_snapshot",
-                "latest_shown_preview", "preview_intent"):
+                "latest_shown_preview", "preview_intent",
+                # V4-A: the design-fidelity verdict is bound to the source
+                # revision it judged; a repair changes the source, so the old
+                # verdict must never be reused as a stale PASS.
+                "design_fidelity"):
         state.deployment.pop(key, None)
