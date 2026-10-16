@@ -154,7 +154,7 @@ class GroundingTests(unittest.TestCase):
         _, body = parse_front_matter(text)
         sections = extract_sections(body)
         self.assertIn(UNRESOLVED_MARKER, sections["color"])
-        self.assertIn(UNRESOLVED_MARKER, sections["imagery"])
+        self.assertIn(UNRESOLVED_MARKER, sections["typography"])
 
     def test_evidence_has_no_candidate_when_abstained(self):
         ev = guidance_evidence(BRIEF, _decision(None))

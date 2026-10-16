@@ -741,11 +741,14 @@ class FrontendBuilder:
             revision = state.revisions.source_revision
             guidance_version = state.revisions.design_guidance_version
 
-        query = " ".join(
-            str(brief.get(k) or "").strip()
-            for k in ("name", "what", "why")
-            if str(brief.get(k) or "").strip()
-        )
+        # V3-B: the retrieval query carries the project DOMAIN, the intended
+        # AESTHETIC (the owner's own design-intent words), and the page type /
+        # visual requirements — so retrieval is steered toward references that
+        # match the requested look rather than a generic term. Application-owned
+        # text only; nothing retrieved feeds back into it.
+        from app.core.design_intent import retrieval_query as _retrieval_query
+
+        query = _retrieval_query(brief)
 
         decision = None
         if self.decision_engine is not None:

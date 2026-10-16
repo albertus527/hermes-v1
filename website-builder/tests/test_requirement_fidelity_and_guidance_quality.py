@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.core.decision_engine import DesignDecision  # noqa: E402
 from app.core.decision_provider import DesignCandidate  # noqa: E402
 from app.core.design_guidance import (  # noqa: E402
+    DESIGN_RECOMMENDED,
     REFERENCE_DERIVED,
     UNRESOLVED_MARKER,
     USER_SPECIFIED,
@@ -320,10 +321,13 @@ class CompositionBoilerplateTests(unittest.TestCase):
         self.assertIn("asymmetric layout", _sections(g)["composition"])
         self.assertIn(REFERENCE_DERIVED, _sections(g)["composition"])
 
-    def test_no_intent_and_no_informative_descriptor_falls_back_to_what(self):
+    def test_no_intent_and_no_informative_descriptor_is_honest(self):
+        # V3-A: with no owner intent and no informative reference descriptor,
+        # Composition is honestly UNRESOLVED. (V2-B dumped the raw `what` string
+        # here, which was itself non-actionable filler — V3-A removes that.)
         g = compile_design_guidance(BRIEF_V1, _decision(_candidate(BOILERPLATE)),
                                     project_id="p", source_revision=1)
-        self.assertIn("Landing page untuk studio arsitektur", _sections(g)["composition"])
+        self.assertIn(UNRESOLVED_MARKER, _sections(g)["composition"])
 
 
 class GuidanceActionabilityTests(unittest.TestCase):
@@ -342,10 +346,13 @@ class GuidanceActionabilityTests(unittest.TestCase):
         self.assertIn(USER_SPECIFIED, s["typography"])
         self.assertIn(USER_SPECIFIED, s["color"])
         self.assertIn(USER_SPECIFIED, s["composition"])
-        # ...and said nothing about imagery/hierarchy/interaction: honest.
-        self.assertIn(UNRESOLVED_MARKER, s["imagery"])
-        self.assertIn(UNRESOLVED_MARKER, s["hierarchy"])
+        # V3-A: the brief names a "showcase 3 proyek", so imagery guidance is
+        # grounded and emitted as a design recommendation...
+        self.assertIn(DESIGN_RECOMMENDED, s["imagery"])
+        # ...while interaction (never auto-fired) and motion (no evidence) stay
+        # honestly UNRESOLVED.
         self.assertIn(UNRESOLVED_MARKER, s["interaction"])
+        self.assertIn(UNRESOLVED_MARKER, s["motion"])
 
     def test_user_specified_is_separated_from_reference_derived(self):
         # Owner intent that does NOT mention composition → the informative

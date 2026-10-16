@@ -44,6 +44,11 @@ from app.core.document_contracts import (
     serialise_document,
     validate_design_guidance,
 )
+from app.core.design_intent import (
+    clauses_by_axis,
+    owner_intent as _owner_intent,
+    recommendations as _recommendations,
+)
 
 #: Stable generator identifier written into the document front matter.
 DESIGN_GUIDANCE_GENERATOR = "requirement-creator/design-guidance"
@@ -100,23 +105,18 @@ _GUIDANCE_SECTIONS: Tuple[Tuple[str, str], ...] = (
 #: reader can always tell a user-specified instruction from an inferred one.
 USER_SPECIFIED = "user-specified"
 
+#: Marker appended to an application implementation RECOMMENDATION derived from
+#: the owner's stated terms + the brief's domain. Never presented as the owner's
+#: words; never a fixed hex, ratio, count, or mandatory element.
+DESIGN_RECOMMENDED = "design-recommended"
+
 #: Marker appended to guidance inferred from a retrieved reference, never from
-#: the user. Kept distinct so the two can never be confused.
+#: the user. Kept distinct so the three classes can never be confused.
 REFERENCE_DERIVED = "reference-derived (not user-specified)"
 
-#: Axis vocabulary used ONLY to decide which heading the owner's OWN intent
-#: words are surfaced under. It never styles anything and is never counted: the
-#: owner's text is carried verbatim, so no keyword can add, drop, or reword a
-#: requirement. A bounded, lower-case substring table.
-_INTENT_AXES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
-    ("typography", ("tipografi", "font", "huruf", "serif", "sans-serif", "sans", "typeface", "typography")),
-    ("color", ("warna", "color", "colour", "palet", "palette", "terracotta", "aksen", "accent", "off-white", "off white", "charcoal", "monokrom", "monochrome")),
-    ("composition", ("komposisi", "composition", "layout", "tata letak", "grid", "editorial", "minimalis", "minimal", "asimetris", "asymmetric", "whitespace", "white space", "premium", "modern", "elegan", "elegant", "clean", "bersih", "kolom", "column")),
-    ("imagery", ("gambar", "foto", "photo", "imagery", "image", "visual", "ilustrasi", "illustration", "render", "3d", "video")),
-    ("hierarchy", ("hierarki", "hierarchy", "prioritas", "penekanan", "emphasis", "kontras", "contrast", "urutan")),
-    ("interaction", ("interaksi", "interaction", "hover", "klik", "click", "microinteraction", "micro-interaction", "gesture")),
-    ("motion", ("animasi", "animation", "motion", "transisi", "transition", "scroll", "gerak", "parallax", "easing")),
-)
+#: Axis vocabulary now lives in ``app.core.design_intent`` (V3-A), which routes
+#: the owner's clauses to the facet that speaks to them. This module no longer
+#: keeps a second copy, so there is a single routing authority.
 
 #: Descriptors that describe a DOCUMENT or DIRECTORY rather than a design. They
 #: are uninformative as composition instruction — the exact failure V2-B fixes,
@@ -153,23 +153,14 @@ _MOTION_LANGUAGE: Tuple[str, ...] = (
 )
 
 
-def _owner_intent(evidence: Mapping[str, Any]) -> str:
-    """The owner's OWN design-intent words, verbatim, or ``""``."""
-    value = evidence.get("design_intent")
-    return value.strip() if isinstance(value, str) else ""
-
-
 def _intent_axes(intent: str) -> dict:
-    """Return ``{axis: bool}`` for which axes the OWNER's text mentions.
+    """Return ``{axis: bool}`` for which facets the OWNER's text mentions.
 
-    Bounded substring detection only. It decides WHERE the owner's verbatim
-    words are surfaced; it never authors, extends, or styles anything.
+    Thin wrapper over the V3-A clause router so callers that only need a
+    boolean keep working. It never authors or styles anything.
     """
-    text = intent.lower()
-    return {
-        axis: any(term in text for term in terms)
-        for axis, terms in _INTENT_AXES
-    }
+    by_axis = clauses_by_axis(intent)
+    return {axis: bool(clauses) for axis, clauses in by_axis.items()}
 
 
 def _is_informative_descriptor(text: str) -> bool:
@@ -324,15 +315,25 @@ def _tag(text: str, marker: str) -> str:
     return f"{text} [{marker}]"
 
 
-def _axis_line(intent: str, axes: Mapping[str, bool], axis: str) -> str:
-    """A section line built from the OWNER'S OWN words when they spoke to ``axis``.
-
-    Returns the verbatim intent (tagged ``user-specified``) or ``""`` when the
-    owner said nothing on this axis. It never paraphrases, extends, or styles.
-    """
-    if intent and axes.get(axis):
-        return _tag(intent, USER_SPECIFIED)
-    return ""
+def _render_facet(
+    intent: str,
+    by_axis: Mapping[str, Sequence[str]],
+    axis: str,
+    recommendation: str,
+    reference_line: str,
+    unresolved_note: str,
+) -> str:
+    """Render one facet as an ordered, provenance-tagged block (see above)."""
+    parts = []
+    for clause in by_axis.get(axis, ()):
+        parts.append(_tag(clause, USER_SPECIFIED))
+    if recommendation:
+        parts.append(_tag(recommendation, DESIGN_RECOMMENDED))
+    if reference_line:
+        parts.append(_tag(reference_line, REFERENCE_DERIVED))
+    if not parts:
+        return f"{UNRESOLVED_MARKER}: {unresolved_note}"
+    return "\n".join(f"- {part}" for part in parts)
 
 
 def compile_design_guidance(
@@ -369,46 +370,69 @@ def compile_design_guidance(
     brand = evidence["brand"]
     descriptor = evidence["descriptor"]
     palette = evidence["palette"]
-    intent = _owner_intent(evidence)
-    axes = _intent_axes(intent)
+    intent = _owner_intent(brief)
+    by_axis = clauses_by_axis(intent)
 
     brand_line = _line(brand)
-    # The owner's own words, verbatim, in their own section.
+    # The owner's own words, verbatim, in their own section. This is the
+    # authoritative requirement and is NEVER replaced by a facet.
     design_intent_line = (
         _tag(intent, USER_SPECIFIED)
         if intent
         else f"{UNRESOLVED_MARKER}: the owner stated no explicit design preference"
     )
 
-    # Composition: the owner's own words if they spoke to it; otherwise a
-    # retrieved descriptor ONLY when it is genuinely design language. A
-    # document/directory meta-description is never presented as composition.
+    # Application recommendations, grounded in the owner's stated terms + the
+    # brief's domain. No fixed hex, ratio, count, or mandatory element.
+    recs = _recommendations(brief, intent)
+
+    # A retrieved descriptor is usable as composition guidance ONLY when it is
+    # genuinely design language; a document/directory meta-description is never
+    # presented as composition (its provenance is still recorded below).
     informative_descriptor = descriptor if _is_informative_descriptor(descriptor) else ""
-    composition = (
-        _axis_line(intent, axes, "composition")
-        or (_tag(informative_descriptor, REFERENCE_DERIVED) if informative_descriptor else "")
-        or _line(evidence["what"])
-    )
-
-    # Typography / Color / Imagery / Hierarchy / Interaction: the owner's own
-    # words where stated; a retrieved palette where it exists (color); else an
-    # honest UNRESOLVED marker.
-    typography = (
-        _axis_line(intent, axes, "typography")
-        or f"{UNRESOLVED_MARKER}: no typography evidence supplied (FRONTEND owns the final choice)"
-    )
-    palette_line = _tag(", ".join(palette), REFERENCE_DERIVED) if palette else ""
-    color = _axis_line(intent, axes, "color") or palette_line or f"{UNRESOLVED_MARKER}: no supporting evidence supplied"
-    imagery = _axis_line(intent, axes, "imagery") or f"{UNRESOLVED_MARKER}: no imagery evidence supplied"
-    hierarchy = _axis_line(intent, axes, "hierarchy") or f"{UNRESOLVED_MARKER}: no supporting evidence supplied"
-    interaction = _axis_line(intent, axes, "interaction") or f"{UNRESOLVED_MARKER}: no supporting evidence supplied"
-
-    # Motion: the owner's own words, else a retrieved descriptor ONLY when it
-    # carries motion language (the pre-V2-B behaviour, now provenance-tagged).
-    motion = _axis_line(intent, axes, "motion") or _line(
+    motion_descriptor = (
         descriptor
         if descriptor and any(kw in descriptor.lower() for kw in _MOTION_LANGUAGE)
         else ""
+    )
+
+    composition = _render_facet(
+        intent, by_axis, "composition",
+        recs.get("composition", ""), informative_descriptor,
+        "no composition evidence supplied",
+    )
+    typography = _render_facet(
+        intent, by_axis, "typography",
+        recs.get("typography", ""), "",
+        "no typography evidence supplied (FRONTEND owns the final choice)",
+    )
+    # Colour: the owner's clauses, an application role recommendation, and a
+    # retrieved palette (provenanced) all coexist, each tagged.
+    palette_line = ", ".join(palette)
+    color = _render_facet(
+        intent, by_axis, "color",
+        recs.get("color", ""), palette_line,
+        "no supporting evidence supplied",
+    )
+    imagery = _render_facet(
+        intent, by_axis, "imagery",
+        recs.get("imagery", ""), "",
+        "no imagery evidence supplied",
+    )
+    hierarchy = _render_facet(
+        intent, by_axis, "hierarchy",
+        recs.get("hierarchy", ""), "",
+        "no supporting evidence supplied",
+    )
+    interaction = _render_facet(
+        intent, by_axis, "interaction",
+        "", "",
+        "no interaction evidence supplied (only added where relevant)",
+    )
+    motion = _render_facet(
+        intent, by_axis, "motion",
+        "", motion_descriptor,
+        "no supporting evidence supplied",
     )
     approved = _render_approved_resources(plan, evidence)
 
@@ -457,6 +481,7 @@ __all__ = [
     "DESIGN_GUIDANCE_GENERATOR",
     "UNRESOLVED_MARKER",
     "USER_SPECIFIED",
+    "DESIGN_RECOMMENDED",
     "REFERENCE_DERIVED",
     "DesignGuidanceError",
     "guidance_evidence",
