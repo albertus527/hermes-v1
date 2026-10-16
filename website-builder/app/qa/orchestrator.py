@@ -73,6 +73,7 @@ class QAOrchestrator:
         toolchain_verify=None,
         critic_scanner=None,
         design_fidelity_enabled: bool = False,
+        frontend_budget=None,
     ):
         self.runner = runner
         self.store = store
@@ -103,6 +104,10 @@ class QAOrchestrator:
         # :meth:`_run_design_fidelity_stage`.
         self._design_fidelity_enabled = bool(design_fidelity_enabled)
         self._design_fidelity_result = None
+        # V4-B2: the ONE durable per-operation FRONTEND budget shared with the
+        # build's initial generation and compile repair. None (the production
+        # default) leaves every repair path byte-identical to pre-V4-B2.
+        self._frontend_budget = frontend_budget
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -534,6 +539,18 @@ class QAOrchestrator:
         if self.hermes_adapter is None:
             return False
 
+        # V4-B2: cheap, non-authoritative peek. The FRONTEND boundary remains
+        # the authoritative check; this only avoids a pointless attempt.
+        if (
+            self._frontend_budget is not None
+            and not self._frontend_budget.has_capacity()
+        ):
+            logger.info(
+                "V4-B2: skipping critic repair for %s — FRONTEND budget exhausted",
+                project_id,
+            )
+            return False
+
         from app.core.critic_policy import build_repair_request
 
         with self.store.acquire_writer(project_id) as state:
@@ -564,6 +581,8 @@ class QAOrchestrator:
             workspace=workspace,
             design_dna_instructions=instructions,
             build_operation_id=repair_operation_id,
+            frontend_budget=self._frontend_budget,
+            invocation_stage="critic_repair",
         )
 
         # MEDIUM-5: verify protected starter/toolchain files after EVERY
@@ -572,7 +591,7 @@ class QAOrchestrator:
             violation = self._toolchain_verify(workspace)
             if violation:
                 logger.warning(
-                    "Protected toolchain file mutated during critic repair of %s: %s",
+                    "Protected toolchain file mutated during QA repair of %s: %s",
                     project_id, violation,
                 )
                 self._toolchain_error = f"TOOLCHAIN_MUTATION_REJECTED ({violation})"
@@ -902,7 +921,10 @@ class QAOrchestrator:
             ),
             vision=VisionFindings(pass_=False, blocking_findings=blockers),
         )
-        repaired = self._repair(project_id, workspace, brief, design_dna, synthetic)
+        repaired = self._repair(
+            project_id, workspace, brief, design_dna, synthetic,
+            invocation_stage="fidelity_repair",
+        )
         if not repaired:
             return False
         captured["repaired"] = True
@@ -998,6 +1020,7 @@ class QAOrchestrator:
         brief: Dict[str, Any],
         design_dna: Optional[Dict[str, Any]],
         failed_attempt: QAAttempt,
+        invocation_stage: str = "qa_repair",
     ) -> bool:
         """Invoke FRONTEND to perform the smallest targeted fix.
 
@@ -1005,6 +1028,20 @@ class QAOrchestrator:
         whether the resulting rebuild passes — that is checked separately).
         """
         if self.hermes_adapter is None:
+            return False
+
+        # V4-B2: cheap, non-authoritative peek. If the global budget is already
+        # spent, skip this repair without composing instructions or touching the
+        # workspace. The FRONTEND boundary (adapter.frontend_build) remains the
+        # AUTHORITATIVE check; this only avoids a pointless attempt.
+        if (
+            self._frontend_budget is not None
+            and not self._frontend_budget.has_capacity()
+        ):
+            logger.info(
+                "V4-B2: skipping QA repair for %s — FRONTEND budget exhausted",
+                project_id,
+            )
             return False
 
         # Invalidate before invoking a mutating tool: even a failed or timed
@@ -1034,6 +1071,8 @@ class QAOrchestrator:
             workspace=workspace,
             design_dna_instructions=instructions,
             build_operation_id=repair_operation_id,
+            frontend_budget=self._frontend_budget,
+            invocation_stage=invocation_stage,
         )
 
         # MEDIUM-5: verify protected starter/toolchain files after EVERY

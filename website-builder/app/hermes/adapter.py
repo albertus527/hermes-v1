@@ -91,6 +91,10 @@ except ImportError as exc:  # pragma: no cover - depends on host environment
 # failure that cannot explain itself must still explain itself: this code is
 # what makes ``state.failure.error`` non-empty instead of blank.
 FRONTEND_RESULT_CONTRACT_INVALID = "FRONTEND_RESULT_CONTRACT_INVALID"
+# V4-B2: a bounded refusal returned when the per-operation FRONTEND invocation
+# budget is exhausted. Distinct from every model/tool failure: FRONTEND was
+# never invoked for this call.
+FRONTEND_BUDGET_EXHAUSTED = "FRONTEND_BUDGET_EXHAUSTED"
 
 # Stable classification for a FRONTEND run that DECLARED success while leaving
 # the starter placeholder in place. A declared success is a claim about the
@@ -1575,6 +1579,8 @@ Respond in this exact JSON format:
         design_dna_instructions: Optional[str] = None,
         build_operation_id: Optional[str] = None,
         design_context=None,
+        frontend_budget=None,
+        invocation_stage: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Use Hermes FRONTEND role to derive design direction and build the site.
 
@@ -1587,7 +1593,42 @@ Respond in this exact JSON format:
 
         *build_operation_id* distinguishes two invocations of the SAME project so
         neither can refresh the other's watchdog.
+
+        V4-B2: this is the ONE common FRONTEND invocation boundary. When a
+        *frontend_budget* is supplied (the isolated staging E2E sets a global
+        per-operation cap of 2), a slot is reserved DURABLY here — before the
+        model runs — and a refusal returns a bounded ``FRONTEND_BUDGET_EXHAUSTED``
+        failure without invoking FRONTEND. The initial generation, the compile
+        repair, the deterministic QA repair, the critic repair, and the
+        design-fidelity repair all pass through here, so they share ONE budget.
+        When *frontend_budget* is None (the production default) this method is
+        byte-identical to pre-V4-B2: no ledger, no lock, no extra check.
         """
+        if frontend_budget is not None:
+            if not frontend_budget.try_acquire(
+                stage=(invocation_stage or "frontend"),
+                operation_id=build_operation_id,
+            ):
+                snapshot = frontend_budget.snapshot()
+                logger.warning(
+                    "FRONTEND invocation refused by budget for project %s "
+                    "(stage=%s used=%s limit=%s)",
+                    project_id,
+                    invocation_stage or "frontend",
+                    snapshot.get("used"),
+                    snapshot.get("limit"),
+                )
+                return {
+                    "success": False,
+                    "error": (
+                        "FRONTEND invocation budget exhausted for this "
+                        "operation (no further FRONTEND execution permitted)"
+                    ),
+                    "error_code": FRONTEND_BUDGET_EXHAUSTED,
+                    "frontend_budget": snapshot,
+                    "design_dna": None,
+                }
+
         # Build the FRONTEND prompt. N4: the adapter derives the bounded PRD/
         # Design guidance from the workspace it is handed, so EVERY caller
         # (initial build, compile repair, QA repair, revision) gets consistent

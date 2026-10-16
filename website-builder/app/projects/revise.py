@@ -149,6 +149,7 @@ class RevisionOrchestrator:
         source_repo_url: Optional[str] = None,
         critic_scanner=None,
         design_fidelity_enabled: bool = False,
+        frontend_invocation_limit: Optional[int] = None,
     ):
         self.runner = runner
         self.store = store
@@ -170,6 +171,10 @@ class RevisionOrchestrator:
         # orchestrator this revision runs. FALSE (default) keeps the revision
         # path byte-identical to pre-V4-A.
         self.design_fidelity_enabled = bool(design_fidelity_enabled)
+        # V4-B2: the GLOBAL per-operation FRONTEND invocation cap. None (default)
+        # keeps production byte-identical; the staging E2E sets 2 so ONE budget
+        # spans this revision's generation and every repair stage.
+        self.frontend_invocation_limit = frontend_invocation_limit
 
     # ------------------------------------------------------------------
     # Revision base (frozen at reservation time)
@@ -542,6 +547,20 @@ class RevisionOrchestrator:
                 base_kind = outcome.base_kind
                 hydrated_from = outcome.hydrated_from
 
+            # V4-B2: ONE durable FRONTEND budget for this revision operation.
+            # Keyed by the durable ``seq`` (NOT ``source_revision``, which is
+            # bumped below), so a crash-and-resume of the SAME revision re-uses
+            # the SAME ledger and can never refund consumed slots. ``None`` when
+            # no global cap is configured (production default).
+            from app.core.frontend_budget import budget_for_operation
+
+            frontend_budget = budget_for_operation(
+                self.store,
+                project_id,
+                operation_token=f"revision-seq{seq}",
+                limit=self.frontend_invocation_limit,
+            )
+
             # QUEUED -> RUNNING, mirroring Phase 7. Invalidate QA/preview/
             # approval BEFORE invoking FRONTEND -- even a failed or partial
             # mutation may have changed source on disk.
@@ -645,6 +664,8 @@ class RevisionOrchestrator:
                             project_id=project_id, brief=brief, workspace=workspace,
                             design_dna_instructions=instructions,
                             build_operation_id=revision_operation_id,
+                            frontend_budget=frontend_budget,
+                            invocation_stage="revision_generation",
                         ) if self.hermes_adapter is not None else
                         {"success": False, "error": "Hermes adapter not configured"}
                     )
@@ -730,6 +751,9 @@ class RevisionOrchestrator:
                 critic_scanner=self.critic_scanner,
                 # V4-A: the bounded design-fidelity gate (default off).
                 design_fidelity_enabled=self.design_fidelity_enabled,
+                # V4-B2: the SAME per-operation budget as this revision's
+                # generation, so its QA/critic/fidelity repairs share the cap.
+                frontend_budget=frontend_budget,
             )
             qa_result = qa_orchestrator.run(
                 project_id=project_id,

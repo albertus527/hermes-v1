@@ -671,6 +671,9 @@ class TestPhase8Handoff(unittest.TestCase):
             # V4-A: the bounded design-fidelity gate is wired into every QA
             # handoff. Default FALSE, so production is byte-identical.
             design_fidelity_enabled=False,
+            # V4-B2: the SAME per-operation FRONTEND budget as the initial
+            # build. Default None (no global cap), so production is unchanged.
+            frontend_budget=None,
         )
         # MEDIUM-5: the toolchain verifier closes over this build's hashes.
         verify_fn = mock_qa_cls.call_args.kwargs["toolchain_verify"]
@@ -852,6 +855,200 @@ class TestPhase8Handoff(unittest.TestCase):
 
         self.assertTrue(result.success)
         mock_acquire.assert_called_once_with("proj-handoff-g")
+
+
+# ---------------------------------------------------------------------------
+# V4-B2: the GLOBAL per-operation FRONTEND budget, at the build level
+# ---------------------------------------------------------------------------
+
+
+class TestV4B2SharedFrontendBudget(unittest.TestCase):
+    """One durable budget spans the initial generation AND every repair stage."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.workspace_root = Path(self.tmpdir) / "workspaces"
+        self.state_root = Path(self.tmpdir) / "state"
+        self.store = ProjectStateStore(self.state_root)
+        self.runner = ProjectRunner(self.workspace_root, self.store)
+        self.mock_adapter = MagicMock()
+        self.builder = FrontendBuilder(
+            self.runner,
+            self.store,
+            hermes_adapter=self.mock_adapter,
+            frontend_invocation_limit=2,
+        )
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _queue(self, project_id):
+        _queue_project(self.store, project_id)
+
+    def _passing_checks(self):
+        return {
+            "npm_ci": {"success": True, "stdout": "", "stderr": ""},
+            "npm_build": {"success": True, "stdout": "", "stderr": ""},
+            "npm_typecheck": {"success": True, "stdout": "", "stderr": ""},
+        }
+
+    def _ts6133_failure(self):
+        return {
+            "npm_ci": {"success": True, "stdout": "", "stderr": ""},
+            "npm_build": {
+                "success": False,
+                "stdout": "",
+                "stderr": (
+                    "src/components/BookingCta.tsx(1,1): error TS6133: "
+                    "'Icon' is declared but its value is never read."
+                ),
+            },
+            "npm_typecheck": {"success": True, "stdout": "", "stderr": ""},
+        }
+
+    def _consuming_frontend(self, design_dna=None):
+        """A frontend_build side_effect that reserves from the budget, like the real adapter."""
+        result = {
+            "success": True,
+            "design_dna": design_dna or {"version": 1, "brand_personality": "premium"},
+        }
+
+        def _fn(*args, **kwargs):
+            budget = kwargs.get("frontend_budget")
+            if budget is not None and not budget.try_acquire(
+                stage=kwargs.get("invocation_stage") or "frontend"
+            ):
+                return {
+                    "success": False,
+                    "error": "FRONTEND invocation budget exhausted",
+                    "error_code": "FRONTEND_BUDGET_EXHAUSTED",
+                    "design_dna": None,
+                }
+            return dict(result)
+
+        self.mock_adapter.frontend_build.side_effect = _fn
+
+    def test_build_creates_one_budget_and_threads_it_to_qa(self):
+        """The build hands the SAME budget object to the QA orchestrator."""
+        self._consuming_frontend()
+        self._queue("proj-budget-1")
+
+        captured = {}
+
+        class _QA:
+            def __init__(self, *a, **kw):
+                captured.update(kw)
+
+            def run(self, **kw):
+                return MagicMock(success=True, error=None)
+
+        with patch.object(self.builder, "_run_fixed_checks") as mock_checks, \
+             patch("app.projects.build.QAOrchestrator", _QA):
+            mock_checks.return_value = self._passing_checks()
+            result = self.builder.build(
+                "proj-budget-1",
+                {"name": "Northcut", "what": "barbershop", "why": "booking WA"},
+            )
+
+        self.assertTrue(result.success)
+        # A budget object was created and shared with QA...
+        budget = captured.get("frontend_budget")
+        self.assertIsNotNone(budget)
+        # ...and the initial generation consumed its FIRST slot on that object.
+        self.assertEqual(budget.snapshot()["used"], 1)
+        self.assertEqual(budget.snapshot()["limit"], 2)
+
+    def test_no_cap_threads_no_budget(self):
+        """With no configured cap, NO budget is threaded (production path)."""
+        builder = FrontendBuilder(
+            self.runner, self.store, hermes_adapter=self.mock_adapter
+        )
+        self.mock_adapter.frontend_build.return_value = {
+            "success": True,
+            "design_dna": {"version": 1},
+        }
+        self._queue("proj-budget-2")
+
+        captured = {}
+
+        class _QA:
+            def __init__(self, *a, **kw):
+                captured.update(kw)
+
+            def run(self, **kw):
+                return MagicMock(success=True, error=None)
+
+        with patch.object(builder, "_run_fixed_checks") as mock_checks, \
+             patch("app.projects.build.QAOrchestrator", _QA):
+            mock_checks.return_value = self._passing_checks()
+            builder.build(
+                "proj-budget-2",
+                {"name": "Northcut", "what": "barbershop", "why": "booking WA"},
+            )
+
+        self.assertIsNone(captured.get("frontend_budget"))
+        # The adapter was called WITHOUT a budget kwarg -> unchanged behaviour.
+        _, kwargs = self.mock_adapter.frontend_build.call_args
+        self.assertIsNone(kwargs.get("frontend_budget"))
+
+    def test_initial_generation_consumes_slot_one_then_compile_repair_slot_two(self):
+        """Initial + Phase-7 compile repair = the two allowed invocations."""
+        self._consuming_frontend()
+        self._queue("proj-budget-3")
+
+        with patch.object(self.builder, "_run_fixed_checks") as mock_checks, \
+             patch("app.projects.build.QAOrchestrator") as mock_qa_cls:
+            # First check fails (triggers compile repair), then all pass.
+            mock_checks.side_effect = [
+                self._ts6133_failure(),
+                self._passing_checks(),
+            ]
+            mock_qa = MagicMock()
+            mock_qa.run.return_value = MagicMock(success=True, error=None)
+            mock_qa_cls.return_value = mock_qa
+            result = self.builder.build(
+                "proj-budget-3",
+                {"name": "Northcut", "what": "barbershop", "why": "booking WA"},
+            )
+
+        # Two FRONTEND calls: initial + one compile repair.
+        self.assertEqual(self.mock_adapter.frontend_build.call_count, 2)
+        # Both calls carried the SAME budget object, and it now shows 2/2 used.
+        budgets = {
+            id(c.kwargs.get("frontend_budget"))
+            for c in self.mock_adapter.frontend_build.call_args_list
+        }
+        self.assertEqual(len(budgets), 1)
+        budget = self.mock_adapter.frontend_build.call_args_list[0].kwargs["frontend_budget"]
+        self.assertEqual(budget.snapshot()["used"], 2)
+
+    def test_third_frontend_call_is_refused(self):
+        """If a repair stage tries a THIRD call, the shared budget refuses it."""
+        self._consuming_frontend()
+        self._queue("proj-budget-4")
+
+        with patch.object(self.builder, "_run_fixed_checks") as mock_checks, \
+             patch("app.projects.build.QAOrchestrator") as mock_qa_cls:
+            # Compile repair "succeeds" but a later stage would need a 3rd call.
+            mock_checks.side_effect = [
+                self._ts6133_failure(),
+                self._passing_checks(),
+            ]
+            mock_qa = MagicMock()
+            mock_qa.run.return_value = MagicMock(success=True, error=None)
+            mock_qa_cls.return_value = mock_qa
+            self.builder.build(
+                "proj-budget-4",
+                {"name": "Northcut", "what": "barbershop", "why": "booking WA"},
+            )
+
+        # Exactly two calls happened; a third would have been refused.
+        self.assertEqual(self.mock_adapter.frontend_build.call_count, 2)
+        budget = self.mock_adapter.frontend_build.call_args_list[0].kwargs["frontend_budget"]
+        self.assertFalse(budget.try_acquire(stage="fidelity_repair"))
+        self.assertFalse(budget.has_capacity())
 
 
 # ---------------------------------------------------------------------------
@@ -1855,14 +2052,17 @@ class TestPhase7CompileRepair(unittest.TestCase):
         # threaded into it, so its own bounded repair budget is untouched.
         # D3b adds ONLY the injected critic scanner; the QA repair budget
         # (MAX_REPAIR_ATTEMPTS) is a separate, untouched constant. V4-A adds
-        # ONLY the design-fidelity gate switch (default off).
+        # ONLY the design-fidelity gate switch (default off). V4-B2 adds ONLY
+        # the shared per-operation FRONTEND budget (default None = no cap).
         self.assertEqual(
             set(mock_qa_cls.call_args.kwargs.keys()),
             {"hermes_adapter", "web3forms_access_key", "toolchain_verify",
-             "critic_scanner", "design_fidelity_enabled"},
+             "critic_scanner", "design_fidelity_enabled", "frontend_budget"},
         )
         self.assertIsNone(mock_qa_cls.call_args.kwargs["critic_scanner"])
         self.assertFalse(mock_qa_cls.call_args.kwargs["design_fidelity_enabled"])
+        # No global cap configured -> no budget is threaded (production path).
+        self.assertIsNone(mock_qa_cls.call_args.kwargs["frontend_budget"])
         mock_qa.run.assert_called_once_with(
             project_id="proj-repair-g",
             workspace=result.workspace,

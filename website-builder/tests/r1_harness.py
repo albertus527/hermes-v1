@@ -145,13 +145,27 @@ class FakeHermes:
 
     def frontend_build(self, project_id, brief, workspace,
                        design_dna_instructions=None, build_operation_id=None,
-                       design_context=None):
+                       design_context=None, frontend_budget=None,
+                       invocation_stage=None):
         # build_operation_id is the caller's operation identity, recorded by the
         # orchestrator for diagnostics; this boundary only needs to accept it.
         # design_context is the N6 bounded D2/D3a pack; accepted for signature
         # parity with the real adapter (the fake does not render a prompt).
+        # V4-B2: frontend_budget/invocation_stage are accepted for signature
+        # parity too. When a budget is supplied the fake reserves a slot the
+        # SAME way the real adapter does, so harness builds exercise the shared
+        # per-operation cap; a refusal mirrors the real bounded failure.
         self.frontend_calls += 1
         self.frontend_operation_ids.append(build_operation_id)
+        if frontend_budget is not None and not frontend_budget.try_acquire(
+            stage=invocation_stage or "frontend"
+        ):
+            return {
+                "success": False,
+                "error": "FRONTEND invocation budget exhausted",
+                "error_code": "FRONTEND_BUDGET_EXHAUSTED",
+                "design_dna": None,
+            }
         if self.frontend_results:
             result = self.frontend_results.pop(0)
         elif self.frontend_result is not None:

@@ -214,6 +214,14 @@ class RuntimeConfig:
     # TRUE (staging E2E) enables the bounded evaluate + AT-MOST-ONE-repair +
     # re-verify stage. It never changes publication or lifecycle authority.
     design_fidelity_enabled: bool = False
+    # V4-B2: the GLOBAL per-operation FRONTEND invocation cap. None (DEFAULT)
+    # means NO global cap, so production behaviour is exactly as before: the
+    # independent per-stage repair budgets (compile 1, QA 2, critic 2, fidelity
+    # 1) remain the only bounds. The isolated staging E2E sets this to 2, which
+    # enforces ONE shared budget across the initial generation, the compile
+    # repair, the QA repair, the critic repair, and the fidelity repair: at most
+    # two actual FRONTEND invocations per build/revision operation.
+    frontend_invocation_limit: Optional[int] = None
 
     def __post_init__(self):
         # Expand ~ in paths
@@ -248,6 +256,27 @@ def _coerce_bool(raw, default: bool) -> bool:
     if isinstance(raw, bool):
         return raw
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _coerce_optional_int(raw, default=None) -> Optional[int]:
+    """Coerce a config/env value to a positive int, else fall back.
+
+    A missing/empty/malformed/non-positive value yields ``default`` (``None``
+    for the FRONTEND cap), so a typo can never silently install a cap and a
+    deployment that does not set the key keeps its previous behaviour exactly.
+    """
+    for candidate in (raw, default):
+        if candidate is None:
+            continue
+        if isinstance(candidate, bool):
+            continue
+        try:
+            value = int(str(candidate).strip())
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
 
 
 def _conversation_app_id(project_id: str) -> str:
@@ -423,6 +452,15 @@ def load_runtime_config(config_path: Optional[Path] = None) -> RuntimeConfig:
         wb.get("design_fidelity", {}).get("enabled", False),
     )
 
+    # V4-B2: the GLOBAL per-operation FRONTEND invocation cap. DEFAULT None =
+    # no global cap (production behaviour unchanged). The staging E2E config
+    # sets 2. An env override exists for operator convenience (never required).
+    # A malformed/<=0 value yields None (no cap), never an accidental cap.
+    frontend_invocation_limit = _coerce_optional_int(
+        os.environ.get("WEBSITE_BUILDER_FRONTEND_INVOCATION_LIMIT"),
+        wb.get("frontend_invocation_limit"),
+    )
+
     return RuntimeConfig(
         telegram_bot_token=telegram_bot_token,
         hermes_home=hermes_home,
@@ -443,6 +481,7 @@ def load_runtime_config(config_path: Optional[Path] = None) -> RuntimeConfig:
         friendly_slug=friendly_slug,
         publication_enabled=publication_enabled,
         design_fidelity_enabled=design_fidelity_enabled,
+        frontend_invocation_limit=frontend_invocation_limit,
     )
 
 
@@ -1325,6 +1364,8 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
         design_capability_report=design_capability_report,
         # V4-A: the bounded design-fidelity gate (default off).
         design_fidelity_enabled=config.design_fidelity_enabled,
+        # V4-B2: the global per-operation FRONTEND cap (None = no cap).
+        frontend_invocation_limit=config.frontend_invocation_limit,
     )
 
     # Revision orchestrator.
@@ -1352,6 +1393,8 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
         critic_scanner=critic_scanner,
         # V4-A: the bounded design-fidelity gate (default off).
         design_fidelity_enabled=config.design_fidelity_enabled,
+        # V4-B2: the global per-operation FRONTEND cap (None = no cap).
+        frontend_invocation_limit=config.frontend_invocation_limit,
     )
 
     # LIVE source publication (R1). The friendly branch name is the project's

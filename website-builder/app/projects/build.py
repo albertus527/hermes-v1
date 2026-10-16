@@ -590,6 +590,7 @@ class FrontendBuilder:
         decision_engine_config: Optional[DecisionEngineConfig] = None,
         design_capability_report=None,
         design_fidelity_enabled: bool = False,
+        frontend_invocation_limit: Optional[int] = None,
     ):
         self.preview_orchestrator = preview_orchestrator
         self.runner = runner
@@ -628,6 +629,11 @@ class FrontendBuilder:
         # QAOrchestrator this builder constructs. FALSE (default) keeps the
         # build path byte-identical to pre-V4-A.
         self.design_fidelity_enabled = bool(design_fidelity_enabled)
+        # V4-B2: the GLOBAL per-operation FRONTEND invocation cap. None (default)
+        # keeps production byte-identical (per-stage budgets only); the staging
+        # E2E sets 2 so ONE budget spans the initial generation and every repair
+        # stage of a single build.
+        self.frontend_invocation_limit = frontend_invocation_limit
 
     def _copy_starter(self, workspace: Path) -> None:
         """Merge the fixed frontend starter into the project workspace.
@@ -1096,6 +1102,7 @@ Respond with a JSON summary:
         checks: Dict[str, Any],
         decision: CompileRepairDecision,
         toolchain_hashes: Dict[str, str],
+        frontend_budget=None,
     ) -> Dict[str, Any]:
         """Invoke FRONTEND exactly once for the minimum compile fix.
 
@@ -1143,6 +1150,8 @@ Respond with a JSON summary:
             workspace=workspace,
             design_dna_instructions=instructions,
             build_operation_id=repair_operation_id,
+            frontend_budget=frontend_budget,
+            invocation_stage="compile_repair",
         )
 
         # Toolchain protection stays mandatory: verify protected
@@ -1262,6 +1271,20 @@ Respond with a JSON summary:
                 frontend_operation_id = str(state.revisions.source_revision)
                 self.store.save(state)
 
+            # V4-B2: ONE durable FRONTEND budget for this whole build operation,
+            # shared by the initial generation, the Phase-7 compile repair, and
+            # every Phase-8 repair (deterministic QA, critic, design-fidelity).
+            # ``None`` when no global cap is configured (production default), in
+            # which case every frontend_build call below is unchanged.
+            from app.core.frontend_budget import budget_for_operation
+
+            frontend_budget = budget_for_operation(
+                self.store,
+                project_id,
+                operation_token=f"build-r{frontend_operation_id}",
+                limit=self.frontend_invocation_limit,
+            )
+
             workspace = self.runner.create_workspace(project_id)
             self._copy_starter(workspace)
             toolchain_hashes = _capture_toolchain_hashes(workspace)
@@ -1309,6 +1332,8 @@ Respond with a JSON summary:
                     design_dna_instructions=combined_instructions,
                     build_operation_id=frontend_operation_id,
                     design_context=_design_pack,
+                    frontend_budget=frontend_budget,
+                    invocation_stage="initial_generation",
                 )
 
                 # MEDIUM-5: verify the protected starter/toolchain identity
@@ -1478,6 +1503,7 @@ Respond with a JSON summary:
                         checks=checks,
                         decision=decision,
                         toolchain_hashes=toolchain_hashes,
+                        frontend_budget=frontend_budget,
                     )
                     if repair_outcome["toolchain_violation"]:
                         # Deterministic toolchain-policy rejection — fail
@@ -1632,6 +1658,9 @@ Respond with a JSON summary:
                 critic_scanner=self.critic_scanner,
                 # V4-A: the bounded design-fidelity gate (default off).
                 design_fidelity_enabled=self.design_fidelity_enabled,
+                # V4-B2: the SAME per-operation budget as the initial build, so
+                # the QA / critic / fidelity repairs share the global cap.
+                frontend_budget=frontend_budget,
             )
             qa_result = qa_orchestrator.run(
                 project_id=project_id,
