@@ -37,6 +37,8 @@ from app.core.design_critic import (
     run_critic_scan,
     scan_is_authoritative,
 )
+from app.core.design_retrieval import CriticFinding
+from app.core import font_audit
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +166,13 @@ class ImpeccableScanner:
 
     ``runner`` is injectable so offline tests can drive every branch without
     executing the engine.
+
+    ``font_audit_enabled`` (C, default True) additionally runs the
+    application-owned CSS font audit, which closes the engine's confirmed
+    ``var()``/``@font-face`` blind spot for the ``overused-font`` rule. It is a
+    pure, in-process check over the workspace's own CSS — no model, no network,
+    no execution — and its findings are ordinary ``overused-font`` findings, so
+    the existing classification/repair policy applies unchanged.
     """
 
     def __init__(
@@ -173,11 +182,13 @@ class ImpeccableScanner:
         node_executable: Optional[str],
         timeout_seconds: int = 120,
         runner: Any = None,
+        font_audit_enabled: bool = True,
     ):
         self.skill_root = Path(skill_root) if skill_root is not None else None
         self.node_executable = node_executable
         self.timeout_seconds = timeout_seconds
         self._runner = runner
+        self._font_audit_enabled = bool(font_audit_enabled)
 
     def scan(self, workspace: Path) -> CriticScanResult:
         """Scan ``workspace`` as the critic's fixed target (``cwd``).
@@ -245,11 +256,88 @@ class ImpeccableScanner:
         result = _state_from_outcome(
             outcome, quality=quality, intended_project_scanned=intended
         )
+        result = self._merge_font_audit(result, workspace)
         logger.info(
             "Impeccable critic scan: state=%s authoritative=%s quality=%s findings=%d",
             result.state, result.authoritative, quality, len(result.findings),
         )
         return result
+
+    def _merge_font_audit(
+        self, result: CriticScanResult, workspace: Path
+    ) -> CriticScanResult:
+        """Add the application-owned CSS font audit to an engine result (C).
+
+        The audit only ever ADDS ``overused-font`` findings the engine missed
+        through ``var()``/``@font-face`` indirection. It never removes an engine
+        finding, and it never turns a FAILED/DEGRADED scan into a CLEAN one: a
+        scan the engine could not certify stays uncertified, so a font audit
+        cannot be used to launder a broken critic.
+
+        Findings already reported by the engine (matched on the lower-cased font
+        name in the finding text) are not duplicated.
+        """
+        if not self._font_audit_enabled:
+            return result
+        if result.state not in (critic_policy.CLEAN, critic_policy.FINDINGS):
+            return result
+
+        try:
+            audited = font_audit.audit_workspace(workspace)
+        except Exception:  # noqa: BLE001 - an audit must never break a scan
+            logger.warning("CSS font audit failed", exc_info=True)
+            return result
+
+        if not audited:
+            return result
+
+        engine_text = " ".join(
+            f"{f.finding} {f.evidence} {f.suggested_action}".lower()
+            for f in result.findings
+        )
+        added = []
+        for entry in audited:
+            font = str(entry.get("font") or "").lower()
+            if not font or font in engine_text:
+                continue
+            added.append(
+                CriticFinding(
+                    rule_id=font_audit.RULE_ID,
+                    category="slop",
+                    severity="warning",
+                    finding=(
+                        f"Overused font '{font}' is applied to the page "
+                        "(detected through CSS variable/@font-face indirection, "
+                        "which the engine's literal-text scan does not resolve)."
+                    ),
+                    evidence=(
+                        f"{font} (used via {entry.get('source') or 'CSS'}"
+                        + ("; referenced through var()" if entry.get("via_var") else "")
+                        + ")"
+                    ),
+                    suggested_action=(
+                        "Choose a face that gives the interface personality; "
+                        "the application does not prescribe a specific pairing."
+                    ),
+                )
+            )
+
+        if not added:
+            return result
+
+        logger.info(
+            "CSS font audit added %d overused-font finding(s) the engine missed",
+            len(added),
+        )
+        return CriticScanResult(
+            state=critic_policy.FINDINGS,
+            authoritative=result.authoritative,
+            intended_project_scanned=result.intended_project_scanned,
+            engine_quality=result.engine_quality,
+            findings=tuple(result.findings) + tuple(added),
+            reasons=result.reasons,
+            degraded=result.degraded,
+        )
 
 
 def scanner_from_config(
@@ -258,12 +346,17 @@ def scanner_from_config(
     node_executable: Optional[str],
     timeout_seconds: int = 120,
     runner: Any = None,
+    font_audit_enabled: bool = True,
 ) -> Optional[ImpeccableScanner]:
     """Build the production scanner from runtime config.
 
     Returns ``None`` when there is no profile home to resolve the skill from --
     the caller then records an explicit ``NOT_RUN`` degraded state rather than
     pretending a scan happened.
+
+    ``font_audit_enabled`` (C) is on by default and only ever ADDS overused-font
+    findings the engine's literal scan misses; setting it off restores the
+    pre-C scanner byte-for-byte.
     """
     if hermes_home is None:
         return None
@@ -275,6 +368,7 @@ def scanner_from_config(
         node_executable=node_executable,
         timeout_seconds=timeout_seconds,
         runner=runner,
+        font_audit_enabled=font_audit_enabled,
     )
 
 

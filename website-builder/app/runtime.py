@@ -222,6 +222,15 @@ class RuntimeConfig:
     # repair, the QA repair, the critic repair, and the fidelity repair: at most
     # two actual FRONTEND invocations per build/revision operation.
     frontend_invocation_limit: Optional[int] = None
+    # C (Design Autonomy Restoration): the application-owned CSS font audit that
+    # closes the Impeccable engine's confirmed ``var()``/``@font-face`` blind
+    # spot for the ``overused-font`` rule. TRUE (DEFAULT) so every environment
+    # catches the overused font the engine's literal scan misses -- this
+    # restores the behaviour the production pipeline already had via its literal
+    # CSS. It only ever ADDS a finding the engine missed; it never removes one
+    # and never turns a failed/degraded scan into a clean one. FALSE restores
+    # the pre-C scanner exactly.
+    font_audit_enabled: bool = True
 
     def __post_init__(self):
         # Expand ~ in paths
@@ -461,6 +470,14 @@ def load_runtime_config(config_path: Optional[Path] = None) -> RuntimeConfig:
         wb.get("frontend_invocation_limit"),
     )
 
+    # C: the application-owned CSS font audit. DEFAULT true so the overused font
+    # the engine's literal scan misses is caught everywhere. An env override
+    # exists for operator convenience (never required).
+    font_audit_enabled = _coerce_bool(
+        os.environ.get("WEBSITE_BUILDER_FONT_AUDIT_ENABLED"),
+        wb.get("font_audit", {}).get("enabled", True),
+    )
+
     return RuntimeConfig(
         telegram_bot_token=telegram_bot_token,
         hermes_home=hermes_home,
@@ -482,6 +499,7 @@ def load_runtime_config(config_path: Optional[Path] = None) -> RuntimeConfig:
         publication_enabled=publication_enabled,
         design_fidelity_enabled=design_fidelity_enabled,
         frontend_invocation_limit=frontend_invocation_limit,
+        font_audit_enabled=font_audit_enabled,
     )
 
 
@@ -1094,6 +1112,7 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
     critic_scanner = scanner_from_config(
         hermes_home=config.hermes_home,
         node_executable=_critic_node,
+        font_audit_enabled=config.font_audit_enabled,
     )
     logger.info(
         "D3b critic scanner: node=%s skill_root=%s",

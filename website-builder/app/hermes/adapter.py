@@ -1861,6 +1861,13 @@ Rules:
 - Never invent business facts (services, pricing, addresses, contact details,
   testimonials, claims).
 - If a CTA destination is unresolved, use a placeholder and mark it clearly.
+- You OWN the art direction: choose the hero composition and focal point, the
+  typography pairing, the imagery treatment, the editorial section rhythm, the
+  responsive layout, and the colour-accent placement. Any design guidance you
+  were given that is tagged as a recommendation or reference is OPTIONAL — an
+  option to consider, not a rule to execute; choose the direction you judge
+  strongest. The owner's own design intent and the stated requirements remain
+  MANDATORY.
 - Design DNA is a DECLARATIVE description of design intent only. It must NOT
   contain implementation-level acceptance criteria: no DOM attributes, no CSS
   class names, no file paths, no event handlers, no component counts, no

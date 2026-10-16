@@ -201,6 +201,16 @@ website_builder:
   design_fidelity:
     enabled: false
 
+  # C (Design Autonomy Restoration): the application-owned CSS font audit that
+  # closes the Impeccable engine's confirmed var()/@font-face blind spot for the
+  # overused-font rule. TRUE (DEFAULT) catches the overused font the engine's
+  # literal-text scan misses — restoring the behaviour the production pipeline
+  # already had via its literal CSS. It only ever ADDS a finding the engine
+  # missed; it never removes one and never turns a failed/degraded scan into a
+  # clean one. It is a pure in-process check: no model, no network, no execution.
+  font_audit:
+    enabled: true
+
   # Message debounce
   intake:
     debounce_seconds: 2.0

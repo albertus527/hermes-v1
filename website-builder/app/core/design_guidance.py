@@ -108,16 +108,39 @@ _GUIDANCE_SECTIONS: Tuple[Tuple[str, str], ...] = (
 
 #: Marker appended to a line that carries the OWNER'S OWN words verbatim, so a
 #: reader can always tell a user-specified instruction from an inferred one.
+#: This is the ONLY mandatory design-provenance class.
 USER_SPECIFIED = "user-specified"
 
 #: Marker appended to an application implementation RECOMMENDATION derived from
 #: the owner's stated terms + the brief's domain. Never presented as the owner's
 #: words; never a fixed hex, ratio, count, or mandatory element.
-DESIGN_RECOMMENDED = "design-recommended"
+#:
+#: C (Design Autonomy Restoration): the marker now states explicitly that the
+#: line is an OPTIONAL reference and that FRONTEND owns the final art-direction
+#: choice. The requirement to keep the recommendation grounded is unchanged --
+#: only its AUTHORITY is clarified, so a prescriptive reading can no longer
+#: displace FRONTEND's own composition/typography/layout decisions.
+DESIGN_RECOMMENDED = "design-recommended (optional reference — FRONTEND owns the final choice)"
 
 #: Marker appended to guidance inferred from a retrieved reference, never from
 #: the user. Kept distinct so the three classes can never be confused.
-REFERENCE_DERIVED = "reference-derived (not user-specified)"
+#: C: like DESIGN_RECOMMENDED this is an OPTIONAL reference, never an instruction.
+REFERENCE_DERIVED = "reference-derived (optional reference, not user-specified)"
+
+#: C: the explicit art-direction authority statement emitted as the guidance
+#: document's PREAMBLE (before the first ``##`` section, so it never alters the
+#: section contract). It names exactly what FRONTEND decides and what the
+#: inferred lines mean, so a reader cannot mistake a recommendation for a rule.
+ART_DIRECTION_PREAMBLE = (
+    "> Art direction: FRONTEND owns the final design decisions — hero "
+    "composition and visual focal point, typography pairing, imagery treatment, "
+    "section rhythm, responsive layout, and colour-accent placement. "
+    "Lines tagged [design-recommended] or [reference-derived] are OPTIONAL "
+    "references offered for consideration, not execution instructions; FRONTEND "
+    "may choose any coherent alternative that still satisfies the owner's "
+    "requirements below. Lines tagged [user-specified] are the owner's own words "
+    "and remain MANDATORY, as do the PRD requirements."
+)
 
 #: Axis vocabulary now lives in ``app.core.design_intent`` (V3-A), which routes
 #: the owner's clauses to the facet that speaks to them. This module no longer
@@ -489,9 +512,16 @@ def compile_design_guidance(
     # V3-B: emit the Asset Strategy section after the required sections. It is
     # optional in the contract (not in REQUIRED_SECTIONS), so old documents stay
     # readable.
+    #
+    # C: the art-direction authority statement is the document PREAMBLE (before
+    # the first ``##``), so it never changes the section contract while still
+    # telling every reader — and FRONTEND — exactly what the inferred lines mean.
     body_parts = [
-        f"## {heading}\n\n{rendered[slug]}\n"
-        for heading, slug in _GUIDANCE_SECTIONS
+        f"{ART_DIRECTION_PREAMBLE}\n",
+        *[
+            f"## {heading}\n\n{rendered[slug]}\n"
+            for heading, slug in _GUIDANCE_SECTIONS
+        ],
     ]
     body_parts.append(
         f"## {_ASSET_STRATEGY_HEADING}\n\n{asset_strategy}\n"

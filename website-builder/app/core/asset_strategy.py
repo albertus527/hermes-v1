@@ -217,8 +217,13 @@ def plan_assets(
             "repeating identical placeholder cards."
         )
         instructions.append(
-            "Label each conceptual visual as a placeholder; never imply it "
-            "depicts a real completed project."
+            "Disclose the conceptual nature of these visuals truthfully, but keep "
+            "it proportionate: a concise disclosure at the section level (one "
+            "short note per section) is sufficient to distinguish conceptual "
+            "studies from real completed work. Do NOT stamp a repeated, visually "
+            "dominant PLACEHOLDER badge on every decorative element — that makes "
+            "a public-facing preview read like an internal requirements document. "
+            "Never imply any visual depicts a real completed project."
         )
         missing_launch.append(
             "real showcase content — project names, descriptions, and "
