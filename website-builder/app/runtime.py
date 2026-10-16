@@ -1068,6 +1068,11 @@ class RuntimeComposition:
     # never an authority -- it is not wired into FRONTEND, FAST, or QA in this
     # batch, and it exposes no write path.
     openviking: "OpenVikingRetrievalAdapter"
+    # D3b: the production Impeccable critic scanner, exposed so the
+    # operator-only QA re-acceptance path can build a repair-free QAOrchestrator
+    # that uses the SAME scanner the normal build path uses (no second scanner,
+    # no second Node resolution). Read-only here; it has no write path.
+    critic_scanner: Any = None
 
 
 def compose(config: RuntimeConfig) -> RuntimeComposition:
@@ -1495,6 +1500,7 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
         vercel=vercel,
         registry_store=registry_store,
         openviking=openviking,
+        critic_scanner=critic_scanner,
     )
 
 @dataclass
@@ -3335,6 +3341,7 @@ _KNOWN_FLAGS = frozenset({
     "--inspect-canonical-url",
     "--as",
     "--provision-impeccable-parser",
+    "--qa-reaccept",
 })
 
 _USAGE = """\
@@ -3355,6 +3362,13 @@ Usage:
                                                Impeccable parser runtime into the
                                                provisioned skill's own node_modules
                                                (exact pins only), then exit.
+    python -m app --qa-reaccept <project_id> --as <principal_id>
+                                               OPERATOR-ONLY QA re-acceptance of an
+                                               already-built, previously FAILED
+                                               revision. Re-runs QA acceptance on
+                                               the SAME source revision with NO
+                                               FRONTEND invocation and NO budget
+                                               reset; never deploys a Preview.
     python -m app --help                       Show this message.
 
 Environment: TELEGRAM_BOT_TOKEN, VERCEL_TOKEN, VERCEL_TEAM_ID (required).
@@ -3578,6 +3592,19 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 1
         return _run_reconcile_publish(composition, argv)
 
+    # ---- Operator-only QA re-acceptance of an already-built FAILED revision:
+    #   python -m app --qa-reaccept <project_id> --as <principal_id>
+    #
+    # Re-runs the QA acceptance gates on the SAME source revision with NO
+    # FRONTEND invocation and NO budget reset. It is deliberately NOT a Telegram
+    # action and NOT a public endpoint: a user turn must never be able to drive
+    # recovery. It exits without starting the receive loop, so it can never
+    # race the running runtime. Publication is irrelevant here -- re-acceptance
+    # NEVER deploys a Preview, approves, or publishes -- so it is NOT gated on
+    # publication_enabled.
+    if "--qa-reaccept" in argv:
+        return _run_qa_reaccept(composition, argv)
+
     loop = TelegramReceiveLoop(
         bot_token=config.telegram_bot_token,
         dispatcher=composition.dispatcher,
@@ -3705,6 +3732,102 @@ def _run_reconcile_publish(composition, argv) -> int:
     logger.info(
         "Publish recovery complete project=%s lifecycle=LIVE production_url=%s",
         project_id, (result.data or {}).get("production_url"),
+    )
+    return 0
+
+
+def _run_qa_reaccept(composition, argv) -> int:
+    """Operator entry point for QA re-acceptance of a failed build.
+
+    Fails closed on anything it cannot prove: a missing/ambiguous project id, a
+    missing ``--as`` principal, a non-owner principal, an inadmissible lifecycle
+    or revision, a changed source/artifact identity, or an N6-E guidance
+    mismatch. The principal is stated explicitly rather than inferred, so the
+    recovery is attributable and can never self-authorize.
+
+    It builds a REPAIR-FREE QAOrchestrator: no FRONTEND adapter is injected, so
+    the evaluation path physically cannot invoke FRONTEND, and the durable
+    FRONTEND budget is never passed. The single worker slot is acquired for the
+    duration, so re-acceptance can never run concurrently with a build.
+    """
+    from app.core.state import reconcile_stranded_projects
+    from app.projects.build import _capture_toolchain_hashes, _verify_toolchain_untouched
+    from app.qa.orchestrator import QAOrchestrator
+    from app.qa.reacceptance import (
+        ReacceptanceError, VisionOnlyAdapter, run_qa_reacceptance,
+    )
+
+    project_id = _flag_value(argv, "--qa-reaccept")
+    principal_id = _flag_value(argv, "--as")
+    if not project_id or not principal_id:
+        logger.error(
+            "Usage: python -m app --qa-reaccept <project_id> --as <principal_id>"
+        )
+        return 2
+
+    state = composition.store.load(project_id)
+    if state is None:
+        logger.error("No project state for project=%s", project_id)
+        return 1
+    if state.owner_id != principal_id:
+        logger.error("Principal does not own the project project=%s", project_id)
+        return 1
+
+    # Reconcile a re-acceptance stranded by a previous process death BEFORE
+    # deciding admissibility, so a crashed run does not wedge the project with a
+    # permanent QA_REACCEPTANCE_IN_PROGRESS.
+    try:
+        reconcile_stranded_projects(composition.store)
+    except Exception:
+        logger.exception("Stranded-project recovery failed; continuing")
+
+    workspace = composition.runner.create_workspace(project_id)
+    if not composition.runner.acquire_project(project_id):
+        logger.error("Refusing --qa-reaccept: another operation holds the worker slot")
+        return 1
+    try:
+        # REPAIR-FREE orchestrator: the adapter is wrapped so frontend_build is
+        # structurally unreachable (AssertionError), while VISION still works;
+        # no frontend_budget is passed, so the durable ledger is never touched.
+        toolchain_hashes = _capture_toolchain_hashes(workspace)
+        orchestrator = QAOrchestrator(
+            composition.runner,
+            composition.store,
+            hermes_adapter=VisionOnlyAdapter(composition.hermes),
+            toolchain_verify=lambda ws: _verify_toolchain_untouched(
+                ws, toolchain_hashes
+            ),
+            critic_scanner=composition.critic_scanner,
+            design_fidelity_enabled=composition.config.design_fidelity_enabled,
+        )
+        try:
+            result = run_qa_reacceptance(
+                store=composition.store,
+                orchestrator=orchestrator,
+                workspace=workspace,
+                project_id=project_id,
+                principal_id=principal_id,
+            )
+        except ReacceptanceError as exc:
+            logger.error(
+                "QA re-acceptance refused project=%s error_code=%s",
+                project_id, exc.code,
+            )
+            return 1
+    finally:
+        composition.runner.release_project(project_id)
+
+    if not result.success:
+        logger.error(
+            "QA re-acceptance rejected project=%s error_code=%s",
+            project_id, result.error,
+        )
+        return 1
+    logger.info(
+        "QA re-acceptance accepted project=%s source_revision=%s claim=%s",
+        project_id,
+        result.evidence.get("source_revision"),
+        result.evidence.get("claim_id"),
     )
     return 0
 

@@ -23,6 +23,14 @@ class ProjectLifecycle(str, Enum):
     FAILED = "FAILED"
     PAUSED = "PAUSED"
     CANCELED = "CANCELED"
+    #: Operator-only QA re-acceptance of an ALREADY-BUILT, previously FAILED
+    #: revision, with NO new FRONTEND invocation (see app.qa.reacceptance). A
+    #: dedicated state, rather than reusing RUNNING, keeps the lawful edge set
+    #: narrow: it is reachable ONLY from FAILED and can exit ONLY to
+    #: PREVIEW_READY / FAILED / PAUSED / CANCELED -- never to QUEUED, RUNNING,
+    #: REVISION_REQUESTED or PUBLISHING, so it can never start a new build or a
+    #: publication.
+    QA_REACCEPTING = "QA_REACCEPTING"
 
 
 # Valid transitions: current -> allowed next states
@@ -85,6 +93,11 @@ _TRANSITIONS: Dict[ProjectLifecycle, Set[ProjectLifecycle]] = {
     ProjectLifecycle.FAILED: {
         ProjectLifecycle.DISCOVERING,
         ProjectLifecycle.READY,
+        # Operator-only QA re-acceptance of an already-built, previously FAILED
+        # revision, with NO new FRONTEND invocation. The edge is deliberately
+        # FAILED -> QA_REACCEPTING ONLY: nothing else may enter the state, and
+        # its own exits are narrow (see below). It is NOT a generic door.
+        ProjectLifecycle.QA_REACCEPTING,
         # Same-operation publish recovery ONLY. A project that failed during
         # promotion keeps its durable promotion_intent; re-entering the SAME
         # operation (approval.operation_id == promotion_intent.operation_id)
@@ -96,6 +109,18 @@ _TRANSITIONS: Dict[ProjectLifecycle, Set[ProjectLifecycle]] = {
         # target against drifted remote state.
         ProjectLifecycle.PUBLISHING,
         ProjectLifecycle.CANCELED,
+    },
+    #: Operator-only QA re-acceptance (see app.qa.reacceptance). Its exits are
+    #: deliberately NOT the generic RUNNING set: it may reach PREVIEW_READY on a
+    #: passing re-acceptance, FAILED on any blocking finding or crash, or
+    #: PAUSED/CANCELED as the ordinary administrative outs. It can NEVER reach
+    #: QUEUED, RUNNING, REVISION_REQUESTED or PUBLISHING, so re-acceptance can
+    #: never start a new build, a FRONTEND invocation, or a publication.
+    ProjectLifecycle.QA_REACCEPTING: {
+        ProjectLifecycle.PREVIEW_READY,
+        ProjectLifecycle.PAUSED,
+        ProjectLifecycle.CANCELED,
+        ProjectLifecycle.FAILED,
     },
     ProjectLifecycle.PAUSED: {
         ProjectLifecycle.DISCOVERING,

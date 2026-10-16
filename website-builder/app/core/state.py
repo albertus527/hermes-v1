@@ -499,8 +499,9 @@ class ProjectStateStore:
 
 # Lifecycles whose ONLY exit is code running inside the process that entered
 # them. QUEUED exits only via build.py's QUEUED -> RUNNING; RUNNING exits only
-# via a QA success/failure or an exception handler. A crash therefore leaves
-# the project wedged: no user turn can re-admit it, because
+# via a QA success/failure or an exception handler. QA_REACCEPTING exits only
+# via the operator re-acceptance run's own success/failure finalizer. A crash
+# therefore leaves the project wedged: no user turn can re-admit it, because
 # ``IntakeProcessor.apply_to_project`` can only reach READY from FAILED.
 #
 # PUBLISHING and REVISION_REQUESTED are deliberately NOT listed. Both have
@@ -509,6 +510,7 @@ class ProjectStateStore:
 STRANDED_LIFECYCLES = (
     ProjectLifecycle.QUEUED.value,
     ProjectLifecycle.RUNNING.value,
+    ProjectLifecycle.QA_REACCEPTING.value,
 )
 
 
@@ -560,6 +562,22 @@ def reconcile_stranded_projects(
                     "interrupted_from": stranded_from,
                     "failed_at": time.time(),
                 }
+                # A crashed QA re-acceptance leaves a CLAIMED record behind. If
+                # it is not released here, every future run would be refused
+                # with QA_REACCEPTANCE_IN_PROGRESS forever. Release it to a
+                # REJECTED terminal state (never ACCEPTED -- no snapshot was
+                # written), preserving the original failure record it carried.
+                if stranded_from == ProjectLifecycle.QA_REACCEPTING.value:
+                    from app.qa.reacceptance import (
+                        DEPLOYMENT_KEY, STATUS_CLAIMED, STATUS_REJECTED,
+                    )
+
+                    block = state.deployment.get(DEPLOYMENT_KEY)
+                    if isinstance(block, dict) and block.get("status") == STATUS_CLAIMED:
+                        block["status"] = STATUS_REJECTED
+                        block["finished_at"] = time.time()
+                        block["reason"] = "OPERATION_INTERRUPTED"
+                        state.deployment[DEPLOYMENT_KEY] = block
                 store.save(state)
                 recovered[project_id] = stranded_from
         except (TimeoutError, OSError, ValueError) as exc:

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -55,6 +56,29 @@ class QABlockingError(Exception):
     def __init__(self, code: str):
         super().__init__(code)
         self.code = code
+
+
+@dataclass
+class ReacceptanceEvaluation:
+    """Result of ONE repair-free QA evaluation for operator re-acceptance.
+
+    Deliberately NOT a :class:`~app.qa.findings.QAResult`: re-acceptance never
+    repairs, never consumes the FRONTEND budget, and never writes the normal
+    acceptance evidence, so it must not be confusable with a Phase-8 run. The
+    caller (:mod:`app.qa.reacceptance`) owns all lifecycle and persistence.
+    """
+
+    passed: bool
+    reason: str
+    build_ok: bool = False
+    typecheck_ok: bool = False
+    self_contained_ok: bool = False
+    #: True when a gate found something that WOULD require a FRONTEND repair.
+    #: The caller fails closed on this -- it never invokes FRONTEND.
+    repair_required: bool = False
+    attempt: Optional[QAAttempt] = None
+    critic: Optional[Dict[str, Any]] = None
+    fidelity: Optional[Dict[str, Any]] = None
 
 
 class QAOrchestrator:
@@ -1240,6 +1264,219 @@ Instructions:
                 before = source_fingerprint(workspace)
                 record_checks(self.store, project_id, workspace, before)
         return build_proc.returncode == 0, typecheck_proc.returncode == 0, self_contained
+
+    # ------------------------------------------------------------------
+    # Operator-only QA re-acceptance evaluation (NO repair, NO FRONTEND)
+    # ------------------------------------------------------------------
+
+    def evaluate_for_reacceptance(
+        self,
+        project_id: str,
+        workspace: Path,
+        brief: Dict[str, Any],
+        design_dna: Optional[Dict[str, Any]] = None,
+    ) -> "ReacceptanceEvaluation":
+        """Run ONE fresh, REPAIR-FREE QA evaluation of an EXISTING revision.
+
+        The evidence-gathering half of the operator-only QA re-acceptance path
+        (see :mod:`app.qa.reacceptance`). It reuses the SAME primitives the
+        normal Phase-8 path uses -- ``_run_rebuild_checks`` (deterministic
+        build/typecheck/self-contained), ``_run_one_attempt`` (browser
+        screenshots + VISION + deterministic), the Impeccable critic scanner and
+        the design-fidelity gate -- but it NEVER repairs:
+
+        * No FRONTEND invocation is possible from here: this method contains no
+          ``frontend_build`` call and never touches the durable FRONTEND budget.
+        * A blocking deterministic/VISION finding, an ACTIONABLE critic finding,
+          or a HARD fidelity finding is reported with ``repair_required=True`` so
+          the caller FAILS CLOSED with a clear reason instead of invoking
+          FRONTEND.
+        * It writes NO deployment evidence of its own: the caller persists the
+          returned records under a re-acceptance-scoped key, so the ORIGINAL
+          ``critic`` / ``design_fidelity`` / ``qa`` evidence of the failed build
+          is never overwritten.
+        """
+        qa_dir = workspace / "qa" / "reaccept"
+
+        # 1. Deterministic authority: build + typecheck + self-contained. This
+        #    also re-binds ``deployment["checked"]`` to the current bytes, which
+        #    the caller then compares against the immutable expected identity.
+        build_ok, typecheck_ok, self_contained_ok = self._run_rebuild_checks(
+            project_id, workspace
+        )
+        if not (build_ok and typecheck_ok and self_contained_ok):
+            return ReacceptanceEvaluation(
+                passed=False,
+                reason="QA_REACCEPTANCE_DETERMINISTIC_FAILED",
+                build_ok=build_ok,
+                typecheck_ok=typecheck_ok,
+                self_contained_ok=self_contained_ok,
+            )
+
+        # 2. Browser screenshots + VISION + deterministic (fresh, never reused).
+        attempt = self._run_one_attempt(
+            project_id, workspace, qa_dir, 0, brief, design_dna
+        )
+        if attempt.infrastructure_error:
+            return ReacceptanceEvaluation(
+                passed=False,
+                reason=f"QA_REACCEPTANCE_INFRASTRUCTURE:{attempt.infrastructure_error}",
+                build_ok=True, typecheck_ok=True, self_contained_ok=True,
+                attempt=attempt,
+            )
+        if not attempt.final_pass:
+            return ReacceptanceEvaluation(
+                passed=False,
+                reason="QA_REACCEPTANCE_BLOCKING_FINDINGS",
+                build_ok=True, typecheck_ok=True, self_contained_ok=True,
+                attempt=attempt,
+            )
+
+        # 3. Critic scan (detection only -- a repair need FAILS CLOSED).
+        critic = self._critic_scan_only(project_id, workspace)
+        if not critic["allowed"]:
+            return ReacceptanceEvaluation(
+                passed=False, reason=critic["error"],
+                build_ok=True, typecheck_ok=True, self_contained_ok=True,
+                attempt=attempt, critic=critic["record"],
+                repair_required=critic["repair_required"],
+            )
+
+        # 4. Design fidelity (detection only -- a repair need FAILS CLOSED).
+        fidelity = self._fidelity_detect_only(project_id, workspace, brief, attempt)
+        if not fidelity["allowed"]:
+            return ReacceptanceEvaluation(
+                passed=False, reason=fidelity["error"],
+                build_ok=True, typecheck_ok=True, self_contained_ok=True,
+                attempt=attempt, critic=critic["record"],
+                fidelity=fidelity["record"],
+                repair_required=fidelity["repair_required"],
+            )
+
+        return ReacceptanceEvaluation(
+            passed=True, reason="QA_REACCEPTANCE_PASSED",
+            build_ok=True, typecheck_ok=True, self_contained_ok=True,
+            attempt=attempt, critic=critic["record"], fidelity=fidelity["record"],
+        )
+
+    def _critic_scan_only(self, project_id: str, workspace: Path) -> Dict[str, Any]:
+        """Scan with the Impeccable critic WITHOUT any repair path.
+
+        Returns ``{"allowed", "error", "repair_required", "record"}``. A
+        repairable (actionable) finding is NOT repaired -- it is reported as
+        ``QA_REACCEPTANCE_REPAIR_REQUIRED`` so the caller fails closed.
+        """
+        from app.core import critic_policy
+        from app.core.critic_policy import (
+            acceptance_allowed,
+            classify_findings,
+            repairable_findings,
+            unrepaired_blockers,
+        )
+
+        if self._critic_scanner is None:
+            # No scanner -> explicit degraded outcome (never a false "verified").
+            allowed, why = acceptance_allowed(
+                critic_state=critic_policy.NOT_RUN, authoritative=False,
+                unresolved_blockers=(), repairable_remaining=(),
+                degraded_record=True,
+            )
+            record = {
+                "state": critic_policy.NOT_RUN, "authoritative": False,
+                "degraded_record": True, "allowed": allowed,
+                "reason": why or "critic_not_run",
+            }
+            return {"allowed": allowed, "error": None if allowed else "CRITIC_NOT_RUN",
+                    "repair_required": False, "record": record}
+
+        scan = self._critic_scanner.scan(workspace)
+        classified = classify_findings(
+            scan.findings, protected_terms=self._critic_protected_terms(project_id)
+        )
+        base = scan.to_dict()
+
+        if scan.state in (critic_policy.NOT_RUN, critic_policy.DEGRADED, critic_policy.FAILED):
+            allowed, why = acceptance_allowed(
+                critic_state=scan.state, authoritative=False,
+                unresolved_blockers=(), repairable_remaining=(),
+                degraded_record=True,
+            )
+            record = {**base, "authoritative": False, "degraded_record": True,
+                      "allowed": allowed, "reason": why or f"critic_{scan.state.lower()}"}
+            return {"allowed": allowed,
+                    "error": None if allowed else f"CRITIC_{scan.state}",
+                    "repair_required": False, "record": record}
+
+        repairable = repairable_findings(classified)
+        unresolvable = unrepaired_blockers(classified)
+        record = {
+            **base,
+            "authoritative": scan.authoritative,
+            "repairable": [f.to_dict() for f in repairable],
+            "unresolved_blockers": [f.to_dict() for f in unresolvable],
+        }
+        if unresolvable:
+            record["allowed"] = False
+            record["reason"] = "requirement_conflict"
+            return {"allowed": False, "error": "CRITIC_REQUIREMENT_CONFLICT",
+                    "repair_required": False, "record": record}
+        if repairable:
+            # A repair WOULD be required. Fail closed -- never invoke FRONTEND.
+            record["allowed"] = False
+            record["reason"] = "repair_required"
+            return {"allowed": False, "error": "QA_REACCEPTANCE_REPAIR_REQUIRED",
+                    "repair_required": True, "record": record}
+
+        allowed, why = acceptance_allowed(
+            critic_state=scan.state, authoritative=scan.authoritative,
+            unresolved_blockers=(), repairable_remaining=(), degraded_record=False,
+        )
+        record["allowed"] = allowed
+        record["reason"] = why or "acceptance_gates_passed"
+        return {"allowed": allowed,
+                "error": None if allowed else f"CRITIC_{scan.state}",
+                "repair_required": False, "record": record}
+
+    def _fidelity_detect_only(
+        self, project_id: str, workspace: Path, brief: Dict[str, Any], attempt: QAAttempt,
+    ) -> Dict[str, Any]:
+        """Evaluate the design-fidelity gate WITHOUT any repair path.
+
+        A HARD finding (which would normally drive a repair) is reported as
+        ``QA_REACCEPTANCE_REPAIR_REQUIRED``; a soft WARN or UNKNOWN never blocks
+        (matching the gate's own B7 semantics).
+        """
+        from app.core.design_fidelity import (
+            VERDICT_FAIL, overall_terminal_outcome,
+        )
+        from app.core.design_fidelity_runtime import build_fidelity_report
+
+        state = self.store.load(project_id)
+        persisted_brief = dict((state.brief if state is not None else {}) or brief or {})
+        technical_ok = (
+            not bool(attempt.infrastructure_error)
+            and not bool(attempt.deterministic.failures)
+        )
+        report = build_fidelity_report(
+            workspace, persisted_brief, vision=attempt.vision, technical_ok=technical_ok
+        )
+        outcome = overall_terminal_outcome(
+            report, repair_used=False, repair_verified=False
+        )
+        failed = report.overall == VERDICT_FAIL
+        record = {
+            "outcome": outcome, "repair_used": False, "repair_verified": False,
+            "failed": failed, "report": report.to_dict(),
+        }
+        if failed:
+            return {
+                "allowed": False, "error": f"DESIGN_FIDELITY_{outcome}",
+                # Only a HIGH-confidence actionable finding is visually
+                # repairable; a technical failure is not.
+                "repair_required": bool(report.repairable_findings()),
+                "record": record,
+            }
+        return {"allowed": True, "error": None, "repair_required": False, "record": record}
 
     # ------------------------------------------------------------------
     # Lifecycle finalization
