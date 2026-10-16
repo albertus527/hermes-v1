@@ -72,6 +72,7 @@ class QAOrchestrator:
         web3forms_access_key: Optional[str] = None,
         toolchain_verify=None,
         critic_scanner=None,
+        design_fidelity_fn=None,
     ):
         self.runner = runner
         self.store = store
@@ -95,6 +96,16 @@ class QAOrchestrator:
         # Set by the critic stage so the caller can persist an honest degraded
         # record instead of claiming full verification.
         self._critic_stage_result = None
+        # V3-C: an OPTIONAL, injected design-fidelity gate. When None (the
+        # default) the QA path is byte-identical to pre-V3-C: no extra model
+        # call, no extra repair. When provided, it is a callable
+        # ``(workspace, brief, design_dna, technical_ok) -> object`` that runs
+        # the bounded fidelity gate (evaluate + at most ONE repair) and returns
+        # a result exposing ``to_dict()`` and ``failed``. The orchestrator only
+        # RECORDS its verdict as honest evidence; the gate itself owns the
+        # evaluate/repair/verify policy (app.core.design_fidelity).
+        self._design_fidelity_fn = design_fidelity_fn
+        self._design_fidelity_result = None
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -191,6 +202,32 @@ class QAOrchestrator:
                                 repair_attempts=repair_count,
                                 error=critic_stage["error"],
                             )
+
+                    # --- V3-C: the OPTIONAL bounded design-fidelity gate ------
+                    # Runs after the browser/VISION QA (and after the critic
+                    # stage) and BEFORE the tested snapshot, so a fidelity
+                    # repair invalidates nothing that has already been bound.
+                    # When unconfigured this is a no-op and the QA path is
+                    # byte-identical to pre-V3-C.
+                    fidelity = self._run_design_fidelity_stage(
+                        project_id=project_id,
+                        workspace=workspace,
+                        brief=brief,
+                        design_dna=design_dna,
+                    )
+                    if fidelity is not None and fidelity.get("failed"):
+                        self._finalize_failure(
+                            project_id, attempts, repair_count,
+                            error=fidelity.get("error"),
+                            fidelity=fidelity.get("record"),
+                        )
+                        return QAResult(
+                            project_id=project_id,
+                            success=False,
+                            attempts=attempts,
+                            repair_attempts=repair_count,
+                            error=fidelity.get("error"),
+                        )
 
                     # The attempt that FINALLY passed QA. After a critic repair
                     # this is the stage's fresh browser/VISION attempt; without
@@ -659,6 +696,73 @@ class QAOrchestrator:
             "record": record,
         }
 
+    def _run_design_fidelity_stage(
+        self,
+        *,
+        project_id: str,
+        workspace: Path,
+        brief: Dict[str, Any],
+        design_dna: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """Run the OPTIONAL V3-C design-fidelity gate; return bookkeeping.
+
+        Returns ``None`` when no gate is configured (the default), so the QA
+        path is byte-identical to pre-V3-C. When a gate IS configured it is
+        invoked with the real workspace and brief; its honest verdict is
+        RECORDED (never fabricated) and its ``failed`` flag is surfaced so the
+        caller can refuse acceptance. The gate owns the bounded evaluate +
+        repair + verify policy in :mod:`app.core.design_fidelity`; this method
+        only supplies evidence and records the outcome.
+
+        The gate is an ENHANCEMENT: an unexpected gate error is recorded as a
+        degraded (non-blocking) note rather than crashing a passing QA run,
+        exactly like the design-context pack. A HARD fidelity failure the gate
+        itself reports is honoured and blocks acceptance.
+        """
+        if self._design_fidelity_fn is None:
+            return None
+        try:
+            result = self._design_fidelity_fn(
+                workspace=workspace,
+                brief=brief,
+                design_dna=design_dna,
+            )
+        except Exception:  # noqa: BLE001 - a gate error never crashes QA
+            logger.warning(
+                "V3-C design-fidelity gate raised for %s; recording degraded",
+                project_id, exc_info=True,
+            )
+            record = {
+                "outcome": "FIDELITY_UNKNOWN",
+                "failed": False,
+                "degraded": True,
+                "error": "design_fidelity_gate_raised",
+            }
+            self._design_fidelity_result = record
+            self._record_fidelity_record(project_id, record)
+            return {"failed": False, "error": None, "record": record}
+
+        record = result.to_dict() if hasattr(result, "to_dict") else dict(result)
+        failed = bool(getattr(result, "failed", record.get("failed", False)))
+        self._design_fidelity_result = record
+        self._record_fidelity_record(project_id, record)
+        error = None
+        if failed:
+            error = f"DESIGN_FIDELITY_{record.get('outcome', 'FAILED')}"
+        return {"failed": failed, "error": error, "record": record}
+
+    def _record_fidelity_record(self, project_id: str, record: Dict[str, Any]) -> None:
+        """Persist the fidelity verdict as honest evidence (never as a claim)."""
+        try:
+            with self.store.acquire_writer(project_id) as state:
+                state.deployment["design_fidelity"] = record
+                self.store.save(state)
+        except Exception:  # noqa: BLE001 - recording must never crash QA
+            logger.warning(
+                "V3-C could not record design-fidelity result for %s",
+                project_id, exc_info=True,
+            )
+
     def _critic_protected_terms(self, project_id: str):
         """Terms a critic finding must not propose to change.
 
@@ -878,6 +982,7 @@ Instructions:
         repair_attempts: int,
         error: Optional[str] = None,
         critic: Optional[Dict[str, Any]] = None,
+        fidelity: Optional[Dict[str, Any]] = None,
     ) -> None:
         with self.store.acquire_writer(project_id) as state:
             self.store.transition_lifecycle_locked(state, ProjectLifecycle.FAILED)
@@ -895,4 +1000,7 @@ Instructions:
                 # D3b: the critic stage's own evidence for the failure, so an
                 # operator can see WHICH finding/regression ended the loop.
                 state.failure["critic"] = critic
+            if fidelity is not None:
+                # V3-C: the fidelity gate's own evidence for the failure.
+                state.failure["design_fidelity"] = fidelity
             self.store.save(state)
