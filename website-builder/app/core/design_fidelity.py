@@ -99,6 +99,15 @@ MAX_EVIDENCE_CHARS = 400
 #: by ``=`` or a word character (``x2="140"``, ``="…"``), and the content class
 #: excludes ``=`` so a stray ``x2=`` fragment can never be captured.
 _STRING_LITERAL = re.compile(r"""(?<![=\w])['"`]([^'"`=\n]{3,80})['"`]""")
+#: A module specifier is NEVER visible card content. Two independent guards:
+#:  (a) a quoted string that immediately follows an import/export/require/
+#:      dynamic-import keyword is a module specifier;
+#:  (b) a path-shaped literal (``./x``, ``../x``, ``@scope/x``) is a module path.
+_MODULE_SPECIFIER_PREFIX = re.compile(
+    r"(?:\bfrom|\brequire\s*\(|\bimport\s*\(|\bimport|\bexport)\s*$",
+    re.IGNORECASE,
+)
+_PATH_SPECIFIER = re.compile(r"^(?:\.{1,2}/|@[A-Za-z0-9-]+/)[\w./@-]*$")
 #: A trailing index ("Contoh Proyek 01") is normalised away so a numbered family
 #: of otherwise-identical labels reads as ONE repeated label.
 _TRAILING_INDEX = re.compile(r"\b0?[1-9]\d?\b")
@@ -134,6 +143,19 @@ _REAL_WORK_CLAIM: Tuple[str, ...] = (
     "our portfolio", "completed projects", "proyek selesai", "klien kami",
     "our clients", "studi kasus kami", "our case studies",
 )
+#: Negation cues that flip a real-work phrase into an honest DISCLAIMER. A claim
+#: only counts when it is NOT negated. Cues are checked in a bounded window
+#: immediately BEFORE the phrase (so "bukan proyek selesai" is a disclaimer) and
+#: in the same clause AFTER it (so "proyek selesai? belum" is a disclaimer too).
+#: Deliberately narrow: an affirmative claim in a mixed sentence still fires.
+_NEGATION_CUES: Tuple[str, ...] = (
+    "bukan", "bukanlah", "belum", "tidak", "tak", "tanpa", "no", "not",
+    "never", "none", "without", "n't", "neither", "nor",
+)
+#: A claim is only suppressed when a negation cue sits within this many
+#: characters before it (or within the same short window after it) AND no clause
+#: break separates the two. Bounded so a distant negation cannot launder a claim.
+_NEGATION_WINDOW = 24
 #: Colour words the owner may name, mapped to CSS-ish tokens that count as the
 #: same colour family. Used ONLY to detect a CONTRADICTION, never to impose a
 #: value (no hex is required or emitted).
@@ -247,18 +269,39 @@ class FidelityReport:
 # ---------------------------------------------------------------------------
 
 
+def _is_module_specifier(source_text: str, match) -> bool:
+    """True when a quoted literal is a module specifier, never visible content.
+
+    Two independent, conservative guards (P1):
+      * the literal is a path-shaped specifier (``./x``, ``../x``, ``@scope/x``);
+      * the text immediately before the opening quote ends with an import/
+        export/require/dynamic-import keyword (``from '…'``, ``require('…')``,
+        ``import '…'``, ``import('…')``).
+    Neither a JSX text node nor a props/array display label matches these.
+    """
+    value = match.group(1)
+    if _PATH_SPECIFIER.match(value):
+        return True
+    prefix = source_text[max(0, match.start() - 12):match.start()]
+    return bool(_MODULE_SPECIFIER_PREFIX.search(prefix))
+
+
 def _display_labels(source_text: str):
     """Yield quoted DISPLAY labels from ``source_text``, skipping markup.
 
     The ``_STRING_LITERAL`` pattern already excludes attribute values (its
     lookbehind rejects a quote preceded by ``=`` or a word char, and its content
     class excludes ``=``); this helper additionally requires a letter so pure
-    numeric noise can never be treated as a label.
+    numeric noise can never be treated as a label, and skips MODULE SPECIFIERS
+    (import/require paths) which are code, never rendered card content (P1).
     """
     for match in _STRING_LITERAL.finditer(source_text or ""):
         value = match.group(1)
-        if _HAS_LETTER.search(value) and _DISPLAY_LIKE.search(value):
-            yield value
+        if not (_HAS_LETTER.search(value) and _DISPLAY_LIKE.search(value)):
+            continue
+        if _is_module_specifier(source_text or "", match):
+            continue
+        yield value
 
 
 def _detect_repeated_content(source_text: str) -> Tuple[FidelityFinding, ...]:
@@ -305,6 +348,54 @@ def _detect_repeated_content(source_text: str) -> Tuple[FidelityFinding, ...]:
     return tuple(findings)
 
 
+def _claim_is_negated(haystack: str, index: int, length: int) -> bool:
+    """True when the real-work phrase at ``index`` is NEGATED (a disclaimer).
+
+    Checks a bounded window immediately BEFORE the phrase and a short window
+    immediately AFTER it, stopping at a clause break. This makes
+    "bukan proyek selesai" (a disclaimer) not fire, while an affirmative claim
+    — including one in a MIXED sentence such as "bukan proyek selesai, ini karya
+    kami" — still fires because the negation is in a different clause.
+    """
+    clause_breaks = (".", ",", ";", ":", "!", "?", "\n", "(", ")", "—", "–")
+
+    before = haystack[max(0, index - _NEGATION_WINDOW):index]
+    # Cut at the nearest clause break so a negation in a PRIOR clause is ignored.
+    for brk in clause_breaks:
+        pos = before.rfind(brk)
+        if pos != -1:
+            before = before[pos + 1:]
+    if any(cue in before for cue in _NEGATION_CUES):
+        return True
+
+    after = haystack[index + length:index + length + _NEGATION_WINDOW]
+    for brk in clause_breaks:
+        pos = after.find(brk)
+        if pos != -1:
+            after = after[:pos]
+    return any(cue in after for cue in _NEGATION_CUES)
+
+
+def _real_work_claims(haystack: str) -> list:
+    """Return the real-work claim phrases that are actually ASSERTED.
+
+    A phrase only counts when it is not negated (P1). This preserves detection
+    of genuine fabricated completed-project claims, including mixed sentences.
+    """
+    asserted = []
+    for term in _REAL_WORK_CLAIM:
+        start = 0
+        while True:
+            idx = haystack.find(term, start)
+            if idx == -1:
+                break
+            if not _claim_is_negated(haystack, idx, len(term)):
+                asserted.append(term)
+                break
+            start = idx + len(term)
+    return asserted
+
+
 def _detect_unlabeled_conceptual(
     source_text: str,
     asset_plan: Optional[Mapping[str, Any]],
@@ -314,7 +405,8 @@ def _detect_unlabeled_conceptual(
     Fires only when the asset strategy says the showcase is CONCEPTUAL and the
     source neither discloses that nor (worse) claims the visuals are the
     studio's own completed work. A clearly-labelled conceptual preview is
-    ALLOWED and produces no finding.
+    ALLOWED and produces no finding. A NEGATED claim ("bukan proyek selesai") is
+    a disclosure, not a claim (P1).
     """
     if not isinstance(asset_plan, Mapping):
         return ()
@@ -325,7 +417,11 @@ def _detect_unlabeled_conceptual(
     if not haystack:
         return ()
     disclosed = any(term in haystack for term in _DISCLOSURE_TERMS)
-    claims_real = [term for term in _REAL_WORK_CLAIM if term in haystack]
+    claims_real = _real_work_claims(haystack)
+    # A real-work phrase that is present but NEGATED ("bukan proyek selesai") is
+    # itself an honest disclaimer, so it counts as disclosure too (P1).
+    if not claims_real and any(term in haystack for term in _REAL_WORK_CLAIM):
+        disclosed = True
     if claims_real:
         return (
             FidelityFinding(
