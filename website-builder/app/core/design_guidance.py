@@ -383,12 +383,18 @@ def _render_facet(
     reference_line: str,
     unresolved_note: str,
 ) -> str:
-    """Render one facet as an ordered, provenance-tagged block (see above)."""
+    """Render one facet as an ordered, provenance-tagged block (see above).
+
+    ``recommendation`` may carry several newline-separated recommendations; each
+    is rendered as its own tagged bullet so a reader can tell them apart and no
+    recommendation inherits another's provenance.
+    """
     parts = []
     for clause in by_axis.get(axis, ()):
         parts.append(_tag(clause, USER_SPECIFIED))
-    if recommendation:
-        parts.append(_tag(recommendation, DESIGN_RECOMMENDED))
+    for line in str(recommendation or "").splitlines():
+        if line.strip():
+            parts.append(_tag(line.strip(), DESIGN_RECOMMENDED))
     if reference_line:
         parts.append(_tag(reference_line, REFERENCE_DERIVED))
     if not parts:
@@ -479,9 +485,14 @@ def compile_design_guidance(
         recs.get("imagery", ""), "",
         "no imagery evidence supplied",
     )
+    # P1-A: the action-affordance recommendation rides in the EXISTING
+    # Hierarchy section rather than a new one, so the ten-section document
+    # contract is unchanged. Both lines are independently tagged; either can
+    # be absent without affecting the other.
+    hierarchy_parts = [p for p in (recs.get("hierarchy", ""), recs.get("action", "")) if p]
     hierarchy = _render_facet(
         intent, by_axis, "hierarchy",
-        recs.get("hierarchy", ""), "",
+        "\n".join(hierarchy_parts), "",
         "no supporting evidence supplied",
     )
     interaction = _render_facet(

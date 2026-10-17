@@ -216,6 +216,66 @@ _VISUAL_CONTENT_TERMS: Tuple[str, ...] = (
 #: Terms that mean "an accent colour exists" without naming one.
 _ACCENT_TERMS = ("aksen", "accent")
 
+#: Terms that mean the brief ASKS THE VISITOR TO DO SOMETHING — contact, book,
+#: sign up, buy, explore. Used only to decide whether action guidance is
+#: GROUNDED. Deliberately broader than "CTA"/"button": the owner almost never
+#: says either, but nearly always says what the visitor should be able to do.
+#: When no such term appears, no action guidance is emitted at all — inventing
+#: an action the brief never asked for would be fabricated guidance.
+_ACTION_TERMS: Tuple[str, ...] = (
+    # contact / enquiry
+    "kontak", "contact", "hubungi", "menghubungi", "whatsapp", "email",
+    "konsultasi", "consultation", "inquiry", "enquiry", "penawaran", "quote",
+    # booking / scheduling
+    "booking", "book", "reservasi", "reservation", "jadwal", "schedule",
+    "appointment", "janji",
+    # purchase / order
+    "pesan", "pemesanan", "order", "beli", "buy", "purchase", "checkout",
+    "keranjang", "cart",
+    # account / subscription
+    "daftar", "pendaftaran", "sign up", "signup", "register", "registrasi",
+    "berlangganan", "subscribe", "langganan",
+    # exploration / conversion
+    "jelajahi", "explore", "lihat karya", "view work", "lihat proyek",
+    "download", "unduh", "get started", "coba gratis", "free trial",
+    "demo", "bergabung", "join",
+)
+
+#: Appended to the Composition recommendation when one is already emitted, so
+#: section-to-section pacing is considered. States a PROPERTY (deliberate
+#: transitions, legible density, clear priority); it does not require
+#: alternating tones, a featured item, a fixed order, or any grid.
+_RHYTHM_CLAUSE = (
+    "; and give the page a deliberate rhythm of transitions between sections "
+    "— vary information density and make each section's content priority "
+    "legible — so the page reads as a considered sequence rather than a stack "
+    "of equally-weighted blocks"
+)
+
+#: Appended to the Hierarchy recommendation when one is already emitted, so the
+#: hierarchy is re-checked after responsive reflow. States a PROPERTY (ordering,
+#: grouping, spacing and continuity survive); it fixes no breakpoint, no height,
+#: and no mobile composition.
+_REFLOW_CLAUSE = (
+    "; and re-check that this ordering, the grouping of related items, and the "
+    "spacing between them still hold at the narrowest layout the page supports "
+    "— a hierarchy that reads clearly on a wide screen can collapse or drift "
+    "apart when the layout reflows"
+)
+
+#: Action-affordance recommendation. Emitted only when the brief asks the
+#: visitor to DO something (see ``_ACTION_TERMS``). Principles only: no colour,
+#: size, radius, or state value is fixed, and FRONTEND keeps the final styling.
+_ACTION_RECOMMENDATION = (
+    "make the page's main action unmistakable for {domain}: when several "
+    "actions appear together one should read clearly as primary and the rest "
+    "as secondary, and a control meant to be used must never look inert — a "
+    "muted or low-contrast control reads as disabled even when it works; give "
+    "controls distinguishable resting, hover, focus, and disabled states so "
+    "the affordance matches what the control actually does"
+)
+
+
 
 def _clean(value: Any) -> str:
     """Return a trimmed string, or ``""`` for anything that is not text."""
@@ -296,6 +356,31 @@ def _imagery_is_relevant(brief: Mapping[str, Any], intent: str) -> bool:
     return any(term in haystack for term in _VISUAL_CONTENT_TERMS)
 
 
+def _short_domain(brief: Mapping[str, Any]) -> str:
+    """The project's NAME when it has one, else the generic fallback.
+
+    The action recommendation is a single sentence about affordance, so the
+    long ``what`` description would swamp it; the name reads as "this site".
+    """
+    name = _clean((brief or {}).get("name"))
+    return name or "this website"
+
+
+def _action_is_relevant(brief: Mapping[str, Any], intent: str) -> bool:
+    """Whether the brief actually asks the visitor to DO something.
+
+    Grounded check, mirroring :func:`_imagery_is_relevant`: scans the brief's
+    own wording plus the owner's intent for a contact / booking / purchase /
+    sign-up / exploration signal. Returns ``False`` when the brief is a pure
+    brochure page with no action, so no action guidance is invented.
+    """
+    haystack = " ".join(
+        _clean((brief or {}).get(k)) for k in ("name", "what", "why")
+    ).lower()
+    haystack = f"{haystack} {_clean(intent).lower()}"
+    return any(term in haystack for term in _ACTION_TERMS)
+
+
 def recommendations(
     brief: Mapping[str, Any],
     intent: str,
@@ -316,11 +401,12 @@ def recommendations(
     domain = _domain_phrase(brief)
     if imagery_is_relevant is None:
         imagery_is_relevant = _imagery_is_relevant(brief, intent)
+    action_is_relevant = _action_is_relevant(brief, intent)
     out: dict = {}
 
     composition = _mechanisms(intent_lower, _COMPOSITION_MECHANISMS)
     if composition:
-        out["composition"] = f"For {domain}: " + "; ".join(composition)
+        out["composition"] = f"For {domain}: " + "; ".join(composition) + _RHYTHM_CLAUSE
 
     typography = _mechanisms(intent_lower, _TYPOGRAPHY_MECHANISMS)
     if typography:
@@ -339,12 +425,22 @@ def recommendations(
             "(primary action, active state) so it reads as intentional"
         )
 
-    if typography:
+    # Hierarchy fires from a stated typographic preference OR from a stated
+    # visitor action. The second trigger matters because an action hierarchy
+    # ("one primary, the rest secondary") is itself a hierarchy claim, and
+    # without it the most consequential element on the page — what the visitor
+    # is asked to do — would receive no ordering guidance at all.
+    if typography or action_is_relevant:
         out["hierarchy"] = (
             "establish a clear typographic hierarchy: one dominant display "
             "level, one secondary level, and a quiet body level, with "
-            "consistent scale steps"
+            "consistent scale steps" + _REFLOW_CLAUSE
         )
+
+    # Action affordance: only when the brief asks the visitor to DO something.
+    # Never invented for a page with no action; always tagged optional upstream.
+    if action_is_relevant:
+        out["action"] = _ACTION_RECOMMENDATION.format(domain=_short_domain(brief))
 
     if imagery_is_relevant:
         out["imagery"] = (
