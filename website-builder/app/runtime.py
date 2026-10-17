@@ -527,6 +527,40 @@ def _build_decision_engine(
         if provider.enabled:
             registry.register(provider)
 
+    # N8: register the Decisions Design provider when a design model is
+    # configured. It plugs into the SAME registry the existing engine already
+    # uses, so ``decide_design`` -> ``propose_design_candidates`` needs no
+    # change. A design model that is not configured leaves the registry exactly
+    # as before N8 (deterministic fallback only).
+    design_model = getattr(engine_config, "design_model", None)
+    if design_model and engine_config.design_enabled:
+        try:
+            from app.core.decisions_design_provider import (
+                DecisionsDesignProvider,
+            )
+
+            design_key = _resolve_decisions_api_key(None)
+            if design_key:
+                registry.register(
+                    DecisionsDesignProvider(
+                        model=design_model,
+                        api_key=design_key,
+                        base_url=engine_config.decisions_base_url,
+                        deadline_seconds=float(
+                            engine_config.decisions_timeout_seconds
+                        ),
+                    )
+                )
+            else:
+                logger.warning(
+                    "Decision design configured but no credential resolved; "
+                    "design falls back to the deterministic provider"
+                )
+        except Exception:  # noqa: BLE001 - registry wiring must never break startup
+            logger.warning(
+                "Decision design provider could not be registered", exc_info=True
+            )
+
     # The intake and design jobs may use different providers. When a mode names
     # one, that name is resolved by the engine; an unknown name falls back to the
     # deterministic provider rather than failing.
@@ -2029,6 +2063,7 @@ class TelegramReceiveLoop:
         error_backoff: float = 5.0,
         conversations: Optional[ConversationRouter] = None,
         display_name_for=None,
+        decision_intake=None,
     ):
         self.bot_token = bot_token
         self.dispatcher = dispatcher
@@ -2036,6 +2071,11 @@ class TelegramReceiveLoop:
         self.hermes = hermes
         self.conversations = conversations
         self.display_name_for = display_name_for
+        #: N8 Decision Intake router, or ``None`` when the role is disabled.
+        #:
+        #: ``None`` is the default and keeps every existing behaviour identical:
+        #: ``_classify_intent`` then goes straight to FAST, exactly as before N8.
+        self.decision_intake = decision_intake
         self.transport = transport or UrllibHttpTransport()
         self.poll_timeout = poll_timeout
         self.error_backoff = error_backoff
@@ -2105,6 +2145,26 @@ class TelegramReceiveLoop:
         # If only INTAKE is valid for this lifecycle, skip FAST entirely.
         if valid_intents == [ConversationIntent.INTAKE]:
             return ConversationIntent.INTAKE
+
+        # N8: Decision Intake is consulted exactly where FAST sits today, and
+        # only after the lifecycle short-circuit above. It returns a label from
+        # ``valid_intents`` or ``None``; ``None`` falls through to FAST. The
+        # router owns degradation, shadow mode, and label validation, so this
+        # branch stays inert when the role is disabled.
+        if self.decision_intake is not None:
+            try:
+                decision_label = self.decision_intake.classify(
+                    text=text,
+                    lifecycle=lifecycle,
+                    valid_intents=[i.value for i in valid_intents],
+                    conversation_key=project_id or "",
+                    context="",
+                    intent_enum=ConversationIntent,
+                )
+            except Exception:  # noqa: BLE001 - never break a turn on a provider fault
+                decision_label = None
+            if decision_label is not None:
+                return decision_label
 
         # If Hermes is unavailable, fall back to INTAKE.
         if self.hermes is None:
@@ -3613,6 +3673,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         telegram_out=composition.telegram_out,
         hermes=composition.hermes,
         conversations=composition.conversations,
+        decision_intake=_build_decision_intake_router(
+            config.decision_engine_config, composition
+        ),
     )
 
     # Graceful shutdown on SIGINT/SIGTERM
@@ -3671,6 +3734,88 @@ def handle_shutdown_signal(loop, hermes, signum, _frame=None) -> None:
             "Shutdown requested cancellation of in-flight FRONTEND invocation(s): %s",
             ", ".join(sorted(cancelled)),
         )
+
+
+def _build_decision_intake_router(engine_config, composition):
+    """Build the N8 Decision Intake router, or ``None`` when the role is disabled.
+
+    Returning ``None`` is the default and the important case: the receive loop
+    then never consults a Decision model, so ``_classify_intent`` behaves exactly
+    as it did before N8.
+
+    The API key is obtained through the SAME native credential seam the FAST path
+    already uses (``resolve_runtime_provider`` + ``_require_runtime_credentials``
+    inside the Hermes adapter). This factory never reads ``os.environ`` directly
+    and never persists the key.
+
+    Any failure here -- missing key, unresolvable provider, unregistered model --
+    yields ``None``. A misconfigured Decision role must never stop the runtime.
+    """
+    try:
+        model = getattr(engine_config, "intake_model", None)
+        if not model:
+            return None
+        if not getattr(engine_config, "intake_enabled", False):
+            return None
+
+        from app.core.decision_intake_router import IntakeRouter
+        from app.core.decisions_intake_provider import DecisionsIntakeProvider
+
+        api_key = _resolve_decisions_api_key(composition)
+        if not api_key:
+            logger.warning(
+                "Decision intake configured but no credential resolved; "
+                "falling back to FAST for this run"
+            )
+            return None
+
+        provider = DecisionsIntakeProvider(
+            model=model,
+            api_key=api_key,
+            base_url=getattr(
+                engine_config, "decisions_base_url",
+                "https://openrouter.ai/api/alpha/decisions",
+            ),
+            deadline_seconds=float(
+                getattr(engine_config, "decisions_timeout_seconds", 20.0)
+            ),
+        )
+        mode = getattr(engine_config.intake_mode, "value", None) or str(
+            engine_config.intake_mode
+        )
+        return IntakeRouter(provider=provider, mode=mode)
+    except Exception:  # noqa: BLE001 - configuration must never break startup
+        logger.warning(
+            "Decision intake router could not be constructed; using FAST",
+            exc_info=True,
+        )
+        return None
+
+
+def _resolve_decisions_api_key(composition) -> str:
+    """Resolve the OpenRouter key through the existing native credential seam.
+
+    Reuses ``resolve_runtime_provider`` -- the same function ``adapter.py``
+    already calls to obtain ``api_key`` for FAST/FRONTEND/VISION -- so N8 adds no
+    credential system of its own. Returns ``""`` when it cannot be resolved.
+    """
+    try:
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        hermes = getattr(composition, "hermes", None)
+        adapter = getattr(hermes, "adapter", hermes)
+        resolver = getattr(adapter, "_resolve_runtime_for_role", None)
+        if callable(resolver):
+            runtime = resolver("FAST")
+            if isinstance(runtime, dict) and runtime.get("api_key"):
+                return str(runtime["api_key"])
+        # Fall back to the documented module-level seam.
+        runtime = resolve_runtime_provider(requested="openrouter")
+        if isinstance(runtime, dict) and runtime.get("api_key"):
+            return str(runtime["api_key"])
+    except Exception:  # noqa: BLE001 - credential resolution must fail closed
+        return ""
+    return ""
 
 
 def _shutdown_handler_for(loop, hermes):

@@ -112,6 +112,24 @@ class DecisionEngineConfig:
     #: project. Mirrors :attr:`app.core.laya_context.LayaConfig.library_project_id`.
     design_library_project_id: str = DEFAULT_DESIGN_LIBRARY_PROJECT_ID
 
+    # -- N8: OpenRouter Decisions models -----------------------------------
+    #
+    # Both default to ``None``, which means "no Decisions provider is
+    # registered". Combined with the default ``disabled`` modes above, a
+    # deployment that sets neither key behaves exactly as before N8: the
+    # Decision Engine is not even constructed (``_build_decision_engine``
+    # returns ``None``).
+    #
+    # The model ids are the PINNED identities selected by the N8 benchmark, not
+    # floating aliases, so a provider-side model update cannot silently change
+    # what staging runs.
+    intake_model: Optional[str] = None
+    design_model: Optional[str] = None
+    #: Decisions endpoint. Overridable for a gateway, never derived from input.
+    decisions_base_url: str = "https://openrouter.ai/api/alpha/decisions"
+    #: Bounded operational deadline for ONE Decisions call, in seconds.
+    decisions_timeout_seconds: float = 20.0
+
     @property
     def intake_enabled(self) -> bool:
         """True when the engine is consulted for intake at all (shadow or active)."""
@@ -177,6 +195,49 @@ def _parse_max_candidates(value: Any) -> int:
     return max(0, min(count, MAX_CONFIGURED_CANDIDATES))
 
 
+def _parse_optional_model(value: Any) -> Optional[str]:
+    """Return a Decisions model id, or ``None`` to leave the role disabled.
+
+    Model ids are operator configuration, never user input. A blank or
+    non-string value disables the role rather than guessing a model -- an
+    accidental activation is the failure mode worth preventing.
+    """
+    candidate = value.strip() if isinstance(value, str) else ""
+    if not candidate:
+        return None
+    # A model id is "<vendor>/<name>"; reject anything that cannot be one.
+    if "/" not in candidate or any(ch.isspace() for ch in candidate):
+        return None
+    return candidate
+
+
+def _parse_base_url(value: Any) -> str:
+    """Return a validated Decisions endpoint, or the documented default.
+
+    Only https endpoints are accepted. The URL is operator configuration and is
+    never derived from a message, so this is a typo guard, not an input filter.
+    """
+    candidate = value.strip() if isinstance(value, str) else ""
+    if candidate.startswith("https://") and " " not in candidate:
+        return candidate
+    return "https://openrouter.ai/api/alpha/decisions"
+
+
+def _parse_timeout(value: Any) -> float:
+    """Return a bounded per-call deadline in seconds.
+
+    Clamped to a sane window: below 1s would fail on healthy calls, above 120s
+    would let a stalled peer hold a turn longer than any interactive budget.
+    """
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return 20.0
+    if seconds <= 0:
+        return 20.0
+    return max(1.0, min(seconds, 120.0))
+
+
 def config_from_mapping(
     data: Optional[Mapping[str, Any]],
 ) -> DecisionEngineConfig:
@@ -197,6 +258,12 @@ def config_from_mapping(
         max_candidates=_parse_max_candidates(data.get("max_candidates", 4)),
         design_library_project_id=_parse_library_project_id(
             data.get("design_library_project_id")
+        ),
+        intake_model=_parse_optional_model(data.get("intake_model")),
+        design_model=_parse_optional_model(data.get("design_model")),
+        decisions_base_url=_parse_base_url(data.get("decisions_base_url")),
+        decisions_timeout_seconds=_parse_timeout(
+            data.get("decisions_timeout_seconds", 20.0)
         ),
     )
 

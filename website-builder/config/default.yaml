@@ -138,6 +138,16 @@ website_builder:
     score_floor: 0.5
     # Hard cap on candidates considered (0-8). Clamped; never widened by config.
     max_candidates: 4
+    # N8 Decision models (OpenRouter Decisions API). Both default to empty,
+    # which means "no Decisions provider is registered" -- the Decision roles
+    # are OFF and the pipeline behaves exactly as before N8. Set a PINNED model
+    # id (e.g. 'typesafe/jev-1.14') together with the matching *_mode to enable.
+    intake_model: ''
+    design_model: ''
+    # Bounded operational deadline for ONE Decisions call, in seconds.
+    # Clamped to [1, 120]; a stalled peer can never exceed it.
+    decisions_timeout_seconds: 20
+    decisions_base_url: 'https://openrouter.ai/api/alpha/decisions'
 
   # Workspace root for generated projects
   workspace_root: '~/website-workspaces'
