@@ -12,7 +12,7 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +136,10 @@ class QAOrchestrator:
         # blocking VISION verdict. Set only when a blocking verdict actually
         # stops acceptance; read by :meth:`_finalize_failure`.
         self._vision_consistency: Optional[Dict[str, Any]] = None
+        # P0: bounded VISION observations from the most recent QA attempt. Used
+        # ONLY as advisory context for an already-authorized repair. Never
+        # triggers repair, never changes blocking status, never consumes budget.
+        self._recent_vision_observations: Tuple[str, ...] = ()
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -529,6 +533,17 @@ class QAOrchestrator:
                     summary=vision_raw.get("summary", ""),
                     raw_error=raw_err,
                 )
+                # P0: remember the bounded observations for advisory use in a
+                # later (already-authorized) repair prompt. This is a passive
+                # cache: it never influences pass/fail, budget, or acceptance.
+                try:
+                    from app.core.critic_policy import select_vision_observations
+
+                    self._recent_vision_observations = select_vision_observations(
+                        vision_findings.observations
+                    )
+                except Exception:  # noqa: BLE001 - advisory cache must never crash QA
+                    self._recent_vision_observations = ()
 
         # Build/typecheck are already known-good from Phase 7 on attempt 0;
         # subsequent attempts re-verify via _run_rebuild_checks before this
@@ -614,6 +629,17 @@ class QAOrchestrator:
     # D3b: the bounded critic repair stage
     # ------------------------------------------------------------------
 
+    def _latest_vision_observations(self) -> Tuple[str, ...]:
+        """Bounded VISION observations from the most recent QA attempt (P0).
+
+        ADVISORY ONLY. The caller forwards these into an already-authorized
+        repair prompt as context. This accessor cannot trigger a repair, cannot
+        change blocking status, and cannot consume budget. Returns ``()`` when
+        no observations were recorded, which keeps the repair prompt
+        byte-identical to its pre-P0 form.
+        """
+        return tuple(getattr(self, "_recent_vision_observations", ()) or ())
+
     def _critic_repair(
         self,
         project_id: str,
@@ -649,6 +675,14 @@ class QAOrchestrator:
 
         from app.core.critic_policy import build_repair_request
 
+        # P0: forward bounded VISION observations as ADVISORY context for this
+        # already-authorized repair. Sourced from the most recent QA attempt's
+        # VISION evidence. These never create repair eligibility, never change
+        # blocking status, and never consume budget -- they only add context to
+        # a repair that is happening anyway. Absent observations leave the
+        # prompt byte-identical to pre-P0.
+        _vision_obs = self._latest_vision_observations()
+
         with self.store.acquire_writer(project_id) as state:
             request = build_repair_request(
                 requirements=state.brief or {},
@@ -660,6 +694,7 @@ class QAOrchestrator:
                 source_revision=state.revisions.source_revision,
                 previous_results=previous_results,
                 budget=budget,
+                vision_observations=_vision_obs,
             )
             instructions = compose_project_instructions(
                 state, access_key=self.web3forms_access_key, task=request,

@@ -194,6 +194,12 @@ _INSTRUCTION_LIKE = re.compile(
 MAX_EVIDENCE_CHARS = 400
 #: Bound on how many findings a repair request may carry.
 MAX_REPAIR_FINDINGS = 12
+#: Bound on how many VISION observations a repair request may carry (P0).
+#: Deliberately small: observations are ADVISORY context for an already-authorized
+#: repair, never a work queue.
+MAX_REPAIR_VISION_OBSERVATIONS = 5
+#: Bound on the length of a single forwarded VISION observation (P0).
+MAX_VISION_OBSERVATION_CHARS = 200
 
 
 def _bounded(text: object, limit: int = MAX_EVIDENCE_CHARS) -> str:
@@ -202,6 +208,69 @@ def _bounded(text: object, limit: int = MAX_EVIDENCE_CHARS) -> str:
     if not isinstance(text, str):
         return ""
     return text.strip()[:limit]
+
+
+def select_vision_observations(
+    observations: object,
+    *,
+    limit: int = MAX_REPAIR_VISION_OBSERVATIONS,
+    char_limit: int = MAX_VISION_OBSERVATION_CHARS,
+) -> Tuple[str, ...]:
+    """Conservatively bound VISION observations for repair-prompt context (P0).
+
+    This is a BOUNDING function, not a classifier. It deliberately performs NO
+    semantic filtering: no keyword allow/deny lists, no aesthetic scoring, no
+    second model. Hedged wording ("maybe", "premium", "could be better") is
+    RETAINED, because such a sentence can still name a concrete element.
+
+    Only mechanical hygiene is applied:
+
+    * non-string / blank entries are dropped (they cannot be forwarded safely);
+    * control characters and collapsed whitespace;
+    * per-item and total length bounds;
+    * duplicate (case-insensitive, whitespace-normalised) entries dropped,
+      preserving first-seen order;
+    * entries that look like executable instructions are dropped, because the
+      repair prompt treats everything in this block as DATA.
+
+    Returns a tuple of at most ``limit`` bounded strings. An empty/absent input
+    yields ``()`` so the caller's prompt stays byte-identical to before.
+    """
+    if not observations:
+        return ()
+    if isinstance(observations, str):
+        # A bare string is ONE observation, never a character sequence.
+        items: list = [observations]
+    elif isinstance(observations, (list, tuple)):
+        items = list(observations)
+    else:
+        return ()
+
+    out: list = []
+    seen: set = set()
+    for item in items:
+        if not isinstance(item, str):
+            continue
+        # Strip control characters (keep normal punctuation/accents), collapse
+        # runs of whitespace, then bound.
+        cleaned = "".join(
+            ch for ch in item if ch == "\n" or ch == "\t" or ord(ch) >= 32
+        )
+        cleaned = " ".join(cleaned.split())[:char_limit].strip()
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        if _looks_instructional(cleaned):
+            # Observations are DATA. Anything shaped like an instruction is not
+            # forwarded, so it can never be mistaken for a directive.
+            continue
+        seen.add(key)
+        out.append(cleaned)
+        if len(out) >= limit:
+            break
+    return tuple(out)
 
 
 def _severity_rank(severity: str) -> Optional[int]:
@@ -573,6 +642,7 @@ def build_repair_request(
     source_revision: int = 0,
     previous_results: Sequence[Mapping[str, Any]] = (),
     budget: Optional[RepairBudget] = None,
+    vision_observations: Sequence[str] = (),
 ) -> str:
     """The ONE bounded text block a critic repair request may carry.
 
@@ -581,6 +651,13 @@ def build_repair_request(
     relevant build/typecheck errors, the project/revision identity, previous
     repair results, and the remaining budget. Nothing else -- no raw engine
     output, no unbounded finding list, no executable fragment.
+
+    ``vision_observations`` (P0) are ADVISORY contextual design feedback from
+    VISION, rendered in their OWN labelled section. They are deliberately NOT
+    merged into the findings or blocking sections: they cannot trigger a repair,
+    cannot change blocking status, and cannot consume repair budget. When the
+    parameter is empty (the default) the returned prompt is byte-identical to
+    the pre-P0 prompt.
     """
     budget = budget or RepairBudget()
 
@@ -617,6 +694,24 @@ def build_repair_request(
         for p in previous_results
     ) or "(none)"
 
+    # P0: advisory VISION observations, bounded and rendered in their OWN block.
+    # Empty input produces an empty string, so the prompt below is byte-identical
+    # to the pre-P0 prompt when no observations are supplied.
+    _obs = select_vision_observations(vision_observations)
+    vision_obs_block = ""
+    if _obs:
+        _obs_lines = "\n".join(f"- {o}" for o in _obs)
+        vision_obs_block = (
+            "\nVISION observations — contextual design feedback, NOT mandatory "
+            "requirements.\n"
+            "These are OPTIONAL suggestions from a visual review of the current "
+            "render. They are NOT defects, do NOT affect acceptance, and do NOT "
+            "authorise extra scope. You OWN the art direction: apply only what "
+            "genuinely improves the page, and ignore any that conflict with the "
+            "approved requirements or Design DNA.\n"
+            f"{_obs_lines}\n"
+        )
+
     return f"""CRITIC REPAIR TASK (bounded design-critic repair).
 
 Project: {project_id}
@@ -640,7 +735,7 @@ Build / typecheck errors:
 
 Previous repair results:
 {previous_text}
-
+{vision_obs_block}
 HARD constraints:
 - Make the SMALLEST targeted change that resolves the findings above.
 - Do NOT change the approved requirements or the accepted Design DNA.
@@ -727,6 +822,8 @@ __all__ = [
     "MAX_CRITIC_REPAIR_ATTEMPTS",
     "MAX_EVIDENCE_CHARS",
     "MAX_REPAIR_FINDINGS",
+    "MAX_REPAIR_VISION_OBSERVATIONS",
+    "MAX_VISION_OBSERVATION_CHARS",
     "NOT_RUN",
     "OUTCOME_ACCEPTED",
     "OUTCOME_DEGRADED_ACCEPTED",
@@ -746,6 +843,7 @@ __all__ = [
     "blocking_findings",
     "bound_repair_findings",
     "build_repair_request",
+    "select_vision_observations",
     "classify_finding",
     "classify_findings",
     "evaluate_convergence",
