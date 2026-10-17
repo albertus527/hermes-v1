@@ -116,6 +116,7 @@ class CriticStage:
         browser_qa_fn: BrowserQAFn,
         budget: Optional[RepairBudget] = None,
         protected_terms: Sequence[str] = (),
+        design_font_families: Sequence[str] = (),
         initial_attempts: int = 0,
         record_attempt: Optional[Callable[[Dict[str, Any]], None]] = None,
         revision_of: Optional[Callable[[], int]] = None,
@@ -129,6 +130,10 @@ class CriticStage:
         # count, or recovery could silently consume unlimited attempts.
         self.budget = budget or RepairBudget(attempts_used=max(0, int(initial_attempts)))
         self.protected_terms = tuple(protected_terms)
+        #: Font families the accepted Design DNA SELECTED. Used only to keep an
+        #: overused-font finding about a DNA-mandated face from authorising a
+        #: repair; every other rule and severity is unaffected.
+        self.design_font_families = tuple(design_font_families)
         # Optional durable sink invoked after each attempt, so the attempt
         # identity survives a crash and recovery can reconcile.
         self._record_attempt = record_attempt
@@ -141,7 +146,11 @@ class CriticStage:
     # -- helpers -------------------------------------------------------
 
     def _classify(self, scan: CriticScanResult) -> Tuple[ClassifiedFinding, ...]:
-        return classify_findings(scan.findings, protected_terms=self.protected_terms)
+        return classify_findings(
+            scan.findings,
+            protected_terms=self.protected_terms,
+            design_font_families=self.design_font_families,
+        )
 
     def _degraded(self, scan: CriticScanResult, reason: str) -> CriticStageResult:
         """A missing/degraded/failed critic -> explicit degraded outcome.

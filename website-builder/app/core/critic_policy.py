@@ -277,6 +277,74 @@ def _severity_rank(severity: str) -> Optional[int]:
     return SEVERITY_RANK.get((severity or "").strip().lower())
 
 
+#: The font-overuse rule id (engine + the application's own CSS font audit).
+#: Named once so the DNA-protection rule can never drift from the rule it targets.
+_FONT_OVERUSE_RULE = "overused-font"
+
+#: Separates a Design DNA typography value from its trailing prose description,
+#: e.g. ``"Fraunces (high-contrast display serif, ...)"`` -> ``"Fraunces"``.
+#: A family name is the leading token before an opening parenthesis, a comma, or
+#: the first sentence break; everything after that is commentary, never a name.
+_FAMILY_SPLIT = re.compile(r"[\(\[,;]|\s+[-\u2013\u2014]\s+")
+
+#: CSS generic / system keywords that are never a *selected* family, so they are
+#: never treated as a Design DNA choice even if a DNA value mentions them.
+_NON_FAMILY_TOKENS = frozenset(
+    {
+        "serif", "sans-serif", "monospace", "cursive", "fantasy",
+        "system-ui", "ui-serif", "ui-sans-serif", "ui-monospace",
+        "inherit", "initial", "unset", "revert",
+    }
+)
+
+
+def extract_design_font_families(design_dna: Any) -> Tuple[str, ...]:
+    """The font FAMILY NAMES the accepted Design DNA actually selected.
+
+    Reads the canonical contract (``typography.heading_font`` /
+    ``typography.body_font``) and reduces each descriptive value to just the
+    family name. The prose tail is deliberately dropped: a term like
+    ``"Fraunces (high-contrast display serif, light weights, ...)"`` would never
+    match a finding's text, so keeping it would silently protect nothing, while
+    keeping it *and* substring-matching would over-match.
+
+    Returns lower-cased names, de-duplicated, order preserved. An empty or
+    malformed DNA yields ``()`` — no families, therefore no extra protection.
+    """
+    if not isinstance(design_dna, Mapping):
+        return ()
+    typography = design_dna.get("typography")
+    if not isinstance(typography, Mapping):
+        return ()
+    out: list = []
+    for key in ("heading_font", "body_font"):
+        value = typography.get(key)
+        if not isinstance(value, str):
+            continue
+        head = _FAMILY_SPLIT.split(value.strip(), 1)[0].strip().strip("'\"")
+        if not head:
+            continue
+        lowered = head.lower()
+        if lowered in _NON_FAMILY_TOKENS:
+            continue
+        if lowered not in out:
+            out.append(lowered)
+    return tuple(out)
+
+
+def _family_is_named(text: str, family: str) -> bool:
+    """Whether ``text`` NAMES ``family`` as a whole word.
+
+    Word-boundary matching, not substring: ``"inter"`` must not be satisfied by
+    ``"internet"`` or ``"printer"``, because an accidental match would protect a
+    finding the DNA never asked to protect.
+    """
+    if not family:
+        return False
+    pattern = r"(?<![\w-])" + re.escape(family) + r"(?![\w-])"
+    return re.search(pattern, text or "", re.IGNORECASE) is not None
+
+
 def _looks_instructional(text: str) -> bool:
     return bool(_INSTRUCTION_LIKE.search(text or ""))
 
@@ -334,6 +402,7 @@ def classify_finding(
     finding: Any,
     *,
     protected_terms: Sequence[str] = (),
+    design_font_families: Sequence[str] = (),
 ) -> ClassifiedFinding:
     """Classify ONE critic finding. Conservative by construction.
 
@@ -343,6 +412,10 @@ def classify_finding(
        application never converts critic text into an executable action.
     2. A finding whose rule or text proposes changing a required element is a
        REQUIREMENT_CONFLICT (requirements outrank the critic).
+    2b. An ``overused-font`` finding that names a family the accepted Design DNA
+       actually SELECTED is also a REQUIREMENT_CONFLICT: acting on it would mean
+       replacing a font the design contract requires. The finding is still
+       reported; it simply never authorises a repair.
     3. A finding with no evidence AND no rule identity is INSUFFICIENT_EVIDENCE.
     4. Otherwise severity decides: blocker/critical -> BLOCKING; warning ->
        ACTIONABLE; note -> ADVISORY; unknown -> UNKNOWN.
@@ -398,6 +471,36 @@ def classify_finding(
             "would_change_an_accepted_requirement_or_design_dna",
         )
 
+    # 2b. A font-overuse finding that names a family the accepted Design DNA
+    #     actually SELECTED. Replacing that face is precisely what the design
+    #     contract forbids, so the finding cannot authorise a repair.
+    #
+    #     Deliberately NARROW. It applies only to the font-overuse rule at the
+    #     one severity that would otherwise authorise a repair (``warning``
+    #     -> ACTIONABLE). Advisory findings are already non-repairable, so
+    #     reclassifying them would change the report for no benefit; blocking
+    #     severities are handled below and must stay BLOCKING. It does NOT
+    #     touch:
+    #       * critical/blocker severities (always BLOCKING),
+    #       * advisory severities (already non-repairable, left as-is),
+    #       * any other rule id (contrast, accessibility, load failure,
+    #         layout, motion, content honesty...),
+    #       * fonts the DNA never named, which stay ACTIONABLE,
+    #       * descriptive DNA prose, which is never a family name.
+    #     The finding is still recorded verbatim in the QA evidence; only its
+    #     repairability changes.
+    if (
+        lower_rule == _FONT_OVERUSE_RULE
+        and severity in _ACTIONABLE_SEVERITIES
+        and design_font_families
+    ):
+        for family in design_font_families:
+            if _family_is_named(f"{text} {evidence}", family):
+                return _build(
+                    CLASS_REQUIREMENT_CONFLICT, False,
+                    "font_is_required_by_design_dna",
+                )
+
     # 3. A finding with no rule identity and no evidence is not actionable.
     if not rule_id and not evidence:
         return _build(CLASS_INSUFFICIENT_EVIDENCE, False, "no_rule_identity_or_evidence")
@@ -420,9 +523,17 @@ def classify_findings(
     findings: Iterable[Any],
     *,
     protected_terms: Sequence[str] = (),
+    design_font_families: Sequence[str] = (),
 ) -> Tuple[ClassifiedFinding, ...]:
     """Classify every finding, preserving input order."""
-    return tuple(classify_finding(f, protected_terms=protected_terms) for f in findings)
+    return tuple(
+        classify_finding(
+            f,
+            protected_terms=protected_terms,
+            design_font_families=design_font_families,
+        )
+        for f in findings
+    )
 
 
 def repairable_findings(
@@ -846,6 +957,7 @@ __all__ = [
     "select_vision_observations",
     "classify_finding",
     "classify_findings",
+    "extract_design_font_families",
     "evaluate_convergence",
     "repairable_findings",
     "unrepaired_blockers",

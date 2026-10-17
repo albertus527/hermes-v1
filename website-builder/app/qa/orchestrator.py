@@ -828,6 +828,7 @@ class QAOrchestrator:
             revision_of=_revision_of,
             expected_start_revision=start_revision,
             protected_terms=self._critic_protected_terms(project_id),
+            design_font_families=self._critic_design_font_families(project_id),
         )
         result = stage.run(workspace)
         self._critic_stage_result = result.to_dict()
@@ -1131,6 +1132,25 @@ class QAOrchestrator:
                 out.append(t)
         return tuple(out[:12])
 
+    def _critic_design_font_families(self, project_id: str):
+        """The font families the accepted Design DNA actually SELECTED.
+
+        Separate from :meth:`_critic_protected_terms` on purpose. Protected terms
+        are matched as substrings against finding text; a typography value is
+        descriptive prose ("Fraunces (high-contrast display serif, ...)") that
+        would never match and must not be substring-matched. The family names are
+        extracted and matched on word boundaries by the classifier instead.
+        """
+        try:
+            state = self.store.load(project_id)
+        except Exception:
+            return ()
+        if state is None:
+            return ()
+        from app.core.critic_policy import extract_design_font_families
+
+        return extract_design_font_families(state.design_dna or {})
+
     def _record_critic_record(self, project_id: str, record: Dict[str, Any]) -> None:
         """Persist the critic stage record durably (never a source mutation)."""
         try:
@@ -1426,7 +1446,9 @@ Instructions:
 
         scan = self._critic_scanner.scan(workspace)
         classified = classify_findings(
-            scan.findings, protected_terms=self._critic_protected_terms(project_id)
+            scan.findings,
+            protected_terms=self._critic_protected_terms(project_id),
+            design_font_families=self._critic_design_font_families(project_id),
         )
         base = scan.to_dict()
 
