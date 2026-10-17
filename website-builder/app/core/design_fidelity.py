@@ -138,10 +138,88 @@ _DISCLOSURE_TERMS: Tuple[str, ...] = (
     "preview", "pratinjau",
 )
 #: Terms that CLAIM the visuals are the studio's own real, completed work.
+#:
+#: Each entry carries its OWN attribution — a first-person possessive ("karya
+#: kami", "our work") or an explicit portfolio/collection noun — so the phrase is
+#: a claim on its own. Completion language that does NOT name an owner
+#: ("proyek selesai", "completed projects") is deliberately NOT listed here: on
+#: its own it is a schedule or a noun, not an assertion of authorship. Those are
+#: handled contextually by :func:`_contextual_real_work_claims`.
 _REAL_WORK_CLAIM: Tuple[str, ...] = (
     "karya kami", "our work", "our projects", "proyek kami", "portfolio kami",
-    "our portfolio", "completed projects", "proyek selesai", "klien kami",
-    "our clients", "studi kasus kami", "our case studies",
+    "portofolio kami", "our portfolio", "klien kami", "our clients",
+    "studi kasus kami", "our case studies",
+)
+
+#: Completion / portfolio language that is AMBIGUOUS on its own.
+#:
+#: "hingga proyek selesai" is a service schedule ("supervision until the project
+#: finishes"), while "proyek selesai kami" is a claim. These phrases therefore
+#: never assert anything by themselves. They become a claim only when the same
+#: clause also carries an ownership marker (see
+#: :func:`_contextual_real_work_claims`), and they count as an honest DISCLAIMER
+#: when they are negated ("bukan proyek selesai").
+_REAL_WORK_AMBIGUOUS: Tuple[str, ...] = (
+    "proyek selesai", "pembangunan selesai", "proyek yang selesai",
+    "completed projects", "completed project",
+)
+
+#: Work / completion / portfolio signals for the disclosure path. Matched on
+#: word boundaries so "pembangunan" is not read as "bangun" and "your" is not
+#: read as "our". Intentionally BROAD: it only decides whether a negation is
+#: about work at all, never whether something is a claim.
+_WORK_SIGNAL_RE = re.compile(
+    r"(?<![\w-])(?:"
+    r"selesai\w*|diselesaikan|menyelesaikan|"
+    r"dibangun|membangun|bangun\w*|dikerjakan|mengerjakan|diserahkan|"
+    r"portofolio|portfolio|"
+    r"completed|finished|delivered|built"
+    r")(?![\w-])",
+    re.I,
+)
+
+#: ATTRIBUTION-BEARING work signals: a completion verb (transitive — someone
+#: completed/built/delivered the work) or a portfolio noun. Paired with an owner
+#: in the same clause, these assert authorship.
+#:
+#: Deliberately EXCLUDES the bare state word "selesai"/"completed"/"finished" on
+#: its own: "pengawasan hingga proyek selesai" and "supervision until
+#: construction is finished" describe a schedule, not authorship. "kami
+#: selesaikan" and "completed client projects" do assert it.
+_ATTRIBUTION_SIGNAL_RE = re.compile(
+    r"(?<![\w-])(?:"
+    r"selesaikan|diselesaikan|menyelesaikan|penyelesaian|"
+    r"dibangun|membangun|bangun|dikerjakan|mengerjakan|diserahkan|"
+    r"portofolio|portfolio|"
+    r"completed|delivered|built"
+    r")(?![\w-])",
+    re.I,
+)
+
+#: Ownership signals: who the work belongs to. Required alongside an
+#: attribution-bearing signal before a clause may count as a claim.
+_OWNER_SIGNAL_RE = re.compile(
+    r"(?<![\w-])(?:kami|kita|our|ours|klien|client)(?![\w-])",
+    re.I,
+)
+
+#: POSSESSIVE adjacency: a bare state word immediately followed by an owner.
+#:
+#: "proyek selesai kami" ("our completed projects") asserts ownership, while
+#: "pengawasan hingga proyek selesai" and "kami melakukan pengawasan hingga
+#: proyek selesai" do not — in both, the owner is not the possessor of the
+#: completed work. This one adjacency rule covers the possessive form without
+#: widening the bare state word into a general claim signal.
+_POSSESSIVE_STATE_RE = re.compile(
+    r"(?<![\w-])(?:selesai|completed|finished|delivered|built)\s+"
+    r"(?:kami|kita|our|ours)(?![\w-])",
+    re.I,
+)
+
+#: Clause separators, shared by the negation window and the contextual rule so a
+#: claim in one clause can never borrow an owner from another.
+_CLAUSE_BREAKS: Tuple[str, ...] = (
+    ".", ",", ";", ":", "!", "?", "\n", "(", ")", "\u2014", "\u2013",
 )
 #: Negation cues that flip a real-work phrase into an honest DISCLAIMER. A claim
 #: only counts when it is NOT negated. Cues are checked in a bounded window
@@ -376,11 +454,85 @@ def _claim_is_negated(haystack: str, index: int, length: int) -> bool:
     return any(cue in after for cue in _NEGATION_CUES)
 
 
+def _clause_around(haystack: str, index: int, length: int) -> str:
+    """The clause containing ``haystack[index:index+length]``.
+
+    Bounded to the nearest clause separators on each side, so an ownership marker
+    in a neighbouring clause can never be borrowed.
+    """
+    start = 0
+    for brk in _CLAUSE_BREAKS:
+        pos = haystack.rfind(brk, 0, index)
+        if pos != -1:
+            start = max(start, pos + 1)
+    end = len(haystack)
+    for brk in _CLAUSE_BREAKS:
+        pos = haystack.find(brk, index + length)
+        if pos != -1:
+            end = min(end, pos)
+    return haystack[start:end]
+
+
+def _contextual_real_work_claims(haystack: str) -> list:
+    """Completion/portfolio claims that ARE asserted as the studio's own work.
+
+    The unit of judgement is the CLAUSE, not a phrase. A clause counts as a claim
+    only when it carries BOTH:
+
+    * an ownership marker — ``kami`` / ``kita`` / ``our`` / ``klien`` / ``client``
+      (the studio, or a client of the studio), and
+    * an ATTRIBUTION-BEARING work signal — a completion verb such as
+      ``selesaikan`` / ``diselesaikan`` / ``dibangun`` / ``dikerjakan`` /
+      ``diserahkan`` / ``completed`` / ``delivered`` / ``built``, or a portfolio
+      noun.
+
+    The bare state word ``selesai``/``completed`` is NOT an attribution signal.
+    That single distinction is what separates a schedule ("pengawasan hingga
+    proyek selesai", "supervision until the project is completed") from a claim
+    ("proyek selesai kami", "completed client projects") — with no list of
+    exempted prepositions ("hingga"/"sampai"/"until"/"through") anywhere, so a
+    genuine claim that happens to sit beside such a word still fires.
+
+    Returns the matching clause fragments (bounded) for the finding evidence.
+    """
+    claimed = []
+    for clause in re.split(r"[.;:!?\n]|\u2014|\u2013", haystack):
+        clause = clause.strip()
+        if not clause:
+            continue
+        if not _OWNER_SIGNAL_RE.search(clause):
+            continue
+        # Either an attribution verb/portfolio noun, or a possessive state word
+        # ("proyek selesai kami") — but never a bare "selesai" on its own.
+        if not (
+            _ATTRIBUTION_SIGNAL_RE.search(clause)
+            or _POSSESSIVE_STATE_RE.search(clause)
+        ):
+            continue
+        if _has_negation(clause):
+            # A negated clause ("bukan proyek selesai kami") is a disclaimer.
+            continue
+        claimed.append(clause[:160])
+    return claimed
+
+
+def _has_negation(clause: str) -> bool:
+    """Whether ``clause`` contains a negation cue anywhere."""
+    return any(cue in clause for cue in _NEGATION_CUES)
+
+
 def _real_work_claims(haystack: str) -> list:
     """Return the real-work claim phrases that are actually ASSERTED.
 
-    A phrase only counts when it is not negated (P1). This preserves detection
-    of genuine fabricated completed-project claims, including mixed sentences.
+    Two independent sources, both negation-aware:
+
+    * attributed phrases from :data:`_REAL_WORK_CLAIM`, which assert ownership
+      on their own ("karya kami", "our portfolio");
+    * ambiguous completion phrases from :data:`_REAL_WORK_AMBIGUOUS` that are
+      corroborated by an ownership marker in the same clause.
+
+    A phrase only counts when it is not negated (P1). This preserves detection of
+    genuine fabricated completed-project claims, including mixed sentences.
     """
     asserted = []
     for term in _REAL_WORK_CLAIM:
@@ -393,7 +545,20 @@ def _real_work_claims(haystack: str) -> list:
                 asserted.append(term)
                 break
             start = idx + len(term)
+    asserted.extend(_contextual_real_work_claims(haystack))
     return asserted
+
+
+def _has_work_completion_signal(haystack: str) -> bool:
+    """Whether the source speaks about work being completed/delivered at all.
+
+    Used by the disclosure path: "bukan proyek selesai" is an honest disclaimer
+    even though it contains no :data:`_DISCLOSURE_TERMS` word, because it
+    explicitly denies having completed work. A negation is only honoured when a
+    completion/portfolio signal is actually present, so this cannot become a
+    blanket "any negation anywhere counts as disclosure".
+    """
+    return _WORK_SIGNAL_RE.search(haystack) is not None
 
 
 def _detect_unlabeled_conceptual(
@@ -419,8 +584,14 @@ def _detect_unlabeled_conceptual(
     disclosed = any(term in haystack for term in _DISCLOSURE_TERMS)
     claims_real = _real_work_claims(haystack)
     # A real-work phrase that is present but NEGATED ("bukan proyek selesai") is
-    # itself an honest disclaimer, so it counts as disclosure too (P1).
-    if not claims_real and any(term in haystack for term in _REAL_WORK_CLAIM):
+    # itself an honest disclaimer, so it counts as disclosure too (P1). The
+    # phrase may be an ambiguous completion term rather than an attributed one,
+    # so this checks for EITHER list, and requires an actual completion/portfolio
+    # signal so a stray negation can never launder a genuine claim.
+    if not claims_real and (
+        any(term in haystack for term in _REAL_WORK_CLAIM)
+        or any(term in haystack for term in _REAL_WORK_AMBIGUOUS)
+    ) and _has_work_completion_signal(haystack):
         disclosed = True
     if claims_real:
         return (
