@@ -22,7 +22,13 @@ SRC=/home/wbe2e/src-r2
 WB="$SRC/website-builder"
 VENV="$STAGE/venv"
 NODE_BIN="$STAGE/node/bin"
-PINNED_COMMIT=310a029c5c7a0198d88c3b3fdb9a000cd929432b
+# The approved commit is NOT baked in here. A single root-owned record
+# (/etc/wb-e2e/approved-pin) is the only source of truth, so the environment
+# can be moved to a new commit by an explicit operator approval instead of by
+# editing this tracked script. See verify-approved-pin.sh for why the
+# wbe2e-owned marker and manifest cannot serve as authorization.
+APPROVED_PIN=/etc/wb-e2e/approved-pin
+STAGING_BRANCH=feature/website-r2-redesign
 PROD_APP_ENV=/home/albertus527/.website-builder/state/app.env
 
 echo "=== staging guard ==="
@@ -34,19 +40,27 @@ if [ "$(id -un)" != "wbe2e" ]; then
 fi
 echo "OK: running as $(id -un) (uid=$(id -u) gid=$(id -g))"
 
-# 1. Pinned commit. The staging source is a git-less archive; verify by file
-#    digest of the pinned marker written at provision time.
-if [ -f "$STAGE/PINNED_COMMIT" ]; then
-  REC="$(cat "$STAGE/PINNED_COMMIT")"
-  if [ "$REC" != "$PINNED_COMMIT" ]; then
-    echo "REFUSING: staging source pinned at $REC, expected $PINNED_COMMIT" >&2
-    exit 1
-  fi
-  echo "OK: staging source pinned at $PINNED_COMMIT"
-else
-  echo "REFUSING: missing $STAGE/PINNED_COMMIT" >&2
+# 1. APPROVED-PIN GATE. The commit that may run comes from the root-owned
+#    approved record, never from a hardcoded constant and never from the
+#    wbe2e-writable marker. Refuses on: missing record, malformed record,
+#    short/non-hex SHA, unexpected branch, marker != approved, manifest
+#    != approved, or a manifest without a usable tree digest.
+APPROVE_VERIFY="$STAGE/bin/verify-approved-pin.sh"
+if [ ! -f "$APPROVE_VERIFY" ]; then
+  echo "REFUSING: missing approved-pin verifier $APPROVE_VERIFY" >&2
   exit 1
 fi
+if ! WB_PYTHON="$VENV/bin/python" bash "$APPROVE_VERIFY" \
+        --approved "$APPROVED_PIN" \
+        --marker "$STAGE/PINNED_COMMIT" \
+        --manifest "$STAGE/SOURCE_IDENTITY.json" \
+        --branch "$STAGING_BRANCH" \
+        --python "${WB_PYTHON:-python3}"; then
+  echo "REFUSING: approved-pin authorization failed (see above)." >&2
+  exit 1
+fi
+PINNED_COMMIT="$(tr -d '[:space:]' < "$STAGE/PINNED_COMMIT")"
+echo "OK: approved commit $PINNED_COMMIT (branch $STAGING_BRANCH)"
 
 # 1b. FAIL-CLOSED source-identity check. The marker above is TEXT ONLY and was
 #     once a lie: the executable tree ($SRC) held an OLDER commit while the
