@@ -122,6 +122,30 @@ class DesignDecision:
         }
 
 
+def _suitability_comparable(
+    accepted: Sequence[DesignCandidate],
+) -> Tuple[bool, bool]:
+    """Return ``(rank_by_suitability, mixed)``.
+
+    Comparable means EVERY accepted candidate carries a validated suitability,
+    they all came from one ``suitability_contract``, and they were all scored
+    against the same ``requirement_version``. Anything else is *mixed*: the
+    engine must never let a scored candidate silently outrank an unscored one
+    from another provider, nor compare a score judged against one brief revision
+    with a score judged against another.
+    """
+    scored = [c for c in accepted if c.suitability is not None]
+    if not scored:
+        return False, False
+    if len(scored) != len(accepted):
+        return False, True
+    if len({c.suitability_contract for c in accepted}) != 1:
+        return False, True
+    if len({c.requirement_version for c in accepted}) != 1:
+        return False, True
+    return True, False
+
+
 def _valid_score(value: Any) -> Optional[float]:
     """Return a finite float in ``[0, 1]``, or ``None`` when unvalidatable."""
     try:
@@ -155,6 +179,19 @@ def _normalize_candidate(raw: Any) -> Optional[DesignCandidate]:
                 source_revision=str(raw.get("source_revision", "")).strip(),
                 score=raw.get("score", 0.0),
                 uncertainty=str(raw.get("uncertainty", "")),
+                suitability=raw.get("suitability"),
+                suitability_detail=tuple(
+                    (str(k), float(v))
+                    for k, v in (raw.get("suitability_detail") or {}).items()
+                ),
+                suitability_contract=str(raw.get("suitability_contract") or "").strip(),
+                evidence=tuple(
+                    (str(k), str(v))
+                    for k, v in (raw.get("evidence") or {}).items()
+                ),
+                evidence_revision=str(raw.get("evidence_revision") or "").strip(),
+                assets=tuple(raw.get("assets") or ()),
+                requirement_version=str(raw.get("requirement_version") or "").strip(),
             )
         except (DecisionProviderError, TypeError, ValueError):
             return None
@@ -176,6 +213,37 @@ def _normalize_candidate(raw: Any) -> Optional[DesignCandidate]:
             source_revision=candidate.source_revision,
             score=0.0,
             uncertainty=candidate.uncertainty or "score_unvalidatable",
+            # N8 B6: the rebuild must CARRY the N8 fields, or a candidate with a
+            # bad retrieval score would silently lose its suitability and flip a
+            # comparable set into a mixed one.
+            suitability=candidate.suitability,
+            suitability_detail=candidate.suitability_detail,
+            suitability_contract=candidate.suitability_contract,
+            evidence=candidate.evidence,
+            evidence_revision=candidate.evidence_revision,
+            assets=candidate.assets,
+            requirement_version=candidate.requirement_version,
+        )
+    # N8 B6: an out-of-range suitability is not trusted. Drop it to None rather
+    # than clamping, so the candidate is treated as UNSCORED (mixed) instead of
+    # silently ranked on a bogus value.
+    if candidate.suitability is not None and _valid_score(candidate.suitability) is None:
+        candidate = DesignCandidate(
+            candidate_id=candidate.candidate_id,
+            label=candidate.label,
+            descriptor=candidate.descriptor,
+            palette=candidate.palette,
+            source_uri=candidate.source_uri,
+            source_revision=candidate.source_revision,
+            score=candidate.score,
+            uncertainty=candidate.uncertainty or "suitability_unvalidatable",
+            suitability=None,
+            suitability_detail=candidate.suitability_detail,
+            suitability_contract="",
+            evidence=candidate.evidence,
+            evidence_revision=candidate.evidence_revision,
+            assets=candidate.assets,
+            requirement_version=candidate.requirement_version,
         )
     return candidate
 
@@ -398,9 +466,26 @@ class DecisionEngine:
                 error_code=error_code,
             )
 
-        # Rank deterministically: score descending, then candidate_id ascending,
-        # so equal scores never depend on provider iteration order.
-        ranked = tuple(sorted(accepted, key=lambda c: (-c.score, c.candidate_id)))
+        # N8 B6: rank by validated suitability ONLY when every accepted candidate
+        # carries one from the SAME contract and the SAME requirement revision.
+        # A mixed set falls back to the existing retrieval ranking and is
+        # reported as degraded -- never a silent win for whichever provider
+        # happens to emit scores, and never a comparison across brief revisions.
+        by_suitability, mixed = _suitability_comparable(accepted)
+        if mixed:
+            degraded = True
+            error_code = error_code or "suitability_incomplete"
+        if by_suitability:
+            ranked = tuple(
+                sorted(
+                    accepted,
+                    key=lambda c: (-c.suitability, -c.score, c.candidate_id),
+                )
+            )
+        else:
+            # Unchanged path: score descending, then candidate_id ascending, so
+            # equal scores never depend on provider iteration order.
+            ranked = tuple(sorted(accepted, key=lambda c: (-c.score, c.candidate_id)))
         return DesignDecision(
             selected=ranked[0],
             ranked=ranked,

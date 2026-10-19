@@ -48,15 +48,6 @@ ABSTAIN_CRITERION = (
     "No candidate is adequately grounded by the brief and provenance."
 )
 
-#: Score assigned to the candidate the model named.
-#:
-#: The existing DecisionEngine ranks by ``(-score, candidate_id)`` and discards
-#: provider iteration order, so a proposal order alone cannot express a choice.
-#: Setting the chosen candidate's score above any plausible retrieval score makes
-#: the model's selection authoritative while leaving every other candidate -- and
-#: every engine gate -- untouched.
-_DOMINANT_SCORE = 1.0
-
 #: Scope rule injected verbatim into the prompt. This is the D11 fix: the
 #: website-only constraint must be VISIBLE to the model whenever it determines
 #: the correct answer, never implicit.
@@ -295,30 +286,42 @@ class DecisionsDesignProvider:
             )
             return ()
 
-        # The existing DecisionEngine ranks by ``(-score, candidate_id)`` and
-        # DISCARDS provider iteration order. To make the model's selection
-        # authoritative without touching the engine, the chosen candidate is
-        # returned with a score that dominates the others. Provenance, label and
-        # descriptor are copied verbatim from the original candidate -- only the
-        # ranking score is raised, and only for the one the model named.
-        ranked = []
-        for candidate in real:
-            if candidate.candidate_id == selected.candidate_id:
-                ranked.append(
-                    DesignCandidate(
-                        candidate_id=candidate.candidate_id,
-                        label=candidate.label,
-                        descriptor=candidate.descriptor,
-                        palette=candidate.palette,
-                        source_uri=candidate.source_uri,
-                        source_revision=candidate.source_revision,
-                        score=_DOMINANT_SCORE,
-                        uncertainty=candidate.uncertainty,
-                        requirement_version=requirement_version,
-                    )
-                )
-            else:
-                ranked.append(candidate)
+        # N8 B6: the artificial score promotion is GONE.
+        #
+        # The old code rewrote the chosen candidate's score to 1.0 so the
+        # engine's ``(-score, candidate_id)`` sort would pick it. That destroyed
+        # the evidence pipeline's own ranking signal and encoded "the model named
+        # this" as if it were a quality score.
+        #
+        # The model's preference is now expressed the only honest way available:
+        # as an ORDER, with every candidate's retrieval score preserved exactly
+        # as retrieved. Ranking by suitability is B7's job; until a suitability
+        # score exists, the engine's own score-floor and provenance gates decide.
+        ranked = [
+            DesignCandidate(
+                candidate_id=candidate.candidate_id,
+                label=candidate.label,
+                descriptor=candidate.descriptor,
+                palette=candidate.palette,
+                source_uri=candidate.source_uri,
+                source_revision=candidate.source_revision,
+                # Verbatim: never rewritten.
+                score=candidate.score,
+                uncertainty=candidate.uncertainty,
+                suitability=candidate.suitability,
+                suitability_detail=candidate.suitability_detail,
+                suitability_contract=candidate.suitability_contract,
+                evidence=candidate.evidence,
+                evidence_revision=candidate.evidence_revision,
+                assets=candidate.assets,
+                requirement_version=requirement_version or candidate.requirement_version,
+            )
+            for candidate in real
+        ]
+
+        # Put the model's pick first so a stable sort preserves the preference
+        # when scores tie. This changes ORDER only, never a score.
+        ranked.sort(key=lambda c: c.candidate_id != selected.candidate_id)
 
         logger.info(
             "decisions design selection",

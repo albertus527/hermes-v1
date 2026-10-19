@@ -93,10 +93,11 @@ class TestT10Scope:
                           return_value=_ok({"answers": {"choice": {"choice": "c2"}}})):
             out = provider.propose_design_candidates(
                 {"candidates": [brand, website], "brief": {}}, limit=4)
-        # The chosen candidate must carry the dominant score so the engine's
-        # (-score, id) ranking selects it.
+        # N8 B6: no score is rewritten. The model's pick leads the ORDER, and
+        # each candidate keeps its retrieval score.
         chosen = [c for c in out if c.candidate_id == "c2"][0]
-        assert chosen.score > max(c.score for c in out if c.candidate_id != "c2")
+        assert out[0].candidate_id == "c2"
+        assert all(c.score != 1.0 for c in out)
         # And its provenance is still the original one, not invented.
         assert chosen.source_uri == "okv://b"
 
@@ -196,7 +197,7 @@ class TestGenuineCandidatesReachGuidance:
         with patch.object(ddp, "post_decision",
                           return_value=_ok({"answers": {"choice": {"choice": "c2"}}})):
             decision = engine.decide_design(
-                {"candidates": [_cand("c1", score=0.9), real], "brief": {}}, limit=4)
+                {"candidates": [_cand("c1", score=0.4), real], "brief": {}}, limit=4)
         assert decision.selected is not None
         assert decision.selected.candidate_id == "c2"
         # Provenance came from the evidence pipeline, not the model.
@@ -213,7 +214,7 @@ class TestGenuineCandidatesReachGuidance:
         with patch.object(ddp, "post_decision",
                           return_value=_ok({"answers": {"choice": {"choice": "c2"}}})):
             decision = engine.decide_design(
-                {"candidates": [_cand("c1"), real], "brief": {}}, limit=4)
+                {"candidates": [_cand("c1", score=0.4), real], "brief": {}}, limit=4)
         evidence = guidance_evidence({"what": "studio"}, decision)
         assert evidence["has_candidate"] is True
         assert evidence["source_uri"] == "okv://library/ref-42"
