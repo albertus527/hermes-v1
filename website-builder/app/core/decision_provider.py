@@ -91,6 +91,13 @@ class DesignCandidate:
     candidate without both is *untrusted* and is dropped by the engine — it can
     never reach ranking. There is deliberately **no** field that could carry a
     requirement, an override, or an instruction.
+
+    ``score`` is the RETRIEVAL relevance score. It is never overwritten: the
+    evidence pipeline's own ranking signal must survive ranking, so a model's
+    preference is expressed through ``suitability`` instead.
+
+    The N8 fields below are all optional and defaulted, so every existing
+    construction site keeps working unchanged.
     """
 
     candidate_id: str
@@ -102,9 +109,40 @@ class DesignCandidate:
     score: float = 0.0
     uncertainty: str = ""
 
+    # -- N8 B2: design evidence -------------------------------------------
+    #: Validated suitability in ``[0, 1]``, or ``None`` when this candidate was
+    #: not scored under a suitability contract. Deliberately separate from
+    #: ``score`` above.
+    suitability: Optional[float] = None
+    #: Per-dimension breakdown as ``((name, value), ...)``. Audit only; ranking
+    #: reads ``suitability``.
+    suitability_detail: Tuple[Tuple[str, float], ...] = ()
+    #: Identifier of the scoring contract the suitability was produced under.
+    #: Two suitability values are comparable only when these match, so a stale
+    #: or foreign contract can never silently win a ranking.
+    suitability_contract: str = ""
+    #: Evidence class per rubric dimension: ``(("hierarchy", "E2"), ...)``.
+    evidence: Tuple[Tuple[str, str], ...] = ()
+    #: The ``source_revision`` the attached assets were bound to. A mismatch
+    #: means the evidence is stale and the candidate must not be scored.
+    evidence_revision: str = ""
+    #: Stored artefacts whose ``revision`` matched ``source_revision``.
+    assets: Tuple[Any, ...] = ()
+    #: The REQUIREMENT revision the requirement-fit score was computed against.
+    #: This is the brief's own revision, not the reference's.
+    requirement_version: str = ""
+
     @property
     def has_provenance(self) -> bool:
         return bool(self.source_uri.strip()) and bool(self.source_revision.strip())
+
+    @property
+    def evidence_map(self) -> dict:
+        return dict(self.evidence)
+
+    def evidence_for(self, dimension: str) -> str:
+        """The evidence class recorded for *dimension*, or ``"E0"``."""
+        return dict(self.evidence).get(dimension, "E0")
 
     def to_dict(self) -> dict:
         return {
@@ -116,6 +154,23 @@ class DesignCandidate:
             "source_revision": self.source_revision,
             "score": round(float(self.score), 4),
             "uncertainty": self.uncertainty,
+            "suitability": (
+                round(float(self.suitability), 4)
+                if self.suitability is not None
+                else None
+            ),
+            "suitability_detail": {
+                name: round(float(value), 4)
+                for name, value in self.suitability_detail
+            },
+            "suitability_contract": self.suitability_contract,
+            "evidence": dict(self.evidence),
+            "evidence_revision": self.evidence_revision,
+            "assets": [
+                a.to_dict() if hasattr(a, "to_dict") else dict(a)
+                for a in self.assets
+            ],
+            "requirement_version": self.requirement_version,
         }
 
 
