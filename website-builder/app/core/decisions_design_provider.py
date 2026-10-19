@@ -32,6 +32,22 @@ from app.core.decisions_client import (
     post_decision,
     resolved_model_id,
 )
+from app.core.design_reference_safety import one_line
+from app.core.design_scoring import (
+    DEFAULT_DIMENSION_FLOORS,
+    STATUS_ABSTAINED,
+    STATUS_INSUFFICIENT_BRIEF,
+    STATUS_INSUFFICIENT_EVIDENCE,
+    STATUS_STALE_EVIDENCE,
+    SUITABILITY_CONTRACT,
+    ScoringError,
+    apply_gates,
+    build_scoring_questions,
+    build_scoring_state,
+    evidence_is_current,
+    evidence_sufficient,
+    parse_pool_scores,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -71,12 +87,15 @@ def build_design_state(
     holds, so the model chooses among real, cited options only.
     """
     lines = []
-    brief_what = str(brief.get("what") or "").strip()
-    brief_why = str(brief.get("why") or "").strip()
-    brief_name = str(brief.get("name") or "").strip()
+    # N8 B7: every interpolated value is untrusted reference text, so it passes
+    # through one_line() before it can become prompt structure. A newline in a
+    # label would otherwise fabricate what looks like application-authored lines.
+    brief_what = one_line(brief.get("what") or "", 400)
+    brief_why = one_line(brief.get("why") or "", 400)
+    brief_name = one_line(brief.get("name") or "", 200)
     if brief_name or brief_what or brief_why:
         lines.append(f"Brief: {brief_name} {brief_what} {brief_why}".strip())
-    intent = str(brief.get("design_intent") or "").strip()
+    intent = one_line(brief.get("design_intent") or "", 600)
     if intent:
         lines.append(f"Owner design intent (verbatim): {intent}")
     if include_scope_rule:
@@ -85,9 +104,11 @@ def build_design_state(
     lines.append("Candidate references:")
     for candidate in candidates:
         lines.append(
-            f"- {candidate.candidate_id}: {candidate.label} | "
-            f"provenance: {candidate.source_uri} @ {candidate.source_revision} | "
-            f"descriptor: {candidate.descriptor}"
+            f"- {one_line(candidate.candidate_id, 80)}: "
+            f"{one_line(candidate.label, 160)} | "
+            f"provenance: {one_line(candidate.source_uri, 300)} @ "
+            f"{one_line(candidate.source_revision, 64)} | "
+            f"descriptor: {one_line(candidate.descriptor, 600)}"
         )
     lines.append("")
     lines.append(
@@ -102,12 +123,16 @@ def build_design_questions(candidates: Sequence[DesignCandidate]) -> dict:
 
     Only ids that actually exist are offered, plus ``ABSTAIN``. The model cannot
     name anything else because it is not an option.
+
+    N8 B7: the criteria text embeds untrusted reference fields, so each one is
+    sanitised. A newline inside a label would otherwise inject a fake criterion.
     """
     criteria: dict = {}
     for candidate in candidates:
-        criteria[candidate.candidate_id] = (
+        criteria[candidate.candidate_id] = one_line(
             f"{candidate.label}. Provenance: {candidate.source_uri} @ "
-            f"{candidate.source_revision}. Descriptor: {candidate.descriptor}"
+            f"{candidate.source_revision}. Descriptor: {candidate.descriptor}",
+            900,
         )
     criteria[ABSTAIN_OPTION] = ABSTAIN_CRITERION
     return {
@@ -138,6 +163,11 @@ class DecisionsDesignProvider:
         base_url: str,
         deadline_seconds: float = 20.0,
         include_scope_rule: bool = True,
+        scoring_enabled: bool = False,
+        min_quality: float = 0.70,
+        min_fit: float = 0.70,
+        min_suitability: float = 0.75,
+        dimension_floors: Optional[Mapping[str, float]] = None,
     ) -> None:
         self.model = model
         #: Name-mangled and excluded from repr(), so logging the provider can
@@ -146,6 +176,18 @@ class DecisionsDesignProvider:
         self.base_url = base_url
         self.deadline_seconds = deadline_seconds
         self.include_scope_rule = include_scope_rule
+        #: N8 B7: multimodal scoring is OPT-IN. Off by default, so a provider
+        #: built without explicit configuration keeps the grounding-only path
+        #: and never claims a quality assessment.
+        self.scoring_enabled = scoring_enabled
+        #: Provisional quality standards. Configurable; NOT calibrated
+        #: probabilities.
+        self.min_quality = min_quality
+        self.min_fit = min_fit
+        self.min_suitability = min_suitability
+        self.dimension_floors = dict(
+            dimension_floors or DEFAULT_DIMENSION_FLOORS
+        )
         #: Set by the last call so telemetry can distinguish abstain vs failure.
         self.last_error_code = ""
         self.last_degraded = False
@@ -175,6 +217,152 @@ class DecisionsDesignProvider:
         raise DecisionProviderError(
             "NOT_IMPLEMENTED", "decisions-design provides design selection only"
         )
+
+    # -- N8 B7: multimodal scoring -----------------------------------------
+
+    def _score_pool(
+        self,
+        *,
+        real: Sequence[DesignCandidate],
+        brief: Mapping[str, Any],
+        requirement_version: str,
+        limit: int,
+    ) -> Sequence[DesignCandidate]:
+        """Score the WHOLE eligible pool, or return nothing at all.
+
+        All-or-nothing by construction: a partial response is a failed response,
+        never a partially ranked success. An intentional abstention is reported
+        as an abstention (``degraded=False``); a transport or parse failure is
+        reported as degraded.
+        """
+        if not brief or not any(
+            one_line(brief.get(k) or "") for k in ("what", "why", "name", "design_intent")
+        ):
+            self.last_error_code = STATUS_INSUFFICIENT_BRIEF
+            return ()
+
+        # Evidence gates. A candidate without rendered evidence, or whose assets
+        # are bound to a different revision, is NOT scored -- never scored 0.0.
+        eligible = [c for c in real if evidence_sufficient(c)]
+        stale = [c for c in eligible if not evidence_is_current(c)]
+        if stale:
+            # A stale binding means we cannot trust which image we would send.
+            self.last_error_code = STATUS_STALE_EVIDENCE
+            self.last_degraded = True
+            logger.info(
+                "decisions design refused stale evidence",
+                extra={"n8_role": "design", "n8_model": self.model,
+                       "n8_error_class": STATUS_STALE_EVIDENCE,
+                       "n8_stale": len(stale)},
+            )
+            return ()
+
+        pool = eligible[:limit]
+        if not pool:
+            self.last_error_code = STATUS_INSUFFICIENT_EVIDENCE
+            return ()
+
+        state = build_scoring_state(
+            brief=brief,
+            candidates=pool,
+            include_scope_rule=self.include_scope_rule,
+            scope_rule=SCOPE_RULE,
+        )
+        questions = build_scoring_questions(pool)
+
+        result = post_decision(
+            model=self.model,
+            state=state,
+            questions=questions,
+            api_key=self._credential,
+            base_url=self.base_url,
+            deadline_seconds=self.deadline_seconds,
+        )
+
+        if not result.ok:
+            self.last_error_code = result.error_code or "transport"
+            self.last_degraded = True
+            logger.info(
+                "decisions design scoring failed",
+                extra={"n8_role": "design", "n8_model": self.model,
+                       "n8_error_class": result.error_code,
+                       "n8_latency_ms": result.elapsed_ms},
+            )
+            return ()
+
+        try:
+            scores = parse_pool_scores(result.payload or {}, pool)
+        except ScoringError as exc:
+            self.last_error_code = exc.status
+            self.last_degraded = True
+            logger.info(
+                "decisions design returned unusable scores",
+                extra={"n8_role": "design", "n8_model": self.model,
+                       "n8_error_class": exc.status},
+            )
+            return ()
+
+        passing, rejected = apply_gates(
+            scores,
+            min_quality=self.min_quality,
+            min_fit=self.min_fit,
+            min_suitability=self.min_suitability,
+            floors=self.dimension_floors,
+        )
+
+        by_id = {c.candidate_id: c for c in pool}
+        cost = None
+        usage = result.payload.get("usage") if isinstance(result.payload, Mapping) else None
+        if isinstance(usage, Mapping):
+            try:
+                cost = float(usage.get("cost"))
+            except (TypeError, ValueError):
+                cost = None
+
+        logger.info(
+            "decisions design scored pool",
+            extra={
+                "n8_role": "design",
+                "n8_model": self.model,
+                "n8_resolved_model": resolved_model_id(result.payload or {}),
+                "n8_scored": len(scores),
+                "n8_passed": len(passing),
+                "n8_rejected": len(rejected),
+                "n8_latency_ms": result.elapsed_ms,
+                "n8_cost": cost,
+            },
+        )
+
+        if not passing:
+            # Every candidate was scored but none cleared the gates. This is an
+            # INTENTIONAL abstention, not a failure.
+            self.last_error_code = STATUS_ABSTAINED
+            return ()
+
+        out: list = []
+        for score in passing:
+            candidate = by_id[score.candidate_id]
+            out.append(
+                DesignCandidate(
+                    candidate_id=candidate.candidate_id,
+                    label=candidate.label,
+                    descriptor=candidate.descriptor,
+                    palette=candidate.palette,
+                    source_uri=candidate.source_uri,
+                    source_revision=candidate.source_revision,
+                    # Retrieval score preserved verbatim.
+                    score=candidate.score,
+                    uncertainty=candidate.uncertainty,
+                    suitability=score.suitability,
+                    suitability_detail=score.detail(),
+                    suitability_contract=SUITABILITY_CONTRACT,
+                    evidence=candidate.evidence,
+                    evidence_revision=candidate.evidence_revision,
+                    assets=candidate.assets,
+                    requirement_version=requirement_version,
+                )
+            )
+        return tuple(out)
 
     # -- design half --------------------------------------------------------
 
@@ -227,6 +415,20 @@ class DecisionsDesignProvider:
             requirement_version = str(
                 context.get("requirement_version") or ""
             ).strip()
+
+        # N8 B7: when scoring is enabled, take the multimodal scoring path
+        # unconditionally. It decides for itself whether any candidate has
+        # enough evidence; falling through to the grounding-only choice path
+        # here would mean a scoring provider silently makes a NETWORK call it
+        # was not asked to make, and would report "transport" instead of the
+        # honest "insufficient_evidence".
+        if self.scoring_enabled:
+            return self._score_pool(
+                real=real,
+                brief=brief,
+                requirement_version=requirement_version,
+                limit=limit,
+            )
 
         state = build_design_state(
             brief=brief,

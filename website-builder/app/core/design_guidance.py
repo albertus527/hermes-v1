@@ -38,6 +38,7 @@ from __future__ import annotations
 import hashlib
 from typing import Any, Mapping, Optional, Sequence, Tuple
 
+from app.core.design_reference_safety import one_line
 from app.core.document_contracts import (
     DESIGN_GUIDANCE_SCHEMA_VERSION,
     DOCUMENT_KIND_DESIGN_GUIDANCE,
@@ -265,19 +266,35 @@ def guidance_evidence(
     brand = "; ".join(brand_parts)
 
     candidate = getattr(decision, "selected", None) if decision is not None else None
-    descriptor = _clean(getattr(candidate, "descriptor", "")) if candidate else ""
-    label = _clean(getattr(candidate, "label", "")) if candidate else ""
+    # N8 B7: reference text is untrusted and reaches the Design Guidance
+    # DOCUMENT here. `_clean` only strips, so control characters and newlines
+    # would survive into a file that other systems read. one_line() collapses
+    # them to a single inert line. Rendering normalises; stored evidence is
+    # never mutated.
+    descriptor = one_line(getattr(candidate, "descriptor", ""), 600) if candidate else ""
+    label = one_line(getattr(candidate, "label", ""), 160) if candidate else ""
     palette: Tuple[str, ...] = ()
     if candidate is not None:
         raw_palette = getattr(candidate, "palette", ()) or ()
-        palette = tuple(str(p).strip() for p in raw_palette if str(p).strip())
+        palette = tuple(
+            one_line(p, 40) for p in raw_palette if one_line(p, 40)
+        )
 
-    source_uri = _clean(getattr(candidate, "source_uri", "")) if candidate else ""
-    source_revision = _clean(getattr(candidate, "source_revision", "")) if candidate else ""
+    source_uri = one_line(getattr(candidate, "source_uri", ""), 300) if candidate else ""
+    source_revision = (
+        one_line(getattr(candidate, "source_revision", ""), 64) if candidate else ""
+    )
 
     # V2-A/V2-B: the OWNER'S OWN design-intent words, verbatim. This is the
     # primary, highest-authority design evidence when present.
     design_intent = _clean(brief.get("design_intent"))
+
+    # N8 B7: a selection is NOT a quality verification. When no suitability
+    # score exists, the evidence says so explicitly, so a reader of the guidance
+    # cannot mistake "selected" for "visually assessed".
+    suitability = getattr(candidate, "suitability", None) if candidate else None
+    has_suitability = suitability is not None
+    suitability_value = float(suitability) if has_suitability else 0.0
 
     return {
         "name": name,
@@ -291,6 +308,11 @@ def guidance_evidence(
         "source_uri": source_uri,
         "source_revision": source_revision,
         "has_candidate": candidate is not None,
+        "has_suitability": has_suitability,
+        "suitability": suitability_value,
+        "selection_basis": (
+            "assessed_suitability" if has_suitability else "grounding_only"
+        ),
     }
 
 
