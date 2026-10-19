@@ -296,6 +296,28 @@ def guidance_evidence(
     has_suitability = suitability is not None
     suitability_value = float(suitability) if has_suitability else 0.0
 
+    # N8 B8: the audit trail a reader needs to judge the assessment. Only the
+    # contract and requirement revision are carried -- never a confidence, which
+    # is deliberately absent from the candidate entirely.
+    suitability_contract = (
+        one_line(getattr(candidate, "suitability_contract", "") or "", 64)
+        if candidate else ""
+    )
+    requirement_version = (
+        one_line(getattr(candidate, "requirement_version", "") or "", 64)
+        if candidate else ""
+    )
+    raw_detail = getattr(candidate, "suitability_detail", ()) or () if candidate else ()
+    suitability_detail: Tuple[Tuple[str, float], ...] = ()
+    if has_suitability and raw_detail:
+        try:
+            suitability_detail = tuple(
+                (one_line(name, 32), float(value))
+                for name, value in dict(raw_detail).items()
+            )
+        except (TypeError, ValueError):
+            suitability_detail = ()
+
     return {
         "name": name,
         "what": what,
@@ -310,6 +332,9 @@ def guidance_evidence(
         "has_candidate": candidate is not None,
         "has_suitability": has_suitability,
         "suitability": suitability_value,
+        "suitability_contract": suitability_contract,
+        "suitability_detail": suitability_detail,
+        "requirement_version": requirement_version,
         "selection_basis": (
             "assessed_suitability" if has_suitability else "grounding_only"
         ),
@@ -367,8 +392,52 @@ def _select_resources(evidence: Mapping[str, Any], *, requested_resources):
         return None
 
 
+def _render_suitability_line(evidence: Mapping[str, Any]) -> str:
+    """Render the suitability assessment, or an explicit NOT-ASSESSED note.
+
+    N8 B8. This is the honesty line. A selection made on grounding alone must
+    never read as a quality verification, so the two cases are rendered in
+    visibly different language rather than the same field with a different
+    number.
+    """
+    if not evidence.get("has_candidate"):
+        return ""
+    if not evidence.get("has_suitability"):
+        return (
+            f"{UNRESOLVED_MARKER}: visual design quality was NOT assessed. "
+            "The reference was selected on grounding and provenance only "
+            "(no multimodal suitability score exists for this build)."
+        )
+
+    lines = [
+        f"Suitability: {float(evidence.get('suitability') or 0.0):.3f} "
+        f"(selection basis: {evidence.get('selection_basis') or 'assessed_suitability'})"
+    ]
+    contract = str(evidence.get("suitability_contract") or "").strip()
+    if contract:
+        lines.append(f"Suitability contract: {contract}")
+    requirement = str(evidence.get("requirement_version") or "").strip()
+    if requirement:
+        lines.append(f"Requirement version: {requirement}")
+
+    detail = evidence.get("suitability_detail") or ()
+    try:
+        pairs = [(str(k), float(v)) for k, v in dict(detail).items()]
+    except (TypeError, ValueError):
+        pairs = []
+    if pairs:
+        rendered = ", ".join(f"{name} {value:.2f}" for name, value in pairs)
+        lines.append(f"Dimension scores: {rendered}")
+    return "\n".join(lines)
+
+
 def _render_approved_resources(plan, evidence: Mapping[str, Any]) -> str:
-    """Render the approved-resources section, grounded in real provenance."""
+    """Render the approved-resources section, grounded in real provenance.
+
+    N8 B8: the selected reference now travels with the evidence that justifies
+    it -- its revision, the requirement version it was judged against, and its
+    suitability only when a score legitimately exists.
+    """
     lines = []
     if plan is not None:
         for entry in plan.selected_resources:
@@ -382,6 +451,9 @@ def _render_approved_resources(plan, evidence: Mapping[str, Any]) -> str:
             f"@{evidence['source_revision']}"
             + (f": {evidence['label']}" if evidence.get("label") else "")
         )
+        assessment = _render_suitability_line(evidence)
+        if assessment:
+            lines.append(assessment)
     if not lines:
         return f"{UNRESOLVED_MARKER}: no approved resource was selected from the evidence"
     return "\n".join(lines)
