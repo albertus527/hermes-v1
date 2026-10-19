@@ -52,8 +52,11 @@ def _source(source_id="s1", project_id="alpha", category="design_dna",
 
 
 def test_the_category_vocabulary_is_closed():
+    # N8 B3 adds "references" for real design artefacts (manifest + assets).
+    # The set stays CLOSED: an unknown category is still refused by SourceSpec.
     assert set(lib.CATEGORIES) == {
         "design_dna", "components", "motion", "briefs", "decisions",
+        "references",
     }
 
 
