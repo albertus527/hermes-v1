@@ -48,7 +48,7 @@ from app.core.design_scoring import (
     evidence_is_current,
     evidence_sufficient,
     parse_pool_scores,
-    requirements_are_sufficient,
+    assess_requirement_sufficiency,
 )
 
 logger = logging.getLogger(__name__)
@@ -276,7 +276,12 @@ class DecisionsDesignProvider:
         # requirements are missing DATA, not a design-quality failure, and a
         # fabricated F would flow straight into the S gate as if it were real.
         requirements = tuple(requirements or ())
-        fit_usable = requirements_are_sufficient(requirements)
+        # N9: sufficiency is an evidence-coverage judgement, not a count. Template
+        # boilerplate is dropped here, so a set of compiler defaults cannot make
+        # Fit look answerable when it is not.
+        fit_usable, _fit_reason, requirements, _excluded = (
+            assess_requirement_sufficiency(requirements)
+        )
 
         state = build_scoring_state(
             brief=brief,
