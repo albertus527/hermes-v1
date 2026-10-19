@@ -106,6 +106,7 @@ CATEGORIES: Tuple[str, ...] = (
     "motion",            # motion and interaction guidance
     "briefs",            # project briefs and accepted requirements
     "decisions",         # revision decisions and approved preferences
+    "references",        # N8 B3: real design references (manifest + assets)
 )
 
 #: Trust classifications. A CLOSED set, ordered from most to least trusted.
@@ -140,7 +141,23 @@ LEVELS: Tuple[int, ...] = (LEVEL_ABSTRACT, LEVEL_OVERVIEW, LEVEL_DETAIL)
 MAX_INGEST_RESOURCES = 32
 
 #: Max bytes read from ONE source file for ingestion.
+#:
+#: This is the TEXT ceiling. Binary assets have their own, separate limits
+#: below -- a reference screenshot must never be admitted or rejected by a rule
+#: meant for a markdown file.
 MAX_SOURCE_BYTES = 256 * 1024
+
+#: N8 B3: max bytes for ONE binary asset (an image), decoded.
+#: Separate from ``MAX_SOURCE_BYTES`` on purpose: an image legitimately exceeds
+#: a text file, and a text file must never be held to an image budget.
+MAX_ASSET_BYTES = 2 * 1024 * 1024
+
+#: N8 B3: max bytes for ONE reference manifest (text).
+#: Separate again: the manifest describes assets, it is not an asset.
+MAX_MANIFEST_BYTES = 64 * 1024
+
+#: N8 B3: max total asset bytes one reference may carry.
+MAX_REFERENCE_TOTAL_ASSET_BYTES = 8 * 1024 * 1024
 
 #: Max total bytes one ingestion batch may read.
 MAX_INGEST_TOTAL_BYTES = 4 * 1024 * 1024
