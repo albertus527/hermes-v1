@@ -198,12 +198,15 @@ class TestDesignProvider:
                 {"candidates": cands, "brief": {}}, limit=4
             )
         assert out
-        # The chosen candidate is marked dominant so the engine's (-score, id)
-        # ranking selects it; provenance stays the original object's.
+        # N8 B6: the artificial score promotion is gone. The model's preference
+        # is expressed as an ORDER (its pick first), and every candidate keeps
+        # the retrieval score it was retrieved with. Provenance stays the
+        # original object's.
         chosen = [c for c in out if c.candidate_id == "c2"][0]
         assert chosen.source_uri == "okv://other"
         assert chosen.source_revision == "r9"
-        assert chosen.score > max(c.score for c in out if c.candidate_id != "c2")
+        assert out[0].candidate_id == "c2"
+        assert all(c.score != 1.0 for c in out)
 
     def test_abstain_returns_empty(self):
         provider = self._provider()
