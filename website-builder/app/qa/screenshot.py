@@ -10,6 +10,7 @@ added to this project.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import shlex
@@ -21,6 +22,9 @@ from pathlib import Path
 from typing import Callable, List, Optional
 
 from app.core import credentials
+from app.core.structural_probe import probe_expression
+
+logger = logging.getLogger(__name__)  # noqa: E402
 
 # Fixed viewport sizes per canonical Phase 8 spec.
 DESKTOP_VIEWPORT = (1440, 900)
@@ -95,6 +99,10 @@ class CaptureResult:
     metrics: Optional[BrowserMetrics]
     status: str
     error: str = ""
+    #: Raw browser-side structural probe payload (N8 B7 Option C). ``None`` when
+    #: the probe did not run or failed; callers must treat that as "no
+    #: measurement", never as "no problem".
+    structural: Optional[dict] = None
 
     @property
     def captured(self) -> bool:
@@ -159,26 +167,70 @@ def _run_browser_command(argv: List[str], timeout: int) -> subprocess.CompletedP
         return subprocess.CompletedProcess(argv, result.returncode, sink.read(), "")
 
 
-def _probe_browser_metrics(result: subprocess.CompletedProcess) -> BrowserMetrics:
-    """Parse agent-browser's outer JSON envelope and its nested eval result."""
+def _unwrap_eval_envelope(result: subprocess.CompletedProcess) -> object:
+    """Parse agent-browser's outer JSON envelope and return ``data.result``.
+
+    Shared by the metric probe and the structural probe so the two can never
+    disagree about what a successful eval response looks like.
+    """
     if result.returncode != 0:
-        raise ScreenshotError(f"browser metric probe exited with status {result.returncode}")
+        raise ScreenshotError(f"browser eval exited with status {result.returncode}")
     try:
         envelope = json.loads(result.stdout or "")
     except (json.JSONDecodeError, TypeError) as exc:
-        raise ScreenshotError(f"browser metric probe returned invalid JSON: {exc}") from exc
+        raise ScreenshotError(f"browser eval returned invalid JSON: {exc}") from exc
     if not isinstance(envelope, dict) or envelope.get("success") is not True:
-        raise ScreenshotError("browser metric probe did not report success")
+        raise ScreenshotError("browser eval did not report success")
     data = envelope.get("data")
     if not isinstance(data, dict) or "result" not in data:
-        raise ScreenshotError("browser metric probe response is missing data.result")
+        raise ScreenshotError("browser eval response is missing data.result")
     payload = data["result"]
     if isinstance(payload, str):
         try:
             payload = json.loads(payload)
         except json.JSONDecodeError as exc:
-            raise ScreenshotError(f"browser metric data.result is invalid JSON: {exc}") from exc
-    return BrowserMetrics.from_payload(payload)
+            raise ScreenshotError(f"browser eval data.result is invalid JSON: {exc}") from exc
+    return payload
+
+
+def _probe_browser_metrics(result: subprocess.CompletedProcess) -> BrowserMetrics:
+    """Parse the metrics probe payload into ``BrowserMetrics``."""
+    return BrowserMetrics.from_payload(_unwrap_eval_envelope(result))
+
+
+def _probe_structural(browser_cmd: str, session_name: str) -> Optional[dict]:
+    """Run the bounded structural probe in an existing browser session.
+
+    Returns the parsed payload, or ``None`` on any failure. Deliberately silent:
+    the caller distinguishes "probe did not run" from "probe ran and found
+    nothing" via the payload's own ``ok`` flag, and neither case may fail a
+    capture. Measurements are an upgrade, not a precondition.
+    """
+    try:
+        proc = _run_browser_command(
+            [browser_cmd, "--session", session_name, "--json", "eval", probe_expression()],
+            30,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("structural probe timed out; continuing without measurements")
+        return None
+    except Exception:  # noqa: BLE001 - a probe failure never fails a capture
+        logger.warning("structural probe failed to run", exc_info=True)
+        return None
+
+    if proc.returncode != 0:
+        logger.warning("structural probe exited with status %s", proc.returncode)
+        return None
+
+    try:
+        payload = _unwrap_eval_envelope(proc)
+    except ScreenshotError:
+        logger.warning("structural probe returned an unusable envelope", exc_info=True)
+        return None
+    if isinstance(payload, dict) and not payload.get("ok"):
+        logger.warning("structural probe reported %s", payload.get("error"))
+        return None
+    return payload
 
 
 def _default_capture_fn(
@@ -235,6 +287,15 @@ def _default_capture_fn(
             except ScreenshotError as exc:
                 return CaptureResult.failure("metric_probe_failed", str(exc))
 
+            # N8 B7 Option C: collect structural evidence from the SAME session
+            # and the SAME rendered state the screenshot will capture. The probe
+            # runs after the metrics eval (page already loaded and laid out) and
+            # before the screenshot, so the DOM it reads is the DOM that gets
+            # photographed. It is best-effort: a probe failure must not fail a
+            # capture, because a screenshot without measurements is still valid
+            # evidence at E2, whereas a lost screenshot is a lost attempt.
+            structural = _probe_structural(browser_cmd, session_name)
+
             result = _run_browser_command(
                 [
                     browser_cmd, "--session", session_name, "--json",
@@ -247,7 +308,9 @@ def _default_capture_fn(
                     "capture_failed",
                     f"agent-browser screenshot exited with status {result.returncode} or produced no file",
                 )
-            return CaptureResult(path=out_path, metrics=metrics, status="captured")
+            return CaptureResult(
+                path=out_path, metrics=metrics, status="captured", structural=structural
+            )
         except subprocess.TimeoutExpired as exc:
             return CaptureResult.failure("capture_failed", f"agent-browser command timed out: {exc}")
     finally:
@@ -268,6 +331,10 @@ class ScreenshotSet:
     mobile: Optional[Path]
     desktop_metrics: Optional[BrowserMetrics] = None
     mobile_metrics: Optional[BrowserMetrics] = None
+    #: Raw structural probe payloads, when the probe ran. Absent means no
+    #: measurement exists -- never that the page measured clean.
+    desktop_structural: Optional[dict] = None
+    mobile_structural: Optional[dict] = None
 
     @property
     def complete(self) -> bool:
@@ -403,4 +470,6 @@ class ScreenshotCapture:
             mobile=mobile.path,
             desktop_metrics=desktop.metrics,
             mobile_metrics=mobile.metrics,
+            desktop_structural=desktop.structural,
+            mobile_structural=mobile.structural,
         )

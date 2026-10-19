@@ -42,7 +42,9 @@ from app.core.design_reference import (
     DIMENSION_TYPOGRAPHY,
     DIMENSION_USABILITY,
     EVIDENCE_RANK,
+    EVIDENCE_RENDERED,
     EVIDENCE_SCORABLE_FROM,
+    EVIDENCE_STRUCTURAL,
 )
 from app.core.design_reference_safety import one_line
 
@@ -417,6 +419,154 @@ DIMENSION_LIMITS: Mapping[str, str] = {
 }
 
 
+#: Marker that opens the measured-evidence block. Kept as a constant so tests
+#: and downstream readers can detect its presence without string matching prose.
+MEASURED_EVIDENCE_HEADER = "MEASURED EVIDENCE (from the rendered page, not from the screenshot):"
+
+
+def measured_evidence_block(dimension: str, evidence: Any) -> str:
+    """Render measured facts for *dimension* as prompt context, or ``""``.
+
+    This is the E3 path. It does NOT produce a score and does NOT set a
+    threshold; it supplies a number the model could not otherwise obtain, and
+    states plainly what the number does and does not settle.
+
+    Returns an empty string when there is no measurement for this dimension, so
+    a candidate without evidence keeps its E2 instruction byte-for-byte.
+    """
+    if evidence is None:
+        return ""
+
+    lines: list = []
+
+    if dimension == DIMENSION_COLOR and getattr(evidence, "has_contrast", False):
+        measured = evidence.measured_pairs
+        doubtful = evidence.doubtful_pairs
+        lines.append(
+            "The foreground/background contrast below was MEASURED from computed "
+            "styles on the rendered page. Use it for legibility only."
+        )
+        for pair in measured[:6]:
+            lines.append(
+                f"  - {pair.sample_tag or 'text'} at {pair.font_size_px:g}px: "
+                f"{pair.foreground} on {pair.background} = {pair.ratio}:1"
+            )
+        if doubtful:
+            kinds = sorted({p.state for p in doubtful})
+            lines.append(
+                f"  - {len(doubtful)} further text/background pair(s) could not be "
+                f"measured ({', '.join(kinds)}: gradient, image, or translucency "
+                f"behind the text). Judge those from the screenshot."
+            )
+        lines.append(
+            "The ratio settles LEGIBILITY of the pairs listed. It does not settle "
+            "palette harmony, and a passing ratio does not make the colour design "
+            "good. Judge palette and overall colour quality yourself."
+        )
+        return "\n".join(lines)
+
+    if dimension == DIMENSION_TYPOGRAPHY and getattr(evidence, "has_typography", False):
+        families = ", ".join(evidence.font_families[:4])
+        lines.append(
+            "Computed type facts from the rendered page (context, not a score):"
+        )
+        lines.append(f"  - font families in use: {families}")
+        for tag, size, line in list(evidence.type_scale)[:6]:
+            ratio = f", line-height {line:g}px" if line else ""
+            lines.append(f"  - {tag or 'text'}: {size:g}px{ratio}")
+        lines.append(
+            "These numbers describe the type SYSTEM. Whether the type is "
+            "appropriate, well-set and attractive remains your judgement."
+        )
+        return "\n".join(lines)
+
+    if dimension == DIMENSION_LAYOUT and getattr(evidence, "has_spacing", False):
+        steps = ", ".join(f"{v:g}" for v in evidence.spacing_scale[:12])
+        lines.append(
+            "Measured spacing steps present on the rendered page (px), as context:"
+        )
+        lines.append(f"  - {steps}")
+        lines.append(
+            "A short list of repeated values suggests a scale; a long list of "
+            "unrelated values suggests ad-hoc spacing. This is a hint about the "
+            "spacing SYSTEM, not a verdict on composition or alignment."
+        )
+        return "\n".join(lines)
+
+    return ""
+
+
+def evidence_class_for(dimension: str, evidence: Any) -> str:
+    """The evidence class actually available for *dimension*.
+
+    Mirrors ``DesignReference.evidence_for`` so scoring and reference selection
+    cannot disagree about what counts as measurement. ``E2`` means screenshot
+    only; ``E3`` means a real measurement backs the judgement.
+    """
+    if evidence is None:
+        return EVIDENCE_RENDERED
+    if dimension == DIMENSION_COLOR and getattr(evidence, "has_contrast", False):
+        return EVIDENCE_STRUCTURAL
+    if dimension == DIMENSION_TYPOGRAPHY and getattr(evidence, "has_typography", False):
+        return EVIDENCE_STRUCTURAL
+    if dimension == DIMENSION_LAYOUT and getattr(evidence, "has_spacing", False):
+        return EVIDENCE_STRUCTURAL
+    return EVIDENCE_RENDERED
+
+
+def assess_evidence_conflict(
+    *,
+    dimension: str,
+    score: float,
+    evidence: Any,
+) -> Optional[dict]:
+    """Report a disagreement between a measured fact and a model score.
+
+    The owner's constraint: expose the conflict, never silently override. This
+    returns a record for the report and changes NOTHING -- the score stands,
+    the gate result stands, and the candidate is neither rescued nor punished.
+
+    Only colour can conflict with a hard number, because it is the one dimension
+    where a measurement settles the question the score claims to answer.
+    """
+    if evidence is None or dimension != DIMENSION_COLOR:
+        return None
+    if not getattr(evidence, "has_contrast", False):
+        return None
+
+    worst = min(evidence.measured_pairs, key=lambda p: p.ratio or 99.0)
+    ratio = worst.ratio or 0.0
+    fails_aa = ratio < 4.5
+
+    # A high score alongside a failing measured ratio, or a low score alongside a
+    # comfortably passing one, is a material disagreement worth surfacing.
+    conflict = None
+    if fails_aa and score >= 0.75:
+        conflict = "score_high_but_measured_contrast_fails_aa"
+    elif (not fails_aa) and ratio >= 7.0 and score <= 0.25:
+        conflict = "score_low_but_measured_contrast_is_strong"
+
+    if conflict is None:
+        return None
+    return {
+        "dimension": dimension,
+        "kind": conflict,
+        "model_score": round(float(score), 4),
+        "measured_ratio": ratio,
+        "measured_pair": {
+            "foreground": worst.foreground,
+            "background": worst.background,
+            "font_size_px": worst.font_size_px,
+        },
+        "resolution": "reported_only",
+        "note": (
+            "The model score is preserved and still governs eligibility. This "
+            "record exists so the disagreement is visible, not so it can be "
+            "silently corrected."
+        ),
+    }
+
+
 def _dimension_instruction(dimension: str) -> str:
     """The per-dimension instruction: primary criterion, exclusions, honesty limit.
 
@@ -473,6 +623,7 @@ def _dimension_instruction(dimension: str) -> str:
 def build_scoring_questions(
     candidates: Sequence[DesignCandidate],
     requirements: Sequence[str] = (),
+    evidence: Optional[Mapping[str, Any]] = None,
 ) -> dict:
     """One score question per dimension plus one for fit, per candidate.
 
@@ -486,19 +637,30 @@ def build_scoring_questions(
     slot and, worse, invite a number that looks like an assessment. The absence
     of ``f<i>`` is what makes ``parse_pool_scores`` abstain with
     ``insufficient_requirements`` rather than invent an F.
+
+    ``evidence`` optionally maps ``candidate_id`` to a ``StructuralEvidence``.
+    When a candidate has a measurement for a dimension, the question gains a
+    measured-facts block; when it does not, the instruction is byte-for-byte
+    what it was before, so E2 behaviour is preserved exactly.
     """
     questions: dict = {}
     fit_usable = requirements_are_sufficient(requirements)
     usable = usable_requirements(requirements)
+    evidence = evidence or {}
 
     for index, candidate in enumerate(candidates):
         cid = one_line(candidate.candidate_id, 80)
+        candidate_evidence = evidence.get(candidate.candidate_id)
         for dimension in DIMENSIONS:
+            instruction = _dimension_instruction(dimension).replace(
+                "{{cid}}", f"'{cid}'"
+            )
+            measured = measured_evidence_block(dimension, candidate_evidence)
+            if measured:
+                instruction = f"{instruction}\n\n{MEASURED_EVIDENCE_HEADER}\n{measured}"
             questions[f"q{index}_{dimension}"] = {
                 "type": "score",
-                "instructions": _dimension_instruction(dimension).replace(
-                    "{{cid}}", f"'{cid}'"
-                ),
+                "instructions": instruction,
                 "criteria": list(LEVELS),
             }
         if not fit_usable:

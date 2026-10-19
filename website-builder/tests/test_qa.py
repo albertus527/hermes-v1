@@ -1299,7 +1299,8 @@ class TestAgentBrowserArgsEnv(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             ok, calls = self._run_capture(None, tmpdir)
         self.assertTrue(ok.captured)
-        self.assertEqual(len(calls), 5)  # open, set viewport, eval, screenshot, close
+        # open, set viewport, metrics eval, structural-probe eval, screenshot, close
+        self.assertEqual(len(calls), 6)
         for argv in calls:
             self.assertNotIn("--args", argv)
 
@@ -1343,8 +1344,11 @@ class TestAgentBrowserArgsEnv(unittest.TestCase):
 
         self.assertTrue(ok_noenv.captured)
         self.assertTrue(ok_env.captured)
-        self.assertEqual(len(calls_noenv), 5)
-        self.assertEqual(len(calls_env), 5)
+        # Six: open, set viewport, metrics eval, structural-probe eval,
+        # screenshot, close. The probe rides the same session, so AGENT_BROWSER_ARGS
+        # handling must remain identical on both paths.
+        self.assertEqual(len(calls_noenv), 6)
+        self.assertEqual(len(calls_env), 6)
 
         # Strip the open call's optional --args tail, then the flows must match
         # command-for-command (same tmpdir + same inputs -> same session name
@@ -1531,7 +1535,12 @@ class TestViewportAppliedBeforeScreenshot(unittest.TestCase):
             ok, calls, _ = self._run_capture(tmpdir)
 
         self.assertTrue(ok.captured)
-        self.assertEqual(len(calls), 5)
+        # N8 B7 Option C added a SECOND eval: the structural probe. It must run
+        # in the same session, after the page has loaded and laid out, and
+        # before the screenshot, so the DOM it reads is the DOM that is
+        # photographed. The count is asserted rather than derived so that an
+        # accidental extra browser round-trip cannot slip in unnoticed.
+        self.assertEqual(len(calls), 6)
         command_names = [
             "open" if "open" in call else
             "viewport" if "viewport" in call else
@@ -1540,7 +1549,9 @@ class TestViewportAppliedBeforeScreenshot(unittest.TestCase):
             "close" if "close" in call else "unknown"
             for call in calls
         ]
-        self.assertEqual(command_names, ["open", "viewport", "eval", "screenshot", "close"])
+        self.assertEqual(
+            command_names, ["open", "viewport", "eval", "eval", "screenshot", "close"]
+        )
         sessions = {call[call.index("--session") + 1] for call in calls}
         self.assertEqual(len(sessions), 1)
         screenshot_argv = next(call for call in calls if "screenshot" in call)
@@ -1553,6 +1564,13 @@ class TestViewportAppliedBeforeScreenshot(unittest.TestCase):
         viewport_idx = next(i for i, c in enumerate(calls) if "viewport" in c)
         screenshot_idx = next(i for i, c in enumerate(calls) if "screenshot" in c)
         self.assertLess(open_idx, viewport_idx)
+        # Both evals sit strictly between the viewport being set and the
+        # screenshot being taken: measurements describe the captured state.
+        eval_indexes = [i for i, c in enumerate(calls) if "eval" in c]
+        self.assertEqual(len(eval_indexes), 2)
+        for idx in eval_indexes:
+            self.assertLess(viewport_idx, idx)
+            self.assertLess(idx, screenshot_idx)
         self.assertLess(viewport_idx, screenshot_idx)
 
         viewport_argv = calls[viewport_idx]
