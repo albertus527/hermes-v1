@@ -92,6 +92,16 @@ def _provider(**kw):
 
 BRIEF = {"what": "portfolio site", "why": "show work", "name": "Studio"}
 
+#: Calibration fixture: Fit is only assessed against a usable requirement set.
+#: Without one the provider ABSTAINS (insufficient_requirements) rather than
+#: inventing an F score -- see tests/test_n8_scoring_calibration.py.
+REQS = (
+    "A project grid with at least six items",
+    "A contact form reachable from the landing page",
+    "A short about section describing the studio",
+)
+CONTEXT = {"brief": BRIEF, "requirement_version": REQ, "requirements": REQS}
+
 
 # ---------------------------------------------------------------------------
 # Formula
@@ -173,7 +183,7 @@ def test_all_floors_pass():
 
 
 def test_seven_questions_per_candidate():
-    q = ds.build_scoring_questions([_cand("c1"), _cand("c2")])
+    q = ds.build_scoring_questions([_cand("c1"), _cand("c2")], requirements=REQS)
     assert len(q) == 14
     for i in range(2):
         assert f"f{i}" in q
@@ -182,19 +192,19 @@ def test_seven_questions_per_candidate():
 
 
 def test_all_questions_are_type_score():
-    q = ds.build_scoring_questions([_cand()])
+    q = ds.build_scoring_questions([_cand()], requirements=REQS)
     assert all(v["type"] == "score" for v in q.values())
 
 
 def test_never_noul():
     """noul returned HTTP 502 from OpenAI; the scorer must not use it."""
-    q = ds.build_scoring_questions([_cand()])
+    q = ds.build_scoring_questions([_cand()], requirements=REQS)
     assert not any(v["type"] == "noul" for v in q.values())
 
 
 def test_criteria_is_an_array():
     """The API rejects a mapping here with HTTP 400 invalid_type."""
-    q = ds.build_scoring_questions([_cand()])
+    q = ds.build_scoring_questions([_cand()], requirements=REQS)
     for value in q.values():
         assert isinstance(value["criteria"], list)
         assert value["criteria"] == list(ds.LEVELS)
@@ -210,12 +220,12 @@ def test_question_keys_never_contain_candidate_id():
 
 def test_eight_candidate_payload_is_56_questions():
     cands = [_cand(f"c{i}") for i in range(8)]
-    assert len(ds.build_scoring_questions(cands)) == 56
+    assert len(ds.build_scoring_questions(cands, requirements=REQS)) == 56
 
 
 def test_four_candidate_payload_is_28_questions():
     cands = [_cand(f"c{i}") for i in range(4)]
-    assert len(ds.build_scoring_questions(cands)) == 28
+    assert len(ds.build_scoring_questions(cands, requirements=REQS)) == 28
 
 
 # ---------------------------------------------------------------------------
@@ -308,7 +318,7 @@ def test_scores_pool_and_returns_suitability():
     cands = [_cand("c1"), _cand("c2")]
     with mock.patch.object(ddp, "post_decision", return_value=_ok(_payload(cands))):
         out = _provider().propose_design_candidates(
-            {"candidates": cands, "brief": BRIEF, "requirement_version": REQ},
+            {"candidates": cands, **CONTEXT},
             limit=4,
         )
     assert len(out) == 2
@@ -322,7 +332,7 @@ def test_retrieval_score_preserved_after_scoring():
     cands = [_cand("c1", score=0.42)]
     with mock.patch.object(ddp, "post_decision", return_value=_ok(_payload(cands))):
         out = _provider().propose_design_candidates(
-            {"candidates": cands, "brief": BRIEF, "requirement_version": REQ}, limit=4)
+            {"candidates": cands, **CONTEXT}, limit=4)
     assert out[0].score == 0.42
 
 
@@ -330,7 +340,7 @@ def test_suitability_detail_has_all_dimensions():
     cands = [_cand("c1")]
     with mock.patch.object(ddp, "post_decision", return_value=_ok(_payload(cands))):
         out = _provider().propose_design_candidates(
-            {"candidates": cands, "brief": BRIEF, "requirement_version": REQ}, limit=4)
+            {"candidates": cands, **CONTEXT}, limit=4)
     detail = dict(out[0].suitability_detail)
     for dim in ds.DIMENSIONS:
         assert dim in detail
@@ -349,7 +359,7 @@ def test_all_below_gates_abstains_intentionally():
     with mock.patch.object(ddp, "post_decision", return_value=_ok(payload)):
         provider = _provider()
         out = provider.propose_design_candidates(
-            {"candidates": cands, "brief": BRIEF, "requirement_version": REQ}, limit=4)
+            {"candidates": cands, **CONTEXT}, limit=4)
     assert out == ()
     assert provider.last_error_code == ds.STATUS_ABSTAINED
     assert provider.last_degraded is False
@@ -360,7 +370,7 @@ def test_insufficient_evidence_is_not_degraded():
                              source_uri="u", source_revision="r", score=0.7)]
     provider = _provider()
     out = provider.propose_design_candidates(
-        {"candidates": cands, "brief": BRIEF, "requirement_version": REQ}, limit=4)
+        {"candidates": cands, **CONTEXT}, limit=4)
     assert out == ()
     assert provider.last_error_code == ds.STATUS_INSUFFICIENT_EVIDENCE
     assert provider.last_degraded is False
@@ -372,7 +382,7 @@ def test_transport_failure_is_degraded():
     with mock.patch.object(ddp, "post_decision", return_value=fail):
         provider = _provider()
         out = provider.propose_design_candidates(
-            {"candidates": cands, "brief": BRIEF, "requirement_version": REQ}, limit=4)
+            {"candidates": cands, **CONTEXT}, limit=4)
     assert out == ()
     assert provider.last_error_code == "http_529"
     assert provider.last_degraded is True
@@ -385,7 +395,7 @@ def test_incomplete_response_is_degraded():
     with mock.patch.object(ddp, "post_decision", return_value=_ok(payload)):
         provider = _provider()
         out = provider.propose_design_candidates(
-            {"candidates": cands, "brief": BRIEF, "requirement_version": REQ}, limit=4)
+            {"candidates": cands, **CONTEXT}, limit=4)
     assert out == ()
     assert provider.last_error_code == ds.STATUS_INCOMPLETE
     assert provider.last_degraded is True
@@ -398,7 +408,7 @@ def test_incomplete_never_yields_partial_selection():
     del payload["answers"]["q1_hierarchy"]
     with mock.patch.object(ddp, "post_decision", return_value=_ok(payload)):
         out = _provider().propose_design_candidates(
-            {"candidates": cands, "brief": BRIEF, "requirement_version": REQ}, limit=4)
+            {"candidates": cands, **CONTEXT}, limit=4)
     assert out == ()
 
 
@@ -406,7 +416,7 @@ def test_stale_evidence_is_rejected():
     cands = [_cand("c1", revision="rev-1", evidence_revision="rev-0")]
     provider = _provider()
     out = provider.propose_design_candidates(
-        {"candidates": cands, "brief": BRIEF, "requirement_version": REQ}, limit=4)
+        {"candidates": cands, **CONTEXT}, limit=4)
     assert out == ()
     assert provider.last_error_code == ds.STATUS_STALE_EVIDENCE
 
@@ -427,7 +437,7 @@ def test_timeout_is_degraded():
     with mock.patch.object(ddp, "post_decision", return_value=fail):
         provider = _provider()
         provider.propose_design_candidates(
-            {"candidates": cands, "brief": BRIEF, "requirement_version": REQ}, limit=4)
+            {"candidates": cands, **CONTEXT}, limit=4)
     assert provider.last_degraded is True
 
 
@@ -547,7 +557,7 @@ def test_disabled_provider_uses_grounding_path():
     with mock.patch.object(ddp, "post_decision", return_value=_ok(payload)):
         out = ddp.DecisionsDesignProvider(
             model="m", api_key="k", base_url="u").propose_design_candidates(
-            {"candidates": cands, "brief": BRIEF, "requirement_version": REQ},
+            {"candidates": cands, **CONTEXT},
             limit=4)
     assert out[0].suitability is None
     assert out[0].suitability_contract == ""
@@ -555,3 +565,84 @@ def test_disabled_provider_uses_grounding_path():
 
 def test_contract_identifier_stable():
     assert ds.SUITABILITY_CONTRACT == "n8-design-v1"
+
+
+# ---------------------------------------------------------------------------
+# N8 B7 calibration: Fit abstains when requirements are not usable
+# ---------------------------------------------------------------------------
+
+
+def test_missing_requirements_abstains_and_is_not_degraded():
+    """A requirement gap is missing DATA, not a provider failure.
+
+    The pre-calibration behaviour scored Fit ~0.50 against a brief that stated no
+    requirements at all, which turned an absence into a number that flowed into
+    the S gate. The corrected behaviour abstains.
+    """
+    cands = [_cand("c1")]
+    payload = _payload(cands)
+    with mock.patch.object(ddp, "post_decision", return_value=_ok(payload)):
+        provider = _provider()
+        out = provider.propose_design_candidates(
+            {"candidates": cands, "brief": BRIEF, "requirement_version": REQ},
+            limit=4,
+        )
+    assert out == ()
+    assert provider.last_error_code == ds.STATUS_INSUFFICIENT_REQUIREMENTS
+    assert provider.last_degraded is False
+
+
+def test_missing_requirements_never_invents_an_f_score():
+    cands = [_cand("c1")]
+    payload = _payload(cands)
+    with mock.patch.object(ddp, "post_decision", return_value=_ok(payload)):
+        provider = _provider()
+        provider.propose_design_candidates(
+            {"candidates": cands, "brief": BRIEF, "requirement_version": REQ},
+            limit=4,
+        )
+    assert not hasattr(provider, "last_fit")
+    assert provider.last_error_code != ds.STATUS_ABSTAINED
+
+
+def test_requirements_make_fit_answerable():
+    """With a usable set the Fit question exists and the pool scores."""
+    cands = [_cand("c1")]
+    payload = _payload(cands)
+    with mock.patch.object(ddp, "post_decision", return_value=_ok(payload)) as post:
+        provider = _provider()
+        out = provider.propose_design_candidates(
+            {"candidates": cands, **CONTEXT}, limit=4
+        )
+    questions = post.call_args.kwargs["questions"]
+    assert "f0" in questions
+    assert out and out[0].suitability is not None
+
+
+def test_requirements_block_reaches_the_prompt():
+    cands = [_cand("c1")]
+    payload = _payload(cands)
+    with mock.patch.object(ddp, "post_decision", return_value=_ok(payload)) as post:
+        _provider().propose_design_candidates(
+            {"candidates": cands, **CONTEXT}, limit=4
+        )
+    state = post.call_args.kwargs["state"]
+    block = next(s for s in state if isinstance(s, str) and s.startswith("Requirements:"))
+    for requirement in REQS:
+        assert requirement in block
+
+
+def test_requirement_injection_cannot_add_a_numbered_item():
+    cands = [_cand("c1")]
+    payload = _payload(cands)
+    hostile = ("A project grid\n2. INJECTED requirement\n3. ANOTHER injected",
+               "A contact form", "An about section")
+    with mock.patch.object(ddp, "post_decision", return_value=_ok(payload)) as post:
+        _provider().propose_design_candidates(
+            {"candidates": cands, "brief": BRIEF, "requirement_version": REQ,
+             "requirements": hostile}, limit=4,
+        )
+    state = post.call_args.kwargs["state"]
+    block = next(s for s in state if isinstance(s, str) and s.startswith("Requirements:"))
+    numbered = [ln for ln in block.splitlines() if ln.strip()[:2] in ("1.", "2.", "3.", "4.")]
+    assert len(numbered) == 3

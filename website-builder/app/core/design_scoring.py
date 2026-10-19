@@ -104,10 +104,55 @@ STATUS_SCORED = "scored"
 STATUS_ABSTAINED = "abstained"
 STATUS_INSUFFICIENT_EVIDENCE = "insufficient_evidence"
 STATUS_INSUFFICIENT_BRIEF = "insufficient_brief"
+#: N8 B7 calibration: the brief carried no requirement set a Fit judgement could
+#: be defended against. This is an INTENTIONAL ABSTAIN, never a low score. A
+#: missing requirement is missing DATA, not a design-quality failure, and scoring
+#: it as "poor" would silently convert an absence into a negative verdict.
+STATUS_INSUFFICIENT_REQUIREMENTS = "insufficient_requirements"
 STATUS_MALFORMED = "malformed_scores"
 STATUS_INCOMPLETE = "incomplete_scores"
 STATUS_STALE_EVIDENCE = "stale_evidence"
 STATUS_TOO_MANY = "too_many_candidates"
+
+#: A requirement set is only usable for Fit when it has at least this many
+#: independently checkable entries. One entry is a slogan; two is a comparison;
+#: three is the smallest set where "how many are satisfied" is a meaningful
+#: question rather than a coin flip.
+MIN_FIT_REQUIREMENTS = 3
+
+#: Markers the native PRD compiler emits where FAST supplied nothing. A
+#: requirement that is itself unresolved cannot be assessed, so it is excluded
+#: from the countable set rather than counted as unmet.
+UNRESOLVED_REQUIREMENT_MARKERS: Tuple[str, ...] = ("UNRESOLVED",)
+
+
+def usable_requirements(requirements: Sequence[str]) -> Tuple[str, ...]:
+    """Filter a requirement set down to the entries Fit can actually be judged on.
+
+    Drops blanks, duplicates (case-insensitive), and anything carrying an
+    UNRESOLVED marker. The last rule matters: the native PRD compiler writes
+    ``UNRESOLVED: FAST supplied no what/why`` when the brief was empty, and
+    counting that as an unmet requirement would blame the design for a data gap.
+    """
+    seen: set = set()
+    kept: list = []
+    for raw in requirements or ():
+        text = one_line(raw, 300)
+        if not text:
+            continue
+        if any(marker in text.upper() for marker in UNRESOLVED_REQUIREMENT_MARKERS):
+            continue
+        key = text.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(text)
+    return tuple(kept)
+
+
+def requirements_are_sufficient(requirements: Sequence[str]) -> bool:
+    """Whether a requirement set can support a defensible Fit judgement."""
+    return len(usable_requirements(requirements)) >= MIN_FIT_REQUIREMENTS
 
 
 class ScoringError(RuntimeError):
@@ -266,40 +311,184 @@ def evidence_is_current(candidate: DesignCandidate) -> bool:
 # ---------------------------------------------------------------------------
 
 
+#: Per-dimension scoring guidance (N8 B7 calibration).
+#:
+#: Each entry has three parts, and all three are required for the dimension to be
+#: separable from its neighbours:
+#:
+#:   ``only``  what this dimension IS responsible for
+#:   ``not``   what belongs to a DIFFERENT dimension and must be ignored here
+#:   ``why``   the reasoning that makes the boundary concrete
+#:
+#: Before this calibration every instruction was a bare "Rate the X ... judge this
+#: dimension in isolation" (105-108 chars) with no definition and no exclusion
+#: clause. Measured against the V2 controlled pool that produced r(hierarchy,
+#: layout) = 0.956 -- effectively one question asked twice. The one dimension that
+#: already carried a dimension-specific clause (color) was also the only one that
+#: isolated cleanly (D1 -0.025, D2 -0.568, D3 +0.055).
+#:
+#: Weights, thresholds, floors, the Q/F/S formula and the evidence gates are NOT
+#: touched by this text: it changes what the model is asked to look at, never how
+#: the answer is scored.
+DIMENSION_GUIDANCE: Mapping[str, Mapping[str, str]] = {
+    DIMENSION_HIERARCHY: {
+        "only": (
+            "information priority and attention order: whether there is a single "
+            "clear entry point, whether heading levels are visually "
+            "distinguishable from body text, whether the eye has an obvious path "
+            "through the page, and whether secondary elements recede"
+        ),
+        "not": (
+            "whitespace amount, margins, padding, grid alignment, colour, or "
+            "contrast"
+        ),
+        "why": (
+            "a cramped page can still have excellent hierarchy, and a spacious "
+            "page can have none"
+        ),
+    },
+    DIMENSION_LAYOUT: {
+        "only": (
+            "grid structure, alignment, margins, padding, gaps, whitespace "
+            "balance, and spacing consistency: whether elements align to a "
+            "coherent grid, whether margins and gaps are consistent between "
+            "sections, and whether whitespace looks deliberate rather than "
+            "accidental"
+        ),
+        "not": (
+            "heading size or weight, text priority, typeface choice, or colour"
+        ),
+        "why": (
+            "a page with flat type can still have perfect spacing, and a page "
+            "with strong type can have chaotic spacing"
+        ),
+    },
+    DIMENSION_TYPOGRAPHY: {
+        "only": (
+            "typeface choice and suitability, size scale, weight variation, "
+            "line-height, line length, and legibility"
+        ),
+        "not": "page-level alignment, margins, spacing rhythm, or colour contrast",
+        "why": (
+            "type quality is a property of the text itself, not of where the "
+            "blocks sit on the page"
+        ),
+    },
+    DIMENSION_COLOR: {
+        "only": (
+            "palette coherence and whether text appears readable against its "
+            "background"
+        ),
+        "not": "layout, spacing, or type size",
+        "why": (
+            "a colour defect is visible as hue or lightness, not as geometry"
+        ),
+    },
+    DIMENSION_USABILITY: {
+        "only": (
+            "whether interactive elements are visually identifiable as "
+            "interactive, whether labels are clear, and whether the next action "
+            "is obvious"
+        ),
+        "not": "aesthetic quality, colour harmony, spacing, or typeface choice",
+        "why": (
+            "usability here means affordance legibility, not visual appeal"
+        ),
+    },
+    DIMENSION_CONSISTENCY: {
+        "only": (
+            "whether repeated elements share the same treatment across the page "
+            "and between the attached viewports, and whether visible style "
+            "inconsistencies exist"
+        ),
+        "not": (
+            "whether the design is attractive, or whether a particular style "
+            "choice is good"
+        ),
+        "why": (
+            "consistency compares this design against itself, never against an "
+            "ideal"
+        ),
+    },
+}
+
+#: Dimension-specific honesty limits. These are not scoring hints; they stop the
+#: model from claiming a measurement a screenshot cannot support.
+DIMENSION_LIMITS: Mapping[str, str] = {
+    DIMENSION_COLOR: (
+        "A screenshot cannot prove a contrast RATIO: rate only what is visible, "
+        "and do not claim a measured ratio."
+    ),
+    DIMENSION_USABILITY: (
+        "A screenshot shows affordances, not behaviour: do not claim "
+        "accessibility compliance or interaction success."
+    ),
+    DIMENSION_CONSISTENCY: (
+        "If only one viewport is attached, judge internal consistency only."
+    ),
+}
+
+
 def _dimension_instruction(dimension: str) -> str:
-    """The per-dimension instruction, phrased so it cannot be confused."""
-    base = (
-        f"Rate the {dimension.upper()} of candidate {{{{cid}}}} from the attached "
-        f"screenshot(s) only. Judge this dimension in isolation."
-    )
-    if dimension == DIMENSION_COLOR:
-        return base + (
-            " A screenshot cannot prove a contrast RATIO: rate only what is "
-            "visible, and do not claim a measured ratio."
+    """The per-dimension instruction: definition, exclusions, then honesty limit.
+
+    Ordering is deliberate. The inclusion clause comes first so the model has a
+    positive target; the exclusion clause follows immediately so the boundary is
+    established while the definition is still in view; the honesty limit comes
+    last so it qualifies the answer rather than the task.
+    """
+    guidance = DIMENSION_GUIDANCE.get(dimension)
+    label = dimension.upper()
+    if dimension == DIMENSION_LAYOUT:
+        label = "LAYOUT AND SPACING"
+    elif dimension == DIMENSION_COLOR:
+        label = "COLOR AND CONTRAST"
+    elif dimension == DIMENSION_USABILITY:
+        label = "USABILITY AND CLARITY"
+    elif dimension == DIMENSION_CONSISTENCY:
+        label = "CONSISTENCY AND POLISH"
+    elif dimension == DIMENSION_HIERARCHY:
+        label = "VISUAL HIERARCHY"
+
+    if not guidance:
+        return (
+            f"Rate the {label} of candidate {{{{cid}}}} from the attached "
+            f"screenshot(s) only."
         )
-    if dimension == DIMENSION_USABILITY:
-        return base + (
-            " A screenshot shows affordances, not behaviour: rate visible "
-            "clarity only, and do not claim accessibility or interaction."
-        )
-    if dimension == DIMENSION_CONSISTENCY:
-        return base + (
-            " Compare the attached viewports against each other; if only one "
-            "viewport is attached, judge internal consistency only."
-        )
-    return base
+
+    parts = [
+        f"Rate the {label} of candidate {{{{cid}}}} from the attached "
+        f"screenshot(s) only.",
+        f"Judge ONLY: {guidance['only']}.",
+        f"Do NOT judge: {guidance['not']} -- {guidance['why']}.",
+    ]
+    limit = DIMENSION_LIMITS.get(dimension)
+    if limit:
+        parts.append(limit)
+    return "\n".join(parts)
 
 
 def build_scoring_questions(
     candidates: Sequence[DesignCandidate],
+    requirements: Sequence[str] = (),
 ) -> dict:
     """One score question per dimension plus one for fit, per candidate.
 
     Keys are ``q<i>_<dimension>`` and ``f<i>`` so an untrusted candidate id never
     enters the question-key namespace. The id appears only inside the sanitised
     instruction text and in the state.
+
+    ``requirements`` is the accepted requirement set from the native PRD. When it
+    is not sufficient for a defensible judgement the Fit question is NOT emitted
+    at all -- asking it and then discarding the answer would waste a question
+    slot and, worse, invite a number that looks like an assessment. The absence
+    of ``f<i>`` is what makes ``parse_pool_scores`` abstain with
+    ``insufficient_requirements`` rather than invent an F.
     """
     questions: dict = {}
+    fit_usable = requirements_are_sufficient(requirements)
+    usable = usable_requirements(requirements)
+
     for index, candidate in enumerate(candidates):
         cid = one_line(candidate.candidate_id, 80)
         for dimension in DIMENSIONS:
@@ -310,12 +499,23 @@ def build_scoring_questions(
                 ),
                 "criteria": list(LEVELS),
             }
+        if not fit_usable:
+            continue
         questions[f"f{index}"] = {
             "type": "score",
             "instructions": (
-                f"Rate how well candidate '{cid}' FITS the owner requirements "
-                f"stated in the brief. Judge requirement alignment only, not "
-                f"visual merit."
+                f"Rate how well candidate '{cid}' SATISFIES the explicit "
+                f"requirements listed under 'Requirements' in the brief.\n"
+                f"For EACH numbered requirement, decide whether the attached "
+                f"screenshot(s) show it satisfied, partially satisfied, or "
+                f"absent. Base the score on how many requirements are satisfied "
+                f"and how completely.\n"
+                f"If a requirement cannot be judged from a screenshot, say so "
+                f"and do not count it as satisfied.\n"
+                f"Do NOT consider general visual attractiveness, polish, or "
+                f"design quality. A beautiful page that omits a required "
+                f"element must score LOW here.\n"
+                f"There are {len(usable)} requirements; judge every one."
             ),
             "criteria": list(LEVELS),
         }
@@ -328,12 +528,19 @@ def build_scoring_state(
     candidates: Sequence[DesignCandidate],
     include_scope_rule: bool = True,
     scope_rule: str = "",
+    requirements: Sequence[str] = (),
 ) -> list:
     """Build the multimodal ``state`` array.
 
     Text items are plain strings and image items are ``image_url`` parts, per the
     documented Decisions contract. EVERY interpolated value passes through
     ``one_line()`` so untrusted reference text cannot fabricate prompt structure.
+
+    ``requirements`` are rendered as a NUMBERED list under a ``Requirements:``
+    heading. Numbering is what makes the Fit question answerable
+    requirement-by-requirement; an unnumbered blob of prose is not. Each entry is
+    sanitised individually, so a requirement cannot inject extra numbered items
+    or a new section.
     """
     parts: list = []
 
@@ -348,6 +555,13 @@ def build_scoring_state(
     if include_scope_rule and scope_rule:
         header.append("  " + one_line(scope_rule, 600))
     parts.append("\n".join(header))
+
+    usable = usable_requirements(requirements)
+    if usable:
+        numbered = [f"Requirements:"]
+        for position, text in enumerate(usable, start=1):
+            numbered.append(f"  {position}. {text}")
+        parts.append("\n".join(numbered))
 
     for index, candidate in enumerate(candidates):
         parts.append(
@@ -403,13 +617,29 @@ def _score_of(answer: Any) -> Optional[Tuple[float, Optional[float]]]:
 def parse_pool_scores(
     payload: Mapping[str, Any],
     candidates: Sequence[DesignCandidate],
+    *,
+    expect_fit: bool = True,
 ) -> Tuple[CandidateScore, ...]:
     """Parse a full-pool response.
 
     ALL-OR-NOTHING: if any candidate is missing any answer, the whole response is
     rejected. A partially scored pool would let the engine rank a candidate whose
     evidence was never assessed against one that was.
+
+    ``expect_fit=False`` is the intentional-abstain path. When the requirement set
+    could not support a Fit judgement, no ``f<i>`` question was asked, so no Fit
+    answer exists. Returning a score here would mean inventing F, and returning a
+    plain ``incomplete_scores`` would report missing DATA as a provider failure.
+    Neither is honest, so this raises ``insufficient_requirements`` -- a distinct
+    status the provider maps to intentional abstention rather than degradation.
     """
+    if not expect_fit:
+        raise ScoringError(
+            STATUS_INSUFFICIENT_REQUIREMENTS,
+            "no requirement set sufficient for a Fit judgement; abstaining "
+            "rather than inventing an F score",
+        )
+
     answers = payload.get("answers") if isinstance(payload, Mapping) else None
     if not isinstance(answers, Mapping):
         raise ScoringError(STATUS_MALFORMED, "no answers object")

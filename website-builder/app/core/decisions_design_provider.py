@@ -21,7 +21,7 @@ because intake is a different role -- exactly the shape
 from __future__ import annotations
 
 import logging
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence, Tuple
 
 from app.core.decision_provider import (
     DecisionProviderError,
@@ -38,6 +38,7 @@ from app.core.design_scoring import (
     STATUS_ABSTAINED,
     STATUS_INSUFFICIENT_BRIEF,
     STATUS_INSUFFICIENT_EVIDENCE,
+    STATUS_INSUFFICIENT_REQUIREMENTS,
     STATUS_STALE_EVIDENCE,
     SUITABILITY_CONTRACT,
     ScoringError,
@@ -47,6 +48,7 @@ from app.core.design_scoring import (
     evidence_is_current,
     evidence_sufficient,
     parse_pool_scores,
+    requirements_are_sufficient,
 )
 
 logger = logging.getLogger(__name__)
@@ -168,6 +170,7 @@ class DecisionsDesignProvider:
         min_fit: float = 0.70,
         min_suitability: float = 0.75,
         dimension_floors: Optional[Mapping[str, float]] = None,
+        requirements: Sequence[str] = (),
     ) -> None:
         self.model = model
         #: Name-mangled and excluded from repr(), so logging the provider can
@@ -188,6 +191,10 @@ class DecisionsDesignProvider:
         self.dimension_floors = dict(
             dimension_floors or DEFAULT_DIMENSION_FLOORS
         )
+        #: N8 B7 calibration: the accepted requirement set from the native PRD.
+        #: Empty by default -- a provider built without requirements abstains on
+        #: Fit rather than inventing one.
+        self.requirements: Tuple[str, ...] = tuple(requirements or ())
         #: Set by the last call so telemetry can distinguish abstain vs failure.
         self.last_error_code = ""
         self.last_degraded = False
@@ -227,6 +234,7 @@ class DecisionsDesignProvider:
         brief: Mapping[str, Any],
         requirement_version: str,
         limit: int,
+        requirements: Sequence[str] = (),
     ) -> Sequence[DesignCandidate]:
         """Score the WHOLE eligible pool, or return nothing at all.
 
@@ -262,13 +270,22 @@ class DecisionsDesignProvider:
             self.last_error_code = STATUS_INSUFFICIENT_EVIDENCE
             return ()
 
+        # N8 B7 calibration: Fit is only assessed against requirements the native
+        # pipeline actually produced. When the set cannot support a defensible
+        # judgement this ABSTAINS -- it never scores Fit low. Missing
+        # requirements are missing DATA, not a design-quality failure, and a
+        # fabricated F would flow straight into the S gate as if it were real.
+        requirements = tuple(requirements or ())
+        fit_usable = requirements_are_sufficient(requirements)
+
         state = build_scoring_state(
             brief=brief,
             candidates=pool,
             include_scope_rule=self.include_scope_rule,
             scope_rule=SCOPE_RULE,
+            requirements=requirements,
         )
-        questions = build_scoring_questions(pool)
+        questions = build_scoring_questions(pool, requirements=requirements)
 
         result = post_decision(
             model=self.model,
@@ -291,10 +308,13 @@ class DecisionsDesignProvider:
             return ()
 
         try:
-            scores = parse_pool_scores(result.payload or {}, pool)
+            scores = parse_pool_scores(result.payload or {}, pool, expect_fit=fit_usable)
         except ScoringError as exc:
             self.last_error_code = exc.status
-            self.last_degraded = True
+            # ``insufficient_requirements`` is an INTENTIONAL abstention: nothing
+            # failed, the input was never sufficient. Marking it degraded would
+            # make a data gap look like a provider outage.
+            self.last_degraded = exc.status != STATUS_INSUFFICIENT_REQUIREMENTS
             logger.info(
                 "decisions design returned unusable scores",
                 extra={"n8_role": "design", "n8_model": self.model,
@@ -411,10 +431,22 @@ class DecisionsDesignProvider:
         # candidate in the pool carries the same value, which is what makes their
         # suitability scores comparable in the engine.
         requirement_version = ""
+        #: N8 B7 calibration: requirements arrive per-call from the native PRD
+        #: read in the build path. A per-call value overrides the constructor
+        #: default so one provider instance cannot leak requirements between
+        #: projects.
+        call_requirements: Tuple[str, ...] = tuple(
+            getattr(self, "requirements", ()) or ()
+        )
         if isinstance(context, Mapping):
             requirement_version = str(
                 context.get("requirement_version") or ""
             ).strip()
+            supplied = context.get("requirements")
+            if isinstance(supplied, Sequence) and not isinstance(
+                supplied, (str, bytes)
+            ):
+                call_requirements = tuple(str(x) for x in supplied)
 
         # N8 B7: when scoring is enabled, take the multimodal scoring path
         # unconditionally. It decides for itself whether any candidate has
@@ -428,6 +460,7 @@ class DecisionsDesignProvider:
                 brief=brief,
                 requirement_version=requirement_version,
                 limit=limit,
+                requirements=call_requirements,
             )
 
         state = build_design_state(

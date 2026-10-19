@@ -25,7 +25,7 @@ import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -766,6 +766,24 @@ class FrontendBuilder:
 
         query = _retrieval_query(brief)
 
+        # N8 B7 calibration: Fit must be judged against requirements the native
+        # pipeline actually produced, never against a hardcoded list. The PRD was
+        # compiled earlier in this same build from FAST's accepted brief, so read
+        # it back and extract its Requirements / Acceptance Criteria sections.
+        # When it yields nothing usable, ``requirements`` stays empty and the
+        # provider abstains on Fit with ``insufficient_requirements`` -- the
+        # honest outcome, not a fabricated score.
+        requirements: Tuple[str, ...] = ()
+        try:
+            from app.core.design_requirements import extract_requirements
+            from app.core.document_store import read_documents
+
+            prd_doc, _design_doc = read_documents(workspace)
+            if prd_doc is not None and prd_doc.text:
+                requirements, _reason = extract_requirements(prd_doc.text)
+        except Exception:  # noqa: BLE001 - requirement lookup never breaks a build
+            requirements = ()
+
         decision = None
         if self.decision_engine is not None:
             try:
@@ -796,6 +814,10 @@ class FrontendBuilder:
                         "brief": dict(brief),
                         # Ties requirement-fit to the exact brief revision.
                         "requirement_version": f"req-{requirements_version}",
+                        # N8 B7 calibration: the native requirement set, read
+                        # from this build's own PRD. Empty means "abstain on
+                        # Fit", never "score Fit low".
+                        "requirements": requirements,
                     }
                 )
             except Exception:  # noqa: BLE001 - engine never breaks the build
