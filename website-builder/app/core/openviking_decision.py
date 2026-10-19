@@ -25,9 +25,21 @@ are never overridden.
 from __future__ import annotations
 
 import logging
-from typing import Any, Mapping, Sequence, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from app.core.decision_provider import DesignCandidate
+from app.core.design_reference import (
+    DIMENSION_COLOR,
+    DIMENSION_CONSISTENCY,
+    DIMENSION_HIERARCHY,
+    DIMENSION_LAYOUT,
+    DIMENSION_TYPOGRAPHY,
+    DIMENSION_USABILITY,
+    EVIDENCE_NONE,
+    EVIDENCE_RENDERED,
+    EVIDENCE_STRUCTURAL,
+    SCREENSHOT_KINDS,
+)
 from app.core.openviking_library import CATEGORIES as _LIBRARY_CATEGORIES
 from app.core.openviking_retrieval import (
     OpenVikingConfig,
@@ -54,6 +66,64 @@ MAX_OPENVIKING_CANDIDATES = 6
 DESIGN_RETRIEVAL_CATEGORIES: Tuple[str, ...] = tuple(
     c for c in ("design_dna", "components", "motion") if c in _LIBRARY_CATEGORIES
 ) or _LIBRARY_CATEGORIES
+
+
+def _assets_from_result(result: Any) -> Dict[str, Sequence[Any]]:
+    """Pull the manifest sidecar's asset map off a retrieval result.
+
+    The D4a adapter surfaces the record sidecar; a reference manifest stores its
+    asset list there. Returns an empty map when nothing is present, so a
+    text-only library behaves exactly as before.
+    """
+    raw = getattr(result, "assets_by_uri", None)
+    if isinstance(raw, Mapping):
+        return {str(k): tuple(v) for k, v in raw.items() if v}
+    return {}
+
+
+def _bind_assets(
+    declared: Sequence[Any], source_revision: str
+) -> Tuple[Any, ...]:
+    """Return only the assets whose revision matches *source_revision*.
+
+    This is the binding rule: an asset produced for a different revision of the
+    source is STALE. It is dropped rather than attached, because attaching it
+    would show the model an image that no longer corresponds to the reference.
+    """
+    bound = []
+    for asset in declared:
+        revision = str(getattr(asset, "revision", "") or "").strip()
+        digest = str(getattr(asset, "digest", "") or "").strip()
+        kind = str(getattr(asset, "kind", "") or "").strip()
+        if revision != source_revision or not digest or kind not in SCREENSHOT_KINDS:
+            continue
+        bound.append(asset)
+    return tuple(bound)
+
+
+def _evidence_for_assets(bound: Sequence[Any]) -> Tuple[Tuple[str, str], ...]:
+    """Evidence class per rubric dimension, from BOUND assets only.
+
+    A screenshot is rendered evidence. Nothing here can manufacture structural
+    or interactive evidence: those require measurements and observations that
+    an image alone does not provide.
+    """
+    if not bound:
+        return tuple(
+            (dim, EVIDENCE_NONE)
+            for dim in (
+                DIMENSION_HIERARCHY, DIMENSION_TYPOGRAPHY, DIMENSION_LAYOUT,
+                DIMENSION_COLOR, DIMENSION_USABILITY, DIMENSION_CONSISTENCY,
+            )
+        )
+    return (
+        (DIMENSION_HIERARCHY, EVIDENCE_RENDERED),
+        (DIMENSION_TYPOGRAPHY, EVIDENCE_RENDERED),
+        (DIMENSION_LAYOUT, EVIDENCE_RENDERED),
+        (DIMENSION_COLOR, EVIDENCE_RENDERED),
+        (DIMENSION_USABILITY, EVIDENCE_RENDERED),
+        (DIMENSION_CONSISTENCY, EVIDENCE_RENDERED),
+    )
 
 
 class OpenVikingDecisionProvider:
@@ -158,17 +228,20 @@ class OpenVikingDecisionProvider:
             return ()
 
         items = getattr(result, "items", ()) or ()
+        assets_by_uri = _assets_from_result(result)
         candidates: list = []
         for item in items:
             if len(candidates) >= min(limit, MAX_OPENVIKING_CANDIDATES):
                 break
-            candidate = self._to_candidate(item)
+            candidate = self._to_candidate(item, assets_by_uri)
             if candidate is not None:
                 candidates.append(candidate)
         return tuple(candidates)
 
     @staticmethod
-    def _to_candidate(item: Any) -> DesignCandidate | None:
+    def _to_candidate(
+        item: Any, assets_by_uri: Optional[Mapping[str, Sequence[Any]]] = None
+    ) -> DesignCandidate | None:
         """Convert one retrieved item to a candidate, or drop it.
 
         A drop happens when provenance is incomplete. The retrieved item is
@@ -200,15 +273,31 @@ class OpenVikingDecisionProvider:
         # Honest, non-fabricated annotation: reviewed content carries none;
         # anything lower-trust is labelled so the engine/caller can see it.
         uncertainty = "" if trust in ("", "reviewed") else f"trust={trust}"
+
+        # N8 B4: bind the reference's assets, but ONLY those whose revision
+        # matches this item's source_revision. A stale asset is not attached:
+        # the candidate simply carries no visual evidence, and a scorer must
+        # then refuse to judge visual quality rather than judge the wrong image.
+        bound = _bind_assets(
+            (assets_by_uri or {}).get(source_uri, ()), source_revision
+        )
+        evidence = _evidence_for_assets(bound)
+
         return DesignCandidate(
             candidate_id=source_id,
             label=label,
             descriptor=descriptor,
+            # A reference's palette is DECLARED metadata, not visual evidence.
+            # It is deliberately NOT promoted into the candidate: only assets
+            # bound by digest may raise an evidence class.
             palette=(),
             source_uri=source_uri,
             source_revision=source_revision,
             score=score if isinstance(score, (int, float)) else 0.0,
             uncertainty=uncertainty,
+            evidence=evidence,
+            evidence_revision=source_revision if bound else "",
+            assets=bound,
         )
 
 
