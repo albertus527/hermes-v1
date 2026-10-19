@@ -50,6 +50,8 @@ from app.core.requirement_creator import (
     compile_design,
     compile_prd,
 )
+from app.core.requirement_artifact_builder import build_artifact_from_brief
+from app.core.design_requirement_artifact import write_requirement_artifact
 from app.core.document_store import (
     DEPLOYMENT_DOCUMENTS_KEY,
     document_records,
@@ -719,6 +721,36 @@ class FrontendBuilder:
         except (ValueError, OSError) as exc:
             self._record_document_failure(project_id, revision, exc, kind="prd")
             return
+
+        # N9: emit the structured requirement artifact alongside the PRD.
+        #
+        # ORDER MATTERS. The PRD is written FIRST and the artifact SECOND. If the
+        # process dies between the two writes the workspace holds a new PRD beside
+        # a missing or stale artifact, which the consumer detects
+        # (verify_artifact_matches_prd) and repairs by re-emitting from the brief.
+        # The reverse order would leave a fresh artifact pointing at a stale PRD,
+        # which is indistinguishable from a legitimate build.
+        #
+        # document_store guarantees atomicity PER FILE only (temp + os.replace);
+        # store_documents writes each kind with its own replace, so this pair is
+        # NOT a cross-file transaction. Recovery is detect-and-rewrite, and the
+        # detection is what makes that safe.
+        try:
+            artifact = build_artifact_from_brief(
+                brief,
+                project_id=project_id,
+                source_revision=revision,
+                requirements_version=requirements_version,
+            )
+            write_requirement_artifact(workspace, artifact)
+        except (ValueError, OSError) as exc:
+            # The PRD is already durable; a missing artifact only means Fit will
+            # abstain, which is the honest outcome and never a build failure.
+            logger.warning(
+                "requirement artifact emission failed for %s: %s",
+                project_id, type(exc).__name__,
+            )
+
         self._record_documents(project_id, revision, prd=prd)
 
     def _prepare_prebuild_design(
@@ -766,21 +798,56 @@ class FrontendBuilder:
 
         query = _retrieval_query(brief)
 
-        # N8 B7 calibration: Fit must be judged against requirements the native
-        # pipeline actually produced, never against a hardcoded list. The PRD was
-        # compiled earlier in this same build from FAST's accepted brief, so read
-        # it back and extract its Requirements / Acceptance Criteria sections.
-        # When it yields nothing usable, ``requirements`` stays empty and the
-        # provider abstains on Fit with ``insufficient_requirements`` -- the
-        # honest outcome, not a fabricated score.
+        # N8 B7 calibration / N9: Fit must be judged against requirements the
+        # native pipeline actually produced, never against a hardcoded list.
+        #
+        # The structured artifact is authoritative. If it is present and its
+        # revision linkage matches this PRD, its screenshot-scorable entries are
+        # used. If it is missing, stale, inconsistent or corrupt, the build does
+        # NOT silently fall back to PRD bullets: those mix project requirements
+        # with compiler boilerplate, and scoring Fit against boilerplate is the
+        # exact failure this replaces. The fallback is abstention.
+        #
+        # Recovery: when the artifact is absent or mismatched, re-emit it from the
+        # brief (idempotent -- the digest is deterministic) and use the result. A
+        # crash between the PRD write and the artifact write is therefore repaired
+        # on the next build rather than papered over.
         requirements: Tuple[str, ...] = ()
         try:
-            from app.core.design_requirements import extract_requirements
+            from app.core.design_requirement_artifact import (
+                REASON_OK,
+                read_requirement_artifact,
+                verify_artifact_matches_prd,
+            )
+            from app.core.design_requirements import requirements_for_fit
             from app.core.document_store import read_documents
 
             prd_doc, _design_doc = read_documents(workspace)
-            if prd_doc is not None and prd_doc.text:
-                requirements, _reason = extract_requirements(prd_doc.text)
+            prd_text = prd_doc.text if prd_doc is not None else ""
+
+            artifact = read_requirement_artifact(workspace)
+            needs_repair = artifact is None
+            if artifact is not None and prd_text:
+                linked, _why = verify_artifact_matches_prd(artifact, prd_text)
+                needs_repair = not linked
+
+            if needs_repair:
+                artifact = build_artifact_from_brief(
+                    brief,
+                    project_id=project_id,
+                    source_revision=revision,
+                    requirements_version=requirements_version,
+                )
+                write_requirement_artifact(workspace, artifact)
+                logger.info(
+                    "requirement artifact re-emitted for %s (idempotent repair)",
+                    project_id,
+                )
+
+            if artifact is not None and prd_text:
+                linked, _why = verify_artifact_matches_prd(artifact, prd_text)
+                if linked:
+                    requirements, _reason = requirements_for_fit(workspace)
         except Exception:  # noqa: BLE001 - requirement lookup never breaks a build
             requirements = ()
 
