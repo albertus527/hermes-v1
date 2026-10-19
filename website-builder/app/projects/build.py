@@ -751,6 +751,11 @@ class FrontendBuilder:
         with self.store.acquire_writer(project_id) as state:
             revision = state.revisions.source_revision
             guidance_version = state.revisions.design_guidance_version
+            # N8 B5: the REQUIREMENT revision this guidance is scored against.
+            # This is the brief's own revision counter -- NOT the OpenViking
+            # reference revision -- so a suitability score can be tied to the
+            # exact requirements it was judged against.
+            requirements_version = state.revisions.requirements_version
 
         # V3-B: the retrieval query carries the project DOMAIN, the intended
         # AESTHETIC (the owner's own design-intent words), and the page type /
@@ -764,6 +769,16 @@ class FrontendBuilder:
         decision = None
         if self.decision_engine is not None:
             try:
+                # N8 B5: retrieval happens ONCE, here, and the resulting
+                # candidates are handed to whichever design provider is
+                # configured. Before this, no caller populated "candidates", so
+                # a Decisions Design provider abstained on every single call.
+                candidates = self._retrieve_design_candidates(
+                    query=query,
+                    library_project_id=(
+                        self.decision_engine_config.design_library_project_id
+                    ),
+                )
                 decision = self.decision_engine.decide_design(
                     {
                         "query": query,
@@ -775,6 +790,12 @@ class FrontendBuilder:
                         "library_project_id": (
                             self.decision_engine_config.design_library_project_id
                         ),
+                        # N8 B5: one explicit candidate contract, shared by the
+                        # native retrieval provider and the Decisions provider.
+                        "candidates": candidates,
+                        "brief": dict(brief),
+                        # Ties requirement-fit to the exact brief revision.
+                        "requirement_version": f"req-{requirements_version}",
                     }
                 )
             except Exception:  # noqa: BLE001 - engine never breaks the build
@@ -867,6 +888,39 @@ class FrontendBuilder:
                 "N6-E: invalidated stale post-build Design.md for %s before FRONTEND",
                 project_id,
             )
+
+    def _retrieve_design_candidates(
+        self,
+        *,
+        query: str,
+        library_project_id: str,
+    ) -> list:
+        """Retrieve design candidates ONCE, for any configured design provider.
+
+        N8 B5: this is the single retrieval seam. The Decisions Design provider
+        does no retrieval of its own, so a build retrieves exactly once and every
+        provider consumes the same list -- which is also what makes candidate ids
+        and their provenance comparable across providers.
+
+        Fail-safe: a retrieval problem yields an empty list. The engine then
+        abstains honestly rather than failing the build, and a provider that
+        receives no candidates returns ``()`` instead of inventing one.
+        """
+        provider = getattr(self.decision_engine, "provider", None)
+        if provider is None:
+            return []
+        retrieve = getattr(provider, "propose_design_candidates", None)
+        if not callable(retrieve):
+            return []
+        try:
+            candidates = retrieve(
+                {"query": query, "library_project_id": library_project_id},
+                limit=self.decision_engine_config.max_candidates,
+            )
+        except Exception:  # noqa: BLE001 - retrieval never breaks a build
+            logger.warning("design candidate retrieval failed", exc_info=True)
+            return []
+        return list(candidates or ())
 
     def _compile_and_store_design(
         self,

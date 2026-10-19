@@ -228,6 +228,15 @@ class DecisionsDesignProvider:
         brief = context.get("brief") if isinstance(context, Mapping) else None
         brief = brief if isinstance(brief, Mapping) else {}
 
+        # N8 B5: the requirement revision this fit judgement is tied to. Every
+        # candidate in the pool carries the same value, which is what makes their
+        # suitability scores comparable in the engine.
+        requirement_version = ""
+        if isinstance(context, Mapping):
+            requirement_version = str(
+                context.get("requirement_version") or ""
+            ).strip()
+
         state = build_design_state(
             brief=brief,
             candidates=real,
@@ -305,6 +314,7 @@ class DecisionsDesignProvider:
                         source_revision=candidate.source_revision,
                         score=_DOMINANT_SCORE,
                         uncertainty=candidate.uncertainty,
+                        requirement_version=requirement_version,
                     )
                 )
             else:
