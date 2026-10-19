@@ -17,18 +17,57 @@ Design constraints (owner-mandated):
 * **Fail closed.** Every non-200, unparseable body, or over-deadline call returns
   a structured failure. Callers translate that into "use FAST" -- never into an
   acting label.
+* **Text and multimodal, one contract.** ``state`` may be a string, a JSON
+  object, or an array of parts carrying ``image_url`` media. Every payload is
+  validated locally before transmission, so an unsupported or oversized payload
+  never reaches the provider and never becomes an opaque 400.
 """
 from __future__ import annotations
 
+import base64
 import json
 import threading
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Mapping, Optional, Tuple
+from typing import Any, Mapping, Optional, Sequence, Tuple, Union
 
 #: Default endpoint. Overridable by configuration; never user input.
 DEFAULT_BASE_URL = "https://openrouter.ai/api/alpha/decisions"
+
+#: The Decisions ``state`` payload.
+#:
+#: The documented contract accepts a plain string, a JSON object, or an ARRAY of
+#: parts. Media parts are::
+#:
+#:     {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
+#:
+#: Remote ``http(s)`` URLs are NOT fetched by the API, so a non-``data:`` url is
+#: rejected locally rather than surfacing as an opaque 400.
+StatePayload = Union[str, Mapping[str, Any], Sequence[Any]]
+
+#: Bounded resource limits for multimodal payloads.
+#:
+#: Deliberately BELOW the documented provider ceilings (200 questions per
+#: request, 128 images for GPT-6 Luna Decisions) so a regression cannot silently
+#: walk into the provider's own limit.
+MAX_QUESTION_COUNT = 64
+MAX_IMAGES_PER_REQUEST = 32
+#: One image, measured as DECODED bytes (not base64 length).
+MAX_IMAGE_BYTES = 2 * 1024 * 1024
+#: Total decoded state: text bytes plus decoded image bytes.
+MAX_STATE_BYTES = 8 * 1024 * 1024
+#: The serialised request body, which base64 inflation can push past the
+#: decoded-size checks above.
+MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024
+
+#: Image MIME types the Decisions contract accepts.
+ALLOWED_IMAGE_MIME: Tuple[str, ...] = ("image/png", "image/jpeg", "image/webp")
+
+#: ``data:`` URL prefixes that correspond to the allowed MIME types.
+_ALLOWED_DATA_PREFIXES: Tuple[str, ...] = tuple(
+    f"data:{mime};base64," for mime in ALLOWED_IMAGE_MIME
+)
 
 #: Total wall-clock deadline for one Decisions call, in seconds.
 #:
@@ -43,6 +82,14 @@ TIMEOUT = "timeout"
 HTTP_ERROR = "http_error"
 MALFORMED = "malformed"
 TRANSPORT_ERROR = "transport_error"
+
+#: Payload-validation codes. These are returned BEFORE any network call, so an
+#: unacceptable payload can never reach the provider.
+UNSUPPORTED_STATE = "unsupported_state"
+TOO_MANY_QUESTIONS = "too_many_questions"
+TOO_MANY_IMAGES = "too_many_images"
+PAYLOAD_TOO_LARGE = "payload_too_large"
+INVALID_IMAGE_PART = "invalid_image_part"
 
 #: Redaction marker.
 _REDACTED = "[REDACTED]"
@@ -161,10 +208,76 @@ def _post_once(
         return None, b"", f"{type(exc).__name__}: {exc}"
 
 
+def validate_state_payload(state: StatePayload, questions: Mapping[str, Any]) -> str:
+    """Return a stable error code, or ``""`` when the payload is sendable.
+
+    Runs BEFORE the request is issued, so an unacceptable payload can never
+    reach the network. Every branch is bounded by an application-owned
+    constant -- no server hint is trusted.
+
+    The accepted shapes follow the documented Decisions contract: a plain
+    string, a JSON object, or an array of parts where media parts are
+    ``{"type": "image_url", "image_url": {"url": "data:image/...;base64,..."}}``.
+    """
+    if not isinstance(questions, Mapping):
+        return UNSUPPORTED_STATE
+    if len(questions) > MAX_QUESTION_COUNT:
+        return TOO_MANY_QUESTIONS
+
+    if isinstance(state, str):
+        return PAYLOAD_TOO_LARGE if len(state.encode("utf-8")) > MAX_STATE_BYTES else ""
+
+    if isinstance(state, Mapping):
+        parts: Sequence[Any] = (state,)
+    elif isinstance(state, (list, tuple)):
+        parts = state
+    else:
+        # ``bytes``, ``set``, ``None``, numbers: not a documented state shape.
+        return UNSUPPORTED_STATE
+
+    images = 0
+    decoded_total = 0
+    for part in parts:
+        if isinstance(part, str):
+            decoded_total += len(part.encode("utf-8"))
+            continue
+        if not isinstance(part, Mapping):
+            return UNSUPPORTED_STATE
+        if part.get("type") != "image_url":
+            # A non-image mapping is legitimate JSON context, not a media part.
+            continue
+
+        images += 1
+        if images > MAX_IMAGES_PER_REQUEST:
+            return TOO_MANY_IMAGES
+
+        container = part.get("image_url")
+        if not isinstance(container, Mapping):
+            return INVALID_IMAGE_PART
+        url = container.get("url")
+        if not isinstance(url, str):
+            return INVALID_IMAGE_PART
+        prefix = next((p for p in _ALLOWED_DATA_PREFIXES if url.startswith(p)), None)
+        if prefix is None:
+            # Rejects remote http(s) urls, bare base64, and unsupported MIME.
+            return INVALID_IMAGE_PART
+        try:
+            raw = base64.b64decode(url[len(prefix):], validate=True)
+        except Exception:  # noqa: BLE001 - any decode fault is a malformed part
+            return INVALID_IMAGE_PART
+        if len(raw) > MAX_IMAGE_BYTES:
+            return PAYLOAD_TOO_LARGE
+        decoded_total += len(raw)
+
+    if decoded_total > MAX_STATE_BYTES:
+        return PAYLOAD_TOO_LARGE
+    return ""
+
+
 def post_decision(
     *,
     model: str,
-    state: str,
+    state: StatePayload,
     questions: Mapping[str, Any],
     api_key: str,
     base_url: str = DEFAULT_BASE_URL,
@@ -177,15 +290,26 @@ def post_decision(
 
     The total wall-clock deadline is enforced by joining a worker thread, so a
     peer that stalls mid-read cannot exceed it.
+
+    ``state`` may be text or a multimodal array. It is validated locally first;
+    an unacceptable payload returns a validation code and never touches the
+    network.
     """
     if not model or not isinstance(model, str):
         return DecisionsResult(TRANSPORT_ERROR, error_code="invalid_model")
     if not api_key:
         return DecisionsResult(TRANSPORT_ERROR, error_code="missing_credential")
 
+    invalid = validate_state_payload(state, questions)
+    if invalid:
+        return DecisionsResult(TRANSPORT_ERROR, error_code=invalid)
+
     body = json.dumps(
         {"model": model, "state": state, "questions": dict(questions)}
     ).encode("utf-8")
+    if len(body) > MAX_REQUEST_BODY_BYTES:
+        # Base64 inflation can exceed the decoded-size checks above.
+        return DecisionsResult(TRANSPORT_ERROR, error_code=PAYLOAD_TOO_LARGE)
 
     box: dict = {}
     started = time.monotonic()
@@ -306,12 +430,25 @@ def resolved_model_id(payload: Mapping[str, Any]) -> str:
 __all__ = [
     "DEFAULT_BASE_URL",
     "DEFAULT_DEADLINE_SECONDS",
+    "StatePayload",
+    "MAX_QUESTION_COUNT",
+    "MAX_IMAGES_PER_REQUEST",
+    "MAX_IMAGE_BYTES",
+    "MAX_STATE_BYTES",
+    "MAX_REQUEST_BODY_BYTES",
+    "ALLOWED_IMAGE_MIME",
     "OK",
     "TIMEOUT",
     "HTTP_ERROR",
     "MALFORMED",
     "TRANSPORT_ERROR",
+    "UNSUPPORTED_STATE",
+    "TOO_MANY_QUESTIONS",
+    "TOO_MANY_IMAGES",
+    "PAYLOAD_TOO_LARGE",
+    "INVALID_IMAGE_PART",
     "DecisionsResult",
+    "validate_state_payload",
     "post_decision",
     "extract_choice",
     "resolved_model_id",
