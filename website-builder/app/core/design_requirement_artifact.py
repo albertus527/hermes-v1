@@ -184,6 +184,15 @@ class RequirementArtifact:
     entries: Tuple[RequirementEntry, ...] = ()
     assumptions: Tuple[Mapping[str, Any], ...] = ()
     unresolved: Tuple[Mapping[str, Any], ...] = ()
+    #: sha256 of the exact PRD text this artifact was derived from.
+    #:
+    #: The three linkage fields above are not sufficient on their own: a PRD can
+    #: be recompiled with different content while the revision counter happens
+    #: to be unchanged (a retried build, a manual re-run, a restored workspace).
+    #: In that case project_id/revision/version all match and the artifact is
+    #: silently stale. The digest closes that hole. Empty means "not recorded",
+    #: which is treated as unverifiable rather than as a match.
+    prd_digest: str = ""
     schema_version: int = ARTIFACT_SCHEMA_VERSION
 
     def to_dict(self) -> dict:
@@ -192,6 +201,7 @@ class RequirementArtifact:
             "project_id": self.project_id,
             "source_revision": self.source_revision,
             "requirements_version": self.requirements_version,
+            "prd_digest": self.prd_digest,
             "entries": [e.to_dict() for e in self.entries],
             "assumptions": [dict(a) for a in self.assumptions],
             "unresolved": [dict(u) for u in self.unresolved],
@@ -282,6 +292,7 @@ def parse_artifact(data: Any) -> RequirementArtifact:
         project_id=project_id,
         source_revision=source_revision,
         requirements_version=requirements_version,
+        prd_digest=str(data.get("prd_digest") or ""),
         entries=tuple(entries),
         assumptions=_side("assumptions"),
         unresolved=_side("unresolved"),
@@ -357,6 +368,15 @@ def verify_artifact_matches_prd(
             return False, REASON_REVISION_MISMATCH
     except (TypeError, ValueError):
         return False, REASON_REVISION_MISMATCH
+
+    # The linkage fields are necessary but not sufficient: a recompiled PRD can
+    # carry the same three values while its content has changed. Compare the
+    # digest when the artifact recorded one. An empty digest means the artifact
+    # predates this check, so it is unverifiable -- not a match.
+    if artifact.prd_digest:
+        expected = hashlib.sha256(prd_text.encode("utf-8")).hexdigest()
+        if artifact.prd_digest != expected:
+            return False, REASON_REVISION_MISMATCH
     return True, REASON_OK
 
 

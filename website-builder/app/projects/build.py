@@ -741,6 +741,7 @@ class FrontendBuilder:
                 project_id=project_id,
                 source_revision=revision,
                 requirements_version=requirements_version,
+                prd_text=prd_text,
             )
             write_requirement_artifact(workspace, artifact)
         except (ValueError, OSError) as exc:
@@ -837,6 +838,7 @@ class FrontendBuilder:
                     project_id=project_id,
                     source_revision=revision,
                     requirements_version=requirements_version,
+                    prd_text=prd_text,
                 )
                 write_requirement_artifact(workspace, artifact)
                 logger.info(

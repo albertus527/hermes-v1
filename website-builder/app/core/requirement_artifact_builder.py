@@ -25,6 +25,7 @@ Fit abstains. That is the correct outcome.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from typing import Any, List, Mapping, Sequence, Tuple
 
@@ -129,6 +130,7 @@ def build_artifact_from_brief(
     project_id: str,
     source_revision: int,
     requirements_version: int,
+    prd_text: str = "",
 ) -> RequirementArtifact:
     """Derive the structured artifact from FAST's accepted brief.
 
@@ -136,6 +138,10 @@ def build_artifact_from_brief(
     because the artifact digest is what a build records. Entries are therefore
     emitted in a fixed order (content, style, behaviour) with ids assigned by
     position, and no timestamps or counters are used.
+
+    ``prd_text`` is the compiled PRD this artifact belongs to. Its digest is
+    recorded so a later consumer can tell "same revision" from "same content" --
+    the three linkage fields alone cannot distinguish those.
     """
     entries: List[RequirementEntry] = []
     assumptions: List[Mapping[str, Any]] = []
@@ -246,6 +252,9 @@ def build_artifact_from_brief(
         project_id=project_id,
         source_revision=source_revision,
         requirements_version=requirements_version,
+        prd_digest=(
+            hashlib.sha256(prd_text.encode("utf-8")).hexdigest() if prd_text else ""
+        ),
         entries=tuple(entries),
         assumptions=tuple(assumptions),
         unresolved=tuple(unresolved),
