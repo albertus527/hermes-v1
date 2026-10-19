@@ -338,50 +338,46 @@ DIMENSION_GUIDANCE: Mapping[str, Mapping[str, str]] = {
             "distinguishable from body text, whether the eye has an obvious path "
             "through the page, and whether secondary elements recede"
         ),
-        "not": (
-            "whitespace amount, margins, padding, grid alignment, colour, or "
-            "contrast"
-        ),
-        "why": (
-            "a cramped page can still have excellent hierarchy, and a spacious "
-            "page can have none"
-        ),
+        "not": "spacing, colour, or contrast",
+        "why": "",
     },
     DIMENSION_LAYOUT: {
         "only": (
-            "grid structure, alignment, margins, padding, gaps, whitespace "
-            "balance, and spacing consistency: whether elements align to a "
-            "coherent grid, whether margins and gaps are consistent between "
-            "sections, and whether whitespace looks deliberate rather than "
-            "accidental"
+            "spacing rhythm and spacing consistency: whether the gaps between "
+            "sections repeat a recognisable scale, whether margins and padding "
+            "are consistent between comparable blocks, whether elements align to "
+            "a coherent grid, and whether whitespace looks deliberate"
         ),
-        "not": (
-            "heading size or weight, text priority, typeface choice, or colour"
-        ),
-        "why": (
-            "a page with flat type can still have perfect spacing, and a page "
-            "with strong type can have chaotic spacing"
-        ),
+        "not": "typography or colour",
+        "why": "",
+        "secondary": "grid structure and alignment",
     },
     DIMENSION_TYPOGRAPHY: {
         "only": (
             "typeface choice and suitability, size scale, weight variation, "
-            "line-height, line length, and legibility"
+            "line-height, line length, and legibility of the text itself"
         ),
-        "not": "page-level alignment, margins, spacing rhythm, or colour contrast",
-        "why": (
-            "type quality is a property of the text itself, not of where the "
-            "blocks sit on the page"
-        ),
+        "not": "page-level alignment, margins, spacing rhythm, or colour",
+        "why": "",
     },
     DIMENSION_COLOR: {
         "only": (
-            "palette coherence and whether text appears readable against its "
-            "background"
+            "foreground/background readability: whether body text, headings, "
+            "labels and button text are comfortably legible against the surface "
+            "behind them, and whether any text visibly washes out or disappears"
         ),
         "not": "layout, spacing, or type size",
-        "why": (
-            "a colour defect is visible as hue or lightness, not as geometry"
+        "why": "",
+        # N8 B7 calibration v2: readability is PRIMARY and outweighs palette
+        # harmony. The previous wording made palette coherence a co-equal
+        # conjunct, which let it average a legibility failure away: the D2
+        # contrast fixture kept an identical palette and moved only the ink
+        # lightness, so "coherent palette" scored it well while "readable text"
+        # scored it badly, and the two cancelled. Sensitivity fell from -0.568
+        # to -0.023. Palette harmony stays, but it can never rescue a legibility
+        # failure.
+        "secondary": (
+            "palette harmony, which cannot compensate for illegible text"
         ),
     },
     DIMENSION_USABILITY: {
@@ -391,9 +387,7 @@ DIMENSION_GUIDANCE: Mapping[str, Mapping[str, str]] = {
             "is obvious"
         ),
         "not": "aesthetic quality, colour harmony, spacing, or typeface choice",
-        "why": (
-            "usability here means affordance legibility, not visual appeal"
-        ),
+        "why": "",
     },
     DIMENSION_CONSISTENCY: {
         "only": (
@@ -401,14 +395,8 @@ DIMENSION_GUIDANCE: Mapping[str, Mapping[str, str]] = {
             "and between the attached viewports, and whether visible style "
             "inconsistencies exist"
         ),
-        "not": (
-            "whether the design is attractive, or whether a particular style "
-            "choice is good"
-        ),
-        "why": (
-            "consistency compares this design against itself, never against an "
-            "ideal"
-        ),
+        "not": "whether the design is attractive, or whether a style choice is good",
+        "why": "",
     },
 }
 
@@ -430,12 +418,18 @@ DIMENSION_LIMITS: Mapping[str, str] = {
 
 
 def _dimension_instruction(dimension: str) -> str:
-    """The per-dimension instruction: definition, exclusions, then honesty limit.
+    """The per-dimension instruction: primary criterion, exclusions, honesty limit.
 
-    Ordering is deliberate. The inclusion clause comes first so the model has a
-    positive target; the exclusion clause follows immediately so the boundary is
-    established while the definition is still in view; the honesty limit comes
-    last so it qualifies the answer rather than the task.
+    Ordering is deliberate. The primary clause comes first so the model has a
+    positive target. The exclusion follows immediately, stated briefly and with
+    NO worked example: an exclusion that describes the confounder in detail hands
+    the model a concrete thing to notice, which is the opposite of suppressing it.
+    Measured on the L1 run, the layout instruction's worked example ("a page with
+    flat type can still have perfect spacing") coincided with layout scoring the
+    flat-type fixture lowest of all -- the example primed the very confound it was
+    meant to exclude.
+
+    The honesty limit comes last so it qualifies the answer rather than the task.
     """
     guidance = DIMENSION_GUIDANCE.get(dimension)
     label = dimension.upper()
@@ -459,9 +453,17 @@ def _dimension_instruction(dimension: str) -> str:
     parts = [
         f"Rate the {label} of candidate {{{{cid}}}} from the attached "
         f"screenshot(s) only.",
-        f"Judge ONLY: {guidance['only']}.",
-        f"Do NOT judge: {guidance['not']} -- {guidance['why']}.",
+        f"Judge PRIMARILY: {guidance['only']}.",
     ]
+    secondary = guidance.get("secondary")
+    if secondary:
+        parts.append(f"Judge SECONDARILY: {secondary}.")
+    exclusion = f"Do NOT judge: {guidance['not']}."
+    why = guidance.get("why")
+    if why:
+        exclusion = f"Do NOT judge: {guidance['not']} -- {why}."
+    parts.append(exclusion)
+
     limit = DIMENSION_LIMITS.get(dimension)
     if limit:
         parts.append(limit)

@@ -67,7 +67,7 @@ def _q(dimension: str) -> str:
 
 @pytest.mark.parametrize("dimension", DIMS)
 def test_every_dimension_states_what_to_judge(dimension):
-    assert "Judge ONLY:" in _q(dimension)
+    assert "Judge PRIMARILY:" in _q(dimension)
 
 
 @pytest.mark.parametrize("dimension", DIMS)
@@ -75,10 +75,47 @@ def test_every_dimension_states_what_not_to_judge(dimension):
     assert "Do NOT judge:" in _q(dimension)
 
 
-@pytest.mark.parametrize("dimension", DIMS)
-def test_every_dimension_gives_a_reason_for_the_boundary(dimension):
-    """A boundary with no rationale is easy to ignore; the '--' clause is why."""
-    assert " -- " in _q(dimension)
+def test_exclusion_has_no_worked_example():
+    """An exclusion that describes the confounder hands the model a thing to notice.
+
+    The L1 layout prompt ended with a worked example ("a page with flat type can
+    still have perfect spacing"). Measured, layout then scored the flat-type
+    fixture lowest of all -- the example primed the confound it was meant to
+    exclude. Every exclusion must now be a bare boundary, no illustration.
+    """
+    for dimension in DIMS:
+        exclusion = _q(dimension).split("Do NOT judge:", 1)[1].split("\n")[0].strip()
+        # One clause, one terminal full stop. A second sentence would be a
+        # worked example, which is what primed the confounder in L1.
+        assert exclusion.count(".") == 1, (dimension, exclusion)
+        assert len(exclusion) < 120, (dimension, exclusion)
+
+
+def test_color_states_readability_is_primary():
+    text = _q("color")
+    primary = text.split("Judge PRIMARILY:", 1)[1].split("Judge SECONDARILY:")[0]
+    assert "readability" in primary.lower()
+
+
+def test_color_palette_is_secondary_and_cannot_rescue_legibility():
+    text = _q("color")
+    assert "Judge SECONDARILY:" in text
+    secondary = text.split("Judge SECONDARILY:", 1)[1]
+    assert "palette" in secondary.lower()
+    assert "cannot compensate" in secondary.lower()
+
+
+def test_layout_states_rhythm_is_primary():
+    text = _q("layout")
+    primary = text.split("Judge PRIMARILY:", 1)[1].split("Judge SECONDARILY:")[0]
+    assert "rhythm" in primary.lower()
+
+
+def test_layout_exclusion_does_not_name_type_size_example():
+    """The L1 exclusion said 'a page with flat type ...'. That must be gone."""
+    text = _q("layout")
+    assert "flat type" not in text.lower()
+    assert "chaotic spacing" not in text.lower()
 
 
 def test_hierarchy_defines_attention_ordering():
@@ -88,11 +125,9 @@ def test_hierarchy_defines_attention_ordering():
 
 
 def test_hierarchy_excludes_spacing():
-    """Spacing belongs to layout. The exclusion must be explicit."""
-    text = _q("hierarchy")
-    tail = text.split("Do NOT judge:", 1)[1]
-    assert "margins" in tail
-    assert "padding" in tail
+    """Spacing belongs to layout. The exclusion is brief but must cover it."""
+    tail = _q("hierarchy").split("Do NOT judge:", 1)[1]
+    assert "spacing" in tail
 
 
 def test_layout_owns_grid_and_spacing():
@@ -103,18 +138,16 @@ def test_layout_owns_grid_and_spacing():
     assert "spacing consistency" in head
 
 
-def test_layout_excludes_type_size():
-    """Heading size belongs to hierarchy/typography, not layout."""
+def test_layout_excludes_typography():
+    """Type belongs to hierarchy/typography, not layout."""
     tail = _q("layout").split("Do NOT judge:", 1)[1]
-    assert "heading size" in tail
+    assert "typography" in tail
 
 
 def test_hierarchy_and_layout_are_mutually_exclusive():
     """Each must name the other's territory as out of scope."""
-    h = _q("hierarchy")
-    l = _q("layout")
-    assert "margins" in h.split("Do NOT judge:", 1)[1]
-    assert "heading size" in l.split("Do NOT judge:", 1)[1]
+    assert "spacing" in _q("hierarchy").split("Do NOT judge:", 1)[1]
+    assert "typography" in _q("layout").split("Do NOT judge:", 1)[1]
 
 
 def test_no_two_dimension_instructions_are_identical():
