@@ -144,10 +144,21 @@ JSON.stringify((() => {
       }
       node = node.parentElement;
       depth += 1;
+
+      // An UNSUPPORTED composite is not merely uncertain: it is a case where
+      // the true background cannot be derived at all. The walk must not
+      // continue past it to an ancestor and pair the text with a surface it
+      // is not actually painted on.
+      if (unsupported) {
+        return {ok: false, color: null, uncertain: true, unsupported: true,
+                reason: reason || 'unsupported_composite'};
+      }
+      return {ok: false, color: null, uncertain: true, unsupported: false,
+              reason: reason || 'no_opaque_background'};
     }
-    return {ok: false, color: null, uncertain: true, unsupported: unsupported,
+      return {ok: false, color: null, uncertain: true, unsupported: false,
             reason: reason || 'no_opaque_background'};
-  }
+      }
 
   const body = document.body;
   if (!body) return {ok: false, error: 'no_body'};
