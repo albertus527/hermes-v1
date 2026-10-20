@@ -33,6 +33,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional, Protocol, Sequence, Tuple
 
+from app.core.design_reference import StructuralEvidence
+
 # ---------------------------------------------------------------------------
 # Stable status / error codes
 # ---------------------------------------------------------------------------
@@ -131,6 +133,18 @@ class DesignCandidate:
     #: The REQUIREMENT revision the requirement-fit score was computed against.
     #: This is the brief's own revision, not the reference's.
     requirement_version: str = ""
+    #: TYPED, BOUND measurements for this candidate, when they exist.
+    #:
+    #: ``evidence`` above records the evidence CLASS per dimension ("E2", "E3").
+    #: This field carries the measurements themselves, each bound to the exact
+    #: candidate, source revision, screenshot digest, viewport and probe
+    #: version. It is a tuple of ``StructuralEvidence`` -- a concrete type, not
+    #: an unbounded ``Any`` -- so a caller cannot smuggle an untyped blob into a
+    #: scoring request.
+    #:
+    #: Empty means "no measurement", which is NOT the same as "measured clean".
+    #: The scorer treats an absent measurement as the screenshot-only tier.
+    measurements: Tuple[StructuralEvidence, ...] = ()
 
     @property
     def has_provenance(self) -> bool:
@@ -166,6 +180,7 @@ class DesignCandidate:
             "suitability_contract": self.suitability_contract,
             "evidence": dict(self.evidence),
             "evidence_revision": self.evidence_revision,
+            "measurements": [m.to_dict() for m in self.measurements],
             "assets": [
                 a.to_dict() if hasattr(a, "to_dict") else dict(a)
                 for a in self.assets

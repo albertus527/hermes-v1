@@ -299,7 +299,13 @@ def test_declared_metadata_cannot_claim_structural():
     assert prepared.reference.evidence_for(dr.DIMENSION_TYPOGRAPHY) == dr.EVIDENCE_RENDERED
 
 
-def test_measured_structural_yields_e3():
+def test_declared_structural_does_not_yield_e3():
+    """A manifest may DECLARE structural facts, but declaring is not measuring.
+
+    Before this rule an ingest manifest could state a contrast ratio for an
+    untrusted reference and the reference would be treated as structurally
+    measured. Only a probe can produce measured facts.
+    """
     prepared = oref.prepare_reference(
         _manifest(structural=dr.StructuralFacts(
             viewport=(1440, 900),
@@ -310,8 +316,29 @@ def test_measured_structural_yields_e3():
         reader=_reader({"ref/desktop.png": _png()}),
         asset_base_uri="viking://p/ref/references/ref-1",
     )
+    assert prepared.reference.evidence_for(dr.DIMENSION_COLOR) == dr.EVIDENCE_RENDERED
+    assert prepared.reference.evidence_for(dr.DIMENSION_TYPOGRAPHY) == dr.EVIDENCE_RENDERED
+    assert prepared.reference.structural is not None
+    assert prepared.reference.structural.provenance == dr.PROVENANCE_DECLARED
+    assert prepared.reference.structural.is_measured is False
+
+
+def test_measured_structural_facts_yield_e3():
+    """Facts a probe produced keep their provenance through ingestion."""
+    prepared = oref.prepare_reference(
+        _manifest(structural=dr.StructuralFacts(
+            viewport=(1440, 900),
+            font_families=("Inter",),
+            type_scale=(("h1", 48.0, 52.0),),
+            palette_pairs=(("#fff", "#000", 17.2),),
+            provenance=dr.PROVENANCE_MEASURED,
+        )),
+        reader=_reader({"ref/desktop.png": _png()}),
+        asset_base_uri="viking://p/ref/references/ref-1",
+    )
     assert prepared.reference.evidence_for(dr.DIMENSION_COLOR) == dr.EVIDENCE_STRUCTURAL
     assert prepared.reference.evidence_for(dr.DIMENSION_TYPOGRAPHY) == dr.EVIDENCE_STRUCTURAL
+    assert prepared.reference.structural.is_measured is True
 
 
 def test_no_asset_means_no_visual_evidence():

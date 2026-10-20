@@ -40,12 +40,17 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-#: Bumped whenever the probe payload shape or semantics change. Stored with every
-#: measurement so a later change cannot be mistaken for a change in the page.
-PROBE_VERSION = "structural-probe-v1"
+from app.core.design_reference import (
+    CONTRAST_MEASURED,
+    CONTRAST_UNCERTAIN,
+    CONTRAST_UNSUPPORTED,
+    ContrastMeasurement,
+    PROBE_VERSION,
+    StructuralEvidence,
+    WCAG_AA_NORMAL,
+)
 
 #: Hard bounds. A page with thousands of nodes must not produce an unbounded
 #: payload, and the model must not receive a wall of numbers.
@@ -53,16 +58,6 @@ MAX_TEXT_NODES = 40
 MAX_BLOCK_NODES = 60
 MAX_CONTRAST_PAIRS = 12
 MAX_SPACING_VALUES = 40
-
-#: Contrast states. ``measured`` is the only one that may carry a ratio.
-CONTRAST_MEASURED = "measured"
-CONTRAST_UNCERTAIN = "uncertain"
-CONTRAST_UNSUPPORTED = "unsupported"
-
-#: WCAG 2.2 SC 1.4.3 thresholds, recorded as REFERENCE ONLY. This module does
-#: not gate on them and does not convert them into a score.
-WCAG_AA_NORMAL = 4.5
-WCAG_AA_LARGE = 3.0
 
 
 # ---------------------------------------------------------------------------
@@ -229,37 +224,6 @@ def contrast_ratio(foreground: Sequence[float], background: Sequence[float]) -> 
     return (lighter + 0.05) / (darker + 0.05)
 
 
-@dataclass(frozen=True)
-class ContrastMeasurement:
-    """One foreground/background pair, with its honesty state attached.
-
-    ``ratio`` is populated ONLY for ``state == "measured"``. Every other state
-    carries ``reason`` instead, because a number would be an invention.
-    """
-
-    state: str
-    ratio: Optional[float]
-    foreground: str
-    background: str
-    font_size_px: float
-    reason: str = ""
-    sample_tag: str = ""
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "state": self.state,
-            "ratio": self.ratio,
-            "foreground": self.foreground,
-            "background": self.background,
-            "font_size_px": self.font_size_px,
-            "reason": self.reason,
-            "sample_tag": self.sample_tag,
-            # Reference only. Deliberately not a gate and not a score.
-            "wcag_aa_normal": WCAG_AA_NORMAL,
-            "meets_aa_normal": (
-                self.ratio >= WCAG_AA_NORMAL if self.ratio is not None else None
-            ),
-        }
 
 
 def _fmt_rgba(color: Optional[Mapping[str, Any]]) -> str:
@@ -350,97 +314,6 @@ def _measure_pair(entry: Mapping[str, Any]) -> Optional[ContrastMeasurement]:
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class StructuralEvidence:
-    """Measurements bound to exactly one candidate, revision, viewport, image.
-
-    The binding is not decoration. Without ``screenshot_digest`` a stale
-    measurement could be paired with a fresh image and no one would notice, which
-    is precisely the failure mode this exists to prevent.
-    """
-
-    candidate_id: str
-    source_revision: str
-    viewport: Tuple[int, int]
-    screenshot_digest: str
-    measured_at_url: str
-    probe_version: str = PROBE_VERSION
-    font_families: Tuple[str, ...] = ()
-    type_scale: Tuple[Tuple[str, float, float], ...] = ()
-    spacing_scale: Tuple[float, ...] = ()
-    contrast: Tuple[ContrastMeasurement, ...] = ()
-    component_count: int = 0
-    counts: Mapping[str, Any] = field(default_factory=dict)
-    document_height: int = 0
-    collected: bool = True
-    error: str = ""
-
-    @property
-    def has_typography(self) -> bool:
-        return bool(self.font_families) and bool(self.type_scale)
-
-    @property
-    def has_spacing(self) -> bool:
-        return bool(self.spacing_scale)
-
-    @property
-    def has_contrast(self) -> bool:
-        """True only when at least one pair is genuinely ``measured``.
-
-        Uncertain and unsupported pairs do NOT count. This is what keeps an
-        external reference at E2 instead of letting a doubt masquerade as
-        measurement.
-        """
-        return any(m.state == CONTRAST_MEASURED for m in self.contrast)
-
-    @property
-    def measured_pairs(self) -> Tuple[ContrastMeasurement, ...]:
-        return tuple(m for m in self.contrast if m.state == CONTRAST_MEASURED)
-
-    @property
-    def doubtful_pairs(self) -> Tuple[ContrastMeasurement, ...]:
-        return tuple(m for m in self.contrast if m.state != CONTRAST_MEASURED)
-
-    def binding(self) -> Dict[str, Any]:
-        return {
-            "candidate_id": self.candidate_id,
-            "source_revision": self.source_revision,
-            "viewport": list(self.viewport),
-            "screenshot_digest": self.screenshot_digest,
-            "measured_at_url": self.measured_at_url,
-            "probe_version": self.probe_version,
-        }
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            **self.binding(),
-            "font_families": list(self.font_families),
-            "type_scale": [list(t) for t in self.type_scale],
-            "spacing_scale": list(self.spacing_scale),
-            "contrast": [m.to_dict() for m in self.contrast],
-            "component_count": self.component_count,
-            "counts": dict(self.counts),
-            "document_height": self.document_height,
-            "collected": self.collected,
-            "error": self.error,
-        }
-
-    def digest(self) -> str:
-        """Stable digest of the measurements, excluding the binding."""
-        payload = {
-            "font_families": list(self.font_families),
-            "type_scale": [list(t) for t in self.type_scale],
-            "spacing_scale": list(self.spacing_scale),
-            "contrast": [
-                [m.state, m.ratio, m.foreground, m.background, m.font_size_px]
-                for m in self.contrast
-            ],
-            "component_count": self.component_count,
-            "probe_version": self.probe_version,
-        }
-        return hashlib.sha256(
-            repr(sorted(payload.items())).encode("utf-8")
-        ).hexdigest()[:16]
 
 
 def _normalise_family(raw: str) -> str:

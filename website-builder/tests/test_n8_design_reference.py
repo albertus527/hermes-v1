@@ -41,6 +41,12 @@ def _asset(kind=dr.ASSET_SCREENSHOT_DESKTOP, digest=DIGEST_A, rev="rev-1",
 
 
 def _structural(**over):
+    """Structural facts as a PROBE produced them.
+
+    The default is ``provenance="measured"`` because these fixtures describe a
+    reference that was actually rendered and probed. A manifest that merely
+    declares structural facts is a different case, covered separately.
+    """
     base = dict(
         viewport=(1440, 900),
         font_families=("Inter",),
@@ -48,6 +54,7 @@ def _structural(**over):
         spacing_scale=(4.0, 8.0, 16.0),
         palette_pairs=(("#f5f5f4", "#0b0b0c", 17.2),),
         component_count=14,
+        provenance=dr.PROVENANCE_MEASURED,
     )
     base.update(over)
     return dr.StructuralFacts(**base)
@@ -180,6 +187,33 @@ def test_structural_escalates_measured_dimensions():
     assert ref.evidence_for(dr.DIMENSION_TYPOGRAPHY) == dr.EVIDENCE_STRUCTURAL
     assert ref.evidence_for(dr.DIMENSION_LAYOUT) == dr.EVIDENCE_STRUCTURAL
     assert ref.evidence_for(dr.DIMENSION_COLOR) == dr.EVIDENCE_STRUCTURAL
+
+
+def test_declared_structural_does_not_escalate():
+    """A manifest that DECLARES structural facts must not reach E3.
+
+    Before this rule, an ingest manifest could state ``contrast_ratio: 21.0``
+    for an untrusted reference and the reference would be treated as though
+    something had measured it. Only a probe can produce measured facts.
+    """
+    ref = _ref(structural=_structural(provenance=dr.PROVENANCE_DECLARED))
+    assert ref.evidence_for(dr.DIMENSION_TYPOGRAPHY) == dr.EVIDENCE_RENDERED
+    assert ref.evidence_for(dr.DIMENSION_LAYOUT) == dr.EVIDENCE_RENDERED
+    assert ref.evidence_for(dr.DIMENSION_COLOR) == dr.EVIDENCE_RENDERED
+
+
+def test_structural_defaults_to_declared_provenance():
+    """A StructuralFacts built without an explicit provenance is a claim."""
+    facts = dr.StructuralFacts(palette_pairs=(("#fff", "#000", 21.0),))
+    assert facts.provenance == dr.PROVENANCE_DECLARED
+    assert facts.is_measured is False
+
+
+def test_unknown_provenance_is_rejected():
+    import pytest
+
+    with pytest.raises(dr.DesignReferenceError):
+        dr.StructuralFacts(provenance="trusted-ish")
 
 
 def test_empty_structural_does_not_escalate():

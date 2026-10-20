@@ -21,7 +21,7 @@ because intake is a different role -- exactly the shape
 from __future__ import annotations
 
 import logging
-from typing import Any, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from app.core.decision_provider import (
     DecisionProviderError,
@@ -32,6 +32,7 @@ from app.core.decisions_client import (
     post_decision,
     resolved_model_id,
 )
+from app.core.design_reference import StructuralEvidence
 from app.core.design_reference_safety import one_line
 from app.core.design_scoring import (
     DEFAULT_DIMENSION_FLOORS,
@@ -52,6 +53,69 @@ from app.core.design_scoring import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _asset_digest(asset: Any) -> str:
+    """Read an asset's digest from either an object or a serialised mapping.
+
+    A candidate's assets may be ``DesignAsset`` instances or the plain
+    mappings produced by ``to_dict()``. Both are legitimate: one is the live
+    object, the other is what came back from storage. Reading only one of them
+    would silently drop every measurement on the other path -- which is exactly
+    what happened before this helper existed.
+    """
+    if isinstance(asset, Mapping):
+        return str(asset.get("digest", "") or "").strip()
+    return str(getattr(asset, "digest", "") or "").strip()
+
+
+def _verified_evidence_map(pool: Sequence[Any]) -> Dict[str, Any]:
+    """Map candidate id -> measurement, for evidence that binds to it.
+
+    The binding is checked at the point of USE, not trusted from wherever the
+    evidence was produced. For each candidate the checks are:
+
+      * the measurement names this candidate
+      * the measurement's source revision is the candidate's revision
+      * the measurement's screenshot digest is the digest of one of the
+        candidate's OWN assets -- the image the model will actually see
+
+    A measurement failing any check is dropped, so its dimension falls back to
+    the screenshot-only tier. It is never repaired and never re-bound.
+
+    This is deliberately a second check rather than a single one: the first
+    happens when a reference is turned into a candidate, the second here, at
+    the boundary where the request is actually built. Two independent points of
+    verification means a mistake in either one alone cannot attach a
+    measurement to the wrong image.
+    """
+    out: Dict[str, Any] = {}
+    for candidate in pool:
+        measurements = getattr(candidate, "measurements", ()) or ()
+        if not measurements:
+            continue
+        candidate_id = str(getattr(candidate, "candidate_id", "") or "")
+        source_revision = str(getattr(candidate, "source_revision", "") or "")
+        digests = {
+            _asset_digest(asset)
+            for asset in (getattr(candidate, "assets", ()) or ())
+        }
+        digests.discard("")
+
+        for evidence in measurements:
+            if not isinstance(evidence, StructuralEvidence):
+                continue
+            if not evidence.collected:
+                continue
+            if evidence.candidate_id != candidate_id:
+                continue
+            if evidence.source_revision != source_revision:
+                continue
+            if evidence.screenshot_digest not in digests:
+                continue
+            out[candidate_id] = evidence
+            break
+    return out
 
 #: Provider name registered with the DecisionProviderRegistry.
 DECISIONS_DESIGN_PROVIDER_NAME = "decisions-design"
@@ -285,7 +349,18 @@ class DecisionsDesignProvider:
             scope_rule=SCOPE_RULE,
             requirements=requirements,
         )
-        questions = build_scoring_questions(pool, requirements=requirements)
+        # N8 B7 Option C: measured evidence travels with the request, but
+        # ONLY evidence that binds to the candidate it is attached to. The
+        # binding is re-verified HERE, at the point of use, rather than
+        # trusted from wherever it was produced: a candidate's revision, its
+        # screenshot digests and the measurement's own anchors must all
+        # agree. Anything that does not agree is DROPPED, and that dimension
+        # falls back to its screenshot-only tier.
+        questions = build_scoring_questions(
+            pool,
+            requirements=requirements,
+            evidence=_verified_evidence_map(pool),
+        )
 
         result = post_decision(
             model=self.model,

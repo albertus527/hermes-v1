@@ -31,6 +31,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional, Sequence, Tuple
 
+from app.core.design_reference import DesignReferenceError, StructuralEvidence
 from app.core.decision_provider import (
     DETERMINISTIC_PROVIDER_NAME,
     INTAKE_UNKNOWN,
@@ -159,6 +160,33 @@ def _valid_score(value: Any) -> Optional[float]:
     return score
 
 
+def _parse_measurements(raw: Any) -> Tuple[StructuralEvidence, ...]:
+    """Parse persisted measurements into typed, bound evidence.
+
+    A malformed entry is DROPPED, not repaired. An unparseable measurement is
+    not evidence: keeping it would let an untyped blob reach a scoring request
+    and defeat the whole point of typing the field. Dropping it degrades the
+    affected dimension to its screenshot-only tier, which is the honest
+    outcome.
+    """
+    if not raw:
+        return ()
+    if isinstance(raw, (str, bytes, Mapping)):
+        return ()
+    parsed: list = []
+    for item in raw:
+        if isinstance(item, StructuralEvidence):
+            parsed.append(item)
+            continue
+        if not isinstance(item, Mapping):
+            continue
+        try:
+            parsed.append(StructuralEvidence.from_dict(item))
+        except (DesignReferenceError, TypeError, ValueError):
+            continue
+    return tuple(parsed)
+
+
 def _normalize_candidate(raw: Any) -> Optional[DesignCandidate]:
     """Coerce a provider's raw output into a validated candidate, or ``None``.
 
@@ -192,6 +220,7 @@ def _normalize_candidate(raw: Any) -> Optional[DesignCandidate]:
                 evidence_revision=str(raw.get("evidence_revision") or "").strip(),
                 assets=tuple(raw.get("assets") or ()),
                 requirement_version=str(raw.get("requirement_version") or "").strip(),
+                measurements=_parse_measurements(raw.get("measurements")),
             )
         except (DecisionProviderError, TypeError, ValueError):
             return None
@@ -223,6 +252,7 @@ def _normalize_candidate(raw: Any) -> Optional[DesignCandidate]:
             evidence_revision=candidate.evidence_revision,
             assets=candidate.assets,
             requirement_version=candidate.requirement_version,
+            measurements=candidate.measurements,
         )
     # N8 B6: an out-of-range suitability is not trusted. Drop it to None rather
     # than clamping, so the candidate is treated as UNSCORED (mixed) instead of
@@ -244,6 +274,7 @@ def _normalize_candidate(raw: Any) -> Optional[DesignCandidate]:
             evidence_revision=candidate.evidence_revision,
             assets=candidate.assets,
             requirement_version=candidate.requirement_version,
+            measurements=candidate.measurements,
         )
     return candidate
 

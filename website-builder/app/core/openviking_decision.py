@@ -39,6 +39,7 @@ from app.core.design_reference import (
     EVIDENCE_RENDERED,
     EVIDENCE_STRUCTURAL,
     SCREENSHOT_KINDS,
+    StructuralEvidence,
 )
 from app.core.openviking_library import CATEGORIES as _LIBRARY_CATEGORIES
 from app.core.openviking_retrieval import (
@@ -99,6 +100,86 @@ def _bind_assets(
             continue
         bound.append(asset)
     return tuple(bound)
+
+
+def _measurements_from_result(result: Any) -> Dict[str, Sequence[Any]]:
+    """Pull the measured-evidence map off a retrieval result.
+
+    Mirrors :func:`_assets_from_result`: the map is optional, and a result
+    without one behaves exactly as before (screenshot-only evidence).
+
+    The map is keyed by the reference's ``source_uri`` -- the same key the
+    asset map uses -- so a measurement and the image it describes are looked up
+    together and cannot be crossed over.
+    """
+    raw = getattr(result, "measurements_by_uri", None)
+    if not isinstance(raw, Mapping):
+        return {}
+    out: Dict[str, Sequence[Any]] = {}
+    for key, value in raw.items():
+        if not value:
+            continue
+        out[str(key)] = tuple(value)
+    return out
+
+
+def _asset_digest(asset: Any) -> str:
+    """Read an asset's digest from either an object or a serialised mapping.
+
+    Assets reach this module both as live objects and as the plain mappings
+    ``to_dict()`` produces. Both are legitimate, so both must be readable.
+    """
+    if isinstance(asset, Mapping):
+        return str(asset.get("digest", "") or "").strip()
+    return str(getattr(asset, "digest", "") or "").strip()
+
+
+def _bound_measurements(
+    declared: Sequence[Any],
+    *,
+    candidate_id: str,
+    source_revision: str,
+    bound_assets: Sequence[Any],
+) -> Tuple[Any, ...]:
+    """Keep only measurements that bind to THIS candidate and ITS assets.
+
+    Three things must agree before a measurement may travel with a candidate:
+
+      1. the measurement's own candidate id is this candidate
+      2. the measurement's source revision is this candidate's revision
+      3. the measurement's screenshot digest is the digest of an asset this
+         candidate actually owns
+
+    Rule 3 is the one that matters most. A measurement taken against a
+    DIFFERENT image describes a different page, even if the revision string
+    happens to match. Binding to the digest is what makes "the picture the
+    model sees" and "the page the numbers describe" the same object.
+
+    A measurement that fails any check is DROPPED. It is never repaired and
+    never re-bound: guessing which anchor was intended is how stale evidence
+    gets attached to the wrong image.
+    """
+    if not declared or not bound_assets:
+        return ()
+    digests = {
+        _asset_digest(asset) for asset in bound_assets
+    }
+    digests.discard("")
+
+    kept: list = []
+    for evidence in declared:
+        if not isinstance(evidence, StructuralEvidence):
+            continue
+        if evidence.candidate_id != candidate_id:
+            continue
+        if evidence.source_revision != source_revision:
+            continue
+        if evidence.screenshot_digest not in digests:
+            continue
+        if not evidence.collected:
+            continue
+        kept.append(evidence)
+    return tuple(kept)
 
 
 def _evidence_for_assets(bound: Sequence[Any]) -> Tuple[Tuple[str, str], ...]:
@@ -233,14 +314,18 @@ class OpenVikingDecisionProvider:
         for item in items:
             if len(candidates) >= min(limit, MAX_OPENVIKING_CANDIDATES):
                 break
-            candidate = self._to_candidate(item, assets_by_uri)
+            candidate = self._to_candidate(
+                item, assets_by_uri, _measurements_from_result(result)
+            )
             if candidate is not None:
                 candidates.append(candidate)
         return tuple(candidates)
 
     @staticmethod
     def _to_candidate(
-        item: Any, assets_by_uri: Optional[Mapping[str, Sequence[Any]]] = None
+        item: Any,
+        assets_by_uri: Optional[Mapping[str, Sequence[Any]]] = None,
+        measurements_by_uri: Optional[Mapping[str, Sequence[Any]]] = None,
     ) -> DesignCandidate | None:
         """Convert one retrieved item to a candidate, or drop it.
 
@@ -298,6 +383,15 @@ class OpenVikingDecisionProvider:
             evidence=evidence,
             evidence_revision=source_revision if bound else "",
             assets=bound,
+            # MEASURED evidence, carried only when it binds to THIS candidate
+            # and to an asset THIS candidate owns. Anything else is dropped
+            # here rather than reaching the scorer.
+            measurements=_bound_measurements(
+                measurements_by_uri.get(source_uri, ()),
+                candidate_id=source_id,
+                source_revision=source_revision,
+                bound_assets=bound,
+            ),
         )
 
 
