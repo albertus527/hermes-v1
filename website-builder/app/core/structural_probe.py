@@ -108,8 +108,15 @@ JSON.stringify((() => {
         if (bg.a >= 1) {
           return {ok: true, color: bg, uncertain: uncertain, unsupported: unsupported, reason: reason};
         }
-        uncertain = true;
-        reason = reason || 'translucent_background';
+        // alpha == 0 is FULLY TRANSPARENT, not "translucent": the element simply
+        // paints no background and the search must continue to its ancestor.
+        // Treating it as uncertainty made 8 of 9 pairs on the baseline page
+        // unmeasurable for no reason. Only a PARTIAL alpha (0 < a < 1) means the
+        // composite genuinely cannot be derived from computed styles.
+        if (bg.a > 0) {
+          uncertain = true;
+          reason = reason || 'translucent_background';
+        }
       }
       node = node.parentElement;
       depth += 1;
