@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from app.core.fit_diagnostics import (  # noqa: E402
     BASIS_DETERMINISTIC,
+    FIT_REQUIRED_OPTIONS,
     BASIS_MODEL,
     BASIS_UNRESOLVED,
     DIAG_ABSENT,
@@ -381,3 +382,40 @@ class TestApprovalPublishUnchanged:
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+class TestClosedOptionSet:
+    def test_the_option_set_is_closed(self):
+        assert FIT_REQUIRED_OPTIONS == (
+            "satisfied", "partial", "absent", "unverified")
+
+    def test_questions_offer_exactly_the_closed_set(self):
+        q = build_diagnostic_questions([_Cand("c1")], REQS)
+        for question in q.values():
+            assert set(question["criteria"]) == set(FIT_REQUIRED_OPTIONS)
+
+    def test_the_option_set_is_exported(self):
+        import app.core.fit_diagnostics as mod
+        assert "FIT_REQUIRED_OPTIONS" in mod.__all__
+
+
+class TestSharedRequirementRevision:
+    """The candidates must be bound to ONE requirement revision.
+
+    An earlier build used each candidate's own asset digest as its
+    ``source_revision``. That made every candidate carry a different revision,
+    so the claim "one identical requirement set" was not actually bound to
+    them -- the requirement artifact's revision and the candidates' revision
+    were different things wearing the same name.
+    """
+
+    def test_the_artifact_revision_is_shared(self):
+        assert str(AUDIT["source_revision"]) == "3"
+
+    def test_candidates_share_the_artifact_revision(self):
+        revs = {c["revision"] for c in CAPS.values()}
+        assert revs == {str(AUDIT["source_revision"])}, revs
+
+    def test_each_candidate_still_has_its_own_image_digests(self):
+        desks = {c["desktop_digest"] for c in CAPS.values()}
+        assert len(desks) == 3, "each candidate must carry its own image"

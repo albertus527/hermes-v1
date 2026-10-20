@@ -64,6 +64,17 @@ OPTION_PARTIAL = "partial"
 OPTION_ABSENT = "absent"
 OPTION_UNVERIFIED = "unverified"
 
+#: The complete set of options a diagnostic question may offer. It is a
+#: CLOSED set: a validator compares against this rather than against a
+#: hand-written list, so the question builder and the contract checker can
+#: never drift apart.
+FIT_REQUIRED_OPTIONS: Tuple[str, ...] = (
+    OPTION_SATISFIED,
+    OPTION_PARTIAL,
+    OPTION_ABSENT,
+    OPTION_UNVERIFIED,
+)
+
 #: Maps a model's chosen option to a diagnostic status. An unknown option is
 #: NOT mapped to a status: it becomes ``unverified``, because guessing which
 #: status the model meant would be inventing a judgment.
@@ -363,6 +374,7 @@ __all__ = [
     "DIAG_UNVERIFIED",
     "DIAGNOSTIC_PREFIX",
     "DIAGNOSTIC_STATUSES",
+    "FIT_REQUIRED_OPTIONS",
     "FitDiagnosticReport",
     "FitDiagnosticsError",
     "RequirementDiagnostic",
