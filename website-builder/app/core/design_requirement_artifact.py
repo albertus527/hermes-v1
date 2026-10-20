@@ -233,6 +233,17 @@ class RequirementArtifact:
     #: enter screenshot Fit. Keeping them recorded means the brief's negative
     #: half is not lost.
     constraints: Tuple[Mapping[str, Any], ...] = ()
+    #: The weighting policy for this set: which parent group carries which
+    #: importance, and which priorities the owner stated. It is RECORDED here
+    #: and passed to the evaluator as context; it is not enforced by the
+    #: provider, which has no weighting parameter.
+    weighting: Optional[Mapping[str, Any]] = None
+    #: A stable identity for the REQUIREMENT SET -- derived from its content,
+    #: group structure, schema version, mandatory flags, evidence modality and
+    #: the weighting policy. Two sets that differ in any of those have
+    #: different ids, so a suitability computed against one can never be
+    #: compared with one computed against the other.
+    requirement_set_id: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -244,6 +255,8 @@ class RequirementArtifact:
             "entries": [e.to_dict() for e in self.entries],
             "groups": [dict(g) for g in self.groups],
             "constraints": [dict(c) for c in self.constraints],
+            "weighting": dict(self.weighting) if self.weighting else None,
+            "requirement_set_id": self.requirement_set_id,
             "assumptions": [dict(a) for a in self.assumptions],
             "unresolved": [dict(u) for u in self.unresolved],
         }
@@ -370,6 +383,11 @@ def parse_artifact(data: Any) -> RequirementArtifact:
         entries=tuple(entries),
         groups=tuple(groups),
         constraints=_side("constraints"),
+        weighting=(
+            dict(data["weighting"])
+            if isinstance(data.get("weighting"), Mapping) else None
+        ),
+        requirement_set_id=str(data.get("requirement_set_id") or ""),
         assumptions=_side("assumptions"),
         unresolved=_side("unresolved"),
     )

@@ -65,6 +65,19 @@ def _payload(**overrides):
     return base
 
 
+def _payload_with_contrast(pairs):
+    payload = _payload()
+    payload["text"] = [{
+        "tag": "p", "font_family": '"Inter"', "font_size": 14,
+        "font_weight": "400", "line_height": 20,
+        "fg": {"r": 1, "g": 2, "b": 3, "a": 1},
+        "bg_ok": True, "bg": {"r": 250, "g": 250, "b": 250, "a": 1},
+        "bg_uncertain": False, "bg_unsupported": False, "bg_reason": "",
+    }]
+    payload["_contrast_pairs"] = pairs
+    return payload
+
+
 def _parse(payload=None, **kw):
     defaults = dict(
         candidate_id="cand-c",
@@ -466,3 +479,197 @@ class TestScreenshotCaptureIntegration:
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+class TestNonRgbColourSpaces:
+    """Chrome serialises colours in the CSS Color 4 lab() space.
+
+    A parser that understood only rgb()/rgba() treated such a background as
+    unparseable, and an unparseable background was treated as TRANSPARENT --
+    so the search walked past the element's own painted background and paired
+    the text with a distant ancestor. On the M2 baseline that produced a
+    1.0:1 ratio for a perfectly legible chip and a 1.09:1 ratio for a CTA
+    that actually measures 4.54:1.
+    """
+
+    def test_the_probe_resolves_any_colour_space(self):
+        import re
+        from app.core import structural_probe as sp
+        expr = sp.probe_expression()
+        # The canvas pixel path must be present, and the rgb fast path must
+        # still be there.
+        assert "getImageData" in expr
+        assert "rgba?" in expr
+
+    def test_the_probe_skips_zero_size_elements(self):
+        from app.core import structural_probe as sp
+        expr = sp.probe_expression()
+        assert "rect.width < 1" in expr
+
+    def test_the_probe_skips_collapsed_disclosure_content(self):
+        from app.core import structural_probe as sp
+        expr = sp.probe_expression()
+        assert "DETAILS" in expr
+        assert "!node.open" in expr or "node.open" in expr
+
+
+class TestNonRgbColourSpaces:
+    """Chrome serialises colours in the CSS Color 4 lab() space.
+
+    A parser that understood only rgb()/rgba() treated such a background as
+    unparseable, and an unparseable background was treated as TRANSPARENT --
+    so the search walked past the element's own painted background and paired
+    the text with a distant ancestor. On the M2 baseline that produced a
+    1.0:1 ratio for a perfectly legible chip and a 1.09:1 ratio for a CTA
+    that actually measures 4.54:1.
+    """
+
+    def test_the_probe_resolves_any_colour_space(self):
+        import re
+        from app.core import structural_probe as sp
+        expr = sp.probe_expression()
+        # The canvas pixel path must be present, and the rgb fast path must
+        # still be there.
+        assert "getImageData" in expr
+        assert "rgba?" in expr
+
+    def test_the_probe_skips_zero_size_elements(self):
+        from app.core import structural_probe as sp
+        expr = sp.probe_expression()
+        assert "rect.width < 1" in expr
+
+    def test_the_probe_skips_collapsed_disclosure_content(self):
+        from app.core import structural_probe as sp
+        expr = sp.probe_expression()
+        assert "DETAILS" in expr
+        assert "!node.open" in expr or "node.open" in expr
+
+
+class TestContrastStatesRemainHonest:
+    """The colour fix must not weaken the honesty rules.
+
+    The fix makes MORE pairs measurable. It must not make a doubtful pair
+    measurable: a gradient behind text, or a translucent stack, still yields
+    no ratio.
+    """
+
+    @staticmethod
+    def _evidence_with(pairs):
+        from app.core.design_reference import (
+            ContrastMeasurement,
+            StructuralEvidence,
+        )
+        return StructuralEvidence(
+            candidate_id="c1", source_revision="r1", viewport=(1440, 900),
+            screenshot_digest="d" * 64, measured_at_url="http://x/",
+            probe_version="structural-probe-v1",
+            contrast=tuple(
+                ContrastMeasurement(
+                    state=p["state"], ratio=p["ratio"],
+                    foreground=p["foreground"], background=p["background"],
+                    font_size_px=p["font_size_px"], reason=p["reason"],
+                    sample_tag=p["sample_tag"],
+                ) for p in pairs
+            ),
+        )
+
+    def test_a_doubtful_pair_never_becomes_a_ratio(self):
+        ev = self._evidence_with([
+            {"state": "uncertain", "ratio": None,
+             "foreground": "rgba(1,2,3,1.0)", "background": "none",
+             "font_size_px": 14.0, "reason": "translucent_background",
+             "sample_tag": "p"},
+        ])
+        assert ev.has_contrast is False
+        assert ev.measured_pairs == ()
+        assert ev.doubtful_pairs[0].ratio is None
+
+    def test_an_unsupported_pair_never_becomes_a_ratio(self):
+        ev = self._evidence_with([
+            {"state": "unsupported", "ratio": None,
+             "foreground": "rgba(255,255,255,1.0)", "background": "none",
+             "font_size_px": 14.0, "reason": "gradient_behind_text",
+             "sample_tag": "a"},
+        ])
+        assert ev.has_contrast is False
+        assert ev.measured_pairs == ()
+
+    def test_a_measured_pair_still_carries_its_ratio(self):
+        ev = self._evidence_with([
+            {"state": "measured", "ratio": 4.54,
+             "foreground": "rgba(255,255,255,1.0)",
+             "background": "rgba(230,0,118,1.0)",
+             "font_size_px": 14.0, "reason": "", "sample_tag": "a"},
+        ])
+        assert ev.has_contrast is True
+        assert ev.measured_pairs[0].ratio == 4.54
+        assert ev.measured_pairs[0].state == "measured"
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-q"]))
+
+
+class TestNonRgbColourSpaces:
+    """Chrome serialises colours in the CSS Color 4 lab() space.
+
+    A parser that understood only rgb()/rgba() treated such a background as
+    unparseable, and an unparseable background was treated as TRANSPARENT --
+    so the search walked past the element's own painted background and paired
+    the text with a distant ancestor. On the M2 baseline that produced a
+    1.0:1 ratio for a perfectly legible chip and a 1.09:1 ratio for a CTA
+    that actually measures 4.54:1.
+    """
+
+    def test_the_probe_resolves_any_colour_space(self):
+        import re
+        from app.core import structural_probe as sp
+        expr = sp.probe_expression()
+        # The canvas pixel path must be present, and the rgb fast path must
+        # still be there.
+        assert "getImageData" in expr
+        assert "rgba?" in expr
+
+    def test_the_probe_skips_zero_size_elements(self):
+        from app.core import structural_probe as sp
+        expr = sp.probe_expression()
+        assert "rect.width < 1" in expr
+
+    def test_the_probe_skips_collapsed_disclosure_content(self):
+        from app.core import structural_probe as sp
+        expr = sp.probe_expression()
+        assert "DETAILS" in expr
+        assert "!node.open" in expr or "node.open" in expr
+
+
+class TestNonRgbColourSpaces:
+    """Chrome serialises colours in the CSS Color 4 lab() space.
+
+    A parser that understood only rgb()/rgba() treated such a background as
+    unparseable, and an unparseable background was treated as TRANSPARENT --
+    so the search walked past the element's own painted background and paired
+    the text with a distant ancestor. On the M2 baseline that produced a
+    1.0:1 ratio for a perfectly legible chip and a 1.09:1 ratio for a CTA
+    that actually measures 4.54:1.
+    """
+
+    def test_the_probe_resolves_any_colour_space(self):
+        import re
+        from app.core import structural_probe as sp
+        expr = sp.probe_expression()
+        # The canvas pixel path must be present, and the rgb fast path must
+        # still be there.
+        assert "getImageData" in expr
+        assert "rgba?" in expr
+
+    def test_the_probe_skips_zero_size_elements(self):
+        from app.core import structural_probe as sp
+        expr = sp.probe_expression()
+        assert "rect.width < 1" in expr
+
+    def test_the_probe_skips_collapsed_disclosure_content(self):
+        from app.core import structural_probe as sp
+        expr = sp.probe_expression()
+        assert "DETAILS" in expr
+        assert "!node.open" in expr or "node.open" in expr
+

@@ -71,13 +71,42 @@ JSON.stringify((() => {
   const counts = {elements: 0, text_nodes: 0, images: 0, buttons: 0,
                   links: 0, headings: 0, forms: 0};
 
+  // Chrome computes some colours in the CSS Color 4 space and serialises them
+  // as "lab(L a b)" or "oklch(...)", not as rgb(). A parser that only knows
+  // rgb()/rgba() treats such a colour as UNPARSEABLE, and an unparseable
+  // background was being treated as TRANSPARENT -- so the search walked past
+  // the element's own painted background and paired the text with a white
+  // ancestor. That produced a 1.0:1 ratio for a perfectly legible chip.
+  //
+  // The fix is to convert ANY colour the browser can produce into sRGB using
+  // its own canvas, so the arithmetic is done on real channel values.
+  const _colourCanvas = document.createElement('canvas');
+  const _colourCtx = _colourCanvas.getContext('2d', {willReadFrequently: true});
   function parseColor(value) {
     if (!value) return null;
-    const m = String(value).match(/rgba?\(([^)]+)\)/);
-    if (!m) return null;
-    const p = m[1].split(',').map(s => parseFloat(s.trim()));
-    if (p.length < 3 || p.some(n => !isFinite(n))) return null;
-    return {r: p[0], g: p[1], b: p[2], a: p.length > 3 ? p[3] : 1};
+    const text = String(value).trim();
+    if (!text || text === 'transparent') return null;
+    // The fast path: the browser already gave us rgb/rgba.
+    const m = text.match(/rgba?\(([^)]+)\)/);
+    if (m) {
+      const p = m[1].split(/[,\s\/]+/).filter(Boolean).map(s => parseFloat(s));
+      if (p.length < 3 || p.some(n => !isFinite(n))) return null;
+      return {r: p[0], g: p[1], b: p[2], a: p.length > 3 ? p[3] : 1};
+    }
+    // Any other colour space (lab(), oklch(), color-mix(), ...): let the
+    // browser PAINT it and read the pixel back. Assigning to fillStyle keeps
+    // the string in its own space, so the pixels are the only reliable source
+    // of sRGB values.
+    try {
+      _colourCtx.clearRect(0, 0, 1, 1);
+      _colourCtx.fillStyle = text;
+      _colourCtx.fillRect(0, 0, 1, 1);
+      const d = _colourCtx.getImageData(0, 0, 1, 1).data;
+      if (d[3] === 0) return null;   // painted nothing: treat as transparent
+      return {r: d[0], g: d[1], b: d[2], a: d[3] / 255};
+    } catch (e) {
+      return null;
+    }
   }
 
   // Walk ancestors for the first opaque background. Any translucency, gradient,
@@ -126,6 +155,21 @@ JSON.stringify((() => {
   const all = body.querySelectorAll('*');
   counts.elements = all.length;
 
+  // A closed <details> renders its content at ZERO size. That content is not
+  // visible, so its colour must not be paired with a background: doing so
+  // produced a 1.0:1 ratio for a filter chip nobody can see, and a real
+  // accessibility finding was buried under the artefact.
+  const isCollapsed = (el) => {
+    let node = el;
+    let depth = 0;
+    while (node && depth < 30) {
+      if (node.tagName === 'DETAILS' && !node.open) return true;
+      node = node.parentElement;
+      depth += 1;
+    }
+    return false;
+  };
+
   for (const el of all) {
     const tag = el.tagName.toLowerCase();
     if (tag === 'img') counts.images += 1;
@@ -136,7 +180,11 @@ JSON.stringify((() => {
 
     const cs = getComputedStyle(el);
     const rect = el.getBoundingClientRect();
+    // Not rendered: no pixels, so no visible text, so no contrast to measure.
     if (rect.width < 1 || rect.height < 1) continue;
+    // Also skip content inside a collapsed disclosure, whose text is not
+    // visible even though its box may be measured.
+    if (isCollapsed(el)) continue;
 
     // Blocks: spacing and geometry only. No text content is ever sent.
     if (blocks.length < MAXB) {

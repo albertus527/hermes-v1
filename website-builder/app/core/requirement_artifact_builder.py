@@ -31,7 +31,12 @@ from typing import Any, List, Mapping, Sequence, Tuple
 
 from app.core.design_reference_safety import one_line
 from app.core.requirement_decomposition import decompose_clause, group_of
+from app.core.requirement_priority import (
+    build_weighting_policy,
+    compute_requirement_set_id,
+)
 from app.core.design_requirement_artifact import (
+    ARTIFACT_SCHEMA_VERSION,
     EVIDENCE_BEHAVIOURAL,
     EVIDENCE_STRUCTURAL,
     EVIDENCE_VISUAL,
@@ -500,6 +505,30 @@ def build_artifact_from_brief(
                 "trace": f"brief.{field_name}",
             })
 
+    # The weighting policy: Option D when the owner stated a priority, and
+    # the Option C default (equal parent importance, children split it) when
+    # they did not -- or when a stated priority could not be mapped.
+    scorable_ids = {
+        e.id for e in entries
+        if e.evidence_kind == EVIDENCE_VISUAL
+        and e.verifiable_by == VERIFIABLE_SCREENSHOT
+    }
+    eligible_groups = [
+        g for g in groups
+        if any(pid in scorable_ids for pid in g["parts"])
+    ]
+    policy = build_weighting_policy(
+        brief, eligible_groups,
+        eligible_group_ids=[g["group_id"] for g in eligible_groups],
+    )
+
+    requirement_set_id = compute_requirement_set_id(
+        [e.to_dict() for e in entries],
+        groups,
+        policy=policy,
+        schema_version=ARTIFACT_SCHEMA_VERSION,
+    )
+
     return RequirementArtifact(
         project_id=project_id,
         source_revision=source_revision,
@@ -512,6 +541,8 @@ def build_artifact_from_brief(
         assumptions=tuple(assumptions),
         constraints=tuple(exclusions),
         unresolved=tuple(unresolved),
+        weighting=policy.to_dict(),
+        requirement_set_id=requirement_set_id,
     )
 
 
