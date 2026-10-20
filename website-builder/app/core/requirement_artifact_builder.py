@@ -30,6 +30,7 @@ import re
 from typing import Any, List, Mapping, Sequence, Tuple
 
 from app.core.design_reference_safety import one_line
+from app.core.requirement_decomposition import decompose_clause, group_of
 from app.core.design_requirement_artifact import (
     EVIDENCE_BEHAVIOURAL,
     EVIDENCE_STRUCTURAL,
@@ -71,6 +72,10 @@ BEHAVIOUR_WORDS: Tuple[str, ...] = (
     # Indonesian, because a brief is written in the owner's language.
     "memesan", "pesan", "membeli", "beli", "mendaftar", "daftar", "konsultasi",
     "menghubungi", "hubungi", "mengirim", "kirim", "formulir", "mencari",
+    # browsing and choosing are VISITOR actions, not page content: a
+    # screenshot cannot show that a visitor browsed or chose anything.
+    "jelajah", "menjelajah", "browse", "memilih", "membeli", "pilih",
+    "melihat", "choose", "select",
 )
 
 #: Clause separators inside a free-text field. Comma is included because a brief
@@ -84,6 +89,30 @@ BEHAVIOUR_WORDS: Tuple[str, ...] = (
 #: modern (off-white" and "tipografi elegan)", which are not assessable
 #: statements: the trailing ")" and the opening "(" stayed attached to
 #: arbitrary words, and the palette values were lost from their context.
+#: A DOMAIN-LIKE token is kept whole. "tokopedia.com" is one name, and
+#: splitting it into "tokopedia" and "com" leaves a meaningless fragment and
+#: an orphan "com,".
+_DOMAIN_TOKEN = re.compile(r"\b[\w-]+\.[a-z]{2,}\b", re.IGNORECASE)
+
+
+def _protect_domains(text: str) -> str:
+    """Replace domain-like tokens with placeholders the splitter cannot cut."""
+    protected = []
+
+    def _sub(match: "re.Match[str]") -> str:
+        protected.append(match.group(0))
+        return f"\x00DOM{len(protected) - 1}\x00"
+
+    return _DOMAIN_TOKEN.sub(_sub, text)
+
+
+def _restore_domains(text: str) -> str:
+    def _sub(match: "re.Match[str]") -> str:
+        return protected[match.lastindex or 0] if False else _DOMAINS[match.lastindex or 0]
+
+    return text
+
+
 _CLAUSE_SPLIT = re.compile(
     r"[.;:\n]+|,\s*|\s+-\s+|\s+dan\s+|\s+and\s+", re.IGNORECASE
 )
@@ -99,6 +128,30 @@ _PAREN_SPAN = re.compile(r"\([^()]*\)")
 #: portofolio, lokasi kantor" yields "portofolio" and "lokasi kantor", which are
 #: independently assessable.
 _MIN_CLAUSE_CHARS = 12
+
+#: Minimum length for a PART of a decomposed requirement. A part is one
+#: obligation out of a group, so it is legitimately shorter than a whole
+#: requirement: "tentang" and "layanan" are seven characters and are
+#: perfectly checkable on their own.
+_MIN_PART_CHARS = 4
+
+#: Words that introduce an EXCLUSION. Once a clause contains one, the rest of
+#: the enumeration belongs to it.
+_NEGATION_MARKERS_TAIL: Tuple[str, ...] = (
+    "tanpa", "tidak ada", "bukan ", "without ", "no ",
+)
+
+#: A DOMAIN-LIKE token is kept whole. "tokopedia.com" is ONE name; splitting
+#: it into "tokopedia" and "com" leaves a meaningless fragment and an orphan
+#: "com,". The token is masked before the split and restored after.
+_DOMAIN_TOKEN = re.compile(r"\b[\w-]+\.[a-z]{2,}\b", re.IGNORECASE)
+_DOMAIN_MASK = "\x00DOM%d\x00"
+
+#: A part that opens with one of these continues the PREVIOUS part rather
+#: than standing on its own.
+_CONTINUATION_PREFIXES_TAIL: Tuple[str, ...] = (
+    "atau", "and",
+)
 
 #: Boilerplate the compiler emits for every project. Never a project requirement.
 BOILERPLATE_MARKERS: Tuple[str, ...] = (
@@ -133,6 +186,14 @@ def _split_keeping_parens(text: str) -> List[str]:
     The span is kept whole and its parentheses stripped, so the clause reads as
     the list it is: "off-white, charcoal, aksen terracotta, tipografi elegan".
     """
+    domains: List[str] = []
+
+    def _mask(match: "re.Match[str]") -> str:
+        domains.append(match.group(0))
+        return _DOMAIN_MASK % (len(domains) - 1)
+
+    text = _DOMAIN_TOKEN.sub(_mask, text)
+
     pieces: List[str] = []
     cursor = 0
     for match in _PAREN_SPAN.finditer(text):
@@ -143,7 +204,70 @@ def _split_keeping_parens(text: str) -> List[str]:
             pieces.append(inner)
         cursor = match.end()
     pieces.extend(_CLAUSE_SPLIT.split(text[cursor:]))
-    return pieces
+    # A part that CONTINUES the previous one -- it opens with a conjunction
+    # such as "atau" -- is the tail of what came before, not a clause of its
+    # own. "checkout, payment, login, database, atau backend transaksi" is one
+    # exclusion list; splitting it leaves "atau backend transaksi" saying
+    # nothing on its own.
+    merged: List[str] = []
+    for piece in pieces:
+        stripped = piece.strip(" ,:")
+        if not stripped:
+            continue
+        if merged and any(
+            stripped.lower().startswith(prefix + " ")
+            for prefix in _CONTINUATION_PREFIXES_TAIL
+        ):
+            merged[-1] = f"{merged[-1]}, {stripped}"
+            continue
+        merged.append(stripped)
+
+    # An EXCLUSION list is one thing. "mode katalog tanpa checkout, payment,
+    # login, database, atau backend transaksi" enumerates what the site must
+    # NOT have; splitting it produces fragments that each say nothing, and one
+    # of them -- "database, atau backend transaksi" -- would read as a
+    # requirement to HAVE a database. So once a clause introduces a negation,
+    # every following part joins it.
+    out: List[str] = []
+    in_exclusion = False
+    for piece in merged:
+        negated = any(
+            marker in piece.lower() for marker in _NEGATION_MARKERS_TAIL
+        )
+        if negated and not in_exclusion:
+            # The exclusion list STARTS here, as its own clause. It then
+            # swallows the parts that follow it, because "checkout, payment,
+            # login, database" is one enumeration. It does not swallow the
+            # part before it: "layout terinspirasi tokopedia.com" is a
+            # separate requirement that merely happens to be followed by an
+            # exclusion.
+            in_exclusion = True
+            out.append(piece)
+            continue
+        if in_exclusion and out:
+            out[-1] = f"{out[-1]}, {piece}"
+            continue
+        out.append(piece)
+
+    restored: List[str] = []
+    for piece in out:
+        for index, domain in enumerate(domains):
+            piece = piece.replace(_DOMAIN_MASK % index, domain)
+        restored.append(piece)
+    return restored
+
+
+#: Words that introduce an EXCLUSION. A clause containing one is a constraint
+#: on the design, not an obligation to satisfy.
+_EXCLUSION_MARKERS: Tuple[str, ...] = (
+    "tanpa", "tidak ada", "bukan ", "without ", "no ",
+)
+
+
+def _is_exclusion(text: str) -> bool:
+    """True when the clause says what the site must NOT have."""
+    folded = " ".join(str(text or "").lower().split())
+    return any(marker in folded for marker in _EXCLUSION_MARKERS)
 
 
 def _is_boilerplate(text: str) -> bool:
@@ -181,6 +305,8 @@ def build_artifact_from_brief(
     the three linkage fields alone cannot distinguish those.
     """
     entries: List[RequirementEntry] = []
+    groups: List[Mapping[str, Any]] = []
+    exclusions: List[Mapping[str, Any]] = []
     assumptions: List[Mapping[str, Any]] = []
     unresolved: List[Mapping[str, Any]] = []
     counter = 0
@@ -196,21 +322,88 @@ def build_artifact_from_brief(
         discriminating: bool = True,
         mandatory: bool = True,
     ) -> None:
+        """Add one requirement, decomposing it when that is meaningful.
+
+        Decomposition applies only to a clause that is genuinely COMPOSITE, and
+        only where the parts are independently assessable. The rule set lives in
+        :mod:`app.core.requirement_decomposition`; this function only records
+        what it decided.
+
+        The original wording is preserved: every part is a verbatim substring of
+        the clause, and the clause itself is kept as the group's text. Nothing
+        is added, no number is introduced, and an assumption is never promoted.
+        """
         nonlocal counter
         if len(text) < _MIN_CLAUSE_CHARS or _is_boilerplate(text):
             return
-        counter += 1
-        entries.append(RequirementEntry(
-            id=f"R{counter}",
-            text=one_line(text, 300),
-            kind=kind,
-            evidence_kind=evidence_kind,
-            verifiable_by=verifiable_by,
-            origin=origin,
-            trace=trace,
-            mandatory=mandatory,
-            discriminating=discriminating,
-        ))
+        # An EXCLUSION constrains the design; it is not an obligation to
+        # satisfy. "tanpa checkout, payment, login" tells the builder what the
+        # site must NOT have, and emitting it as a requirement would assert
+        # the opposite. It is kept in the artifact's assumptions as a
+        # CONSTRAINT, and never enters Fit.
+        if _is_exclusion(text):
+            exclusions.append({
+                "id": f"C{len(exclusions) + 1}",
+                "text": one_line(text, 300),
+                "trace": trace,
+                "kind": "exclusion",
+                "note": "the site must NOT have this; it is a constraint, not "
+                        "a requirement to satisfy",
+            })
+            return
+
+        parts = decompose_clause(text, min_chars=_MIN_PART_CHARS)
+        if len(parts) == 1:
+            counter += 1
+            entries.append(RequirementEntry(
+                id=f"R{counter}",
+                text=one_line(text, 300),
+                kind=kind,
+                evidence_kind=evidence_kind,
+                verifiable_by=verifiable_by,
+                origin=origin,
+                trace=trace,
+                mandatory=mandatory,
+                discriminating=discriminating,
+            ))
+            groups.append({
+                "group_id": f"R{counter}",
+                "text": one_line(text, 300),
+                "origin": origin,
+                "trace": trace,
+                "parts": [f"R{counter}"],
+            })
+            return
+
+        gid = group_of(text, text)
+        part_ids: List[str] = []
+        for part in parts:
+            if len(part) < _MIN_PART_CHARS or _is_boilerplate(part):
+                continue
+            counter += 1
+            pid = f"R{counter}"
+            part_ids.append(pid)
+            entries.append(RequirementEntry(
+                id=pid,
+                text=one_line(part, 300),
+                kind=kind,
+                evidence_kind=evidence_kind,
+                verifiable_by=verifiable_by,
+                origin=origin,
+                trace=trace,
+                mandatory=mandatory,
+                discriminating=discriminating,
+                group_id=gid,
+                group_text=one_line(text, 300),
+            ))
+        if part_ids:
+            groups.append({
+                "group_id": gid,
+                "text": one_line(text, 300),
+                "origin": origin,
+                "trace": trace,
+                "parts": part_ids,
+            })
 
     # --- content: what the site must carry ---------------------------------
     # ``why`` is included because owners legitimately state the site's content
@@ -315,7 +508,9 @@ def build_artifact_from_brief(
             hashlib.sha256(prd_text.encode("utf-8")).hexdigest() if prd_text else ""
         ),
         entries=tuple(entries),
+        groups=tuple(groups),
         assumptions=tuple(assumptions),
+        constraints=tuple(exclusions),
         unresolved=tuple(unresolved),
     )
 

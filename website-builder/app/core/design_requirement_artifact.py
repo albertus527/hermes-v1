@@ -42,7 +42,20 @@ from app.core.design_reference_safety import one_line
 from app.core.document_contracts import extract_sections, parse_front_matter
 
 #: Bumped when the artifact shape changes incompatibly.
-ARTIFACT_SCHEMA_VERSION = 2
+ARTIFACT_SCHEMA_VERSION = 3
+
+#: Schema versions this reader understands.
+#:
+#: Schema 2 artifacts were NOT decomposed. Reading one as if it had been would
+#: silently change the requirement set of a saved project, so a schema-2
+#: artifact is read as schema 2: its entries stand alone, and each becomes a
+#: single-part group. Decomposition happens only when an artifact is REBUILT
+#: from the accepted brief, which is the existing staleness-repair path.
+ARTIFACT_SCHEMA_VERSION_LEGACY = 2
+SUPPORTED_SCHEMA_VERSIONS: Tuple[int, ...] = (
+    ARTIFACT_SCHEMA_VERSION_LEGACY,
+    ARTIFACT_SCHEMA_VERSION,
+)
 
 #: File name written next to the PRD inside the project workspace.
 ARTIFACT_FILE_NAME = "requirements.json"
@@ -101,6 +114,14 @@ REASON_REVISION_MISMATCH = "revision_mismatch"
 #: Minimum text length for a requirement to carry a checkable predicate.
 MIN_REQUIREMENT_CHARS = 12
 
+#: Minimum text length for a PART of a decomposed requirement.
+#:
+#: A part is shorter than a whole requirement because it is one obligation out
+#: of a group. "tentang" and "layanan" are seven characters and are perfectly
+#: checkable on their own; refusing them would merge the group back together
+#: and defeat the decomposition.
+MIN_PART_CHARS = 4
+
 
 class RequirementArtifactError(ValueError):
     """The artifact is structurally invalid."""
@@ -119,11 +140,18 @@ class RequirementEntry:
     trace: str
     mandatory: bool = True
     discriminating: bool = True
+    #: The group this part belongs to. Empty for a whole (undecomposed)
+    #: requirement, and for every entry of a legacy schema-2 artifact.
+    group_id: str = ""
+    #: The ORIGINAL clause, verbatim. A part is a substring of it, so a reader
+    #: can always find the part inside the requirement the owner wrote.
+    group_text: str = ""
 
     def __post_init__(self) -> None:
         if not self.id.strip():
             raise RequirementArtifactError("empty requirement id")
-        if len(one_line(self.text, 300)) < MIN_REQUIREMENT_CHARS:
+        minimum = MIN_PART_CHARS if self.group_id else MIN_REQUIREMENT_CHARS
+        if len(one_line(self.text, 300)) < minimum:
             raise RequirementArtifactError(
                 f"{self.id}: text too short to be assessable"
             )
@@ -171,6 +199,8 @@ class RequirementEntry:
             "trace": self.trace,
             "mandatory": self.mandatory,
             "discriminating": self.discriminating,
+            "group_id": self.group_id,
+            "group_text": self.group_text,
         }
 
 
@@ -194,6 +224,15 @@ class RequirementArtifact:
     #: which is treated as unverifiable rather than as a match.
     prd_digest: str = ""
     schema_version: int = ARTIFACT_SCHEMA_VERSION
+    #: The decomposition groups. Each records the ORIGINAL clause, where it
+    #: came from, and the ids of the parts it was split into. A group with one
+    #: part is a requirement that was not decomposable.
+    groups: Tuple[Mapping[str, Any], ...] = ()
+    #: EXCLUSIONS the owner stated: things the site must NOT have. They are
+    #: constraints on the design, not obligations to satisfy, so they never
+    #: enter screenshot Fit. Keeping them recorded means the brief's negative
+    #: half is not lost.
+    constraints: Tuple[Mapping[str, Any], ...] = ()
 
     def to_dict(self) -> dict:
         return {
@@ -203,6 +242,8 @@ class RequirementArtifact:
             "requirements_version": self.requirements_version,
             "prd_digest": self.prd_digest,
             "entries": [e.to_dict() for e in self.entries],
+            "groups": [dict(g) for g in self.groups],
+            "constraints": [dict(c) for c in self.constraints],
             "assumptions": [dict(a) for a in self.assumptions],
             "unresolved": [dict(u) for u in self.unresolved],
         }
@@ -242,7 +283,7 @@ def parse_artifact(data: Any) -> RequirementArtifact:
         raise RequirementArtifactError("artifact is not a mapping")
 
     schema = data.get("schema_version")
-    if not isinstance(schema, int) or schema != ARTIFACT_SCHEMA_VERSION:
+    if not isinstance(schema, int) or schema not in SUPPORTED_SCHEMA_VERSIONS:
         raise RequirementArtifactError(f"unsupported schema_version {schema!r}")
 
     project_id = str(data.get("project_id") or "").strip()
@@ -276,6 +317,8 @@ def parse_artifact(data: Any) -> RequirementArtifact:
             trace=str(raw.get("trace") or "").strip(),
             mandatory=bool(raw.get("mandatory", True)),
             discriminating=bool(raw.get("discriminating", True)),
+            group_id=str(raw.get("group_id") or "").strip(),
+            group_text=one_line(raw.get("group_text") or "", 300),
         )
         if entry.id in seen:
             raise RequirementArtifactError(f"duplicate requirement id {entry.id!r}")
@@ -288,12 +331,45 @@ def parse_artifact(data: Any) -> RequirementArtifact:
             raise RequirementArtifactError(f"{name} must be a list")
         return tuple(dict(v) for v in value if isinstance(v, Mapping))
 
+    # A LEGACY artifact has no groups: each entry stands alone, and each
+    # becomes a single-part group whose text is its own text. It is NOT
+    # decomposed on read -- reinterpreting a saved project silently is
+    # exactly what the version binding exists to prevent.
+    groups: list = []
+    if schema == ARTIFACT_SCHEMA_VERSION:
+        raw_groups = data.get("groups")
+        if raw_groups is not None:
+            if not isinstance(raw_groups, Sequence) or isinstance(raw_groups, (str, bytes)):
+                raise RequirementArtifactError("groups must be a list")
+            for raw in raw_groups:
+                if not isinstance(raw, Mapping):
+                    raise RequirementArtifactError("group is not a mapping")
+                groups.append({
+                    "group_id": str(raw.get("group_id") or "").strip(),
+                    "text": one_line(raw.get("text") or "", 300),
+                    "origin": str(raw.get("origin") or "").strip(),
+                    "trace": str(raw.get("trace") or "").strip(),
+                    "parts": [str(p) for p in (raw.get("parts") or ())],
+                })
+    else:
+        for entry in entries:
+            groups.append({
+                "group_id": entry.id,
+                "text": entry.text,
+                "origin": entry.origin,
+                "trace": entry.trace,
+                "parts": [entry.id],
+            })
+
     return RequirementArtifact(
         project_id=project_id,
         source_revision=source_revision,
         requirements_version=requirements_version,
         prd_digest=str(data.get("prd_digest") or ""),
+        schema_version=schema,
         entries=tuple(entries),
+        groups=tuple(groups),
+        constraints=_side("constraints"),
         assumptions=_side("assumptions"),
         unresolved=_side("unresolved"),
     )
