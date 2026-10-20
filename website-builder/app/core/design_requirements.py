@@ -170,11 +170,45 @@ def requirements_from_state(state: Any) -> Tuple[Tuple[str, ...], str]:
     return (), "no_document"
 
 
+def requirements_for_fit(workspace: Any) -> Tuple[Tuple[str, ...], str]:
+    """N9: requirements a SCREENSHOT-BASED Fit judgement may use.
+
+    Reads the structured artifact written beside ``PRD.md`` and returns only the
+    entries a rendered screenshot can actually settle. Returns
+    ``(texts, reason)``; an empty tuple with a non-empty reason means the caller
+    must abstain rather than score Fit against something unverifiable.
+
+    This is the replacement for a hard ``MIN_FIT_REQUIREMENTS`` count. Sufficiency
+    is a coverage judgement (see :func:`assess_coverage`), not a size test: one
+    specific screenshot-verifiable requirement is enough, six template entries
+    are not.
+
+    Behavioural requirements are deliberately EXCLUDED here. They remain in the
+    artifact so their own runtime/functional QA path can use them; a screenshot
+    must never mark one satisfied.
+    """
+    from app.core.design_requirement_artifact import (
+        REASON_NO_ARTIFACT,
+        assess_coverage,
+        read_requirement_artifact,
+    )
+
+    artifact = read_requirement_artifact(workspace)
+    if artifact is None:
+        return (), REASON_NO_ARTIFACT
+
+    coverage = assess_coverage(artifact)
+    if not coverage.sufficient:
+        return (), coverage.reason
+    return coverage.scorable, ""
+
+
 __all__ = [
     "MIN_REQUIREMENT_CHARS",
     "RequirementSourceError",
     "SECTION_ACCEPTANCE",
     "SECTION_REQUIREMENTS",
     "extract_requirements",
+    "requirements_for_fit",
     "requirements_from_state",
 ]

@@ -117,16 +117,34 @@ STATUS_INCOMPLETE = "incomplete_scores"
 STATUS_STALE_EVIDENCE = "stale_evidence"
 STATUS_TOO_MANY = "too_many_candidates"
 
-#: A requirement set is only usable for Fit when it has at least this many
-#: independently checkable entries. One entry is a slogan; two is a comparison;
-#: three is the smallest set where "how many are satisfied" is a meaningful
-#: question rather than a coin flip.
+#: A requirement set is only usable for Fit when it contains at least this many
+#: entries.
+#:
+#: DEPRECATED as a gate (N9). Kept exported for callers that still import it, but
+#: it is no longer what decides sufficiency: a count cannot tell one specific
+#: screenshot-verifiable requirement apart from six template boilerplate entries.
+#: The authoritative policy is :func:`assess_requirement_sufficiency`, which
+#: judges evidence coverage instead of size.
 MIN_FIT_REQUIREMENTS = 3
 
 #: Markers the native PRD compiler emits where FAST supplied nothing. A
 #: requirement that is itself unresolved cannot be assessed, so it is excluded
 #: from the countable set rather than counted as unmet.
 UNRESOLVED_REQUIREMENT_MARKERS: Tuple[str, ...] = ("UNRESOLVED",)
+
+#: Phrasings that mark an entry as compiler boilerplate rather than a
+#: project-specific obligation. These are emitted for EVERY project, so counting
+#: them as Fit evidence makes the Fit score a constant -- which is exactly the
+#: V2 symptom (spread 0.040) returning for a different reason.
+#:
+#: The three entries below are the ones ``compile_prd`` writes into
+#: ``## Acceptance Criteria`` unconditionally. A project-specific acceptance
+#: criterion will not match these exact phrasings.
+TEMPLATE_REQUIREMENT_MARKERS: Tuple[str, ...] = (
+    "every published page renders",
+    "no unresolved launch-critical placeholder",
+    "primary call-to-action is reachable from the landing page",
+)
 
 
 def usable_requirements(requirements: Sequence[str]) -> Tuple[str, ...]:
@@ -154,8 +172,54 @@ def usable_requirements(requirements: Sequence[str]) -> Tuple[str, ...]:
 
 
 def requirements_are_sufficient(requirements: Sequence[str]) -> bool:
-    """Whether a requirement set can support a defensible Fit judgement."""
+    """Whether a requirement set can support a defensible Fit judgement.
+
+    DEPRECATED (N9). This is a COUNT test and a count cannot distinguish evidence
+    quality: one specific screenshot-verifiable requirement is more assessable
+    than six template boilerplate entries, yet this returns False for the first
+    and True for the second.
+
+    Kept for backward compatibility with callers that pass plain strings. New
+    callers should use :func:`assess_requirement_sufficiency`, or better,
+    ``design_requirements.requirements_for_fit`` which reads the structured
+    artifact and applies the full coverage policy.
+    """
     return len(usable_requirements(requirements)) >= MIN_FIT_REQUIREMENTS
+
+
+def is_template_requirement(text: str) -> bool:
+    """Whether an entry is compiler boilerplate rather than a project obligation."""
+    folded = " ".join(str(text or "").lower().split())
+    return any(marker in folded for marker in TEMPLATE_REQUIREMENT_MARKERS)
+
+
+def assess_requirement_sufficiency(
+    requirements: Sequence[str],
+) -> Tuple[bool, str, Tuple[str, ...], Tuple[str, ...]]:
+    """Evidence-based sufficiency policy, replacing the hard count gate.
+
+    Returns ``(sufficient, reason, scorable, excluded)``.
+
+    Policy:
+      1. drop blanks, duplicates and UNRESOLVED placeholders
+      2. drop template boilerplate
+      3. sufficient iff at least ONE entry survives
+
+    Deliberately no minimum count. A project with a single specific requirement
+    ("A pricing table showing a price per service") is assessable; a project with
+    three compiler defaults is not.
+    """
+    cleaned = usable_requirements(requirements)
+    scorable: list = []
+    excluded: list = []
+    for text in cleaned:
+        if is_template_requirement(text):
+            excluded.append(text)
+        else:
+            scorable.append(text)
+    if not scorable:
+        return False, "no_project_specific_requirement", (), tuple(excluded)
+    return True, "", tuple(scorable), tuple(excluded)
 
 
 class ScoringError(RuntimeError):
