@@ -76,9 +76,21 @@ BEHAVIOUR_WORDS: Tuple[str, ...] = (
 #: Clause separators inside a free-text field. Comma is included because a brief
 #: routinely lists deliverables as "layanan, harga, portofolio" and each item is
 #: separately assessable; leaving them fused makes one requirement out of four.
+#:
+#: Parenthesised lists are kept WHOLE. A brief commonly writes
+#: "(off-white, charcoal, aksen terracotta, tipografi elegan)" -- that is ONE
+#: visual direction expressed as a palette plus a type choice. Splitting it on
+#: the inner commas produced fragments like "gaya editorial minimalis premium
+#: modern (off-white" and "tipografi elegan)", which are not assessable
+#: statements: the trailing ")" and the opening "(" stayed attached to
+#: arbitrary words, and the palette values were lost from their context.
 _CLAUSE_SPLIT = re.compile(
-    r"[.;\n]+|,\s*|\s+-\s+|\s+dan\s+|\s+and\s+", re.IGNORECASE
+    r"[.;:\n]+|,\s*|\s+-\s+|\s+dan\s+|\s+and\s+", re.IGNORECASE
 )
+
+#: Matches a parenthesised span, so it can be split out BEFORE the outer
+#: separators are applied.
+_PAREN_SPAN = re.compile(r"\([^()]*\)")
 
 #: A clause shorter than this is a fragment, not an obligation. Matched to
 #: ``RequirementEntry``'s own floor rather than chosen independently: a bare noun
@@ -99,7 +111,7 @@ BOILERPLATE_MARKERS: Tuple[str, ...] = (
 def _clauses(text: str) -> List[str]:
     """Split a free-text field into individually assessable clauses."""
     out: List[str] = []
-    for piece in _CLAUSE_SPLIT.split(one_line(text, 800)):
+    for piece in _split_keeping_parens(one_line(text, 800)):
         cleaned = piece.strip(" ,:")
         if len(cleaned) < _MIN_CLAUSE_CHARS:
             continue
@@ -107,6 +119,31 @@ def _clauses(text: str) -> List[str]:
             continue
         out.append(cleaned)
     return out
+
+
+def _split_keeping_parens(text: str) -> List[str]:
+    """Split on clause separators, but never INSIDE a parenthesised span.
+
+    A parenthesised list is one thought: "(off-white, charcoal, aksen terracotta,
+    tipografi elegan)" is a single visual direction. Splitting it produced
+    fragments that were not assessable statements -- "gaya editorial minimalis
+    premium modern (off-white" and "tipografi elegan)" -- because the
+    punctuation stayed welded to arbitrary words.
+
+    The span is kept whole and its parentheses stripped, so the clause reads as
+    the list it is: "off-white, charcoal, aksen terracotta, tipografi elegan".
+    """
+    pieces: List[str] = []
+    cursor = 0
+    for match in _PAREN_SPAN.finditer(text):
+        head = text[cursor:match.start()]
+        pieces.extend(_CLAUSE_SPLIT.split(head))
+        inner = match.group(0)[1:-1].strip()
+        if inner:
+            pieces.append(inner)
+        cursor = match.end()
+    pieces.extend(_CLAUSE_SPLIT.split(text[cursor:]))
+    return pieces
 
 
 def _is_boilerplate(text: str) -> bool:
@@ -176,19 +213,38 @@ def build_artifact_from_brief(
         ))
 
     # --- content: what the site must carry ---------------------------------
-    for key in CONTENT_KEYS:
+    # ``why`` is included because owners legitimately state the site's content
+    # there: "Menampilkan identitas studio dan karya (3 proyek arsitektur,
+    # tentang, layanan)" names three sections the page must carry. Reading only
+    # ``what`` dropped those requirements on the floor, so the page could never
+    # be judged against them.
+    for key in CONTENT_KEYS + ("why",):
         raw = brief.get(key)
+        items: List[Tuple[str, str]] = []
         if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
-            for i, item in enumerate(raw):
-                for clause in _clauses(str(item)):
-                    _add(clause, kind=KIND_CONTENT, evidence_kind=EVIDENCE_VISUAL,
-                         verifiable_by=VERIFIABLE_SCREENSHOT,
-                         origin=ORIGIN_USER_BRIEF, trace=f"brief.{key}[{i}]")
+            items = [(str(item), f"brief.{key}[{i}]")
+                     for i, item in enumerate(raw)]
         elif isinstance(raw, str) and raw.strip():
-            for clause in _clauses(raw):
+            items = [(raw, f"brief.{key}")]
+
+        for value, trace in items:
+            for clause in _clauses(value):
+                # A clause that names an INTERACTION is behavioural, wherever it
+                # was written. "Situs untuk pelanggan memesan menu kafe" is a
+                # statement about ordering, not about what the page shows, and
+                # a screenshot cannot settle it. Classifying it as visual put
+                # an unanswerable requirement into Fit, which is the exact
+                # failure this whole path exists to prevent.
+                if _names_behaviour(clause):
+                    _add(clause, kind=KIND_BEHAVIOUR,
+                         evidence_kind=EVIDENCE_BEHAVIOURAL,
+                         verifiable_by=VERIFIABLE_NONE,
+                         origin=ORIGIN_ACCEPTED_CONTEXT,
+                         trace=trace)
+                    continue
                 _add(clause, kind=KIND_CONTENT, evidence_kind=EVIDENCE_VISUAL,
                      verifiable_by=VERIFIABLE_SCREENSHOT,
-                     origin=ORIGIN_USER_BRIEF, trace=f"brief.{key}")
+                     origin=ORIGIN_USER_BRIEF, trace=trace)
 
     # --- style: concrete visual properties named in design_intent ----------
     intent = brief.get("design_intent")
@@ -209,9 +265,12 @@ def build_artifact_from_brief(
                  origin=ORIGIN_USER_BRIEF, trace="brief.design_intent")
 
     # --- behaviour: what the visitor must be able to do -------------------
+    # ``why`` was already consumed as a CONTENT source above, so a behavioural
+    # clause found there is not added a second time. The trace keeps the
+    # content origin, because that is where the requirement was found.
     why = brief.get("why")
     destination = brief.get("why_destination")
-    for field_name, value in (("why", why), ("why_destination", destination)):
+    for field_name, value in (("why_destination", destination),):
         if not isinstance(value, str) or not value.strip():
             continue
         for clause in _clauses(value):
