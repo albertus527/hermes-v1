@@ -35,6 +35,7 @@ from typing import Any, Mapping, Optional, Sequence, Tuple
 
 from app.core.decision_provider import DesignCandidate
 from app.core.design_reference import (
+    StructuralEvidence,
     DIMENSION_COLOR,
     DIMENSION_CONSISTENCY,
     DIMENSION_HIERARCHY,
@@ -424,7 +425,9 @@ DIMENSION_LIMITS: Mapping[str, str] = {
 MEASURED_EVIDENCE_HEADER = "MEASURED EVIDENCE (from the rendered page, not from the screenshot):"
 
 
-def measured_evidence_block(dimension: str, evidence: Any) -> str:
+def measured_evidence_block(
+    dimension: str, evidence: Optional[StructuralEvidence]
+) -> str:
     """Render measured facts for *dimension* as prompt context, or ``""``.
 
     This is the E3 path. It does NOT produce a score and does NOT set a
@@ -496,7 +499,9 @@ def measured_evidence_block(dimension: str, evidence: Any) -> str:
     return ""
 
 
-def evidence_class_for(dimension: str, evidence: Any) -> str:
+def evidence_class_for(
+    dimension: str, evidence: Optional[StructuralEvidence]
+) -> str:
     """The evidence class actually available for *dimension*.
 
     Mirrors ``DesignReference.evidence_for`` so scoring and reference selection
@@ -518,7 +523,7 @@ def assess_evidence_conflict(
     *,
     dimension: str,
     score: float,
-    evidence: Any,
+    evidence: Optional[StructuralEvidence],
 ) -> Optional[dict]:
     """Report a disagreement between a measured fact and a model score.
 
