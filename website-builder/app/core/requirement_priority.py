@@ -145,28 +145,51 @@ class Priority:
         }
 
 
+#: Where a group's numeric importance CAME FROM. This is the whole point:
+#: a number the owner wrote is not the same thing as a number we defaulted to,
+#: and the artifact must never blur the two.
+IMPORTANCE_EXPLICIT_NUMERIC = "explicit_numeric"
+IMPORTANCE_DEFAULT_EQUAL = "default_equal_groups"
+IMPORTANCE_UNCOMMITTED = "uncommitted"
+
+
 @dataclass(frozen=True)
 class GroupWeight:
     """The weight of one parent requirement group.
 
-    Under the Option C default every group carries the SAME importance and
-    its children divide it equally. Under Option D, a group named by an
-    explicit priority carries that priority instead -- and the children STILL
-    divide it equally, so a group never gains influence merely by being
-    split.
+    ``importance`` is OPTIONAL, and ``importance_source`` says where it came
+    from. That distinction is the correction:
+
+      ``explicit_numeric``  the owner wrote a number. It is the owner's.
+      ``default_equal_groups``  the Option C default. It is OURS, and it is
+                            labelled as ours. It is NOT the owner's expressed
+                            weighting.
+      ``uncommitted``       no numeric share is asserted at all.
+
+    A QUALITATIVE priority never produces an importance. The owner said
+    "more important than", not "twice as important", so no share is derived
+    from it. The ordering is recorded in ``qualitative_order`` with the raw
+    source text, and the group's numeric importance stays at the documented
+    default (or uncommitted) -- never a number that pretends to be the
+    owner's.
+
+    The children STILL divide their parent's share equally, so splitting a
+    group never multiplies its influence.
     """
 
     group_id: str
     text: str
-    importance: float
+    importance: Optional[float]
+    importance_source: str
     child_ids: Tuple[str, ...] = ()
     priority: Optional[Priority] = None
     mandatory: bool = True
+    qualitative_rank: Optional[int] = None
 
-    def child_weight(self) -> float:
-        """The weight of ONE child of this group."""
-        if not self.child_ids:
-            return 0.0
+    def child_weight(self) -> Optional[float]:
+        """The share of ONE child of this group, if one is committed."""
+        if self.importance is None or not self.child_ids:
+            return None
         return self.importance / len(self.child_ids)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -174,16 +197,33 @@ class GroupWeight:
             "group_id": self.group_id,
             "text": self.text,
             "importance": self.importance,
+            "importance_source": self.importance_source,
             "child_ids": list(self.child_ids),
             "child_weight": self.child_weight(),
             "mandatory": self.mandatory,
             "priority": self.priority.to_dict() if self.priority else None,
+            "qualitative_rank": self.qualitative_rank,
         }
 
 
 @dataclass(frozen=True)
 class WeightingPolicy:
     """The complete weighting decision for one requirement set.
+
+    THE FOUR LAYERS ARE SEPARATE FIELDS, never one number:
+
+      ``priorities``      LAYER 1 -- what the owner declared. Numeric stays
+                          numeric; qualitative stays qualitative, with its
+                          exact source text and trace.
+      ``groups``          LAYER 2 -- the DETERMINISTIC DEFAULT normalisation:
+                          equal parent importance, children split it. This is
+                          OUR policy and every group says which source its
+                          number came from.
+      ``guidance``        LAYER 3 -- what may be TOLD to the evaluator. The
+                          provider has no weighting parameter, so this is
+                          context, never enforcement.
+      ``enforcement``     LAYER 4 -- always "none_available" for the current
+                          provider. Stated, not implied.
 
     ``active`` is False whenever the policy could not be resolved. An
     unresolved priority does not silently fall back to a different policy: it
@@ -196,6 +236,13 @@ class WeightingPolicy:
     unresolved: Tuple[Priority, ...] = ()
     policy_version: str = WEIGHTING_POLICY_VERSION
     note: str = ""
+    #: The qualitative ORDER the owner stated, with its source text. This is
+    #: the faithful representation of "more important than".
+    qualitative_order: Tuple[Mapping[str, Any], ...] = ()
+    #: What may be passed to the evaluator as context. Never enforcement.
+    guidance: Tuple[str, ...] = ()
+    #: What the provider can actually enforce. Never a guess.
+    enforcement: str = "none_available"
 
     @property
     def active(self) -> bool:
@@ -206,18 +253,28 @@ class WeightingPolicy:
         return any(p.kind != "unresolved" and p.explicit
                    for p in self.priorities)
 
+    @property
+    def has_numeric_priority(self) -> bool:
+        return any(p.kind == "numeric" and p.resolution == "resolved"
+                   for p in self.priorities)
+
+    @property
+    def has_qualitative_priority(self) -> bool:
+        return any(p.kind == "qualitative" and p.resolution == "resolved"
+                   for p in self.priorities)
+
     def group(self, group_id: str) -> Optional[GroupWeight]:
         for g in self.groups:
             if g.group_id == group_id:
                 return g
         return None
 
-    def weight_of(self, entry_id: str) -> float:
-        """The weight of one requirement entry, by its id."""
+    def weight_of(self, entry_id: str) -> Optional[float]:
+        """The committed share of one requirement entry, if any."""
         for g in self.groups:
             if entry_id in g.child_ids:
                 return g.child_weight()
-        return 0.0
+        return None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -225,9 +282,14 @@ class WeightingPolicy:
             "policy_version": self.policy_version,
             "active": self.active,
             "has_explicit_priority": self.has_explicit_priority,
+            "has_numeric_priority": self.has_numeric_priority,
+            "has_qualitative_priority": self.has_qualitative_priority,
             "groups": [g.to_dict() for g in self.groups],
             "priorities": [p.to_dict() for p in self.priorities],
             "unresolved": [p.to_dict() for p in self.unresolved],
+            "qualitative_order": [dict(o) for o in self.qualitative_order],
+            "guidance": list(self.guidance),
+            "enforcement": self.enforcement,
             "note": self.note,
         }
 
@@ -412,6 +474,14 @@ def build_weighting_policy(
             priorities=priorities,
             unresolved=unresolved,
             note=note,
+            guidance=(
+                "Every requirement in this set counts equally. The owner "
+                "stated no priority."
+                if not unresolved else
+                "Every requirement in this set counts equally. An owner "
+                "priority was stated but could not be mapped to a specific "
+                "requirement, so none is applied.",
+            ),
         )
 
     # Option D: the named group takes the priority. The DEFAULT (equal) value
@@ -432,32 +502,69 @@ def build_weighting_policy(
             share = 1.0 / len(remaining)
             for g in remaining:
                 weights[str(g.get("group_id", ""))] = share
+        guidance = (
+            "The owner stated numeric priorities: "
+            + "; ".join(
+                f'"{p.source_text}" -> group {p.target_group_id} = {p.value:g}'
+                for p in numeric
+            )
+            + ". These are the owner's own numbers."
+        )
         return WeightingPolicy(
             mode="d_explicit",
             groups=_weighted_groups(usable, weights, resolved),
             priorities=priorities,
             unresolved=unresolved,
-            note="the brief states an explicit numeric priority; the numbers "
-                 "are preserved after validation",
+            guidance=(guidance,),
+            note="the brief states an explicit NUMERIC priority; the owner's "
+                 "numbers are preserved after validation. Groups with no "
+                 "explicit number keep the documented default share.",
         )
 
-    # A qualitative priority is an ORDER, not a number. It is represented as a
-    # rank: the named group comes first, the rest keep the default order. NO
-    # percentage is invented -- the ordering is the whole content.
+    # A qualitative priority is an ORDER, not a number. The order is recorded
+    # with the owner's exact source text, and NO numeric share is derived from
+    # it. The groups keep the documented default share, labelled as the
+    # default, so a number that is ours can never be read as the owner's.
     ordered_ids = [p.target_group_id for p in qualitative]
     ranks = {gid: i + 1 for i, gid in enumerate(ordered_ids)}
+    order_records = tuple({
+        "rank": ranks[p.target_group_id],
+        "group_id": p.target_group_id,
+        "source_text": p.source_text,
+        "trace": p.trace,
+        "kind": p.kind,
+        "numeric_value": None,
+    } for p in qualitative)
+    guidance = (
+        "The owner expressed a priority in these words: "
+        + "; ".join(f'"{p.source_text}"' for p in qualitative)
+        + ". Treat that ordering as the owner's stated preference. The owner "
+          "gave no numbers, so none are assumed."
+    )
     return WeightingPolicy(
         mode="d_explicit",
         groups=_ranked_groups(usable, ranks, resolved),
         priorities=priorities,
         unresolved=unresolved,
-        note="the brief states a qualitative priority; it is kept as an "
-             "ordering and NO numeric share is invented",
+        qualitative_order=order_records,
+        guidance=(guidance,),
+        note="the brief states a QUALITATIVE priority; it is kept as an "
+             "ordering with its exact source text, and NO numeric share is "
+             "derived from it. The groups' numeric importance is the "
+             "documented default, labelled as such.",
     )
 
 
-def _equal_groups(groups: Sequence[Mapping[str, Any]]) -> Tuple[GroupWeight, ...]:
-    """Option C: every group gets the SAME importance; children split it."""
+def _equal_groups(
+    groups: Sequence[Mapping[str, Any]],
+    *,
+    source: str = IMPORTANCE_DEFAULT_EQUAL,
+) -> Tuple[GroupWeight, ...]:
+    """Option C: every group gets the SAME importance; children split it.
+
+    The source is recorded on every group, so a reader can always tell a
+    number the owner wrote from a number we defaulted to.
+    """
     if not groups:
         return ()
     share = 1.0 / len(groups)
@@ -469,6 +576,7 @@ def _equal_groups(groups: Sequence[Mapping[str, Any]]) -> Tuple[GroupWeight, ...
             group_id=gid,
             text=str(g.get("text", "")),
             importance=share,
+            importance_source=source,
             child_ids=children,
             mandatory=bool(g.get("mandatory", True)),
         ))
@@ -476,14 +584,25 @@ def _equal_groups(groups: Sequence[Mapping[str, Any]]) -> Tuple[GroupWeight, ...
 
 
 def _weighted_groups(groups, weights, priorities) -> Tuple[GroupWeight, ...]:
+    """Groups whose numeric importance came from the OWNER's number.
+
+    A group with no explicit number keeps the documented default share, and
+    says so, so a partial specification never silently zeroes the others.
+    """
     out = []
     for g in groups:
         gid = str(g.get("group_id", ""))
         children = tuple(str(c) for c in (g.get("parts") or ()))
+        explicit = any(p.target_group_id == gid and p.kind == "numeric"
+                        and p.resolution == "resolved" for p in priorities)
         out.append(GroupWeight(
             group_id=gid,
             text=str(g.get("text", "")),
             importance=float(weights.get(gid, 0.0)),
+            importance_source=(
+                IMPORTANCE_EXPLICIT_NUMERIC if explicit
+                else IMPORTANCE_DEFAULT_EQUAL
+            ),
             child_ids=children,
             priority=_priority_for(priorities, gid),
             mandatory=bool(g.get("mandatory", True)),
@@ -492,13 +611,21 @@ def _weighted_groups(groups, weights, priorities) -> Tuple[GroupWeight, ...]:
 
 
 def _ranked_groups(groups, ranks, priorities) -> Tuple[GroupWeight, ...]:
-    """A qualitative priority is a RANK, expressed as a decreasing share.
+    """A qualitative priority produces an ORDER and NO number.
 
-    The share is a monotone function of the rank so that the ordering is
-    honoured, and the shares still sum to 1 so the scale is unchanged. The
-    NUMBERS are derived from the ORDER the owner stated; they are not claims
-    about how much more the owner meant. The policy's note says so, and the
-    raw source text is kept on every priority.
+    The owner wrote "more important than", not "twice as important". Turning
+    that into a share would be inventing a weighting the owner never stated,
+    so no number is derived here.
+
+    What IS recorded:
+      * the ORDER, as a rank, on the group the priority named
+      * the exact source text and trace, on the priority itself
+      * the group's numeric importance stays at the DOCUMENTED DEFAULT, and
+        its source says "default_equal_groups" -- so nobody can mistake it
+        for the owner's expressed weighting
+
+    The guidance the evaluator may be given carries the ORDER in words, which
+    is the faithful representation of what the owner said.
     """
     if not groups:
         return ()
@@ -507,34 +634,24 @@ def _ranked_groups(groups, ranks, priorities) -> Tuple[GroupWeight, ...]:
         key=lambda g: (ranks.get(str(g.get("group_id", "")), len(ranks) + 1),
                        str(g.get("group_id", ""))))
     n = len(ordered)
-    # A qualitative priority is an ORDER. It is expressed as a strictly
-    # decreasing share that still sums to 1, so the scale is unchanged and the
-    # ordering is honoured.
-    #
-    # The named groups take the front of the order, and the share falls off
-    # geometrically so the first named group is unambiguously the most
-    # important and the rest follow. The NUMBERS are derived from the ORDER
-    # the owner stated; they are not claims about how much more the owner
-    # meant, and the priority record keeps the raw source text.
-    weights: Dict[str, float] = {}
-    if n == 1:
-        weights[str(ordered[0].get("group_id", ""))] = 1.0
-    else:
-        raw = [0.6**i for i in range(n)]
-        total = sum(raw)
-        for g, value in zip(ordered, raw):
-            weights[str(g.get("group_id", ""))] = value / total
+    share = 1.0 / n
     out = []
-    for g in ordered:
+    for index, g in enumerate(ordered):
         gid = str(g.get("group_id", ""))
         children = tuple(str(c) for c in (g.get("parts") or ()))
+        rank = ranks.get(gid)
         out.append(GroupWeight(
             group_id=gid,
             text=str(g.get("text", "")),
-            importance=weights.get(gid, 0.0),
+            # The DEFAULT share, explicitly labelled as the default. The
+            # owner's qualitative preference is carried by the rank and the
+            # source text, never by a derived percentage.
+            importance=share,
+            importance_source=IMPORTANCE_DEFAULT_EQUAL,
             child_ids=children,
             priority=_priority_for(priorities, gid),
             mandatory=bool(g.get("mandatory", True)),
+            qualitative_rank=rank,
         ))
     return tuple(out)
 
@@ -606,6 +723,9 @@ def compute_requirement_set_id(
 
 __all__ = [
     "GroupWeight",
+    "IMPORTANCE_DEFAULT_EQUAL",
+    "IMPORTANCE_EXPLICIT_NUMERIC",
+    "IMPORTANCE_UNCOMMITTED",
     "Priority",
     "SCORING_CONTRACT_VERSION",
     "WEIGHTING_POLICY_VERSION",

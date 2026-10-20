@@ -35,6 +35,8 @@ from app.core.design_requirement_artifact import (  # noqa: E402
 from app.core.requirement_artifact_builder import build_artifact_from_brief  # noqa: E402
 from app.core.requirement_creator import compile_prd  # noqa: E402
 from app.core.requirement_priority import (  # noqa: E402
+    IMPORTANCE_DEFAULT_EQUAL,
+    IMPORTANCE_EXPLICIT_NUMERIC,
     SCORING_CONTRACT_VERSION,
     WEIGHTING_POLICY_VERSION,
     build_weighting_policy,
@@ -150,22 +152,71 @@ class TestOptionDExplicit:
     def test_a_qualitative_priority_invents_no_percentage(self):
         policy = build_weighting_policy(
             {"what": "Yang paling penting desain premium"}, NAMED_GROUPS)
-        assert policy.mode == "d_explicit"
-        priority = policy.group("G_DESIGN").priority
-        assert priority is not None
-        assert priority.kind == "qualitative"
-        assert priority.value is None, "a qualitative priority carries no number"
-        # The ORDER is expressed, and the note says the numbers are derived.
-        assert policy.note
-        assert "no numeric share is invented" in policy.note.lower() \
-            or "no number" in policy.note.lower()
-
     def test_a_qualitative_priority_keeps_an_ordering(self):
+        """The ORDER is recorded. No number is derived from it."""
         policy = build_weighting_policy(
             {"what": "Yang paling penting desain premium"}, NAMED_GROUPS)
         design = policy.group("G_DESIGN")
         content = policy.group("G_CONTENT")
-        assert design.importance > content.importance
+        assert design.qualitative_rank == 1
+        assert content.qualitative_rank is None
+        # The ORDER is preserved in the policy, not in a share.
+        assert policy.qualitative_order
+        assert policy.qualitative_order[0]["group_id"] == "G_DESIGN"
+        assert policy.qualitative_order[0]["source_text"]
+        assert policy.qualitative_order[0]["numeric_value"] is None
+
+    def test_a_qualitative_priority_invents_no_numbers(self):
+        """The correction: 0.625/0.375 must never reappear.
+
+        The owner wrote "more important than", not "twice as important". A
+        derived share would be a number the owner never stated, so the groups
+        keep the DOCUMENTED DEFAULT and say so.
+        """
+        policy = build_weighting_policy(
+            {"what": "Yang paling penting desain premium"}, NAMED_GROUPS)
+        shares = {g.importance for g in policy.groups}
+        assert len(set(round(s, 9) for s in shares)) == 1, (
+            "a qualitative priority must not produce unequal numeric shares"
+        )
+        for g in policy.groups:
+            assert g.importance_source == IMPORTANCE_DEFAULT_EQUAL, (
+                "a default share must be labelled as the default, never as the "
+                "owner's expressed weighting"
+            )
+            assert g.priority is None or g.priority.value is None
+
+    def test_a_qualitative_policy_states_that_no_number_is_assumed(self):
+        policy = build_weighting_policy(
+            {"what": "Yang paling penting desain premium"}, NAMED_GROUPS)
+        assert policy.guidance
+        assert "none are assumed" in policy.guidance[0].lower()
+
+    def test_the_guidance_carries_the_owners_exact_words(self):
+        policy = build_weighting_policy(
+            {"what": "Yang paling penting desain premium"}, NAMED_GROUPS)
+        assert "Yang paling penting desain premium" in policy.guidance[0]
+
+    def test_the_qualitative_order_keeps_the_source_text_and_trace(self):
+        policy = build_weighting_policy(
+            {"what": "Yang paling penting desain premium"}, NAMED_GROUPS)
+        record = policy.qualitative_order[0]
+        assert record["source_text"] == "Yang paling penting desain premium"
+        assert record["trace"].startswith("brief.")
+        assert record["kind"] == "qualitative"
+
+    def test_a_numeric_priority_is_labelled_as_the_owners_number(self):
+        policy = build_weighting_policy(
+            {"what": "konten priority 3, desain priority 1"}, NAMED_GROUPS)
+        for g in policy.groups:
+            assert g.importance_source == IMPORTANCE_EXPLICIT_NUMERIC
+        assert policy.guidance
+        assert "owner" in policy.guidance[0].lower()
+        assert "3" in policy.guidance[0]
+
+    def test_the_policy_states_that_nothing_is_enforceable(self):
+        policy = build_weighting_policy({}, NAMED_GROUPS)
+        assert policy.enforcement == "none_available"
 
     def test_a_mappable_priority_is_resolved(self):
         """"produk" names the content group, so the priority applies to it."""
@@ -173,8 +224,9 @@ class TestOptionDExplicit:
             {"what": "Prioritaskan informasi produk"}, NAMED_GROUPS)
         assert len(policy.unresolved) == 0
         assert policy.group("G_CONTENT").priority is not None
-        assert policy.group("G_CONTENT").importance > \
-            policy.group("G_DESIGN").importance
+        # The preference is carried by the RANK, not by a derived share.
+        assert policy.group("G_CONTENT").qualitative_rank == 1
+        assert policy.group("G_DESIGN").qualitative_rank is None
 
     def test_an_unmappable_priority_is_unresolved(self):
         """A priority that names nothing any group shares stays unresolved."""
