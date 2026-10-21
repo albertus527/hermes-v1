@@ -27,12 +27,12 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
-from app.core.shadow_evaluation import (
+from app.core.shadow_runner import (
+    ShadowConfig,
     ShadowEvaluationRequest,
     ShadowNotReady,
     evaluate_after_preview,
 )
-from app.core.shadow_runner import ShadowConfig
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +91,43 @@ def run_shadow_evaluation_command(
     The report is the operator-facing summary. It never contains the brief
     or the requirement texts.
     """
+    return run_operator_shadow_evaluation(
+        project_id=project_id,
+        workspace=workspace,
+        state=state,
+        source_revision=source_revision,
+        candidates=candidates,
+        brief=brief,
+        config=config,
+        score_fn=score_fn,
+        requirements_version=requirements_version,
+        requirement_set_id=requirement_set_id,
+    )
+
+
+def run_operator_shadow_evaluation(
+    *,
+    project_id: str,
+    workspace: Any,
+    state: Any,
+    source_revision: str,
+    candidates: Sequence[Any],
+    brief: Mapping[str, Any],
+    config: ShadowConfig,
+    score_fn: Optional[Any] = None,
+    requirements_version: str = "",
+    requirement_set_id: str = "",
+) -> dict:
+    """The whole operator flow, in one testable function.
+
+    It performs ONE shadow evaluation and returns the report. Every refusal
+    raises ``ShadowEvaluationError``; nothing is retried and no model call
+    is made unless every precondition holds.
+    """
+    if not candidates:
+        raise ShadowEvaluationError(
+            "the native retrieval path produced no candidates"
+        )
     request = ShadowEvaluationRequest(
         project_id=project_id,
         source_revision=source_revision,
@@ -124,6 +161,8 @@ def run_shadow_evaluation_command(
                 "suitability": a.suitability,
                 "requirement_set_id": a.requirement_set_id,
                 "scoring_contract_version": a.scoring_contract_version,
+                "invocation_id": a.invocation_id,
+                "invocation_state": a.invocation_state,
                 "latency_ms": a.latency_ms,
                 "cost": a.cost,
             }

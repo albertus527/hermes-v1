@@ -25,10 +25,16 @@ import logging
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 
 from app.core.shadow_scoring import (
     SHADOW_CONTRACT_VERSION,
+    STATE_COMPLETED,
+    STATE_FAILED,
+    STATE_INDETERMINATE,
+    STATE_PENDING,
+    TERMINAL_STATES,
     ShadowAttempt,
     ShadowScoringError,
     write_shadow_record,
@@ -48,8 +54,10 @@ STATUS_MISSING_ARTIFACT = "missing_artifact"
 STATUS_CORRUPT_ARTIFACT = "corrupt_artifact"
 STATUS_NO_CANDIDATES = "no_candidates"
 STATUS_DUPLICATE = "duplicate_invocation"
+STATUS_INDETERMINATE = "indeterminate_previous_outcome"
 STATUS_STORAGE_FAILED = "storage_failed"
 STATUS_NOT_ENABLED = "not_enabled"
+STATUS_PENDING = "pending"
 
 #: The statuses that mean the attempt degraded, i.e. something failed
 #: rather than the measurement simply being inconclusive.
@@ -59,6 +67,56 @@ DEGRADED_STATUSES = frozenset({
     STATUS_MALFORMED,
     STATUS_STORAGE_FAILED,
 })
+
+#: The failures that happened AFTER the dispatch. The request was sent, so
+#: it may already have been billed, so the outcome of that paid call is
+#: UNKNOWN. These get the INDETERMINATE state, which blocks an ordinary
+#: resume from re-dispatching.
+POST_DISPATCH_STATUSES = frozenset({
+    STATUS_PROVIDER_FAILED,
+    STATUS_TIMEOUT,
+    STATUS_MALFORMED,
+})
+
+
+class ShadowNotReady(Exception):
+    """The preconditions for a shadow run are not met."""
+
+
+@dataclass(frozen=True)
+class ShadowEvaluationRequest:
+    """Everything one shadow evaluation needs, and nothing more.
+
+    The brief is passed in so the scoring call can be made, but it is never
+    written into the record: the record carries scores and identifiers, not
+    the owner's words.
+    """
+
+    project_id: str
+    source_revision: str
+    candidates: Sequence[Any]
+    brief: Mapping[str, Any]
+    requirements_version: str = ""
+    requirement_set_id: str = ""
+
+
+def preview_already_delivered(state: Any) -> bool:
+    """Whether a preview for this revision has already been shown.
+
+    This is the same durable fact the build consults to decide whether a
+    preview may be buried: the lifecycle is PREVIEW_READY and the shown
+    preview belongs to the current source revision.
+    """
+    lifecycle = str(getattr(state, "lifecycle", "") or "")
+    deployment = getattr(state, "deployment", None) or {}
+    shown = deployment.get("latest_shown_preview") or {}
+    revisions = getattr(state, "revisions", None)
+    current_revision = str(getattr(revisions, "source_revision", "") or "")
+    return (
+        lifecycle == "PREVIEW_READY"
+        and bool(shown)
+        and str(shown.get("source_revision") or "") == current_revision
+    )
 
 
 class ShadowNotEnabled(Exception):
@@ -121,20 +179,116 @@ class ShadowRunResult:
         }
 
 
-def _copy_candidate(candidate: Any) -> Any:
-    """Return a copy of a candidate that carries no suitability.
+def _frozen_mapping(value: Any) -> Any:
+    """Return an immutable, independently constructed view of a mapping.
 
-    ``DesignCandidate`` is a frozen dataclass, so ``replace`` gives a
-    genuine copy. The copy is what gets scored; the original is never
-    handed to the provider, so the provider cannot mutate it even in
-    principle.
+    A plain ``dict`` is mutable, so sharing one between the live candidate
+    and the scoring copy would let the scorer change the live object. A
+    ``MappingProxyType`` is immutable but wraps the ORIGINAL dict, so
+    mutating the original would still be visible through it. Neither is
+    enough: the mapping has to be COPIED and then frozen.
+    """
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        return MappingProxyType(dict(value))
+    return value
+
+
+def _copy_asset(asset: Any) -> Any:
+    """Rebuild an asset as an independent, frozen value.
+
+    A candidate's assets are typed ``Tuple[Any, ...]``, so in principle an
+    asset could be any object at all, including a mutable one. Rebuilding
+    it as a frozen ``DesignAsset`` means the scorer can read it but cannot
+    write to it, and cannot write through it to the live asset.
+    """
+    from app.core.design_reference import DesignAsset
+
+    if isinstance(asset, DesignAsset):
+        return DesignAsset(
+            kind=asset.kind, uri=asset.uri, revision=asset.revision,
+            digest=asset.digest, mime=asset.mime, width=asset.width,
+            height=asset.height, bytes=asset.bytes,
+        )
+    # A duck-typed or mapping asset. Rebuild the fields that matter, and
+    # carry the rest through as an immutable mapping so nothing mutable
+    # survives.
+    if isinstance(asset, Mapping):
+        return MappingProxyType(dict(asset))
+    fields = {}
+    for name in ("kind", "uri", "revision", "digest", "mime", "width",
+                 "height", "bytes"):
+        if hasattr(asset, name):
+            fields[name] = getattr(asset, name)
+    if fields:
+        return MappingProxyType(fields)
+    return asset
+
+
+def _copy_measurement(measurement: Any) -> Any:
+    """Rebuild a measurement as an independent, frozen value.
+
+    ``StructuralEvidence.counts`` is a ``Mapping[str, Any]`` and in
+    practice a plain dict, which a hostile scorer could mutate to change
+    the live measurement. The copy gets its own dict, frozen.
+    """
+    from app.core.design_reference import StructuralEvidence
+
+    if not isinstance(measurement, StructuralEvidence):
+        if isinstance(measurement, Mapping):
+            return MappingProxyType(dict(measurement))
+        return measurement
+    return StructuralEvidence(
+        candidate_id=measurement.candidate_id,
+        source_revision=measurement.source_revision,
+        viewport=measurement.viewport,
+        screenshot_digest=measurement.screenshot_digest,
+        measured_at_url=measurement.measured_at_url,
+        probe_version=measurement.probe_version,
+        font_families=tuple(measurement.font_families),
+        type_scale=tuple(measurement.type_scale),
+        spacing_scale=tuple(measurement.spacing_scale),
+        contrast=tuple(measurement.contrast),
+        component_count=measurement.component_count,
+        counts=_frozen_mapping(measurement.counts),
+        document_height=measurement.document_height,
+        collected=measurement.collected,
+        error=measurement.error,
+    )
+
+
+def _copy_candidate(candidate: Any) -> Any:
+    """Return a DEEP, independent copy of a candidate that carries no
+    suitability.
+
+    A shallow copy is not enough. A frozen dataclass prevents rebinding its
+    own attributes, but it does not prevent mutating a mutable object
+    REACHABLE through one of them -- and a candidate's assets and a
+    measurement's ``counts`` are exactly that. So every nested value the
+    scorer can reach is rebuilt here as an independent, immutable value.
+
+    The original is never handed to the provider, so the provider cannot
+    mutate it even in principle.
     """
     try:
+        assets = tuple(
+            _copy_asset(a) for a in (getattr(candidate, "assets", ()) or ())
+        )
+        measurements = tuple(
+            _copy_measurement(m)
+            for m in (getattr(candidate, "measurements", ()) or ())
+        )
+        detail = getattr(candidate, "suitability_detail", ()) or ()
+        evidence = getattr(candidate, "evidence", ()) or ()
+        palette = getattr(candidate, "palette", ()) or ()
         return replace(
             candidate,
             suitability=None,
-            suitability_detail=None,
+            suitability_detail=(),
             suitability_contract="",
+            assets=assets,
+            measurements=measurements,
         )
     except (TypeError, ValueError):
         # A candidate type that cannot be replaced is not silently scored.
@@ -170,6 +324,31 @@ def _requirement_binding(
     if not set_id:
         raise ShadowScoringError(STATUS_REQUIREMENT_SET_MISMATCH)
     return tuple(requirements), set_id, str(artifact.source_revision)
+
+
+def invocation_identity(
+    project_id: str,
+    source_revision: str,
+    requirement_set_id: str,
+    scoring_contract_version: str = SHADOW_CONTRACT_VERSION,
+) -> str:
+    """The durable identity of one shadow measurement.
+
+    It is derived from the things that DEFINE the measurement, so:
+
+      * the same measurement always has the same identity, which is what
+        makes a duplicate detectable across process restarts;
+      * a different revision, requirement set or contract can never share
+        an identity, so an old revision can never impersonate the current
+        one.
+    """
+    import hashlib
+
+    material = "\x1f".join((
+        project_id, str(source_revision), requirement_set_id,
+        scoring_contract_version,
+    ))
+    return "inv-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:20]
 
 
 def _existing_attempts(workspace: Any) -> Tuple[ShadowAttempt, ...]:
@@ -228,6 +407,7 @@ def run_shadow_scoring(
                 status=code,
                 error_code=code,
                 note="the requirement artifact could not be read",
+                invocation_state=STATE_FAILED,
             ))
         return _store(ws, project_id, source_revision, attempts, notes)
 
@@ -245,6 +425,7 @@ def run_shadow_scoring(
                     f"the requested requirement set {requirement_set_id!r} does "
                     f"not match the artifact's {artifact_set_id!r}"
                 ),
+                invocation_state=STATE_FAILED,
             ))
         return _store(ws, project_id, source_revision, attempts, notes)
 
@@ -266,16 +447,29 @@ def run_shadow_scoring(
                     f"the artifact is at revision {artifact_revision} but the "
                     f"shadow run is for revision {source_revision}"
                 ),
+                invocation_state=STATE_FAILED,
             ))
         return _store(ws, project_id, source_revision, attempts, notes)
 
-    # --- a duplicate invocation is refused, so one shadow run cannot be
-    # --- charged twice or double-counted. A repeat for a DIFFERENT
-    # --- revision is allowed, because that is a different measurement.
+    # --- The durable invocation identity. A record with this identity that
+    # --- is in a TERMINAL state means the measurement was already made, so
+    # --- this is a duplicate: refuse, and spend no call.
+    # ---
+    # --- A record with this identity that is still PENDING means a
+    # --- previous process died between the dispatch and the completion
+    # --- write. The outcome of that PAID call is UNKNOWN. It is NOT
+    # --- retried: the runner reports it and refuses, because a silent
+    # --- retry could spend a second call for a measurement whose first
+    # --- call may already have been billed. The operator decides.
+    identity = invocation_identity(
+        project_id, source_revision, effective_set_id,
+        config.scoring_contract_version,
+    )
     for previous in _existing_attempts(ws):
-        if (previous.source_revision == str(source_revision)
-                and previous.requirement_set_id == effective_set_id
-                and previous.status == STATUS_OK):
+        if previous.invocation_id != identity:
+            continue
+        if previous.invocation_state == STATE_COMPLETED:
+            # The measurement was made. Refuse, and spend no call.
             return ShadowRunResult(
                 project_id=project_id,
                 source_revision=source_revision,
@@ -283,6 +477,19 @@ def run_shadow_scoring(
                 stored=False,
                 error=STATUS_DUPLICATE,
             )
+        if previous.invocation_state in (STATE_PENDING, STATE_INDETERMINATE):
+            # The previous call was SENT and its outcome is unknown. A
+            # second call could be billed for a measurement whose first
+            # call already happened. Refuse, and say so.
+            return ShadowRunResult(
+                project_id=project_id,
+                source_revision=source_revision,
+                attempts=(),
+                stored=False,
+                error=STATUS_INDETERMINATE,
+            )
+        # STATE_FAILED: the attempt failed BEFORE the dispatch, so nothing
+        # was billed and a retry is safe. Fall through and continue.
 
     if not candidates:
         return _store(ws, project_id, source_revision, (), [
@@ -295,13 +502,56 @@ def run_shadow_scoring(
         try:
             copies.append(_copy_candidate(candidate))
         except ShadowScoringError as exc:
+            # A candidate that cannot be copied is not silently dropped: the
+            # attempt is recorded, so a failure is never invisible.
             notes.append(str(exc))
-            return _store(ws, project_id, source_revision, (), notes)
+            attempts.append(ShadowAttempt(
+                project_id=project_id,
+                candidate_id=str(getattr(candidate, "candidate_id", "")),
+                source_revision=source_revision,
+                requirement_set_id=effective_set_id,
+                degraded=False,
+                status=STATUS_NOT_ENABLED,
+                error_code=STATUS_NOT_ENABLED,
+                note=str(exc),
+                invocation_state=STATE_FAILED,
+            ))
+            return _store(ws, project_id, source_revision, attempts, notes)
 
     if score_fn is None:
         attempts.append(_failed(
             project_id, pool, source_revision, effective_set_id,
             STATUS_NOT_ENABLED, "no shadow scorer was supplied", 0,
+        ))
+        return _store(ws, project_id, source_revision, attempts, notes)
+
+    # --- THE PENDING WRITE. It happens BEFORE the dispatch, so a process
+    # --- death during the paid call leaves a durable record saying the
+    # --- outcome is unknown. Without this, a resume would re-dispatch a
+    # --- call that may already have been billed.
+    pending = [ShadowAttempt(
+        project_id=project_id,
+        candidate_id=str(getattr(candidate, "candidate_id", "")),
+        source_revision=source_revision,
+        requirement_set_id=effective_set_id,
+        scoring_contract_version=config.scoring_contract_version,
+        invocation_id=identity,
+        invocation_state=STATE_PENDING,
+        status=STATUS_PENDING,
+        note="dispatched",
+    ) for candidate in pool]
+    try:
+        write_shadow_record(
+            ws, tuple(pending), project_id=project_id,
+            source_revision=source_revision,
+        )
+    except (ShadowScoringError, OSError):
+        # The pending marker could not be written, so the call is NOT
+        # dispatched: without the marker, a crash would be invisible.
+        attempts.append(_failed(
+            project_id, pool, source_revision, effective_set_id,
+            STATUS_STORAGE_FAILED, "the pending marker could not be written",
+            0,
         ))
         return _store(ws, project_id, source_revision, attempts, notes)
 
@@ -325,6 +575,7 @@ def run_shadow_scoring(
             project_id, pool, source_revision, effective_set_id,
             STATUS_PROVIDER_FAILED, type(exc).__name__,
             int((time.time() - started) * 1000),
+            invocation_id=identity,
         ))
         logger.info(
             "shadow scoring failed",
@@ -338,7 +589,7 @@ def run_shadow_scoring(
         attempts.append(_failed(
             project_id, pool, source_revision, effective_set_id,
             STATUS_MALFORMED, "the provider returned no candidates",
-            elapsed,
+            elapsed, invocation_id=identity,
         ))
         return _store(ws, project_id, source_revision, attempts, notes)
 
@@ -350,6 +601,7 @@ def run_shadow_scoring(
             attempts.append(_failed(
                 project_id, [candidate], source_revision, effective_set_id,
                 STATUS_MALFORMED, f"no result for candidate {cid!r}", elapsed,
+                invocation_id=identity,
             ))
             continue
         suitability = getattr(result, "suitability", None)
@@ -357,7 +609,7 @@ def run_shadow_scoring(
             attempts.append(_failed(
                 project_id, [candidate], source_revision, effective_set_id,
                 STATUS_MALFORMED, f"candidate {cid!r} carries no suitability",
-                elapsed,
+                elapsed, invocation_id=identity,
             ))
             continue
         digests = tuple(
@@ -375,6 +627,8 @@ def run_shadow_scoring(
             degraded=False,
             status=STATUS_OK,
             latency_ms=elapsed,
+            invocation_id=identity,
+            invocation_state=STATE_COMPLETED,
         ))
 
     return _store(ws, project_id, source_revision, attempts, notes)
@@ -388,6 +642,8 @@ def _failed(
     status: str,
     detail: str,
     latency_ms: int,
+    *,
+    invocation_id: str = "",
 ) -> ShadowAttempt:
     """A single record describing a failed attempt for a pool."""
     first = candidates[0] if candidates else None
@@ -401,6 +657,11 @@ def _failed(
         error_code=status,
         latency_ms=latency_ms,
         note=detail,
+        invocation_id=invocation_id,
+        invocation_state=(
+            STATE_INDETERMINATE if status in POST_DISPATCH_STATUSES
+            else STATE_FAILED
+        ),
     )
 
 
@@ -438,3 +699,54 @@ def _store(
         stored=True,
         error="",
     )
+
+
+def evaluate_after_preview(
+    workspace: Any,
+    *,
+    state: Any,
+    request: ShadowEvaluationRequest,
+    config: ShadowConfig,
+    score_fn: Optional[Callable[..., Sequence[Any]]] = None,
+) -> ShadowRunResult:
+    """Run one shadow evaluation, after the preview was delivered.
+
+    The build never calls this. An operator does, after the user has their
+    preview. It refuses unless the preview for the CURRENT source revision
+    has already been delivered, because a shadow run that could delay a
+    preview is a shadow run in the wrong place.
+    """
+    if not config.enabled:
+        raise ShadowNotReady(
+            "shadow scoring is not enabled; enable it explicitly for this run"
+        )
+    if not preview_already_delivered(state):
+        raise ShadowNotReady(
+            "the preview has not been delivered yet; a shadow run must not "
+            "be able to delay a preview"
+        )
+    if not request.candidates:
+        raise ShadowNotReady("there are no candidates to score")
+
+    result = run_shadow_scoring(
+        Path(workspace),
+        project_id=request.project_id,
+        config=config,
+        candidates=request.candidates,
+        source_revision=request.source_revision,
+        requirement_set_id=request.requirement_set_id,
+        score_fn=score_fn,
+        brief=request.brief,
+        requirement_version=request.requirements_version,
+    )
+    logger.info(
+        "shadow evaluation finished",
+        extra={
+            "n8_role": "shadow",
+            "n8_project_id": request.project_id,
+            "n8_stored": result.stored,
+            "n8_attempts": len(result.attempts),
+            "n8_produced_suitability": result.produced_suitability,
+        },
+    )
+    return result

@@ -484,8 +484,12 @@ class TestStorageWriteFailure:
         )
         assert result.stored is False
         assert result.error == STATUS_STORAGE_FAILED
-        # the attempt itself is still visible to the caller
-        assert result.produced_suitability is True
+        # The PENDING marker could not be written, so the paid call was NOT
+        # dispatched: without the marker a crash would be invisible, and a
+        # resume could spend a second call for a call that may already have
+        # been billed. Failing closed is the correct behaviour here.
+        assert result.produced_suitability is False
+        assert result.attempts[0].status == STATUS_STORAGE_FAILED
 
     def test_a_storage_failure_leaves_the_live_candidates_untouched(
             self, tmp_path, monkeypatch):

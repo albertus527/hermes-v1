@@ -37,6 +37,19 @@ SHADOW_FILE_NAME = "shadow-scoring.json"
 #: The schema version of the shadow record.
 SHADOW_SCHEMA_VERSION = 1
 
+#: The invocation states. A record moves PENDING -> one of the terminal
+#: states. A PENDING record that is still present when a new run starts
+#: means a previous process died between the dispatch and the completion
+#: write, so the outcome of that paid call is UNKNOWN.
+STATE_PENDING = "pending"
+STATE_COMPLETED = "completed"
+STATE_FAILED = "failed"
+STATE_INDETERMINATE = "indeterminate"
+
+#: The terminal states. A record in one of these is a finished attempt.
+TERMINAL_STATES = frozenset({STATE_COMPLETED, STATE_FAILED,
+                              STATE_INDETERMINATE})
+
 #: The scoring contract a shadow record is bound to. It MUST match the
 #: contract the live path would use, otherwise the measurement is not
 #: comparable with a future active run.
@@ -109,10 +122,19 @@ class ShadowScore:
     measured_at: float = 0.0
     #: The schema version of this record.
     schema_version: int = SHADOW_SCHEMA_VERSION
+    #: The durable invocation identity. It is derived from the things that
+    #: define the measurement -- the project, the revision, the requirement
+    #: set and the contract -- so the same measurement always has the same
+    #: identity, and a different measurement never can.
+    invocation_id: str = ""
+    #: The invocation state: pending, completed, failed or indeterminate.
+    invocation_state: str = STATE_PENDING
 
     def to_dict(self) -> dict:
         return {
             "schema_version": self.schema_version,
+            "invocation_id": self.invocation_id,
+            "invocation_state": self.invocation_state,
             "project_id": self.project_id,
             "candidate_id": self.candidate_id,
             "source_revision": self.source_revision,
@@ -177,6 +199,10 @@ class ShadowScore:
                 schema_version=int(
                     payload.get("schema_version") or SHADOW_SCHEMA_VERSION
                 ),
+                invocation_id=str(payload.get("invocation_id") or ""),
+                invocation_state=str(
+                    payload.get("invocation_state") or STATE_PENDING
+                ),
             )
         except (TypeError, ValueError) as exc:
             raise ShadowScoringError(f"shadow record is malformed: {exc}") from exc
@@ -212,9 +238,15 @@ class ShadowAttempt:
     #: A free-form operator note, e.g. why the attempt was refused.
     note: str = ""
     extra: Mapping[str, Any] = field(default_factory=dict)
+    #: The durable invocation identity.
+    invocation_id: str = ""
+    #: The invocation state: pending, completed, failed or indeterminate.
+    invocation_state: str = STATE_PENDING
 
     def to_record(self) -> ShadowScore:
         return ShadowScore(
+            invocation_id=self.invocation_id,
+            invocation_state=self.invocation_state,
             project_id=self.project_id,
             candidate_id=self.candidate_id,
             source_revision=self.source_revision,
@@ -260,11 +292,25 @@ def write_shadow_record(
     file and moved into place, so a crash never leaves a half-written
     record that would later be read as a complete one.
     """
-    records = [a.to_dict() for a in attempts]
+    # The file holds EVERY invocation, merged by invocation identity. A
+    # write for one revision can never erase another revision's attempts,
+    # so an old revision can neither overwrite nor impersonate the current
+    # one.
+    existing = read_shadow_attempts(workspace)
+    merged: dict = {}
+    for attempt in existing:
+        merged[attempt.invocation_id or attempt.candidate_id] = attempt
+    for attempt in attempts:
+        merged[attempt.invocation_id or attempt.candidate_id] = attempt
+
+    records = [a.to_dict() for a in merged.values()]
     payload = {
         "schema_version": SHADOW_SCHEMA_VERSION,
         "project_id": project_id,
         "source_revision": source_revision,
+        # The revisions this file holds, so a reader can see at a glance
+        # that it is not a single-revision file.
+        "source_revisions": sorted({a.source_revision for a in merged.values()}),
         "attempts": records,
     }
     text = json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False)
@@ -321,6 +367,8 @@ def read_shadow_attempts(workspace: Any) -> Tuple[ShadowAttempt, ...]:
         except ShadowScoringError:
             continue
         out.append(ShadowAttempt(
+            invocation_id=record.invocation_id,
+            invocation_state=record.invocation_state,
             project_id=record.project_id,
             candidate_id=record.candidate_id,
             source_revision=record.source_revision,

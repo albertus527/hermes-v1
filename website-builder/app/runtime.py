@@ -3486,26 +3486,17 @@ def _run_shadow_evaluate(composition, argv) -> int:
     """``python -m app --shadow-evaluate <project_id> --shadow-config <path>``
 
     An OPERATOR-ONLY diagnostic shadow evaluation. It MEASURES the scoring
-    rubric and writes an internal diagnostic record. It does not:
-
-      * call the model by itself -- the scoring callable is the native
-        provider's own pool scorer, invoked with the candidates the native
-        retrieval path produced;
-      * touch the live candidate state -- the provider is handed COPIES and
-        its output is discarded;
-      * affect the preview, the approval, the publication or the lifecycle;
-      * run automatically for any build. It is only ever reached from this
-        explicit operator flag.
-
-    The preview must ALREADY have been delivered: a shadow run that could
-    delay a preview is a shadow run in the wrong place.
+    rubric and writes an internal diagnostic record. It does not call the
+    model by itself, does not touch the live candidate state, and does not
+    affect the preview, the approval, the publication or the lifecycle. It
+    is only ever reached from this explicit operator flag, and the preview
+    must already have been delivered.
     """
     from app.core.shadow_cli import (
         ShadowEvaluationError,
         load_shadow_config,
         run_shadow_evaluation_command,
     )
-    from app.core.shadow_evaluation import ShadowNotReady
 
     project_id = _flag_value(argv, "--shadow-evaluate")
     config_path = _flag_value(argv, "--shadow-config")
@@ -3533,10 +3524,7 @@ def _run_shadow_evaluate(composition, argv) -> int:
     # uses, so the shadow measurement is about the same candidates the
     # build would have seen. There is no second retrieval path.
     candidates = []
-    brief = {}
     try:
-        from app.projects.build import ProjectBuilder
-
         builder = getattr(composition, "project_builder", None)
         if builder is not None and hasattr(
                 builder, "_retrieve_design_candidates"):
@@ -3549,14 +3537,6 @@ def _run_shadow_evaluate(composition, argv) -> int:
             ) or ())
     except Exception:
         logger.exception("Shadow candidate retrieval failed; continuing")
-
-    if not candidates:
-        logger.error(
-            "Shadow evaluation refused: the native retrieval path produced "
-            "no candidates for project=%s",
-            project_id,
-        )
-        return 1
 
     # The brief is passed to the scoring call but never written into the
     # record; the record carries scores and identifiers only.
@@ -3581,13 +3561,12 @@ def _run_shadow_evaluate(composition, argv) -> int:
             config=shadow_config,
             score_fn=scorer,
         )
-    except (ShadowEvaluationError, ShadowNotReady) as exc:
+    except ShadowEvaluationError as exc:
         logger.error("Shadow evaluation refused: %s", exc)
         return 1
 
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0 if report.get("stored") else 1
-
 
 def main(argv: Optional[List[str]] = None) -> int:
     """Canonical Website Builder runtime entrypoint."""
