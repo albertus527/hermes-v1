@@ -789,7 +789,15 @@ def build_scoring_state(
         header.append("  " + one_line(scope_rule, 600))
     parts.append("\n".join(header))
 
-    usable = usable_requirements(requirements)
+    # The requirement set that reaches the model is the one the POLICY says is
+    # usable. ``usable_requirements`` only drops blanks, duplicates and
+    # UNRESOLVED markers, so compiler boilerplate would otherwise travel to
+    # the model as if it were an owner obligation. The provider already filters
+    # before calling here, but this builder is reachable from other callers,
+    # and the boilerplate must not reach the model through any of them.
+    _sufficient, _reason, usable, _excluded = assess_requirement_sufficiency(
+        requirements
+    )
     if usable:
         numbered = [f"Requirements:"]
         for position, text in enumerate(usable, start=1):
