@@ -235,6 +235,27 @@ def compile_design(
     typography = _field("typography")
     layout = _field("layout")
 
+    # The OWNER'S OWN design intent, read from the same brief field the PRD
+    # reads. It is the highest-authority design evidence available, and it was
+    # absent from the document FRONTEND reads most closely. It is carried
+    # VERBATIM, and it is kept in its own section so it can never be mistaken
+    # for a DNA-derived value or silently overridden by one.
+    design_intent = _clean(brief.get("design_intent"))
+
+    # Assumptions and unresolved questions come from the brief as the
+    # Requirement Creator already records them, so Design.md and the
+    # requirement artifact cannot disagree about what was assumed.
+    assumptions = brief.get("assumptions")
+    assumption_lines = [
+        f"- {_clean(a)}" for a in (assumptions or ())
+        if isinstance(a, str) and _clean(a)
+    ]
+    unresolved = brief.get("unresolved")
+    unresolved_lines = [
+        f"- {_clean(u)}" for u in (unresolved or ())
+        if isinstance(u, str) and _clean(u)
+    ]
+
     # A tiny, deterministic fallback so a minimal-but-valid DNA still yields a
     # non-empty, honest section. It is derived from the DNA's own key set, not
     # from invention.
@@ -250,16 +271,54 @@ def compile_design(
         "generator_version": str(generator_version),
         "design_dna_version": str(design_dna_version),
     }
-    body = (
-        "## Brand Personality\n\n"
-        f"{_or_unresolved(brand)}\n\n"
-        "## Palette\n\n"
-        f"{_or_unresolved(palette)}\n\n"
-        "## Typography\n\n"
-        f"{_or_unresolved(typography)}\n\n"
-        "## Layout\n\n"
-        f"{_or_unresolved(layout)}\n"
+    confirmed_line = (
+        brand
+        or f"{UNRESOLVED_MARKER}: no confirmed brand personality was supplied"
     )
+    assumptions_line = (
+        "\n".join(assumption_lines) if assumption_lines else "None recorded."
+    )
+    unresolved_line = (
+        "\n".join(unresolved_lines) if unresolved_lines else "None recorded."
+    )
+    body = (
+          "## Brand Personality\n\n"
+          f"{_or_unresolved(brand)}\n\n"
+          "## Palette\n\n"
+          f"{_or_unresolved(palette)}\n\n"
+          "## Typography\n\n"
+          f"{_or_unresolved(typography)}\n\n"
+          "## Layout\n\n"
+          f"{_or_unresolved(layout)}\n\n"
+    )
+    # The Design Intent section appears ONLY when the owner actually stated one.
+    #
+    # The PRD may carry an UNRESOLVED marker in its optional Design Intent
+    # section, because that section is not among the PRD's REQUIRED sections.
+    # Design.md is different: its contract is that a document whose facts are
+    # supplied carries no UNRESOLVED markers, and a document with no owner
+    # preference supplied has no intent to report.
+    #
+    # So the honest form of "the owner said nothing" here is to OMIT the
+    # section, not to write a marker for it. Writing "UNRESOLVED: the owner
+    # stated no explicit design preference" into a fully-specified Design.md
+    # would be a marker about a document section that does not exist, and it
+    # would contradict the document's own contract.
+    #
+    # Nothing is invented either way: the owner's words are absent because the
+    # owner wrote none.
+    if design_intent:
+        body += (
+            "## Design Intent\n\n"
+            "Explicit owner preference:\n"
+            f"{design_intent}\n\n"
+            "Confirmed design choice:\n"
+            f"{confirmed_line}\n\n"
+            "Assumptions:\n"
+            f"{assumptions_line}\n\n"
+            "Unresolved design questions:\n"
+            f"{unresolved_line}\n"
+        )
     text = serialise_document(front, body)
     _, violations = validate_design(text)
     if violations:
