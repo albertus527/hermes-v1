@@ -3404,6 +3404,8 @@ _KNOWN_FLAGS = frozenset({
     "--as",
     "--provision-impeccable-parser",
     "--qa-reaccept",
+    "--shadow-evaluate",
+    "--shadow-config",
 })
 
 _USAGE = """\
@@ -3431,6 +3433,18 @@ Usage:
                                                the SAME source revision with NO
                                                FRONTEND invocation and NO budget
                                                reset; never deploys a Preview.
+    python -m app --shadow-evaluate <project_id> --shadow-config <path>
+                                               OPERATOR-ONLY diagnostic shadow
+                                               evaluation. Performs NO model call by
+                                               itself: it scores an already-retrieved
+                                               candidate pool through the native
+                                               evidence pipeline, writes an INTERNAL
+                                               diagnostic record, and never touches
+                                               the live candidate state, the preview,
+                                               the approval or the publication.
+                                               Requires a preview that has already
+                                               been delivered. The config file must
+                                               state "enabled": true.
     python -m app --help                       Show this message.
 
 Environment: TELEGRAM_BOT_TOKEN, VERCEL_TOKEN, VERCEL_TEAM_ID (required).
@@ -3466,6 +3480,113 @@ def _run_provision_impeccable_parser() -> int:
         return 0
     logger.error("Parser runtime provisioning: FAILED (%s)", result.reason)
     return 1
+
+
+def _run_shadow_evaluate(composition, argv) -> int:
+    """``python -m app --shadow-evaluate <project_id> --shadow-config <path>``
+
+    An OPERATOR-ONLY diagnostic shadow evaluation. It MEASURES the scoring
+    rubric and writes an internal diagnostic record. It does not:
+
+      * call the model by itself -- the scoring callable is the native
+        provider's own pool scorer, invoked with the candidates the native
+        retrieval path produced;
+      * touch the live candidate state -- the provider is handed COPIES and
+        its output is discarded;
+      * affect the preview, the approval, the publication or the lifecycle;
+      * run automatically for any build. It is only ever reached from this
+        explicit operator flag.
+
+    The preview must ALREADY have been delivered: a shadow run that could
+    delay a preview is a shadow run in the wrong place.
+    """
+    from app.core.shadow_cli import (
+        ShadowEvaluationError,
+        load_shadow_config,
+        run_shadow_evaluation_command,
+    )
+    from app.core.shadow_evaluation import ShadowNotReady
+
+    project_id = _flag_value(argv, "--shadow-evaluate")
+    config_path = _flag_value(argv, "--shadow-config")
+    if not project_id or not config_path:
+        logger.error(
+            "Usage: python -m app --shadow-evaluate <project_id> "
+            "--shadow-config <path>"
+        )
+        return 2
+
+    try:
+        shadow_config = load_shadow_config(config_path)
+    except ShadowEvaluationError as exc:
+        logger.error("Shadow evaluation refused: %s", exc)
+        return 1
+
+    state = composition.store.load(project_id)
+    if state is None:
+        logger.error("No project state for project=%s", project_id)
+        return 1
+
+    workspace = composition.runner.create_workspace(project_id)
+
+    # The candidates come from the SAME native retrieval seam the build
+    # uses, so the shadow measurement is about the same candidates the
+    # build would have seen. There is no second retrieval path.
+    candidates = []
+    brief = {}
+    try:
+        from app.projects.build import ProjectBuilder
+
+        builder = getattr(composition, "project_builder", None)
+        if builder is not None and hasattr(
+                builder, "_retrieve_design_candidates"):
+            candidates = list(builder._retrieve_design_candidates(
+                query=str(getattr(state, "brief", "") or ""),
+                library_project_id=(
+                    composition.config.decision_engine_config
+                    .design_library_project_id
+                ),
+            ) or ())
+    except Exception:
+        logger.exception("Shadow candidate retrieval failed; continuing")
+
+    if not candidates:
+        logger.error(
+            "Shadow evaluation refused: the native retrieval path produced "
+            "no candidates for project=%s",
+            project_id,
+        )
+        return 1
+
+    # The brief is passed to the scoring call but never written into the
+    # record; the record carries scores and identifiers only.
+    brief = dict(getattr(state, "brief", {}) or {})
+
+    scorer = None
+    provider = getattr(composition.decision_engine, "provider", None)
+    if provider is not None and hasattr(provider, "shadow_score_pool"):
+        scorer = provider.shadow_score_pool
+
+    try:
+        report = run_shadow_evaluation_command(
+            project_id=project_id,
+            workspace=workspace,
+            state=state,
+            source_revision=str(getattr(state, "revisions", None)
+                                .source_revision
+                                if getattr(state, "revisions", None) is not None
+                                else ""),
+            candidates=candidates,
+            brief=brief,
+            config=shadow_config,
+            score_fn=scorer,
+        )
+    except (ShadowEvaluationError, ShadowNotReady) as exc:
+        logger.error("Shadow evaluation refused: %s", exc)
+        return 1
+
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0 if report.get("stored") else 1
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -3666,6 +3787,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     # publication_enabled.
     if "--qa-reaccept" in argv:
         return _run_qa_reaccept(composition, argv)
+
+    # ---- Operator-only diagnostic shadow evaluation:
+    #   python -m app --shadow-evaluate <project_id> --shadow-config <path>
+    #
+    # A shadow evaluation MEASURES the scoring rubric without letting it
+    # influence anything the user sees. It is deliberately NOT a Telegram
+    # action, NOT a public endpoint, and NOT part of the build: the preview
+    # has already been delivered before this can run, and the result is an
+    # internal diagnostic record that no ranking, approval or publication
+    # path reads. It exits without starting the receive loop.
+    if "--shadow-evaluate" in argv:
+        return _run_shadow_evaluate(composition, argv)
 
     loop = TelegramReceiveLoop(
         bot_token=config.telegram_bot_token,

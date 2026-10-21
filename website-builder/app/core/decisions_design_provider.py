@@ -464,6 +464,47 @@ class DecisionsDesignProvider:
             )
         return tuple(out)
 
+    def shadow_score_pool(
+        self,
+        candidates: Sequence[Any],
+        *,
+        brief: Mapping[str, Any],
+        requirements: Sequence[str] = (),
+        requirement_version: str = "",
+        deadline_seconds: float = 20.0,
+    ) -> Sequence[Any]:
+        """Score a pool for a SHADOW evaluation, and nothing else.
+
+        This is the scoring callable the shadow runner uses. It is
+        deliberately separate from ``propose_design_candidates``:
+
+        * it never touches the provider's own ``last_error_code`` or
+          ``last_degraded`` state, so a shadow run cannot change what the
+          live path reports;
+        * it never returns into the engine's candidate pool;
+        * the candidates it is given are COPIES, made by the runner.
+
+        It returns the scored copies, which the runner then reads and
+        discards. Nothing downstream of this call can see them.
+        """
+        if not candidates:
+            return ()
+        try:
+            return self._score_pool(
+                real=candidates,
+                brief=brief,
+                requirement_version=requirement_version,
+                limit=len(candidates),
+                requirements=tuple(requirements or ()),
+            )
+        except Exception:
+            # A shadow failure is a record, not a crash.
+            logger.info(
+                "shadow scoring pool failed",
+                extra={"n8_role": "shadow", "n8_model": self.model},
+            )
+            return ()
+
     # -- design half --------------------------------------------------------
 
     def propose_design_candidates(
