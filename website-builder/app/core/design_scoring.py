@@ -713,7 +713,7 @@ def build_scoring_questions(
     what it was before, so E2 behaviour is preserved exactly.
     """
     questions: dict = {}
-    fit_usable = requirements_are_sufficient(requirements)
+    fit_usable = assess_requirement_sufficiency(requirements)[0]
     usable = usable_requirements(requirements)
     evidence = evidence or {}
 
