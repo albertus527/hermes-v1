@@ -418,6 +418,14 @@ def parse_probe(
     if not isinstance(raw_text, (list, tuple)) or not isinstance(raw_blocks, (list, tuple)):
         return _evidence(collected=False, error="malformed_sections")
 
+    # An EMPTY document is a failed measurement, not a successful one.
+    # The probe ran, but it ran against a page that had not rendered, so
+    # there is nothing to report. Recording collected=True here would read
+    # as "we measured, and the page had no measurable content" -- which is
+    # a fabrication, and the kind that hides a real capture problem.
+    if not raw_text and not raw_blocks:
+        return _evidence(collected=False, error="empty_document")
+
     # -- typography -------------------------------------------------------
     families: List[str] = []
     type_scale: List[Tuple[str, float, float]] = []

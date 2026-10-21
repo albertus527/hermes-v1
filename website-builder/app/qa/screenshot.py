@@ -23,6 +23,11 @@ from typing import Callable, List, Optional
 
 from app.core import credentials
 from app.core.structural_probe import probe_expression
+from app.qa.readiness import (
+    CAPTURE_NOT_READY,
+    READINESS_EXPRESSION,
+    READY_TIMEOUT_SECONDS,
+)
 
 logger = logging.getLogger(__name__)  # noqa: E402
 
@@ -92,7 +97,8 @@ class CaptureResult:
     """Structured result of one browser capture attempt.
 
     ``status`` is one of ``captured``, ``capture_failed``, or
-    ``metric_probe_failed``. Metrics are present only for ``captured``.
+    ``metric_probe_failed`` and ``CAPTURE_NOT_READY``. Metrics are present
+    only for ``captured``.
     """
 
     path: Optional[Path]
@@ -110,7 +116,8 @@ class CaptureResult:
 
     @classmethod
     def failure(cls, status: str, error: str) -> "CaptureResult":
-        if status not in {"capture_failed", "metric_probe_failed"}:
+        if status not in {"capture_failed", "metric_probe_failed",
+                          CAPTURE_NOT_READY}:
             raise ValueError(f"invalid capture failure status: {status}")
         return cls(path=None, metrics=None, status=status, error=error)
 
@@ -196,6 +203,34 @@ def _unwrap_eval_envelope(result: subprocess.CompletedProcess) -> object:
 def _probe_browser_metrics(result: subprocess.CompletedProcess) -> BrowserMetrics:
     """Parse the metrics probe payload into ``BrowserMetrics``."""
     return BrowserMetrics.from_payload(_unwrap_eval_envelope(result))
+
+
+def _wait_for_page_ready(browser_cmd: str, session_name: str):
+    """Wait for the page to be rendered and stable, with a bounded deadline.
+
+    Returns a :class:`app.qa.readiness.ReadinessOutcome`. A page that never
+    becomes ready is NOT ready: the caller refuses the capture rather than
+    photographing an empty document.
+    """
+    from app.qa.readiness import wait_for_ready
+
+    def _evaluate():
+        try:
+            proc = _run_browser_command(
+                [browser_cmd, "--session", session_name, "--json", "eval",
+                 READINESS_EXPRESSION],
+                30,
+            )
+        except subprocess.TimeoutExpired:
+            return None
+        if proc.returncode != 0:
+            return None
+        try:
+            return _unwrap_eval_envelope(proc)
+        except ScreenshotError:
+            return None
+
+    return wait_for_ready(_evaluate, timeout_seconds=READY_TIMEOUT_SECONDS)
 
 
 def _probe_structural(browser_cmd: str, session_name: str) -> Optional[dict]:
@@ -289,11 +324,30 @@ def _default_capture_fn(
 
             # N8 B7 Option C: collect structural evidence from the SAME session
             # and the SAME rendered state the screenshot will capture. The probe
-            # runs after the metrics eval (page already loaded and laid out) and
-            # before the screenshot, so the DOM it reads is the DOM that gets
-            # photographed. It is best-effort: a probe failure must not fail a
-            # capture, because a screenshot without measurements is still valid
-            # evidence at E2, whereas a lost screenshot is a lost attempt.
+            # runs after the metrics eval and before the screenshot, so the DOM
+            # it reads is the DOM that gets photographed. It is best-effort: a
+            # probe failure must not fail a capture, because a screenshot
+            # without measurements is still valid evidence at E2, whereas a lost
+            # screenshot is a lost attempt.
+            #
+            # READINESS GATE. The ordering above is necessary but NOT
+            # sufficient: "open" returning does not mean the application has
+            # rendered. A React application can still be mounting, and a probe
+            # that runs against a half-mounted document reads an empty page --
+            # which is exactly the defect the CF-1 v2 benchmark hit. So the
+            # page must be READY before anything is measured or photographed.
+            #
+            # A page that never becomes ready is CAPTURE_NOT_READY. The
+            # capture is refused rather than producing a screenshot of an
+            # empty page, because an empty page is not evidence.
+            ready = _wait_for_page_ready(browser_cmd, session_name)
+            if not ready.ready:
+                return CaptureResult.failure(
+                    CAPTURE_NOT_READY,
+                    f"the page was not ready: {ready.reason} "
+                    f"(after {ready.attempts} samples)",
+                )
+
             structural = _probe_structural(browser_cmd, session_name)
 
             result = _run_browser_command(

@@ -334,12 +334,37 @@ class TestCollection:
         assert ev.font_families, "families were still read"
         assert ev.has_typography is False, "without a scale this is not typography evidence"
 
-    def test_empty_page_collects_but_measures_nothing(self):
+    def test_empty_page_is_a_failed_measurement_not_a_successful_one(self):
+        """An empty document is a FAILED measurement.
+
+        The old contract was "it collects, it just measures nothing", which
+        reads as "we measured, and the page had no measurable content" --
+        a fabrication that hides a real capture problem. The empty
+        document is now collected=False with an explicit reason, and the
+        dimensions are still absent, which is the property that matters:
+        an empty page can never reach E3.
+        """
         ev = _parse(_payload(text=[], blocks=[], counts={}))
-        assert ev.collected is True
+        assert ev.collected is False
+        assert ev.error == "empty_document"
         assert ev.has_typography is False
         assert ev.has_spacing is False
         assert ev.has_contrast is False
+
+    def test_a_page_with_content_is_still_collected(self):
+        """The change must not turn a real, rendered page into a failure."""
+        ev = _parse(_payload(
+            text=[{"tag": "p", "font_family": "x", "font_size": 12,
+                   "font_weight": "400", "line_height": 18,
+                   "letter_spacing": 0,
+                   "fg": {"r": 0, "g": 0, "b": 0, "a": 1},
+                   "bg": {"r": 255, "g": 255, "b": 255, "a": 1},
+                   "bg_ok": True, "bg_reason": "", "bg_uncertain": False,
+                   "bg_unsupported": False, "width": 10, "height": 18}],
+            blocks=[{"pad": [0, 1], "mar": [0, 0]}],
+            counts={"elements": 1, "text_nodes": 1}))
+        assert ev.collected is True
+        assert ev.error == ""
 
     def test_text_content_is_never_collected(self):
         """Only style and geometry leave the page, never the copy.
@@ -445,6 +470,20 @@ class TestScreenshotCaptureIntegration:
                 return subprocess.CompletedProcess(argv, 0, '{"success": true, "data": {"result": {}}}', "")
             if "eval" in argv:
                 expr = argv[-1]
+                if "rootChildren" in expr or "fontsReady" in expr:
+                    # The READINESS probe: the page IS ready. The test is
+                    # about what happens when the STRUCTURAL probe fails,
+                    # so readiness must not be the thing that fails.
+                    ready = json.dumps({
+                        "readyState": "complete", "hasRoot": True,
+                        "rootChildren": 3, "elements": 146, "height": 3619,
+                        "width": 1440, "fontsState": "loaded",
+                        "fontsReady": True, "images": 0, "imagesSettled": 0,
+                        "imagesReady": True, "textLength": 2015})
+                    return subprocess.CompletedProcess(
+                        argv, 0,
+                        json.dumps({"success": True,
+                                    "data": {"result": ready}}), "")
                 if "innerWidth" in expr:
                     return subprocess.CompletedProcess(
                         argv, 0,

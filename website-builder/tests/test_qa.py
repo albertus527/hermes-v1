@@ -53,6 +53,33 @@ def _agent_metrics_response(metrics: BrowserMetrics) -> str:
     return json.dumps({"success": True, "data": {"result": payload}})
 
 
+def _is_readiness_eval(argv: List[str]) -> bool:
+    """Whether this eval is the READINESS probe rather than the metrics one."""
+    joined = " ".join(argv)
+    return "rootChildren" in joined or "fontsReady" in joined
+
+
+def _agent_readiness_response(ready: bool = True) -> str:
+    """A readiness payload for a page that HAS rendered."""
+    if ready:
+        body = {
+            "readyState": "complete", "hasRoot": True, "rootChildren": 3,
+            "elements": 146, "height": 3619, "width": 1440,
+            "fontsState": "loaded", "fontsReady": True,
+            "images": 0, "imagesSettled": 0, "imagesReady": True,
+            "textLength": 2015,
+        }
+    else:
+        body = {
+            "readyState": "complete", "hasRoot": True, "rootChildren": 0,
+            "elements": 0, "height": 0, "width": 0,
+            "fontsState": "loaded", "fontsReady": True,
+            "images": 0, "imagesSettled": 0, "imagesReady": True,
+            "textLength": 0,
+        }
+    return json.dumps({"success": True, "data": {"result": json.dumps(body)}})
+
+
 class _FakeBrowserRun:
     """Records argv and answers like the real file-backed browser spawn.
 
@@ -94,7 +121,10 @@ class _FakeBrowserRun:
                 Path(out_path).write_bytes(b"fake-png")
         payload = ""
         if command == "eval" and self.metrics is not None:
-            payload = _agent_metrics_response(self.metrics)
+            if _is_readiness_eval(argv):
+                payload = _agent_readiness_response()
+            else:
+                payload = _agent_metrics_response(self.metrics)
         if command == "close":
             payload = json.dumps({"success": True, "data": {"closed": True}})
         if stdout is not None and payload:
@@ -1299,8 +1329,10 @@ class TestAgentBrowserArgsEnv(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             ok, calls = self._run_capture(None, tmpdir)
         self.assertTrue(ok.captured)
-        # open, set viewport, metrics eval, structural-probe eval, screenshot, close
-        self.assertEqual(len(calls), 6)
+        # open, set viewport, metrics eval, readiness evals (the gate needs
+        # two identical samples to call the layout stable), structural-probe
+        # eval, screenshot, close
+        self.assertEqual(len(calls), 9)
         for argv in calls:
             self.assertNotIn("--args", argv)
 
@@ -1347,8 +1379,8 @@ class TestAgentBrowserArgsEnv(unittest.TestCase):
         # Six: open, set viewport, metrics eval, structural-probe eval,
         # screenshot, close. The probe rides the same session, so AGENT_BROWSER_ARGS
         # handling must remain identical on both paths.
-        self.assertEqual(len(calls_noenv), 6)
-        self.assertEqual(len(calls_env), 6)
+        self.assertEqual(len(calls_noenv), 9)
+        self.assertEqual(len(calls_env), 9)
 
         # Strip the open call's optional --args tail, then the flows must match
         # command-for-command (same tmpdir + same inputs -> same session name
@@ -1538,9 +1570,15 @@ class TestViewportAppliedBeforeScreenshot(unittest.TestCase):
         # N8 B7 Option C added a SECOND eval: the structural probe. It must run
         # in the same session, after the page has loaded and laid out, and
         # before the screenshot, so the DOM it reads is the DOM that is
-        # photographed. The count is asserted rather than derived so that an
-        # accidental extra browser round-trip cannot slip in unnoticed.
-        self.assertEqual(len(calls), 6)
+        # photographed.
+        #
+        # The READINESS GATE sits in front of both: the page must be
+        # rendered and stable before anything is measured OR photographed,
+        # so the readiness evals come first, then the metrics eval, then the
+        # structural probe, then the screenshot. The count is asserted rather
+        # than derived so that an accidental extra browser round-trip cannot
+        # slip in unnoticed.
+        self.assertEqual(len(calls), 9)
         command_names = [
             "open" if "open" in call else
             "viewport" if "viewport" in call else
@@ -1550,7 +1588,9 @@ class TestViewportAppliedBeforeScreenshot(unittest.TestCase):
             for call in calls
         ]
         self.assertEqual(
-            command_names, ["open", "viewport", "eval", "eval", "screenshot", "close"]
+            command_names,
+            ["open", "viewport", "eval", "eval", "eval", "eval", "eval",
+             "screenshot", "close"],
         )
         sessions = {call[call.index("--session") + 1] for call in calls}
         self.assertEqual(len(sessions), 1)
@@ -1564,10 +1604,13 @@ class TestViewportAppliedBeforeScreenshot(unittest.TestCase):
         viewport_idx = next(i for i, c in enumerate(calls) if "viewport" in c)
         screenshot_idx = next(i for i, c in enumerate(calls) if "screenshot" in c)
         self.assertLess(open_idx, viewport_idx)
-        # Both evals sit strictly between the viewport being set and the
-        # screenshot being taken: measurements describe the captured state.
+        # Every eval sits strictly between the viewport being set and the
+        # screenshot being taken: the readiness samples, the metrics probe
+        # and the structural probe all describe the captured state. The
+        # readiness gate takes three samples (two to call the layout
+        # stable, plus the first), so there are five evals in total.
         eval_indexes = [i for i, c in enumerate(calls) if "eval" in c]
-        self.assertEqual(len(eval_indexes), 2)
+        self.assertEqual(len(eval_indexes), 5)
         for idx in eval_indexes:
             self.assertLess(viewport_idx, idx)
             self.assertLess(idx, screenshot_idx)
