@@ -30,6 +30,8 @@ from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
 
 from app.core.shadow_scoring import (
     SHADOW_CONTRACT_VERSION,
+    ShadowLockBusy,
+    reservation,
     STATE_COMPLETED,
     STATE_FAILED,
     STATE_INDETERMINATE,
@@ -58,6 +60,8 @@ STATUS_INDETERMINATE = "indeterminate_previous_outcome"
 STATUS_STORAGE_FAILED = "storage_failed"
 STATUS_NOT_ENABLED = "not_enabled"
 STATUS_PENDING = "pending"
+STATUS_BUSY = "reservation_busy"
+STATUS_IDENTITY_MISMATCH = "identity_mismatch"
 
 #: The statuses that mean the attempt degraded, i.e. something failed
 #: rather than the measurement simply being inconclusive.
@@ -451,6 +455,113 @@ def run_shadow_scoring(
             ))
         return _store(ws, project_id, source_revision, attempts, notes)
 
+    # --- The pool is formed BEFORE the reservation, because the identity
+    # --- re-verification needs it and it must happen under the lock.
+    pool = list(candidates)[: config.max_candidates]
+    if not pool:
+        return _store(ws, project_id, source_revision, (), [
+            "there were no candidates to score",
+        ])
+
+    # --- THE RESERVATION. It is taken before the duplicate check and held
+    # --- across the whole run, so two processes cannot both decide "go" and
+    # --- both dispatch a paid call for the same identity. A process that
+    # --- cannot take it refuses: the holder may already have spent it.
+    identity = invocation_identity(
+        project_id, source_revision, effective_set_id,
+        config.scoring_contract_version,
+    )
+    try:
+        held = reservation(ws, identity)
+    except ShadowLockBusy:
+        return ShadowRunResult(
+            project_id=project_id,
+            source_revision=source_revision,
+            attempts=(),
+            stored=False,
+            error=STATUS_BUSY,
+        )
+    with held:
+        return _run_reserved(
+            ws, project_id=project_id, config=config, pool=pool,
+            source_revision=source_revision, effective_set_id=effective_set_id,
+            identity=identity, requirements=requirements,
+            requirement_version=requirement_version, brief=brief,
+            score_fn=score_fn, notes=notes,
+        )
+
+
+def _verify_identity_before_dispatch(
+    pool: Sequence[Any],
+    *,
+    source_revision: str,
+) -> Optional[str]:
+    """Re-verify the candidate / revision / screenshot binding.
+
+    Returns None when the binding holds, or a reason when it does not.
+    This runs IMMEDIATELY before the dispatch, so a change between the
+    earlier check and the call cannot slip through.
+    """
+    for candidate in pool:
+        cid = str(getattr(candidate, "candidate_id", ""))
+        revision = str(getattr(candidate, "source_revision", ""))
+        if revision != str(source_revision):
+            return (
+                f"candidate {cid!r} is at revision {revision!r} but the run "
+                f"is for revision {source_revision!r}"
+            )
+        assets = tuple(getattr(candidate, "assets", ()) or ())
+        if not assets:
+            return f"candidate {cid!r} carries no screenshot to bind to"
+        for asset in assets:
+            digest = getattr(asset, "digest", None)
+            if digest is None and isinstance(asset, dict):
+                digest = asset.get("digest")
+            if not digest:
+                return (
+                    f"candidate {cid!r} has an asset with no digest, so the "
+                    f"measurement could not be bound to a screenshot"
+                )
+        for measurement in tuple(getattr(candidate, "measurements", ()) or ()):
+            measured_for = str(getattr(measurement, "candidate_id", ""))
+            measured_revision = str(
+                getattr(measurement, "source_revision", ""))
+            if measured_for != cid:
+                return (
+                    f"a measurement names candidate {measured_for!r} but is "
+                    f"attached to {cid!r}"
+                )
+            if measured_revision != revision:
+                return (
+                    f"a measurement of {cid!r} is at revision "
+                    f"{measured_revision!r} but the candidate is at "
+                    f"{revision!r}"
+                )
+    return None
+
+
+def _run_reserved(
+    ws: Any,
+    *,
+    project_id: str,
+    config: ShadowConfig,
+    pool: Sequence[Any],
+    source_revision: str,
+    effective_set_id: str,
+    identity: str,
+    requirements: Sequence[str],
+    requirement_version: str,
+    brief: Optional[Mapping[str, Any]],
+    score_fn: Optional[Callable[..., Sequence[Any]]],
+    notes: Sequence[str],
+) -> ShadowRunResult:
+    """The run, with the reservation already held.
+
+    Everything from here to the terminal write happens under the lock, so
+    the record's read-modify-write cannot lose another writer's attempts.
+    """
+    attempts: list = []
+    notes = list(notes)
     # --- The durable invocation identity. A record with this identity that
     # --- is in a TERMINAL state means the measurement was already made, so
     # --- this is a duplicate: refuse, and spend no call.
@@ -461,10 +572,6 @@ def run_shadow_scoring(
     # --- retried: the runner reports it and refuses, because a silent
     # --- retry could spend a second call for a measurement whose first
     # --- call may already have been billed. The operator decides.
-    identity = invocation_identity(
-        project_id, source_revision, effective_set_id,
-        config.scoring_contract_version,
-    )
     for previous in _existing_attempts(ws):
         if previous.invocation_id != identity:
             continue
@@ -491,12 +598,6 @@ def run_shadow_scoring(
         # STATE_FAILED: the attempt failed BEFORE the dispatch, so nothing
         # was billed and a retry is safe. Fall through and continue.
 
-    if not candidates:
-        return _store(ws, project_id, source_revision, (), [
-            "there were no candidates to score",
-        ])
-
-    pool = list(candidates)[: config.max_candidates]
     copies = []
     for candidate in pool:
         try:
@@ -522,6 +623,28 @@ def run_shadow_scoring(
         attempts.append(_failed(
             project_id, pool, source_revision, effective_set_id,
             STATUS_NOT_ENABLED, "no shadow scorer was supplied", 0,
+        ))
+        return _store(ws, project_id, source_revision, attempts, notes)
+
+    # --- THE IDENTITY RE-VERIFICATION, immediately before the dispatch.
+    # --- The duplicate check above looked at the RECORD. This looks at the
+    # --- CANDIDATES: is what is about to be scored still the thing the
+    # --- record will claim to describe?
+    identity_problem = _verify_identity_before_dispatch(
+        pool, source_revision=source_revision)
+    if identity_problem:
+        attempts.append(ShadowAttempt(
+            project_id=project_id,
+            candidate_id=str(getattr(pool[0], "candidate_id", "")) if pool else "",
+            source_revision=source_revision,
+            requirement_set_id=effective_set_id,
+            scoring_contract_version=config.scoring_contract_version,
+            degraded=False,
+            status=STATUS_IDENTITY_MISMATCH,
+            error_code=STATUS_IDENTITY_MISMATCH,
+            invocation_id=identity,
+            invocation_state=STATE_FAILED,
+            note=identity_problem,
         ))
         return _store(ws, project_id, source_revision, attempts, notes)
 

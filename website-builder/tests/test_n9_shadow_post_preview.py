@@ -41,10 +41,15 @@ class _State:
 
 
 def _candidate(cid="c1", revision="7"):
+    from app.core.design_reference import DesignAsset
     return DesignCandidate(
         candidate_id=cid, label=cid, descriptor="d",
         source_uri="n9lib://references/x", source_revision=revision,
         score=0.5, requirement_version="req-1",
+        assets=(DesignAsset(
+            kind="screenshot_desktop", uri="n9lib://references/x",
+            revision=revision, digest="b" * 64, mime="image/png",
+            width=1440, height=900, bytes=1000),),
     )
 
 

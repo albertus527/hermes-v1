@@ -45,10 +45,15 @@ from app.core.shadow_scoring import (
 # ---------------------------------------------------------------- fixtures
 
 def _candidate(cid="c1", revision="7", suitability=None):
+    from app.core.design_reference import DesignAsset
     return DesignCandidate(
         candidate_id=cid, label=cid, descriptor="d",
         source_uri="n9lib://references/x", source_revision=revision,
         score=0.5, suitability=suitability,
+        assets=(DesignAsset(
+            kind="screenshot_desktop", uri="n9lib://references/x",
+            revision=revision, digest="b" * 64, mime="image/png",
+            width=1440, height=900, bytes=1000),),
         suitability_detail=() if suitability is None else (("suitability", 1.0),),
         suitability_contract="" if suitability is None else "n8-design-v1",
         requirement_version="req-1",

@@ -27,6 +27,8 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Optional, Tuple
@@ -271,6 +273,116 @@ class ShadowAttempt:
         if self.note:
             payload["note"] = self.note
         return payload
+
+
+#: The reservation lock file, one per invocation identity.
+LOCK_PREFIX = ".shadow-lock-"
+
+
+def lock_path(workspace: Any, invocation_id: str) -> Path:
+    """Where the reservation lock for an invocation identity lives."""
+    return Path(workspace) / f"{LOCK_PREFIX}{invocation_id}"
+
+
+def _pid_alive(pid: int) -> bool:
+    """Whether a process id is still running."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # The process exists but belongs to another user.
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _reap_stale_lock(path: Path) -> bool:
+    """Remove a lock whose owner is dead. A live owner is NEVER displaced.
+
+    A lock we cannot read is not reapable: it might belong to a process
+    that is alive, and stealing it would let two invocations dispatch.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+        data = json.loads(raw) if raw.strip() else {}
+        pid = int(data.get("pid", 0))
+    except (OSError, ValueError, TypeError):
+        return False
+    if pid and pid != os.getpid() and not _pid_alive(pid):
+        try:
+            path.unlink()
+            return True
+        except OSError:
+            return True
+    return False
+
+
+class ShadowLockBusy(Exception):
+    """Another invocation holds the reservation for this identity."""
+
+
+def acquire_reservation(
+    workspace: Any,
+    invocation_id: str,
+    *,
+    timeout: float = 2.0,
+) -> Path:
+    """Reserve an invocation identity, atomically across processes.
+
+    Returns the lock path when the reservation was taken, and raises
+    ``ShadowLockBusy`` when another live process holds it.
+
+    A caller that cannot take the reservation must NOT dispatch: the
+    holder may already have spent the call.
+    """
+    path = lock_path(workspace, invocation_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                payload = json.dumps(
+                    {"pid": os.getpid(), "time": time.time()}).encode("utf-8")
+                os.write(fd, payload)
+            finally:
+                os.close(fd)
+            return path
+        except FileExistsError:
+            if _reap_stale_lock(path):
+                continue
+            if time.monotonic() >= deadline:
+                raise ShadowLockBusy(
+                    f"another shadow invocation holds {invocation_id}"
+                )
+            time.sleep(0.02)
+
+
+@contextmanager
+def reservation(workspace: Any, invocation_id: str, *, timeout: float = 2.0):
+    """Hold the reservation for an invocation identity, or refuse.
+
+    The holder is the only process allowed to dispatch for that identity.
+    A process that cannot take the reservation must NOT dispatch: the
+    holder may already have spent the call.
+    """
+    path = acquire_reservation(workspace, invocation_id, timeout=timeout)
+    try:
+        yield path
+    finally:
+        release_reservation(path)
+
+
+def release_reservation(path: Any) -> None:
+    """Release a reservation. A missing lock is already released."""
+    try:
+        Path(path).unlink()
+    except (OSError, FileNotFoundError):
+        pass
 
 
 def shadow_path(workspace: Any) -> Path:
