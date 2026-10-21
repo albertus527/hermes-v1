@@ -396,6 +396,7 @@ def write_shadow_record(
     *,
     project_id: str,
     source_revision: str,
+    notes: Tuple[str, ...] = (),
 ) -> Path:
     """Write the shadow records for one invocation, atomically.
 
@@ -420,6 +421,9 @@ def write_shadow_record(
         "schema_version": SHADOW_SCHEMA_VERSION,
         "project_id": project_id,
         "source_revision": source_revision,
+        # Operator-facing notes for this invocation, e.g. that an earlier
+        # attempt for the same scope used a different candidate set.
+        "notes": list(notes),
         # The revisions this file holds, so a reader can see at a glance
         # that it is not a single-revision file.
         "source_revisions": sorted({a.source_revision for a in merged.values()}),

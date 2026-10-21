@@ -109,8 +109,10 @@ class TestTheInvocationIdentity:
         )
         record = read_shadow_record(tmp_path)
         attempt = record["attempts"][0]
+        from app.core.shadow_runner import candidate_set_fingerprint
+        fingerprint = candidate_set_fingerprint([_candidate()])
         assert attempt["invocation_id"] == invocation_identity(
-            "p1", "7", "rs-abc")
+            "p1", "7", "rs-abc", "n8-design-v1", fingerprint)
         assert attempt["invocation_state"] == STATE_COMPLETED
 
 

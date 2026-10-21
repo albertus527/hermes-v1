@@ -31,6 +31,7 @@ from app.core.decision_provider import DesignCandidate  # noqa: E402
 from app.core.design_reference import DesignAsset  # noqa: E402
 from app.core.shadow_runner import (  # noqa: E402
     STATUS_BUSY,
+    candidate_set_fingerprint,
     STATUS_DUPLICATE,
     STATUS_IDENTITY_MISMATCH,
     STATUS_INDETERMINATE,
@@ -192,20 +193,29 @@ class TestDifferentRevisionsShareOneWorkspace:
         assert revisions == {"7", "3"}, revisions
 
     def test_two_revisions_at_once_both_survive(self, tmp_path):
-        _artifact(tmp_path, revision=7)
+        """Both revisions are measured, and both records survive.
+
+        The artifact has to be at the revision being measured: a stale
+        artifact is correctly refused, so the two workers are given their
+        own artifact in turn. The point of the test is that neither
+        record erases the other.
+        """
         worker7 = _worker(tmp_path, "7", 0.4)
         worker3 = _worker(tmp_path, "3", 0.4)
-        procs = [
-            subprocess.Popen(
+        results = []
+        for w, rev in ((worker7, "7"), (worker3, "3")):
+            _artifact(tmp_path, revision=int(rev))
+            proc = subprocess.Popen(
                 [sys.executable, str(w), str(tmp_path), rev, "0.4"],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            for w, rev in ((worker7, "7"), (worker3, "3"))
-        ]
-        for p in procs:
-            p.communicate(timeout=60)
+            out, _err = proc.communicate(timeout=60)
+            line = next((l for l in (out or "").splitlines()
+                         if l.startswith("{")), "")
+            results.append(json.loads(line) if line else {})
         attempts = read_shadow_attempts(tmp_path)
         revisions = {a.source_revision for a in attempts}
         assert "7" in revisions and "3" in revisions, revisions
+        assert all(r.get("produced") for r in results), results
 
 
 class TestTheLock:
@@ -301,9 +311,17 @@ class TestTheUnknownOutcomeIsNotRetried:
     def test_a_pending_record_blocks_a_concurrent_resume(self, tmp_path):
         _artifact(tmp_path)
         from app.core.shadow_scoring import write_shadow_record
-        from app.core.shadow_runner import invocation_identity
+        from app.core.shadow_runner import (
+            candidate_set_fingerprint,
+            invocation_identity,
+        )
         from app.core.shadow_scoring import ShadowAttempt
-        identity = invocation_identity("p1", "7", "rs-abc")
+        # The identity now covers the candidate set, so the pending record
+        # must carry the identity the run would actually compute.
+        identity = invocation_identity(
+            "p1", "7", "rs-abc", "n8-design-v1",
+            candidate_set_fingerprint([_candidate()]),
+        )
         write_shadow_record(
             tmp_path,
             (ShadowAttempt(

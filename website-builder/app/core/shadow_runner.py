@@ -330,27 +330,65 @@ def _requirement_binding(
     return tuple(requirements), set_id, str(artifact.source_revision)
 
 
+def candidate_set_fingerprint(candidates: Sequence[Any]) -> str:
+    """A stable fingerprint of the candidate set and its evidence.
+
+    Two candidate sets are equivalent only when they are the SAME set:
+    the same candidate ids, the same source revisions, and the same
+    screenshot digests. A different screenshot is a different measurement,
+    and so is a different candidate.
+
+    Without this in the identity, a second measurement of a DIFFERENT
+    candidate was refused as a duplicate -- a false equivalence -- and a
+    changed candidate set was a silent extra paid dispatch.
+    """
+    import hashlib
+
+    parts = []
+    for candidate in sorted(
+            candidates or (),
+            key=lambda c: str(getattr(c, "candidate_id", ""))):
+        cid = str(getattr(candidate, "candidate_id", ""))
+        revision = str(getattr(candidate, "source_revision", ""))
+        digests = []
+        for asset in tuple(getattr(candidate, "assets", ()) or ()):
+            digest = getattr(asset, "digest", None)
+            if digest is None and isinstance(asset, dict):
+                digest = asset.get("digest")
+            if digest:
+                digests.append(str(digest))
+        parts.append(
+            f"{cid}@{revision}:{','.join(sorted(digests))}")
+    material = "\x1e".join(parts)
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+
 def invocation_identity(
     project_id: str,
     source_revision: str,
     requirement_set_id: str,
     scoring_contract_version: str = SHADOW_CONTRACT_VERSION,
+    candidate_fingerprint: str = "",
 ) -> str:
     """The durable identity of one shadow measurement.
 
-    It is derived from the things that DEFINE the measurement, so:
+    It is derived from the things that DEFINE the measurement:
 
-      * the same measurement always has the same identity, which is what
-        makes a duplicate detectable across process restarts;
-      * a different revision, requirement set or contract can never share
-        an identity, so an old revision can never impersonate the current
-        one.
+      * the project, the revision, the requirement set and the scoring
+        contract -- so a different revision, requirement set or contract
+        can never share an identity, and an old revision can never
+        impersonate the current one;
+      * the candidate set and its screenshot digests -- so a DIFFERENT
+        measurement is never treated as an equivalent attempt.
+
+    The same measurement therefore always has the same identity, which is
+    what makes a duplicate detectable across process restarts.
     """
     import hashlib
 
     material = "\x1f".join((
         project_id, str(source_revision), requirement_set_id,
-        scoring_contract_version,
+        scoring_contract_version, candidate_fingerprint,
     ))
     return "inv-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:20]
 
@@ -467,9 +505,10 @@ def run_shadow_scoring(
     # --- across the whole run, so two processes cannot both decide "go" and
     # --- both dispatch a paid call for the same identity. A process that
     # --- cannot take it refuses: the holder may already have spent it.
+    candidate_fingerprint = candidate_set_fingerprint(pool)
     identity = invocation_identity(
         project_id, source_revision, effective_set_id,
-        config.scoring_contract_version,
+        config.scoring_contract_version, candidate_fingerprint,
     )
     try:
         held = reservation(ws, identity)
@@ -572,6 +611,25 @@ def _run_reserved(
     # --- retried: the runner reports it and refuses, because a silent
     # --- retry could spend a second call for a measurement whose first
     # --- call may already have been billed. The operator decides.
+    # A prior attempt for the SAME project, revision and requirement set
+    # but a DIFFERENT candidate set is a legitimate different measurement,
+    # and it is allowed. But it is NOT silent: the operator is told that a
+    # second call was spent, and why.
+    prior_same_scope = [
+        a for a in _existing_attempts(ws)
+        if a.source_revision == str(source_revision)
+        and a.requirement_set_id == effective_set_id
+        and a.project_id == project_id
+        and a.invocation_id != identity
+        and a.invocation_state in TERMINAL_STATES
+    ]
+    if prior_same_scope:
+        notes.append(
+            f"{len(prior_same_scope)} earlier attempt(s) for the same project, "
+            f"revision and requirement set used a DIFFERENT candidate set; "
+            f"this run is a second paid call for the same scope"
+        )
+
     for previous in _existing_attempts(ws):
         if previous.invocation_id != identity:
             continue
@@ -667,6 +725,7 @@ def _run_reserved(
         write_shadow_record(
             ws, tuple(pending), project_id=project_id,
             source_revision=source_revision,
+            notes=tuple(notes),
         )
     except (ShadowScoringError, OSError):
         # The pending marker could not be written, so the call is NOT
@@ -802,6 +861,7 @@ def _store(
             tuple(attempts),
             project_id=project_id,
             source_revision=source_revision,
+            notes=tuple(notes),
         )
     except (ShadowScoringError, OSError) as exc:
         logger.warning(
