@@ -296,3 +296,84 @@ class TestNoUnauthorizedConsequence:
         assert "CAPTURE_NOT_READY" in src
         for banned in ("promote(", "publish(", "approve(", "apply_gates("):
             assert banned not in src, banned
+
+
+class TestBelowTheFoldLazyImages:
+    """A long page that legitimately defers offscreen images.
+
+    ``loading="lazy"`` images below the fold are, by specification, not
+    fetched until they approach the viewport. Chromium's prefetch margin is
+    generous but FINITE: measured offline, a page taller than ~3,800 px kept
+    its offscreen images at 0/4 settled indefinitely. The gate then spent its
+    entire deadline and refused a capture that was completely valid -- so a
+    long, perfectly good page could never be photographed.
+
+    The gate must therefore FLUSH pending lazy images (bounded) rather than
+    wait for the viewport to reach them. What it must NOT do is relax the
+    "every image settled" rule itself: a genuinely still-loading eager image
+    is still not ready.
+    """
+
+    def test_the_expression_flushes_lazy_images(self):
+        from app.qa.readiness import READINESS_EXPRESSION
+
+        assert "loading = 'eager'" in READINESS_EXPRESSION
+        assert "img.loading !== 'lazy'" in READINESS_EXPRESSION
+
+    def test_the_flush_is_bounded(self):
+        """A hostile page cannot make the probe unbounded."""
+        from app.qa.readiness import (
+            MAX_LAZY_FLUSH_PER_SAMPLE,
+            READINESS_EXPRESSION,
+        )
+
+        assert MAX_LAZY_FLUSH_PER_SAMPLE > 0
+        assert f"flushed >= {MAX_LAZY_FLUSH_PER_SAMPLE}" in READINESS_EXPRESSION
+
+    def test_the_flush_does_not_relax_the_settled_rule(self):
+        """An eager image that is genuinely still loading is still not ready.
+
+        The flush only targets images the browser is *deferring*; it must not
+        turn a real in-flight load into a pass.
+        """
+        assert is_ready(_sample(images=4, images_settled=0,
+                                images_ready=False)) is False
+        assert is_ready(_sample(images=4, images_settled=3,
+                                images_ready=False)) is False
+
+    def test_an_empty_document_is_still_refused_after_the_flush(self):
+        """The flush must not become a path around empty-document detection."""
+        outcome = wait_for_ready(
+            _evaluate(
+                {"readyState": "complete", "hasRoot": True, "rootChildren": 0,
+                 "elements": 0, "height": 0, "fontsReady": True,
+                 "images": 0, "imagesSettled": 0, "imagesReady": True,
+                 "lazyFlushed": 0},
+            ),
+            timeout_seconds=0.5, interval_seconds=0.0, sleep=lambda _s: None,
+        )
+        assert outcome.ready is False
+        assert outcome.status == CAPTURE_NOT_READY
+        assert outcome.reason == "app_root_empty"
+
+    def test_a_page_whose_images_settle_after_the_flush_is_ready(self):
+        """The realistic long-page sequence: unsettled, flushed, settled."""
+        outcome = wait_for_ready(
+            _evaluate(
+                {"readyState": "complete", "hasRoot": True, "rootChildren": 6,
+                 "elements": 146, "height": 18172, "fontsReady": True,
+                 "images": 4, "imagesSettled": 0, "imagesReady": False,
+                 "lazyFlushed": 4},
+                {"readyState": "complete", "hasRoot": True, "rootChildren": 6,
+                 "elements": 146, "height": 18172, "fontsReady": True,
+                 "images": 4, "imagesSettled": 4, "imagesReady": True,
+                 "lazyFlushed": 0},
+                {"readyState": "complete", "hasRoot": True, "rootChildren": 6,
+                 "elements": 146, "height": 18172, "fontsReady": True,
+                 "images": 4, "imagesSettled": 4, "imagesReady": True,
+                 "lazyFlushed": 0},
+            ),
+            timeout_seconds=5.0, interval_seconds=0.0, sleep=lambda _s: None,
+        )
+        assert outcome.ready is True
+        assert outcome.status == "ready"

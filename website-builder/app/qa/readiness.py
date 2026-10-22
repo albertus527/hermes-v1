@@ -62,6 +62,21 @@ SAMPLE_INTERVAL_SECONDS = 0.25
 #: How many identical layout samples are required to call the layout stable.
 STABLE_SAMPLES_REQUIRED = 2
 
+#: How many images one readiness sample may force to load.
+#:
+#: A ``loading="lazy"`` image that sits BELOW THE FOLD is, by specification,
+#: not fetched until it approaches the viewport. Chromium's prefetch margin
+#: is generous but finite, so on a long page the last images never settle and
+#: a perfectly valid page could never satisfy an "every image is complete"
+#: gate -- the gate would burn its whole deadline and then REFUSE the capture.
+#:
+#: The gate therefore FLUSHES pending lazy images instead of waiting for the
+#: viewport to reach them: it sets them to eager and re-issues the request,
+#: which settles them without scrolling, so the resulting capture is still a
+#: single consistent full-page render. The work is bounded by this constant so
+#: a hostile or broken page cannot make the probe unbounded.
+MAX_LAZY_FLUSH_PER_SAMPLE = 200
+
 #: The JavaScript that reports readiness. It is written to be cheap and to
 #: never block: every branch returns a plain object.
 READINESS_EXPRESSION = r"""
@@ -69,6 +84,23 @@ READINESS_EXPRESSION = r"""
   const root = document.querySelector('#root') || document.body;
   const rootChildren = root ? root.children.length : 0;
   const imgs = Array.from(document.images || []);
+
+  // Bounded lazy-image flush. A below-the-fold loading="lazy" image is not
+  // fetched until it nears the viewport, so on a long page it would never
+  // settle and a valid page would be refused. Promote pending lazy images to
+  // eager and re-issue the request; this settles them WITHOUT scrolling, so
+  // the capture stays a single consistent full-page render.
+  let flushed = 0;
+  for (const img of imgs) {
+    if (flushed >= MAX_LAZY_FLUSH) break;
+    if (img.complete) continue;
+    if (img.loading !== 'lazy') continue;
+    img.loading = 'eager';
+    const src = img.getAttribute('src');
+    if (src) img.src = src;
+    flushed++;
+  }
+
   const imgsSettled = imgs.filter(i => i.complete).length;
   const fontsState = (document.fonts && document.fonts.status)
     ? document.fonts.status : 'unsupported';
@@ -85,10 +117,11 @@ READINESS_EXPRESSION = r"""
     images: imgs.length,
     imagesSettled: imgsSettled,
     imagesReady: imgsSettled === imgs.length,
+    lazyFlushed: flushed,
     textLength: (document.body && document.body.innerText || '').length,
   });
 })()
-"""
+""".replace("MAX_LAZY_FLUSH", str(MAX_LAZY_FLUSH_PER_SAMPLE))
 
 
 @dataclass(frozen=True)
