@@ -94,13 +94,168 @@ _BOOTSTRAP_TERMINAL_STATES = frozenset({'ERROR', 'CANCELED'})
 _BYPASS_SECRET_RE = re.compile(r'[A-Za-z0-9]{32}')
 
 
-def _json_call(transport, method, url, headers, payload=None):
+def _json_call(transport, method, url, headers, payload=None, *, timeout=30):
     data = None if payload is None else json.dumps(payload).encode()
-    response = transport.request(method, url, headers=headers, data=data, timeout=30)
+    response = transport.request(method, url, headers=headers, data=data, timeout=timeout)
     body = json.loads(response.body)
     if not isinstance(body, dict):
         raise ValueError("Invalid response")
     return response.status, body
+
+
+# ---------------------------------------------------------------------------
+# Transport failure classification (diagnostics only)
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS
+# ---------------
+# Every adapter operation wraps its body in a bare ``except Exception`` and
+# returns a single opaque code. That is correct fail-closed behaviour -- a
+# provider body can contain a token, so it must never reach a user or a log --
+# but it also means a failed deploy reports one string for six genuinely
+# different situations:
+#
+#   * a connect/read TIMEOUT (the request may still be processing remotely)
+#   * a connection/transport failure (nothing was ever sent)
+#   * an HTTP error response (the provider answered and refused)
+#   * a provider validation rejection (answered 4xx with a reason)
+#   * a response-parsing or application error (answered, unparseable)
+#
+# Those have different operational consequences: a timeout leaves the outcome
+# UNKNOWN and forbids a blind resend, whereas a deterministic 4xx rejection
+# proves nothing was created. This classifier records WHICH one happened so an
+# operator can tell them apart, without ever exposing provider text.
+#
+# WHAT IS LOGGED (and what never is)
+# ----------------------------------
+#   logged:    operation name, exception class, HTTP status if any, and a
+#              provider error CODE from a fixed allowlist of safe keys
+#   never:     Authorization headers, tokens, request headers, raw response
+#              bodies, or arbitrary provider prose
+#
+# The classifier is best-effort: it must never raise, and it must never change
+# the operation's result.
+
+#: Exception classes that mean "the request did not complete in time". The
+#: outcome is UNKNOWN -- the remote side may still be processing.
+_TRANSPORT_TIMEOUT_ERRORS = (
+    TimeoutError,
+    socket.timeout,
+)
+
+#: Provider error codes safe to surface. These are stable identifiers, not
+#: prose, and contain no user data or credentials.
+_SAFE_PROVIDER_ERROR_CODES = frozenset({
+    "forbidden", "invalid_token", "not_authorized", "unauthorized",
+    "not_found", "conflict", "bad_request", "invalid_request",
+    "missing_required_field", "invalid_type", "payload_too_large",
+    "too_many_requests", "rate_limited", "internal_server_error",
+    "deployment_failed", "invalid_files", "build_failed",
+})
+
+_MAX_DIAGNOSTIC_CHARS = 240
+
+
+def _sanitize_code(value):
+    """Return a safe, bounded provider error code, or ''.
+
+    Only allowlisted identifiers survive. Anything else -- including free-form
+    provider prose that could embed a token -- is discarded.
+    """
+    if not isinstance(value, str):
+        return ""
+    candidate = value.strip().lower().replace("-", "_").replace(" ", "_")
+    if candidate in _SAFE_PROVIDER_ERROR_CODES:
+        return candidate
+    # A bare snake_case identifier is acceptable only if it is short and has
+    # no characters that could carry a secret or break a log line.
+    if re.fullmatch(r"[a-z][a-z0-9_]{0,40}", candidate):
+        return candidate
+    return ""
+
+
+def _provider_error_code(body):
+    """Extract a safe error code from a provider body, never its message."""
+    if not isinstance(body, dict):
+        return ""
+    err = body.get("error")
+    if isinstance(err, dict):
+        for key in ("code", "type"):
+            code = _sanitize_code(err.get(key))
+            if code:
+                return code
+        return ""
+    return _sanitize_code(body.get("code"))
+
+
+def classify_transport_failure(exc):
+    """Map a transport/parse exception to (category, http_status, safe_code).
+
+    Categories, in the vocabulary an operator needs:
+
+      ``timeout``         request/connect/read timed out; outcome UNKNOWN
+      ``connection``      nothing was delivered (DNS, refused, reset, TLS)
+      ``http_error``      provider answered with a non-2xx status
+      ``parse_error``     provider answered, body was not usable JSON
+      ``application``     anything else raised in our own code
+
+    Never raises. Never returns provider text.
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        status = getattr(exc, "code", None)
+        safe = ""
+        try:
+            raw = exc.read()
+            parsed = json.loads(raw) if raw else {}
+            safe = _provider_error_code(parsed)
+        except Exception:
+            safe = ""
+        return "http_error", status, safe
+
+    if isinstance(exc, _TRANSPORT_TIMEOUT_ERRORS):
+        return "timeout", None, ""
+
+    # urllib wraps socket timeouts inside URLError.reason on some paths.
+    if isinstance(exc, urllib.error.URLError):
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, _TRANSPORT_TIMEOUT_ERRORS):
+            return "timeout", None, ""
+        if isinstance(reason, str) and "timed out" in reason.lower():
+            return "timeout", None, ""
+        return "connection", None, ""
+
+    if isinstance(exc, (ConnectionError, OSError)):
+        # OSError covers ConnectionResetError, DNS gaierror, TLS errors.
+        if "timed out" in str(exc).lower():
+            return "timeout", None, ""
+        return "connection", None, ""
+
+    if isinstance(exc, (json.JSONDecodeError, ValueError)):
+        return "parse_error", None, ""
+
+    return "application", None, ""
+
+
+def log_transport_failure(operation, exc):
+    """Record a value-free diagnostic line for a failed transport call.
+
+    Emits ONE warning. Returns the category so a caller may attach it to its
+    result code without re-classifying. Never raises: a diagnostics failure
+    must never break the operation it is describing.
+    """
+    try:
+        category, status, safe_code = classify_transport_failure(exc)
+        parts = [f"operation={operation}", f"category={category}",
+                 f"exc={type(exc).__name__}"]
+        if status is not None:
+            parts.append(f"http_status={status}")
+        if safe_code:
+            parts.append(f"provider_code={safe_code}")
+        line = "Vercel transport failure: " + " ".join(parts)
+        logger.warning(line[:_MAX_DIAGNOSTIC_CHARS])
+        return category
+    except Exception:  # pragma: no cover - diagnostics must never raise
+        return "unknown"
 
 
 _DNS_LABEL = r'(?!-)[A-Za-z0-9-]{1,63}(?<!-)'
@@ -146,11 +301,37 @@ class VercelAdapter:
     marker is a plain preview env entry; require plaintext readback. Missing
     or masked marker fails closed, never adopts a colliding project.
     """
-    def __init__(self, token, team_id, ownership_namespace, transport=None):
+    #: Default timeout for ordinary Vercel API calls (project lookups,
+    #: deployment status polls, alias reads). These are small request/response
+    #: round trips; 30s is generous for them.
+    DEFAULT_API_TIMEOUT = 30
+
+    #: Default timeout for the ONE call that uploads an artifact: the
+    #: ``POST /v13/deployments`` body is the entire static site inlined as
+    #: base64 (1 MB+ for a small site), so it is a bulk upload rather than a
+    #: metadata call. A 30s budget that comfortably covers a project lookup
+    #: does not necessarily cover uploading and enqueuing megabytes. Kept as a
+    #: separate knob so ordinary calls are NOT slowed down to accommodate it.
+    #:
+    #: This is a diagnostic-and-headroom change, not a proven fix: the failed
+    #: attempt's cause was never established (no provider status was
+    #: observable). See ``deploy_static_files`` for what is now recorded.
+    DEFAULT_UPLOAD_TIMEOUT = 120
+
+    def __init__(self, token, team_id, ownership_namespace, transport=None,
+                 *, api_timeout=None, upload_timeout=None):
         if not all(isinstance(v, str) and v for v in (token, team_id, ownership_namespace)):
             raise ValueError("Token, team and ownership namespace required")
         self.token, self.team_id, self.namespace = token, team_id, ownership_namespace
         self.transport = transport or UrllibHttpTransport()
+        self.api_timeout = (
+            self.DEFAULT_API_TIMEOUT if api_timeout is None else int(api_timeout)
+        )
+        self.upload_timeout = (
+            self.DEFAULT_UPLOAD_TIMEOUT if upload_timeout is None else int(upload_timeout)
+        )
+        if self.api_timeout <= 0 or self.upload_timeout <= 0:
+            raise ValueError("Timeouts must be positive")
 
     def project_name_for(self, app_id):
         digest = hashlib.sha256((self.namespace + '\0' + app_id).encode()).hexdigest()
@@ -159,12 +340,13 @@ class VercelAdapter:
     def _marker(self, app_id):
         return hashlib.sha256((self.namespace + '\0' + app_id).encode()).hexdigest()
 
-    def _call(self, method, path, payload=None, **query):
+    def _call(self, method, path, payload=None, *, timeout=None, **query):
         query['teamId'] = self.team_id
         return _json_call(self.transport, method,
                           'https://api.vercel.com' + path + '?' + urlencode(query),
                           {'Authorization': 'Bearer ' + self.token,
-                           'Content-Type': 'application/json'}, payload)
+                           'Content-Type': 'application/json'}, payload,
+                          timeout=self.api_timeout if timeout is None else timeout)
 
     def _project_valid(self, project, app_id, expected_name=None):
         """Ownership/identity check. ``expected_name`` defaults to the
@@ -470,15 +652,34 @@ class VercelAdapter:
                     return _fail('INVALID_STATIC_FILES')
                 entries.append({'file': name, 'data': base64.b64encode(content).decode(),
                                 'encoding': 'base64'})
+            # The upload is the ONE bulk call in this adapter: use the dedicated
+            # upload budget rather than the metadata-call budget. A payload of
+            # N megabytes inlined as base64 is not a 30s round trip on a slow
+            # link, and timing it out leaves the remote outcome UNKNOWN.
             status, body = self._call('POST', '/v13/deployments', {
                 'name': project['name'], 'project': project['id'], 'version': 2,
                 'files': entries, 'builds': [{'src': '**', 'use': '@vercel/static'}],
                 'meta': meta, 'projectSettings': {'framework': None},
-            })
+            }, timeout=self.upload_timeout)
             if status not in (200, 201):
+                # The provider ANSWERED and refused: nothing was created. Record
+                # the status and a sanitized code so the next attempt's operator
+                # can distinguish a rejection from an unknown outcome.
+                logger.warning(
+                    "Vercel deploy rejected: operation=deploy_static_files "
+                    "http_status=%s provider_code=%s payload_bytes=%s",
+                    status, _provider_error_code(body) or "none",
+                    sum(len(e['data']) for e in entries),
+                )
                 return _fail('DEPLOYMENT_RECONCILIATION_REQUIRED')
             return self._deployment(body, project, meta)
-        except Exception:
+        except Exception as exc:
+            # Classify BEFORE the fail-closed return. This preserves the
+            # existing behaviour (one opaque, retryable=False result) while
+            # making the cause observable: a timeout (outcome UNKNOWN, do not
+            # blind-resend) is now distinguishable from a connection failure
+            # (nothing sent) and from an HTTP rejection (provider answered).
+            log_transport_failure('deploy_static_files', exc)
             return _fail('DEPLOYMENT_RECONCILIATION_REQUIRED')
 
     def _find_unique_deployment_by_meta_key(self, project, meta_key, meta_value, max_pages=100):
