@@ -652,6 +652,42 @@ class VercelAdapter:
                     return _fail('INVALID_STATIC_FILES')
                 entries.append({'file': name, 'data': base64.b64encode(content).decode(),
                                 'encoding': 'base64'})
+            # ---- First-deployment guard (release blocker) ----------------
+            # Vercel auto-promotes a brand-new project's FIRST deployment to
+            # target="production", even when no production target is requested
+            # (there is no "preview" literal in this API -- omission IS the
+            # preview request, and it is not honoured for deployment #1).
+            #
+            # The adapter cannot ask for preview-only. It can only refuse to
+            # deploy real user content while the project's one-time
+            # auto-promotion is still unspent, because in that state the very
+            # next deployment becomes LIVE regardless of the request shape.
+            #
+            # ensure_bootstrap() is the supported way to spend it (on
+            # content-free bytes). This check enforces the ORDERING at the
+            # adapter boundary instead of trusting every caller to remember
+            # it: with no production binding the guard fails closed and
+            # nothing is sent. After bootstrap, production is bound, so the
+            # guard is inert for all normal preview deployments.
+            #
+            # Fail-closed on an unreadable binding: an ambiguous lookup is
+            # never evidence that the slot is safe.
+            try:
+                current_production = self._current_production_id(project)
+            except Exception:
+                return _fail('DEPLOYMENT_RECONCILIATION_REQUIRED')
+            if current_production is None:
+                # Unspent auto-promotion: this deployment WOULD become
+                # production. Refuse; the caller must run ensure_bootstrap
+                # first. Logged (no secrets) so the operator sees why.
+                logger.warning(
+                    "Vercel deploy refused: operation=deploy_static_files "
+                    "reason=first_deployment_auto_promotion_unspent "
+                    "project=%s (run ensure_bootstrap before real content)",
+                    project.get('id'),
+                )
+                return _fail('BOOTSTRAP_REQUIRED_BEFORE_DEPLOY')
+
             # The upload is the ONE bulk call in this adapter: use the dedicated
             # upload budget rather than the metadata-call budget. A payload of
             # N megabytes inlined as base64 is not a 30s round trip on a slow

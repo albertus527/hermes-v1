@@ -47,7 +47,7 @@ class FakeTransport:
     def request(self, method, url, headers=None, data=None, timeout=None):
         self.calls.append({"method": method, "url": url,
                            "headers": headers or {}, "timeout": timeout,
-                           "bytes": len(data or b"")})
+                           "data": data, "bytes": len(data or b"")})
         value = self.responses.pop(0)
         if isinstance(value, BaseException):
             raise value
@@ -57,8 +57,24 @@ class FakeTransport:
 
 
 def adapter(*responses, **kw):
+    """Adapter over a project whose production slot is ALREADY consumed.
+
+    The first-deployment guard reads the project's production binding before
+    any POST, so a canned GET is prepended automatically. Pass
+    ``bootstrapped=False`` to model a brand-new project instead (no binding).
+    """
+    bootstrapped = kw.pop("bootstrapped", True)
     t = FakeTransport(*responses)
-    return VercelAdapter("secret-token", TEAM, NS, t, **kw), t
+    a = VercelAdapter("secret-token", TEAM, NS, t, **kw)
+    guard_body = {"id": "prj_1", "name": "dorma-atelier", "accountId": TEAM,
+                  "env": [{"key": "WEBSITE_BUILDER_OWNER",
+                           "value": a._marker(APP), "type": "plain"}]}
+    if bootstrapped:
+        guard_body["targets"] = {"production": {"id": "dpl_bootstrap"}}
+    else:
+        guard_body["targets"] = {}
+    t.responses.insert(0, (200, guard_body))
+    return a, t
 
 
 def project(a):
@@ -264,7 +280,11 @@ class TestTimeoutBudgets:
         a, t = adapter((500, {"error": {"code": "invalid_request"}}),
                        api_timeout=7, upload_timeout=99)
         deploy(a)
-        assert t.calls[0]["timeout"] == 99
+        # The first-deployment guard issues a metadata GET first, so select the
+        # bulk POST explicitly rather than relying on position.
+        posts = [c for c in t.calls if c["method"] == "POST"]
+        assert len(posts) == 1
+        assert posts[0]["timeout"] == 99
 
     def test_defaults_are_separate_and_sane(self):
         a, _ = adapter()
@@ -318,3 +338,101 @@ class TestSuccessUnchanged:
         text = "\n".join(r.getMessage() for r in caplog.records)
         assert "secret-token" not in text
         assert "Bearer" not in text
+
+
+# ---------------------------------------------------------------------------
+# 5. First-deployment / preview-only boundary (release blocker)
+#
+# Vercel auto-promotes a brand-new project's FIRST deployment to
+# target="production", even when no production target is requested: there is
+# no "preview" literal in this API, omission IS the preview request, and it is
+# not honoured for deployment #1. Therefore omitting target does NOT guarantee
+# preview, and the adapter cannot ask for preview-only. Its only safe move is
+# to refuse real content while the one-time auto-promotion is unspent, and to
+# spend it on content-free bytes via ensure_bootstrap().
+# ---------------------------------------------------------------------------
+
+class TestFirstDeploymentBoundary:
+
+    def _ready(self, a, target=None):
+        return {"id": "dpl_1", "projectId": "prj_1", "teamId": TEAM,
+                "name": "dorma-atelier", "target": target,
+                "url": "x.vercel.app", "readyState": "READY",
+                "meta": a._meta(APP, "op-1", 1, SHA)}
+
+    def test_newly_created_project_with_zero_deployments_refuses_content(self):
+        """New project, zero deployments, empty production binding -> refuse.
+
+        This is exactly the dorma-atelier state: the project exists
+        (prj_C2lFWS2fBPlAI7GycXPVG5GS2ebb) but has never had a deployment.
+        """
+        a, t = adapter(bootstrapped=False)
+        r = deploy(a)
+        assert not r.success
+        assert r.error_code == "BOOTSTRAP_REQUIRED_BEFORE_DEPLOY"
+        assert not r.retryable
+
+    def test_zero_deployments_sends_no_deployment_request(self):
+        """The refusal happens BEFORE any upload -- nothing leaves the box."""
+        a, t = adapter(bootstrapped=False)
+        deploy(a)
+        assert [c["method"] for c in t.calls] == ["GET"]
+        assert not any("/v13/deployments" in c["url"] for c in t.calls)
+
+    def test_first_deployment_request_target_is_never_production(self):
+        """When a deploy IS allowed (promotion spent), the request must not ask
+        for production. The payload carries no target field at all."""
+        a, t = adapter((201, {"id": "dpl_1", "projectId": "prj_1",
+                              "teamId": TEAM, "name": "dorma-atelier",
+                              "target": None, "url": "x.vercel.app",
+                              "readyState": "READY",
+                              "meta": None}))
+        # rebuild the canned deployment now that `a` exists
+        t.responses[1] = (201, self._ready(a))
+        r = deploy(a)
+        assert r.success
+        post = [c for c in t.calls if c["method"] == "POST"][0]
+        raw = post["data"]
+        body = json.loads(raw.decode() if isinstance(raw, (bytes, bytearray)) else raw)
+        assert "target" not in body, "must not request a production target"
+
+    def test_publication_disabled_does_not_alter_preview_deploy_request(self):
+        """publication_enabled=false lives on the runtime, not the adapter: it
+        gates publication, never preview. The deploy request shape must be
+        identical either way, and must never carry a production target."""
+        a, t = adapter((201, {"id": "dpl_1", "projectId": "prj_1",
+                              "teamId": TEAM, "name": "dorma-atelier",
+                              "target": None, "url": "x.vercel.app",
+                              "readyState": "READY", "meta": None}))
+        t.responses[1] = (201, self._ready(a))
+        r = deploy(a)
+        assert r.success
+        posts = [c for c in t.calls if c["method"] == "POST"]
+        assert len(posts) == 1
+        raw = posts[0]["data"]
+        body = json.loads(raw.decode() if isinstance(raw, (bytes, bytearray)) else raw)
+        assert "target" not in body
+
+    def test_no_promotion_or_alias_call_on_preview_path(self):
+        """A successful preview deploy must not touch any production endpoint."""
+        a, t = adapter((201, {"id": "dpl_1", "projectId": "prj_1",
+                              "teamId": TEAM, "name": "dorma-atelier",
+                              "target": None, "url": "x.vercel.app",
+                              "readyState": "READY", "meta": None}))
+        t.responses[1] = (201, self._ready(a))
+        assert deploy(a).success
+        urls = " ".join(c["url"] for c in t.calls)
+        for forbidden in ("aliases", "promote"):
+            assert forbidden not in urls, f"preview path touched {forbidden}"
+
+    def test_ambiguous_binding_fails_closed_not_open(self):
+        """An unreadable production binding must never be read as 'safe'."""
+        a, t = adapter(bootstrapped=False)
+        t.responses[0] = (200, {"id": "prj_1", "name": "dorma-atelier",
+                                "accountId": TEAM, "env": [],
+                                "targets": {"production": "not-a-dict"}})
+        r = deploy(a)
+        assert not r.success
+        assert r.error_code in ("DEPLOYMENT_RECONCILIATION_REQUIRED",
+                                "BOOTSTRAP_REQUIRED_BEFORE_DEPLOY")
+        assert not any(c["method"] == "POST" for c in t.calls)

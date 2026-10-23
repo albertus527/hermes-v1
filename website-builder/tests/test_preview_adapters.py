@@ -38,6 +38,16 @@ def adapter(*responses):
     return VercelAdapter('secret', 'team_1', 'installation', transport), transport
 
 
+def _bootstrapped(a, p):
+    """Project body whose production slot is already consumed.
+
+    deploy_static_files() now reads the production binding before POSTing, so
+    every test that expects a real deployment must show a project that has
+    already spent its one-time first-deployment auto-promotion.
+    """
+    return {**p, 'targets': {'production': {'id': 'dpl_bootstrap'}}}
+
+
 def project(a):
     return {'id': 'prj_1', 'name': a.project_name_for('app'), 'accountId': 'team_1',
             'env': [{'key': 'WEBSITE_BUILDER_OWNER', 'value': a._marker('app'), 'type': 'plain'}]}
@@ -85,11 +95,12 @@ def test_creation_timeout_reconcile_without_duplicate_post():
 
 def test_exact_static_files_preview_only():
     a, t = adapter()
-    t.responses = [(201, deployment(a))]
+    p = project(a)
+    t.responses = [(200, _bootstrapped(a, p)), (201, deployment(a))]
     files = {'index.html': b'<html>exact</html>', 'assets/a.bin': bytes(range(256))}
-    result = a.deploy_static_files('app', project(a), files, 'operation', 2, SHA)
+    result = a.deploy_static_files('app', p, files, 'operation', 2, SHA)
     assert result.success
-    body = json.loads(t.calls[0][2]['data'])
+    body = json.loads(t.calls[1][2]['data'])
     assert {e['file']: base64.b64decode(e['data']) for e in body['files']} == files
     assert 'target' not in body and 'gitSource' not in body
     assert body['builds'] == [{'src': '**', 'use': '@vercel/static'}]
@@ -110,7 +121,8 @@ def test_deployment_identity_failclosed(field, value):
     a, t = adapter()
     d = deployment(a)
     d[field] = value
-    t.responses = [(201, d)]
+    p = project(a)
+    t.responses = [(200, _bootstrapped(a, p)), (201, d)]
     result = a.deploy_static_files('app', project(a), {'index.html': b'x'}, 'operation', 2, SHA)
     assert not result.success and not result.retryable
 
@@ -127,6 +139,7 @@ def test_deployment_target_production_rejected_when_already_canonical():
     d['target'] = 'production'
     p = project(a)
     t.responses = [
+        (200, _bootstrapped(a, p)),
         (201, d),
         (200, {**p, 'targets': {'production': {'id': d['id']}}}),
     ]
@@ -135,21 +148,29 @@ def test_deployment_target_production_rejected_when_already_canonical():
     assert result.error_code == 'DEPLOYMENT_ALREADY_LIVE'
 
 
-def test_deployment_target_production_accepted_when_not_yet_canonical():
-    """A first deployment auto-promoted to target="production" by Vercel is
-    a SAFE staged candidate as long as the project's production binding does
-    not yet point at it (e.g. binding is empty, or points elsewhere).
+def test_first_deployment_refused_when_promotion_unspent():
+    """RELEASE BLOCKER: a project with an unspent one-time auto-promotion must
+    never accept real user content.
+
+    Vercel auto-promotes a brand-new project's FIRST deployment to
+    target="production" even when no production target is requested -- there is
+    no "preview" literal in this API, omission IS the preview request, and it is
+    not honoured for deployment #1. The old test asserted the opposite
+    ("accepted_when_not_yet_canonical"), i.e. it pinned the unsafe behaviour.
+
+    The adapter cannot ask for preview-only, so it refuses instead: no request
+    is sent at all when the production binding is empty.
     """
     a, t = adapter()
-    d = deployment(a)
-    d['target'] = 'production'
     p = project(a)
-    t.responses = [
-        (201, d),
-        (200, {**p, 'targets': {}}),
-    ]
+    # Production binding empty == the one-time auto-promotion is still unspent.
+    t.responses = [(200, {**p, 'targets': {}})]
     result = a.deploy_static_files('app', p, {'index.html': b'x'}, 'operation', 2, SHA)
-    assert result.success
+    assert not result.success
+    assert result.error_code == 'BOOTSTRAP_REQUIRED_BEFORE_DEPLOY'
+    # Nothing was uploaded: the guard runs before the deploy POST.
+    assert [m for m, _u, _k in t.calls] == ['GET']
+    assert all('/v13/deployments' not in u for _m, u, _k in t.calls)
 
 
 def test_deployment_production_binding_lookup_ambiguous_failclosed():
@@ -161,12 +182,11 @@ def test_deployment_production_binding_lookup_ambiguous_failclosed():
     d['target'] = 'production'
     p = project(a)
     t.responses = [
-        (201, d),
         (200, {**p, 'targets': 'not-a-dict'}),
     ]
     result = a.deploy_static_files('app', p, {'index.html': b'x'}, 'operation', 2, SHA)
     assert not result.success and not result.retryable
-    assert result.error_code == 'DEPLOYMENT_IDENTITY_MISMATCH'
+    assert result.error_code == 'DEPLOYMENT_RECONCILIATION_REQUIRED'
 
 
 def test_reconciliation_lookup_landing_on_canonical_production_failclosed():
@@ -1004,7 +1024,10 @@ def test_real_content_deploy_after_bootstrap_consumed_promotion_is_accepted():
     p = project(a)
     d = deployment(a)
     d['target'] = None  # real content deploy, NOT auto-promoted this time
-    t.responses = [(201, d)]
+    t.responses = [
+        (200, _bootstrapped(a, p)),   # guard: promotion already spent
+        (201, d),
+    ]
     result = a.deploy_static_files('app', p, {'index.html': b'x'}, 'operation', 2, SHA)
     assert result.success
 
@@ -1171,7 +1194,10 @@ def test_slug_project_full_preview_sequence_passes_with_expected_name():
     assert a.ensure_bootstrap('app', project, expected_name='dapur-kedaton').success
     # 3. real content deploy
     d = _slug_deployment(a, 'dapur-kedaton')
-    t.responses = [(201, d)]
+    t.responses = [
+        (200, {**p, 'targets': {'production': {'id': 'dpl_boot'}}}),  # guard: spent
+        (201, d),
+    ]
     deployed = a.deploy_static_files('app', project, {'index.html': b'x'}, 'operation', 2, SHA,
                                      expected_name='dapur-kedaton')
     assert deployed.success
@@ -1191,7 +1217,10 @@ def test_opaque_project_downstream_passes_without_expected_name():
     p = project(a)
     t.responses = [(200, {**p, 'targets': {'production': {'id': 'dpl_existing'}}})]
     assert a.ensure_bootstrap('app', p).success
-    t.responses = [(201, deployment(a))]
+    t.responses = [
+        (200, {**p, 'targets': {'production': {'id': 'dpl_existing'}}}),  # guard: spent
+        (201, deployment(a)),
+    ]
     assert a.deploy_static_files('app', p, {'index.html': b'x'}, 'operation', 2, SHA).success
     d = deployment(a)
     t.responses = [(200, {'deployments': [d], 'pagination': {'next': None}}), (200, d)]
