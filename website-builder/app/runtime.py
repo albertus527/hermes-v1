@@ -1067,6 +1067,199 @@ def preflight_role_validation(config: RuntimeConfig) -> bool:
     return False
 
 
+def preflight_gateway_authentication(config: RuntimeConfig) -> bool:
+    """Verify the resolved model gateway ACCEPTS the credential.
+
+    Role validation proves that a provider, a ``base_url`` and a non-empty
+    ``api_key`` resolve for every role. It does not prove the gateway
+    authenticates that key. A self-hosted gateway (9router and friends)
+    answers an unauthenticated or wrong-key request with ``HTTP 401``, and the
+    runtime would only discover that on the first real model call — after
+    intake had already accepted the owner's brief and burned its retries on a
+    guaranteed-to-fail request.
+
+    This gate closes that window with ONE non-billable ``GET {base_url}/models``
+    against the SAME endpoint and the SAME key the roles will use. It sends no
+    prompt, generates nothing, and consumes no tokens.
+
+    Design notes:
+
+    * The key is read from ``$HERMES_HOME/.env`` — the same file the
+      ``hermes -z`` child loads — not from the parent's ``os.environ``. The
+      parent frequently does NOT hold the model key (it is scoped to the
+      child), so reading the parent would produce a false failure.
+    * Only ``http``/``https`` base URLs are probed. A non-HTTP provider (or
+      one with no ``base_url``) is skipped rather than failed: this gate exists
+      to catch a rejected credential, not to re-litigate provider topology.
+    * Every message is value-free. The key never appears in a log line, an
+      exception, or a return value.
+    * Transport failures are reported as UNAVAILABLE and fail closed. Starting
+      a run against a gateway that cannot be reached wastes the same brief and
+      the same retries as a 401.
+
+    Returns True when the gateway authenticates (or the provider is not an
+    HTTP gateway and there is nothing to probe).
+    """
+    import json as _json
+    import urllib.error as _urlerror
+    import urllib.request as _urlrequest
+
+    profile_config_path = config.hermes_home / "config.yaml"
+    try:
+        import yaml as _yaml
+
+        with profile_config_path.open(encoding="utf-8-sig") as source:
+            profile = _yaml.safe_load(source) or {}
+    except Exception as exc:  # unreadable profile -> role validation already failed
+        logger.warning(
+            "Gateway auth preflight skipped: profile config unreadable (%s)",
+            type(exc).__name__,
+        )
+        return True
+
+    if not isinstance(profile, dict):
+        return True
+
+    providers = profile.get("providers") or {}
+    role_models = (profile.get("website_builder") or {}).get("models") or {}
+
+    # Resolve the FAST role's provider -> base_url + key_env. FAST is the role
+    # that reads the brief, so its credential is the one that must work first.
+    fast = role_models.get("FAST") if isinstance(role_models, dict) else None
+    provider_name = ""
+    if isinstance(fast, dict):
+        provider_name = str(fast.get("provider") or "").strip()
+    if not provider_name:
+        provider_name = str((profile.get("model") or {}).get("provider") or "").strip()
+
+    # `custom:openai-api` -> the `openai-api` entry under providers.
+    short = provider_name.split(":", 1)[1] if ":" in provider_name else provider_name
+    entry = providers.get(short) if isinstance(providers, dict) else None
+    if not isinstance(entry, dict):
+        logger.info(
+            "Gateway auth preflight skipped: no providers.%s entry to probe.", short
+        )
+        return True
+
+    base_url = str(entry.get("base_url") or "").strip().rstrip("/")
+    key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
+    if not base_url or not base_url.startswith(("http://", "https://")):
+        logger.info(
+            "Gateway auth preflight skipped: providers.%s has no HTTP base_url.",
+            short,
+        )
+        return True
+    if not key_env:
+        logger.info(
+            "Gateway auth preflight skipped: providers.%s declares no key_env.",
+            short,
+        )
+        return True
+
+    # Read the key from the profile .env -- what the child actually loads.
+    api_key = ""
+    dotenv_path = config.hermes_home / ".env"
+    if dotenv_path.is_file():
+        try:
+            for line in dotenv_path.read_text(encoding="utf-8").splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#") or "=" not in stripped:
+                    continue
+                name, _, value = stripped.partition("=")
+                if name.strip() == key_env:
+                    api_key = value.strip().strip("'\"")
+                    break
+        except OSError:
+            api_key = ""
+
+    if not api_key:
+        logger.error(
+            "Website Builder cannot start: the model gateway credential %s is "
+            "not configured for this profile — refusing to start.",
+            key_env,
+        )
+        logger.error("  Expected in: %s", dotenv_path)
+        logger.error(
+            "  Without it every model call fails with HTTP 401 and the brief is "
+            "lost, so this is checked before polling begins."
+        )
+        logger.error("Gateway endpoint: %s", base_url)
+        return False
+
+    probe_url = base_url + "/models"
+    request = _urlrequest.Request(
+        probe_url, headers={"Authorization": "Bearer " + api_key}, method="GET"
+    )
+    try:
+        with _urlrequest.urlopen(request, timeout=15) as response:
+            status = getattr(response, "status", 200)
+            payload = _json.loads(response.read() or b"{}")
+    except _urlerror.HTTPError as exc:
+        if exc.code in (401, 403):
+            logger.error(
+                "Website Builder cannot start: the model gateway REJECTED the "
+                "configured credential (HTTP %d) — refusing to start.",
+                exc.code,
+            )
+            logger.error("  Endpoint: %s", probe_url)
+            logger.error(
+                "  The credential %s is present but not accepted. Correct it in %s.",
+                key_env,
+                dotenv_path,
+            )
+        else:
+            logger.error(
+                "Website Builder cannot start: the model gateway returned "
+                "HTTP %d during the auth preflight — refusing to start.",
+                exc.code,
+            )
+            logger.error("  Endpoint: %s", probe_url)
+        return False
+    except Exception as exc:
+        logger.error(
+            "Website Builder cannot start: the model gateway is unreachable "
+            "(%s) — refusing to start.",
+            type(exc).__name__,
+        )
+        logger.error("  Endpoint: %s", probe_url)
+        return False
+
+    if status != 200:
+        logger.error(
+            "Website Builder cannot start: the model gateway auth preflight "
+            "returned HTTP %d — refusing to start.",
+            status,
+        )
+        return False
+
+    # The gateway accepted the credential. Confirm the FAST model is actually
+    # served, so a renamed/retired model fails here instead of mid-build.
+    served = [
+        str(m.get("id") or "")
+        for m in (payload.get("data") or [])
+        if isinstance(m, dict)
+    ]
+    fast_model = ""
+    if isinstance(fast, dict):
+        fast_model = str(fast.get("model") or "").strip()
+    if fast_model and served and fast_model not in served:
+        logger.error(
+            "Website Builder cannot start: the gateway authenticated but does "
+            "not serve the configured FAST model — refusing to start."
+        )
+        logger.error("  Configured model: %s", fast_model)
+        logger.error("  Gateway serves %d model(s); it is not among them.", len(served))
+        return False
+
+    logger.info(
+        "Gateway auth preflight OK: %s authenticated (%d model(s) served, "
+        "FAST model present).",
+        base_url,
+        len(served),
+    )
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Composition root
 # ---------------------------------------------------------------------------
@@ -3698,6 +3891,20 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # 3. Every model role must resolve against the real profile config
     if not preflight_role_validation(config):
+        return 1
+
+    # 3b. The resolved gateway must actually ACCEPT the credential.
+    #
+    #     Role validation proves a provider, base_url and non-empty api_key
+    #     resolve. It does NOT prove the gateway authenticates that key: a
+    #     self-hosted gateway (9router et al.) answers an unauthenticated or
+    #     wrong-key request with HTTP 401, and the runtime only discovers that
+    #     on the first real model call — after intake has already accepted the
+    #     owner's brief and spent retries. That is exactly the failure this
+    #     gate exists to prevent: one non-billable GET /models against the
+    #     SAME base_url and SAME key the FAST role will use, BEFORE polling
+    #     starts. It sends no prompt and generates nothing.
+    if not preflight_gateway_authentication(config):
         return 1
 
     # 4. Declared design capabilities must actually be present on this host.

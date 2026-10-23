@@ -414,6 +414,8 @@ class TestResumePublicationBlocked:
              patch("app.runtime.preflight_smoke_support"), \
              patch("app.runtime.preflight_screenshot_support"), \
              patch("app.runtime.preflight_role_validation", return_value=True), \
+             patch("app.runtime.preflight_gateway_authentication",
+                   return_value=True), \
              patch("app.runtime.preflight_design_capabilities",
                    return_value=MagicMock(ok=True)), \
              patch("app.runtime.compose", return_value=MagicMock()), \
