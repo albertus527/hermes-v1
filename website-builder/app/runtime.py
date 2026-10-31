@@ -1912,6 +1912,11 @@ ERROR_MESSAGES: Dict[str, str] = {
         "lain, atau aku kasih beberapa pilihan?"
     ),
     "DEPLOYMENT_ALREADY_LIVE": "This deployment is already live in production.",
+    "DEPLOYMENT_PROMOTED_TO_PRODUCTION": (
+        "Deployment-mu berhasil tayang, tapi provider menaikkannya jadi "
+        "PRODUCTION, bukan preview — situsmu sekarang bisa diakses publik. "
+        "Tidak ada rollback otomatis."
+    ),
     "SMOKE_FAILED": (
         "Preview-nya belum lolos pemeriksaan. Aku akan coba benerin dan "
         "bikin preview baru — kirim aja perubahan yang kamu mau."
@@ -2799,6 +2804,22 @@ User message:
             or smoke.get("failure_classification")
         )
         operation_id = intent.get("operation_id")
+
+        # ---- P1.4: promoted-terminal deduplication ------------------------
+        # A DEPLOYMENT_PROMOTED_TO_PRODUCTION outcome is terminal and
+        # operation-scoped: exactly ONE user-facing notification, ever.
+        # The durable intent carries notification_state so a process
+        # restart (or a duplicate Telegram update replayed under the same
+        # claim) cannot re-send. PENDING means the Telegram transport may
+        # have accepted the message but we crashed before persisting SENT —
+        # NOT a proof of delivery, and therefore NOT retried (retried sends
+        # may duplicate; at-most-once is the honest guarantee).
+        if intent.get("promoted_terminal") is True:
+            self._send_promoted_notification_once(
+                project_id, message.conversation_id, operation_id, intent,
+            )
+            return None
+
         if not self._needs_preview_reconcile(fresh):
             if smoke and classification and operation_id:
                 self._send_preview_status_once(
@@ -3487,6 +3508,63 @@ User message:
                 else result.error_code
             )
             self._send_error_reply(conversation_id, err_code)
+
+    def _send_promoted_notification_once(
+        self, project_id, chat_id, operation_id, intent,
+    ) -> None:
+        """P1.4: at-most-once user-facing notification for a terminal
+        DEPLOYMENT_PROMOTED_TO_PRODUCTION outcome.
+
+        The notification is idempotent and operation-scoped:
+
+        * ``NOT_ATTEMPTED``  -> send, persist PENDING before the transport
+          call, then SENT on success.  A crash between PENDING and SENT
+          leaves the state PENDING, which is NEVER re-sent (the transport
+          may have accepted the message; resending risks duplication).
+        * ``PENDING``        -> do nothing: the transport may have
+          accepted the message.  This is the honest at-most-once boundary.
+        * ``SENT``           -> do nothing: already delivered.
+
+        An explicit operator reconciliation path (operator CLI / manual
+        reconcile) may clear ``notification_state`` and re-arm the send;
+        this method itself never re-sends from PENDING or SENT.
+        """
+        ns = intent.get("notification_state", "NOT_ATTEMPTED")
+        if ns in ("PENDING", "SENT"):
+            return
+        error_code = (intent.get("promoted_error_code")
+                      or "DEPLOYMENT_PROMOTED_TO_PRODUCTION")
+        # Persist PENDING before the send: a crash in the send window must
+        # leave a durable marker so the next attempt does NOT re-send.
+        with self.dispatcher.store.acquire_writer(project_id) as locked:
+            i = locked.deployment.get("preview_intent") or {}
+            if i.get("operation_id") != operation_id:
+                return  # operation was superseded; do not touch it
+            i["notification_state"] = "PENDING"
+            locked.deployment["preview_intent"] = i
+            self.dispatcher.store.save(locked)
+        try:
+            result = self.telegram_out.send_text(chat_id, self._promoted_copy(error_code))
+        except Exception:
+            logger.exception("Promoted notification send failed for project %s", project_id)
+            return
+        if result is None or getattr(result, "success", False):
+            with self.dispatcher.store.acquire_writer(project_id) as locked:
+                i = locked.deployment.get("preview_intent") or {}
+                if i.get("operation_id") == operation_id:
+                    i["notification_state"] = "SENT"
+                    if result is not None and isinstance(getattr(result, "data", None), dict):
+                        i["notification_message_id"] = result.data.get("message_id")
+                    locked.deployment["preview_intent"] = i
+                    self.dispatcher.store.save(locked)
+        # A failed send leaves PENDING: the transport accepted or the send
+        # was ambiguous.  We do NOT retry to avoid a duplicate; the user
+        # can trigger a manual reconcile to re-arm.
+
+    @staticmethod
+    def _promoted_copy(error_code: str) -> str:
+        """Sanitized user-facing copy for a terminal promoted outcome."""
+        return render_error_message(error_code)
 
     def _send_preview_status_once(self, project_id, chat_id, diagnostics):
         if not isinstance(diagnostics, dict):

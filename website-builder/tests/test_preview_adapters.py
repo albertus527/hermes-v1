@@ -128,11 +128,13 @@ def test_deployment_identity_failclosed(field, value):
 
 
 def test_deployment_target_production_rejected_when_already_canonical():
-    """Vercel's documented first-deployment auto-promotion means target can
-    legitimately be "production" -- but if the project's OWN production
-    binding already points at this exact deployment id, it is genuinely
-    LIVE and must never be treated as an unpublished preview candidate,
-    even though every other identity marker (project/team/meta) matches.
+    """If the deployment response says target="production" AND the project's
+    OWN production binding points at this exact deployment id, the provider
+    accepted the deployment and it IS live. That is a PROVIDER SUCCESS, not
+    an upload failure: reported as the distinct explicit outcome
+    DEPLOYMENT_PROMOTED_TO_PRODUCTION, success=False (never shown as an
+    approved preview), retryable=False (resending can never fix it), with
+    the full deployment payload preserved for reconciliation.
     """
     a, t = adapter()
     d = deployment(a)
@@ -145,21 +147,24 @@ def test_deployment_target_production_rejected_when_already_canonical():
     ]
     result = a.deploy_static_files('app', p, {'index.html': b'x'}, 'operation', 2, SHA)
     assert not result.success and not result.retryable
-    assert result.error_code == 'DEPLOYMENT_ALREADY_LIVE'
+    assert result.error_code == 'DEPLOYMENT_PROMOTED_TO_PRODUCTION'
+    assert result.data['promoted_to_production'] is True
+    assert result.data['deployment_id'] == d['id']
+    assert result.data['deployment']['id'] == d['id']
 
 
 def test_first_deployment_refused_when_promotion_unspent():
-    """RELEASE BLOCKER: a project with an unspent one-time auto-promotion must
-    never accept real user content.
+    """RELEASE BLOCKER: a project with an unspent one-time auto-promotion
+    must never accept real user content.
 
-    Vercel auto-promotes a brand-new project's FIRST deployment to
-    target="production" even when no production target is requested -- there is
-    no "preview" literal in this API, omission IS the preview request, and it is
-    not honoured for deployment #1. The old test asserted the opposite
-    ("accepted_when_not_yet_canonical"), i.e. it pinned the unsafe behaviour.
-
-    The adapter cannot ask for preview-only, so it refuses instead: no request
-    is sent at all when the production binding is empty.
+    CONFIRMED PROVIDER BEHAVIOR (2026-10-25, dorma-atelier, zero prior
+    deployments): the first deployment requested with the omitted target was
+    auto-promoted to target="production" with the project's production
+    aliases assigned. The documented "omitted -> preview" rule is NOT
+    honoured for deployment #1. So the adapter fails closed before sending
+    anything: no request at all while the production binding is empty.
+    ensure_bootstrap() is the supported way to spend it on content-free
+    bytes, after which this guard is inert for normal preview deploys.
     """
     a, t = adapter()
     p = project(a)
@@ -206,7 +211,9 @@ def test_reconciliation_lookup_landing_on_canonical_production_failclosed():
     ]
     result = a.find_deployment_by_operation_id('app', p, 'operation', 2, SHA)
     assert not result.success
-    assert result.error_code == 'DEPLOYMENT_ALREADY_LIVE'
+    assert result.error_code == 'DEPLOYMENT_PROMOTED_TO_PRODUCTION'
+    assert result.data['promoted_to_production'] is True
+    assert result.data['deployment_id'] == d['id']
 
 
 def test_lookup_paginated_then_authoritative_detail():

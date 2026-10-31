@@ -572,6 +572,10 @@ class VercelAdapter:
         Returns ``None`` when the project has no production deployment yet.
         Any malformed/ambiguous shape raises -- callers must fail closed,
         never assume "not live" from an unreadable response.
+
+        Public contract: orchestrator-level defense-in-depth guards may call
+        this method directly. It performs exactly one GET and makes no
+        mutations.
         """
         status, fresh = self._call('GET', '/v9/projects/' + project['name'])
         if status != 200 or not isinstance(fresh, dict) or fresh.get('id') != project['id']:
@@ -589,16 +593,20 @@ class VercelAdapter:
         return prod['id']
 
     def _deployment(self, body, project, meta):
-        # Vercel's documented behavior: a brand-new project's FIRST
-        # deployment is automatically promoted to target="production" even
-        # when no production target was requested (there is no "preview"
-        # literal accepted/returned by this API -- omission is the only
-        # preview request shape). Because of that, `target` alone is
-        # NEITHER proof this deployment is live NOR safe to auto-accept as
-        # a preview candidate. The only authoritative proof of "currently
+        # Identity and target semantics, from the provider contract:
+        #   * preview deployments respond with target: null
+        #   * production deployments respond with target: "production"
+        # `target` alone is NOT proof this deployment is live, and never
+        # proof it is preview: the only authoritative proof of "currently
         # serving as the project's canonical production target" is the
         # project's own `targets.production` binding, fetched fresh here --
         # never inferred from this deployment response body.
+        # OBSERVED (2026-10-25, dorma-atelier, zero prior deployments): the
+        # provider DID auto-promote a first deployment requested with the
+        # omitted target to target="production" and assigned the project's
+        # production aliases. The documented "omitted -> preview" rule is NOT
+        # honoured for deployment #1; the promotion is confirmed provider
+        # behavior, not a hypothesis.
         team = body.get('teamId') or (body.get('team') or {}).get('id')
         project_id = body.get('projectId') or (body.get('project') or {}).get('id')
         if (not body.get('id') or project_id != project['id'] or team != self.team_id
@@ -606,6 +614,9 @@ class VercelAdapter:
                 or body['target'] not in (None, 'production')
                 or any((body.get('meta') or {}).get(k) != v for k, v in meta.items())):
             return _fail('DEPLOYMENT_IDENTITY_MISMATCH')
+        url = 'https://' + body.get('url', '')
+        if not _safe_origin(url):
+            return _fail('INVALID_PREVIEW_URL')
         if body['target'] == 'production':
             try:
                 current_prod_id = self._current_production_id(project)
@@ -613,13 +624,30 @@ class VercelAdapter:
                 # Ambiguous/malformed binding lookup: never assume safe.
                 return _fail('DEPLOYMENT_IDENTITY_MISMATCH')
             if current_prod_id == body['id']:
-                # This exact deployment IS the project's live production
-                # target -- never show it as an unpublished preview
-                # candidate, even though every other identity marker matches.
-                return _fail('DEPLOYMENT_ALREADY_LIVE')
-        url = 'https://' + body.get('url', '')
-        if not _safe_origin(url):
-            return _fail('INVALID_PREVIEW_URL')
+                # PROVIDER SUCCESS, not an upload failure: the provider
+                # accepted this deployment and it IS the project's live
+                # production target. Reported as a DISTINCT explicit outcome
+                # -- success=False so no caller treats it as an approved
+                # preview, but with the full deployment payload and
+                # promoted_to_production=True so it can never be mistaken
+                # for a failed upload, an identity mismatch, or a reason to
+                # resend. Resending can NEVER fix this outcome.
+                logger.warning(
+                    "Vercel deployment PROMOTED TO PRODUCTION: "
+                    "operation=deploy_static_files project=%s deployment=%s "
+                    "(preview request shape was honoured as production by "
+                    "the provider; no rollback attempted)",
+                    project.get('id'), body['id'],
+                )
+                return OperationResult(
+                    success=False, error='DEPLOYMENT_PROMOTED_TO_PRODUCTION',
+                    error_code='DEPLOYMENT_PROMOTED_TO_PRODUCTION',
+                    retryable=False,
+                    data={'promoted_to_production': True,
+                          'deployment_id': body['id'],
+                          'preview_url': url,
+                          'state': body.get('readyState') or body.get('status'),
+                          'deployment': body})
         return OperationResult.ok({'deployment_id': body['id'], 'preview_url': url,
                                   'state': body.get('readyState') or body.get('status'),
                                   'deployment': body})
@@ -653,10 +681,14 @@ class VercelAdapter:
                 entries.append({'file': name, 'data': base64.b64encode(content).decode(),
                                 'encoding': 'base64'})
             # ---- First-deployment guard (release blocker) ----------------
-            # Vercel auto-promotes a brand-new project's FIRST deployment to
-            # target="production", even when no production target is requested
-            # (there is no "preview" literal in this API -- omission IS the
-            # preview request, and it is not honoured for deployment #1).
+            # CONFIRMED PROVIDER BEHAVIOR (2026-10-25, dorma-atelier,
+            # prj_C2lFWS2fBPlAI7GycXPVG5GS2ebb, zero prior deployments): a
+            # POST /v13/deployments with target OMITTED -- the documented
+            # preview request shape -- was auto-promoted by the provider to
+            # target="production" with the project's production aliases
+            # assigned. The documented "If omitted, the target will be
+            # preview" rule is NOT honoured for a project's FIRST
+            # deployment. This is an OBSERVATION, not a hypothesis.
             #
             # The adapter cannot ask for preview-only. It can only refuse to
             # deploy real user content while the project's one-time
@@ -671,7 +703,7 @@ class VercelAdapter:
             # guard is inert for all normal preview deployments.
             #
             # Fail-closed on an unreadable binding: an ambiguous lookup is
-            # never evidence that the slot is safe.
+            # never evidence that the slot is safe, so it refuses too.
             try:
                 current_production = self._current_production_id(project)
             except Exception:

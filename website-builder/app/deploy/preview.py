@@ -38,6 +38,8 @@ from app.core.state import ProjectStateStore
 from app.deploy.git_output import OutputGitRepository
 from app.deploy.snapshot import TestedSnapshot, source_fingerprint
 
+logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Post-delivery follow-up delivery-state machine
@@ -502,18 +504,97 @@ class PreviewOrchestrator:
             bypass_secret = (bypass_result.data or {}).get('secret')
 
         # ---- 3. Deploy, reconciling any ambiguous prior attempt by lookup ----
+        # P2.8/E guard: the production promotion result must NEVER flow into
+        # the smoke/preview path. This is a defense-in-depth check independent
+        # of the adapter's classification: even if a future upstream change
+        # lets a production-target deployment slip through as a "preview
+        # success", the orchestrator refuses to treat it as an approved
+        # preview candidate. The check re-reads the provider's authoritative
+        # production binding -- the only proof of "is this deployment LIVE".
         attempted = previous.get('deployment_attempted', False)
-        self._update_intent(project_id, operation_id, deployment_attempted=True,
-                            project=vercel_project)
-        deployment = (self.deps.vercel.find_deployment_by_operation_id(
-            app_id, vercel_project, operation_id, source_revision, snapshot.artifact_sha256,
-            expected_name=expected_name
-        ) if attempted else self._deploy_or_reconcile(
-            app_id, vercel_project, snapshot, operation_id, source_revision,
-            expected_name=expected_name
-        ))
+        unresolved = previous.get('deployment_attempt_outcome') == 'unresolved'
+        promoted = previous.get('promoted_terminal', False)
+        # P0.3/E: a prior attempt that could not be safely classified (timeout,
+        # NOT_FOUND, AMBIGUOUS, or a crash before outcome persistence) leaves
+        # the provider outcome UNKNOWN. A missing or ambiguous lookup result
+        # is NOT evidence a resend is safe: the only authorized action is a
+        # read-only reconcile of the provider's own records. A second POST may
+        # duplicate the deployment, so it is never issued on this branch.
+        # PROMOTED terminal: the deployment is already live on production.
+        # No provider call, no POST, no reconcile — return the persisted
+        # terminal result directly.
+        if promoted:
+            return OperationResult(
+                success=False,
+                error="DEPLOYMENT_PROMOTED_TO_PRODUCTION",
+                error_code="DEPLOYMENT_PROMOTED_TO_PRODUCTION",
+                retryable=False,
+                data={
+                    "promoted_to_production": True,
+                    "deployment_id": previous.get("deployment_id"),
+                    "preview_url": previous.get("preview_url"),
+                    "state": "READY",
+                    "note": "terminal: provider promoted to production; no action taken on restart",
+                },
+            )
+        deployment = None
+        if unresolved:
+            lookup = self.deps.vercel.find_deployment_by_operation_id(
+                app_id, vercel_project, operation_id, source_revision,
+                snapshot.artifact_sha256, expected_name=expected_name)
+            # Re-classify through the same persist step so both paths reach
+            # the identical terminal/unresolved states.
+            deployment = lookup
+            if not deployment.success:
+                # The reconcile could not establish a definitive outcome.
+                # Fail closed: the operation stays UNRESOLVED. No POST.
+                self._persist_deployment_attempt_outcome(
+                    project_id, operation_id, deployment,
+                    source_revision=source_revision, snapshot=snapshot,
+                )
+                return deployment
+            # The provider has the deployment: clear the unresolved mark and
+            # continue the normal (re-classified) flow from the found result.
+            self._update_intent(project_id, operation_id,
+                                deployment_unresolved=False,
+                                deployment_attempt_outcome=None)
+            deployment = None  # fall through to the normal reconcile branch
+        if deployment is None:
+            if not unresolved:
+                self._update_intent(project_id, operation_id,
+                                    deployment_attempted=True,
+                                    deployment_unresolved=False,
+                                    project=vercel_project)
+            deployment = (self.deps.vercel.find_deployment_by_operation_id(
+                app_id, vercel_project, operation_id, source_revision,
+                snapshot.artifact_sha256, expected_name=expected_name
+            ) if (attempted or unresolved) else self._deploy_or_reconcile(
+                app_id, vercel_project, snapshot, operation_id, source_revision,
+                expected_name=expected_name
+            ))
         if not deployment.success:
+            # P0.3: persist the terminal/unresolved state BEFORE returning so
+            # a crash-restart can reconcile it read-only without a second POST.
+            self._persist_deployment_attempt_outcome(
+                project_id, operation_id, deployment,
+                source_revision=source_revision, snapshot=snapshot,
+            )
+            # A promoted terminal is the ONLY outcome where a subsequent
+            # same-operation reconcile is provably safe to re-take: the
+            # outcome is terminal (no POST will ever fix it) and the read-only
+            # lookup re-classifies the SAME deployment id. Keep the durable
+            # attempted marker set so a restart enters the read-only
+            # reconcile branch instead of re-issuing the POST.
             return deployment
+        # P2.8/E: refuse a production deployment as an approved preview.
+        prod_guard = self._guard_production_binding(
+            app_id, vercel_project, deployment, expected_name=expected_name)
+        if prod_guard is not None:
+            self._persist_deployment_attempt_outcome(
+                project_id, operation_id, prod_guard,
+                source_revision=source_revision, snapshot=snapshot,
+            )
+            return prod_guard
         preview_url = deployment.data["preview_url"]
         self._update_intent(project_id, operation_id, stage="deployed",
                             deployment_id=deployment.data["deployment_id"],
@@ -1064,6 +1145,137 @@ class PreviewOrchestrator:
         if accepts:
             return self.deps.smoke.run(preview_url, smoke_dir, bypass_secret=bypass_secret)
         return self.deps.smoke.run(preview_url, smoke_dir)
+
+    # ------------------------------------------------------------------
+    # P0.3 / P1.4 / P2.6 — durable deployment-attempt outcome persistence
+    # ------------------------------------------------------------------
+
+    def _persist_deployment_attempt_outcome(self, project_id, operation_id,
+                                            deployment, *, source_revision,
+                                            snapshot):
+        """Persist the outcome of a deployment attempt BEFORE returning.
+
+        This runs on every failed deployment path so a crash-restart can
+        read the durable state and reconcile read-only without issuing a
+        second POST. The state machine:
+
+        * PROMOTED  -> ``promoted_terminal=True`` + full ``external_promotion``
+                        record (P2.6). No retry, no second POST, ever.
+        * BOOTSTRAP_REQUIRED_BEFORE_DEPLOY, DEPLOYMENT_RECONCILIATION_REQUIRED,
+          DEPLOYMENT_IDENTITY_MISMATCH, INCOMPLETE_LOOKUP, NOT_FOUND,
+          AMBIGUOUS_DEPLOYMENT -> ``deployment_unresolved=True``. The attempt
+          is recorded but the outcome is UNRESOLVED: a restart reconciles
+          read-only; it does NOT authorize a second POST.
+        * All other failure codes -> ``deployment_unresolved=True`` as well:
+          a timeout means the provider outcome is UNKNOWN, and unknown is
+          never "safe to resend".
+
+        The write is atomic (store.acquire_writer + save). If it raises,
+        run_owned converts it to PREVIEW_RECONCILIATION_REQUIRED.
+        """
+        import time as _time
+        err = deployment.error_code or deployment.error
+        promoted = err == 'DEPLOYMENT_PROMOTED_TO_PRODUCTION'
+        with self.store.acquire_writer(project_id) as locked:
+            intent = locked.deployment.get("preview_intent") or {}
+            if intent.get("operation_id") != operation_id:
+                return  # superseded operation; do not clobber its record
+            intent["deployment_attempt_at"] = _time.time()
+            intent["deployment_attempt_outcome"] = (
+                "promoted" if promoted else "unresolved")
+            if promoted:
+                intent["promoted_terminal"] = True
+                intent["promoted_error_code"] = err
+                # P2.6: application-owned external promotion record.
+                # Observes the fact without forcing a lifecycle transition:
+                # PREVIEW_READY stays; production_url is NEVER written here
+                # (that belongs exclusively to the release contract).
+                locked.deployment["external_promotion"] = {
+                    "operation_id": operation_id,
+                    "project_id": project_id,
+                    "source_revision": source_revision,
+                    "artifact_sha256": snapshot.artifact_sha256,
+                    "deployment_id": deployment.data.get("deployment_id"),
+                    "deployment_target": (deployment.data.get("deployment") or {}).get("target"),
+                    "ready_state": deployment.data.get("state"),
+                    "ready_substate": (deployment.data.get("deployment") or {}).get("readySubstate"),
+                    "deployment_url": deployment.data.get("preview_url"),
+                    "canonical_alias": None,  # provider read, if available
+                    "automatic_aliases": (deployment.data.get("deployment") or {}).get("aliases") or [],
+                    "evidence": "DIRECT_BINDING",  # the binding read that proved it
+                    "evidence_source": "provider_targets_production",
+                    "observed_at": _time.time(),
+                    "rollback_attempted": False,
+                    # P2.6 conflict handling: if the record already exists
+                    # with a DIFFERENT operation/deployment identity, append
+                    # a conflict entry instead of silently overwriting.
+                    "conflicts": [],
+                }
+                prior = locked.deployment.get("external_promotion") or {}
+                if (prior.get("operation_id") != operation_id
+                        or prior.get("deployment_id") != deployment.data.get("deployment_id")):
+                    rec = locked.deployment["external_promotion"]
+                    rec["conflicts"].append({
+                        "prior_operation_id": prior.get("operation_id"),
+                        "prior_deployment_id": prior.get("deployment_id"),
+                        "observed_at": _time.time(),
+                        "note": "superseded external promotion observation",
+                    })
+            else:
+                intent["deployment_unresolved"] = True
+            # P1.4: outcome-scoped notification state.
+            # NOT_ATTEMPTED means no user-facing notification has been sent
+            # for this operation yet; the runtime sets PENDING before the
+            # send and SENT after confirmed delivery. The state is
+            # operation-scoped so a NEW operation (new revision) restarts it.
+            intent.setdefault("notification_state", "NOT_ATTEMPTED")
+            self.store.save(locked)
+
+    def _guard_production_binding(self, app_id, vercel_project, deployment,
+                                  *, expected_name=None):
+        """P2.8/E: refuse a production-bound deployment as an approved
+        preview.
+
+        Returns ``None`` when the deployment is NOT the production binding
+        (normal preview path proceeds). Returns an ``OperationResult`` when
+        the deployment IS the project's current production binding --
+        which means it went LIVE and must never enter the smoke/preview path.
+
+        This is a defense-in-depth check: the adapter already classifies
+        this as DEPLOYMENT_PROMOTED_TO_PRODUCTION on the direct and lookup
+        paths. This guard catches any future code path that might pass a
+        production deployment as a "success" without the adapter's
+        classification, and it uses the provider's authoritative binding
+        read -- never the deployment response body's own target field.
+
+        On an unreadable binding the guard FAILS CLOSED: it cannot prove
+        the deployment is safe, so it refuses it.
+        """
+        dep_body = deployment.data.get("deployment") or {}
+        dep_id = deployment.data.get("deployment_id") or dep_body.get("id")
+        try:
+            prod_id = self.deps.vercel._current_production_id(vercel_project)
+        except Exception:
+            # Ambiguous/malformed binding: never assume the deployment is
+            # preview-safe. Fail closed with a distinct code.
+            return OperationResult.fail(
+                "DEPLOYMENT_RECONCILIATION_REQUIRED",
+                error_code="DEPLOYMENT_RECONCILIATION_REQUIRED")
+        if prod_id and dep_id and prod_id == dep_id:
+            # This deployment IS the production binding. Build the same
+            # explicit terminal result the adapter would produce.
+            logger.warning(
+                "Orchestrator guard: deployment %s IS the project's "
+                "current production binding; refusing preview path "
+                "(defense-in-depth, P2.8/E)", dep_id,
+            )
+            return OperationResult(
+                success=False,
+                error="DEPLOYMENT_PROMOTED_TO_PRODUCTION",
+                error_code="DEPLOYMENT_PROMOTED_TO_PRODUCTION",
+                retryable=False,
+                data=dict(deployment.data, promoted_to_production=True))
+        return None
 
     def _deploy_or_reconcile(self, app_id, project, snapshot, operation_id, source_revision,
                              *, expected_name=None):

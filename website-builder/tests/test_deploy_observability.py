@@ -361,34 +361,34 @@ class TestFirstDeploymentBoundary:
                 "meta": a._meta(APP, "op-1", 1, SHA)}
 
     def test_newly_created_project_with_zero_deployments_refuses_content(self):
-        """New project, zero deployments, empty production binding -> refuse.
+        """Zero-deployment project + empty production binding -> refuse.
 
-        This is exactly the dorma-atelier state: the project exists
-        (prj_C2lFWS2fBPlAI7GycXPVG5GS2ebb) but has never had a deployment.
+        This is exactly the dorma-atelier state (prj_C2lFWS2fBPlAI7GycXPVG5GS2ebb):
+        the observed 2026-10-25 first-deployment promotion proves the unspent
+        auto-promotion turns the next deployment LIVE. The guard fails closed
+        before any upload: nothing leaves the box.
         """
         a, t = adapter(bootstrapped=False)
+        t.responses.append((201, self._ready(a)))
         r = deploy(a)
         assert not r.success
         assert r.error_code == "BOOTSTRAP_REQUIRED_BEFORE_DEPLOY"
         assert not r.retryable
+        assert not any(c["method"] == "POST" for c in t.calls)
 
     def test_zero_deployments_sends_no_deployment_request(self):
-        """The refusal happens BEFORE any upload -- nothing leaves the box."""
+        """The refusal happens BEFORE any upload -- no POST is issued."""
         a, t = adapter(bootstrapped=False)
-        deploy(a)
+        r = deploy(a)
+        assert r.error_code == "BOOTSTRAP_REQUIRED_BEFORE_DEPLOY"
         assert [c["method"] for c in t.calls] == ["GET"]
         assert not any("/v13/deployments" in c["url"] for c in t.calls)
 
     def test_first_deployment_request_target_is_never_production(self):
         """When a deploy IS allowed (promotion spent), the request must not ask
         for production. The payload carries no target field at all."""
-        a, t = adapter((201, {"id": "dpl_1", "projectId": "prj_1",
-                              "teamId": TEAM, "name": "dorma-atelier",
-                              "target": None, "url": "x.vercel.app",
-                              "readyState": "READY",
-                              "meta": None}))
-        # rebuild the canned deployment now that `a` exists
-        t.responses[1] = (201, self._ready(a))
+        a, t = adapter()
+        t.responses.append((201, self._ready(a)))
         r = deploy(a)
         assert r.success
         post = [c for c in t.calls if c["method"] == "POST"][0]
@@ -400,11 +400,8 @@ class TestFirstDeploymentBoundary:
         """publication_enabled=false lives on the runtime, not the adapter: it
         gates publication, never preview. The deploy request shape must be
         identical either way, and must never carry a production target."""
-        a, t = adapter((201, {"id": "dpl_1", "projectId": "prj_1",
-                              "teamId": TEAM, "name": "dorma-atelier",
-                              "target": None, "url": "x.vercel.app",
-                              "readyState": "READY", "meta": None}))
-        t.responses[1] = (201, self._ready(a))
+        a, t = adapter()
+        t.responses.append((201, self._ready(a)))
         r = deploy(a)
         assert r.success
         posts = [c for c in t.calls if c["method"] == "POST"]
@@ -415,11 +412,8 @@ class TestFirstDeploymentBoundary:
 
     def test_no_promotion_or_alias_call_on_preview_path(self):
         """A successful preview deploy must not touch any production endpoint."""
-        a, t = adapter((201, {"id": "dpl_1", "projectId": "prj_1",
-                              "teamId": TEAM, "name": "dorma-atelier",
-                              "target": None, "url": "x.vercel.app",
-                              "readyState": "READY", "meta": None}))
-        t.responses[1] = (201, self._ready(a))
+        a, t = adapter()
+        t.responses.append((201, self._ready(a)))
         assert deploy(a).success
         urls = " ".join(c["url"] for c in t.calls)
         for forbidden in ("aliases", "promote"):
@@ -433,6 +427,92 @@ class TestFirstDeploymentBoundary:
                                 "targets": {"production": "not-a-dict"}})
         r = deploy(a)
         assert not r.success
-        assert r.error_code in ("DEPLOYMENT_RECONCILIATION_REQUIRED",
-                                "BOOTSTRAP_REQUIRED_BEFORE_DEPLOY")
+        assert r.error_code == "DEPLOYMENT_RECONCILIATION_REQUIRED"
         assert not any(c["method"] == "POST" for c in t.calls)
+
+
+# ---------------------------------------------------------------------------
+# 6. First-deployment promotion observed 2026-10-25 (dorma-atelier):
+#    a target-omitted POST on a zero-deployment project was ACCEPTED and
+#    AUTO-PROMOTED to target="production" with the project's production
+#    aliases assigned. The documented "omitted -> preview" rule is NOT
+#    honoured for deployment #1. This is a provider SUCCESS, and the
+#    adapter must report it as a DISTINCT explicit outcome that can never
+#    be mistaken for a failed upload or retried.
+# ---------------------------------------------------------------------------
+
+class TestPromotedToProduction:
+    def _promoted(self, a):
+        return {"id": "dpl_promoted", "projectId": "prj_1", "teamId": TEAM,
+                "name": "dorma-atelier", "target": "production",
+                "url": "x.vercel.app", "readyState": "READY",
+                "readySubstate": "PROMOTED",
+                "meta": a._meta(APP, "op-1", 1, SHA)}
+
+    def test_promotion_is_a_distinct_explicit_outcome(self):
+        """target=production + binding==this deployment ->
+        DEPLOYMENT_PROMOTED_TO_PRODUCTION with the full payload."""
+        a, t = adapter()
+        t.responses.append((201, self._promoted(a)))
+        t.responses.append((200, {"id": "prj_1", "name": "dorma-atelier",
+                                  "accountId": TEAM, "env": [],
+                                  "targets": {"production": {
+                                      "id": "dpl_promoted"}}}))
+        r = deploy(a)
+        assert not r.success, "must never present itself as an approved preview"
+        assert r.error_code == "DEPLOYMENT_PROMOTED_TO_PRODUCTION"
+        assert r.retryable is False, "resending can never fix this"
+        assert r.data["promoted_to_production"] is True
+        assert r.data["deployment_id"] == "dpl_promoted"
+        assert r.data["deployment"]["target"] == "production"
+        assert r.data["preview_url"] == "https://x.vercel.app"
+        assert r.data["state"] == "READY"
+
+    def test_promotion_is_not_a_upload_failure_classification(self):
+        """The promotion outcome must be distinguishable from every failure
+        code: it is not a reconciliation requirement, not an identity
+        mismatch, and not ALREADY_LIVE (which historically read as an
+        error with no payload)."""
+        a, t = adapter()
+        t.responses.append((201, self._promoted(a)))
+        t.responses.append((200, {"id": "prj_1", "name": "dorma-atelier",
+                                  "accountId": TEAM, "env": [],
+                                  "targets": {"production": {
+                                      "id": "dpl_promoted"}}}))
+        r = deploy(a)
+        assert r.error_code not in (
+            "DEPLOYMENT_RECONCILIATION_REQUIRED", "DEPLOYMENT_IDENTITY_MISMATCH",
+            "DEPLOYMENT_ALREADY_LIVE", "DEPLOY_EXCEPTION")
+        assert r.data, "payload must survive for reconciliation"
+
+    def test_lookup_of_promoted_operation_reports_the_same_outcome(self):
+        """find_deployment_by_operation_id over an operation that was
+        promoted reports the SAME distinct outcome, so a recovery path
+        reconciles instead of concluding NOT_FOUND and resending."""
+        a, t = adapter()
+        d = self._promoted(a)
+        t.responses = [
+            (200, {"deployments": [d], "pagination": {"next": None}}),
+            (200, d),
+            (200, {"id": "prj_1", "name": "dorma-atelier", "accountId": TEAM,
+                   "env": [], "targets": {"production": {
+                       "id": "dpl_promoted"}}}),
+        ]
+        r = a.find_deployment_by_operation_id(APP, project(a), "op-1", 1, SHA,
+                                              expected_name="dorma-atelier")
+        assert not r.success
+        assert r.error_code == "DEPLOYMENT_PROMOTED_TO_PRODUCTION"
+        assert r.data["promoted_to_production"] is True
+
+    def test_ambiguous_binding_still_fails_closed(self):
+        """If the binding read is ambiguous the adapter cannot know whether
+        the deployment went live -- fail closed, no payload trust."""
+        a, t = adapter()
+        t.responses.append((201, self._promoted(a)))
+        t.responses.append((200, {"id": "prj_1", "name": "dorma-atelier",
+                                  "accountId": TEAM, "env": [],
+                                  "targets": {"production": "not-a-dict"}}))
+        r = deploy(a)
+        assert not r.success
+        assert r.error_code == "DEPLOYMENT_IDENTITY_MISMATCH"
+        assert "promoted_to_production" not in r.data

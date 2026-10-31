@@ -50,6 +50,14 @@ class FakeVercel:
         # Records every expected_name threaded by the orchestrator so tests
         # can assert the canonical slug/legacy-None contract end to end.
         self.expected_names = []
+        # P2.8 guard: the orchestrator calls _current_production_id to
+        # refuse a production-bound deployment. By default the fake project
+        # has no production binding (returns None) so the normal preview
+        # path proceeds. Tests that exercise the guard override this.
+        self._current_prod_id = None
+
+    def _current_production_id(self, project):
+        return self._current_prod_id
 
     def ensure_project(self, app_id):
         self.ensure_calls += 1

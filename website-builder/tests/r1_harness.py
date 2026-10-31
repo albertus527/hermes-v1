@@ -428,6 +428,12 @@ class FakeVercel:
     def find_production_deployment(self, app_id, project, *, expected_name=None):
         return OperationResult.ok({"deployment_id": None})
 
+    def _current_production_id(self, project):
+        """P2.8/E guard contract: no production binding in the preview-only
+        fake scenarios. The orchestrator's _guard_production_binding reads
+        this to prove a deployment is NOT the live production target."""
+        return None
+
     def promote_deployment(self, app_id, project, deployment_id, operation_id,
                            source_revision, artifact_sha256, *, expected_name=None):
         self.promote_calls += 1
