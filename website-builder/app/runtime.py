@@ -1580,6 +1580,66 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
     # ONE opaque project name, so a friendly slug can only ever 403.
     _post_preview_slug_for = _bound_slug_for if config.friendly_slug else None
 
+    # P1 FINALIZATION: the durable bootstrap-marker store lives in the
+    # project's OWN deployment state, so a process restart reloads the same
+    # marker and the next bootstrap entry reconciles GET-only instead of
+    # issuing a duplicate POST. The per-app entry is the
+    # `deployment["bootstrap_marker"]` dict of that project; the adapter
+    # reads/writes it through this small mapping facade.
+    def _load_bootstrap_marker(app_id):
+        st = store.load(app_id)
+        if st is None:
+            return {}
+        entry = st.deployment.get("bootstrap_marker")
+        return entry if isinstance(entry, dict) else {}
+
+    def _save_bootstrap_marker(app_id, entry):
+        with store.acquire_writer(app_id) as locked:
+            locked.deployment["bootstrap_marker"] = dict(entry)
+            store.save(locked)
+
+    class _BootstrapMarkerFacade:
+        """Mapping facade over the project's durable bootstrap marker.
+
+        The adapter treats this as an ordinary dict: it reads the
+        ``wbBootstrapMeta`` marker on entry and the adapter writes it after
+        a create POST returns. Every write is persisted immediately so a
+        crash/restart reloads the same marker and the next entry takes the
+        GET-only reconciliation path.
+        """
+
+        def __init__(self, app_id):
+            self._app_id = app_id
+            self._entry = _load_bootstrap_marker(app_id)
+
+        def __getitem__(self, key):
+            return self._entry[key]
+
+        def __setitem__(self, key, value):
+            self._entry[key] = value
+            _save_bootstrap_marker(self._app_id, self._entry)
+
+        def __contains__(self, key):
+            return key in self._entry
+
+        def get(self, key, default=None):
+            return self._entry.get(key, default)
+
+        def keys(self):
+            return self._entry.keys()
+
+        def items(self):
+            return self._entry.items()
+
+        def __iter__(self):
+            return iter(self._entry)
+
+        def __len__(self):
+            return len(self._entry)
+
+    def _bootstrap_state_for(app_id):
+        return _BootstrapMarkerFacade(app_id)
+
     preview_deps = PreviewDeps(
         vercel=vercel,
         telegram=telegram_out,
@@ -1598,6 +1658,7 @@ def compose(config: RuntimeConfig) -> RuntimeComposition:
         ensure_bypass=_ensure_bypass,
         reprovision_bypass=_reprovision_bypass,
         bypass_is_stored=_bypass_is_stored,
+        bootstrap_state_store=_bootstrap_state_for,
     )
     preview = PreviewOrchestrator(store, preview_deps, runner=runner)
 
@@ -1847,6 +1908,7 @@ _HARD_PREVIEW_ERRORS = frozenset({
     "PREVIEW_RECONCILIATION_REQUIRED",
     "DEPLOYMENT_IDENTITY_MISMATCH",
     "DEPLOYMENT_RECONCILIATION_REQUIRED",
+    "DEPLOYMENT_PRODUCTION_TARGET_REJECTED",
     "INCOMPLETE_LOOKUP",
     "BYPASS_RECONCILIATION_REQUIRED",
     "BYPASS_PROVISION_UNAVAILABLE",
@@ -1916,6 +1978,13 @@ ERROR_MESSAGES: Dict[str, str] = {
         "Deployment-mu berhasil tayang, tapi provider menaikkannya jadi "
         "PRODUCTION, bukan preview — situsmu sekarang bisa diakses publik. "
         "Tidak ada rollback otomatis."
+    ),
+    "DEPLOYMENT_PRODUCTION_TARGET_REJECTED": (
+        "Provider melabeli deployment terakhirmu sebagai target PRODUCTION, "
+        "tapi statusnya belum bisa dikonfirmasi dari binding production. "
+        "Aku membatalkan preview-nya dan tidak akan menayangkannya sebagai "
+        "preview. Tidak ada pengiriman ulang otomatis — kirim revisi atau "
+        "permintaan baru kalau kamu ingin mencoba lagi."
     ),
     "SMOKE_FAILED": (
         "Preview-nya belum lolos pemeriksaan. Aku akan coba benerin dan "

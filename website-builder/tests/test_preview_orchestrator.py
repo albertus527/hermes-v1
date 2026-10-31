@@ -55,6 +55,10 @@ class FakeVercel:
         # has no production binding (returns None) so the normal preview
         # path proceeds. Tests that exercise the guard override this.
         self._current_prod_id = None
+        # P0 FINALIZATION guard: by default the fake's deployment carries no
+        # target field (a plain preview). Tests that exercise the
+        # production-shaped-refusal path override this with 'production'.
+        self._deployment_target = None
 
     def _current_production_id(self, project):
         return self._current_prod_id
@@ -78,15 +82,27 @@ class FakeVercel:
     def deploy_static_files(self, app_id, project, files, operation_id, source_revision, artifact_sha256, expected_name=None):
         self.deploy_calls += 1
         self.expected_names.append(expected_name)
+        target = self._deployment_target
+        dep_body = {'id': 'dpl_1', 'url': 'https://tested.vercel.app',
+                    'readyState': 'READY', 'name': project.get('name', 'wb')}
+        if target is not None:
+            dep_body['target'] = target
         return OperationResult.ok({'deployment_id': 'dpl_1',
                                    'preview_url': 'https://tested.vercel.app',
-                                   'state': 'READY'})
+                                   'state': 'READY',
+                                   'deployment': dep_body})
 
     def find_deployment_by_operation_id(self, app_id, project, operation_id, source_revision, artifact_sha256, expected_name=None):
         self.expected_names.append(expected_name)
+        target = self._deployment_target
+        dep_body = {'id': 'dpl_1', 'url': 'https://tested.vercel.app',
+                    'readyState': 'READY', 'name': project.get('name', 'wb')}
+        if target is not None:
+            dep_body['target'] = target
         return OperationResult.ok({'deployment_id': 'dpl_1',
                                    'preview_url': 'https://tested.vercel.app',
-                                   'state': 'READY'})
+                                   'state': 'READY',
+                                   'deployment': dep_body})
 
 
 class FakeTelegram:
@@ -1013,3 +1029,62 @@ def test_no_slug_configured_threads_none_preserving_legacy_opaque_path(tmp_path)
     assert result.success, result.error
     assert vercel.expected_names
     assert all(name is None for name in vercel.expected_names)
+
+
+# ---------------------------------------------------------------------------
+# P1 FINALIZATION — durable bootstrap marker threading across re-entry
+# ---------------------------------------------------------------------------
+
+class _MarkerRecordingVercel(FakeVercel):
+    """Fake Vercel that records the durable bootstrap_state it receives and
+    emulates a pre-POST attempt marker."""
+
+    def __init__(self):
+        super().__init__()
+        self.seen_states = []
+        self.fail_bootstrap = True
+
+    def ensure_bootstrap(self, app_id, project, expected_name=None,
+                         bootstrap_state=None):
+        self.bootstrap_calls += 1
+        self.expected_names.append(expected_name)
+        self.seen_states.append(bootstrap_state)
+        if bootstrap_state is not None:
+            # Emulate the adapter's pre-POST attempt marker.
+            bootstrap_state.setdefault('wbBootstrapMeta', {
+                'payload_digest': 'd' * 64, 'state': 'posted_attempted'})
+        if self.fail_bootstrap:
+            return OperationResult.fail(
+                'BOOTSTRAP_CONFIRMATION_TIMEOUT',
+                error_code='BOOTSTRAP_CONFIRMATION_TIMEOUT')
+        return OperationResult.ok({'bootstrapped': True,
+                                   'deployment_id': 'dpl_boot',
+                                   'reconciled': True, 'confirmed': True})
+
+
+def test_bootstrap_marker_survives_orchestrator_restart(tmp_path):
+    """P1 FINALIZATION: the SAME durable marker mapping is threaded into
+    every run_owned re-entry. A first run that leaves the bootstrap outcome
+    unknown leaves the marker behind; the second run receives that marker
+    (no duplicate POST decision is possible) and succeeds."""
+    store = ProjectStateStore(tmp_path / 'state')
+    ws = _make_workspace(tmp_path)
+    _preview_ready_state(store, 'proj', ws)
+    vercel = _MarkerRecordingVercel()
+    deps = _deps(tmp_path, vercel=vercel)
+    persisted = {}
+    deps.bootstrap_state_store = lambda app_id: persisted.setdefault(app_id, {})
+    orch = PreviewOrchestrator(store, deps)
+
+    first = orch.run_owned('proj', ws)
+    assert not first.success
+    assert first.error_code == 'BOOTSTRAP_CONFIRMATION_TIMEOUT'
+    marker = persisted['proj']['wbBootstrapMeta']
+    assert marker['state'] == 'posted_attempted'
+
+    vercel.fail_bootstrap = False
+    second = orch.run_owned('proj', ws)
+    assert second.success, second.error
+    # Both invocations received the SAME durable mapping object.
+    assert vercel.seen_states[0] is vercel.seen_states[1]
+    assert vercel.seen_states[1].get('wbBootstrapMeta') is not None

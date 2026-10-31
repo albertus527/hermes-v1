@@ -211,6 +211,21 @@ python3 tools/r2_cost_report.py --delta --since 5266
 **Abort target $1.00 is a manual threshold, not an enforced kill switch.**
 Worst case at 8 provider calls ≈ $1.40. If the delta crosses $1.00, stop the run.
 
+### Recovery semantics you will see in the log (finalization P0/P1)
+
+- **`DEPLOYMENT_PRODUCTION_TARGET_REJECTED`** — the provider labelled the
+  deployment `production` while the production binding was absent or
+  ambiguous. Preview is refused, no retry and no resend. This is distinct
+  from a *confirmed* promotion (`DEPLOYMENT_PROMOTED_TO_PRODUCTION`) and the
+  two are never collapsed on restart. A restart is read-only.
+- **`BOOTSTRAP_CONFIRMATION_TIMEOUT` / `BOOTSTRAP_RECONCILIATION_REQUIRED`** —
+  the bootstrap outcome is unknown. The next entry reconciles GET-only
+  against the durable bootstrap marker; it never issues a second bootstrap
+  POST. If the log shows a bootstrap POST twice for the same project, stop
+  the run and treat it as a defect.
+- The bootstrap marker lives in the project's deployment state
+  (`deployment["bootstrap_marker"]`) and survives process restarts.
+
 ---
 
 ## 5. Stop (graceful)

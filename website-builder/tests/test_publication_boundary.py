@@ -476,3 +476,34 @@ class TestPreviewRecoveryUnaffected:
 
         assert result.success
         preview.run_owned.assert_called_once()
+
+
+class TestDurableBootstrapMarkerWiring:
+    """P1 FINALIZATION: compose() must wire a durable bootstrap-marker store
+    into the preview orchestrator so the adapter's pre-POST attempt marker
+    survives a process restart."""
+
+    def test_preview_wires_durable_bootstrap_marker_store(self, tmp_path):
+        from app.runtime import compose
+        cfg = TestIdentityConsistencyAcrossDeps._config(
+            tmp_path, friendly_slug=False, publication_enabled=False)
+        comp = compose(cfg)
+        factory = comp.preview.deps.bootstrap_state_store
+        assert factory is not None
+
+        app_id = "tg-6329821361"
+        facade = factory(app_id)
+        facade["wbBootstrapMeta"] = {
+            "payload_digest": "d" * 64,
+            "state": "posted_attempted",
+        }
+        # Persisted into the project's own deployment state ...
+        st = comp.store.load(app_id)
+        assert st is not None
+        marker = st.deployment["bootstrap_marker"]["wbBootstrapMeta"]
+        assert marker["payload_digest"] == "d" * 64
+        assert marker["state"] == "posted_attempted"
+
+        # ... and a NEW facade (process restart) reads the same marker.
+        facade2 = factory(app_id)
+        assert facade2.get("wbBootstrapMeta")["state"] == "posted_attempted"

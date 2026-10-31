@@ -254,3 +254,296 @@ def test_preview_only_unproven_when_binding_moved():
     # A deployment whose id equals the production binding cannot be
     # asserted preview-only.
     assert prod_id == 'dpl_new'
+
+
+# ---------------------------------------------------------------------------
+# P1 FINALIZATION — crash-safe bootstrap idempotency marker
+# ---------------------------------------------------------------------------
+
+def test_bootstrap_create_records_durable_marker_after_post():
+    """P1 FINALIZATION: a fresh bootstrap POST writes the marker into the
+    caller's persistent bootstrap_state AFTER the create response returns,
+    recording the issued deployment id for later GET-only reconciliation."""
+    a = VercelAdapter('tok', TEAM, NS, None)
+    proj = _proj(targets=None, name=a.project_name_for(APP),
+                 marker=a._marker(APP))
+    b_dep = _ready_dep('dpl_boot', None, 'boot.vercel.app',
+                       proj['name'], proj['env'][0]['value'])
+    bound = {**proj, 'targets': {'production': {'id': 'dpl_boot'}}}
+    transport = CannedTransport([
+        (200, proj),  # initial binding read: None
+        (200, {'deployments': [], 'pagination': {'next': None}}),  # no prior
+        (201, b_dep),  # bootstrap POST
+        (200, bound),  # poll 1: binding moved
+        (200, b_dep),  # deployment detail: READY
+    ])
+    a.transport = transport
+    state = {}
+    r = a.ensure_bootstrap(APP, proj, max_polls=5, interval=0,
+                           bootstrap_state=state)
+    assert r.success, r.error_code
+    marker = state['wbBootstrapMeta']
+    assert marker['deployment_id'] == 'dpl_boot'
+    assert isinstance(marker['payload_digest'], str)
+    posts = [c for c in transport.calls if c['method'] == 'POST']
+    assert len(posts) == 1
+
+
+def test_bootstrap_restart_after_unknown_outcome_is_get_only():
+    """P1 FINALIZATION (the core crash window): a first invocation POSTs the
+    bootstrap and the marker records the deployment id; the process then
+    restarts BEFORE confirmation completes. The second invocation must NOT
+    issue a second POST -- it reconciles read-only (polls the recorded
+    deployment and the provider's own metadata) until confirmation."""
+    a = VercelAdapter('tok', TEAM, NS, None)
+    proj = _proj(targets=None, name=a.project_name_for(APP),
+                 marker=a._marker(APP))
+    b_dep = _ready_dep('dpl_boot', None, 'boot.vercel.app',
+                       proj['name'], proj['env'][0]['value'])
+    building = dict(b_dep, readyState='BUILDING')
+    bound = {**proj, 'targets': {'production': {'id': 'dpl_boot'}}}
+    state = {}
+    # Invocation 1: POST the bootstrap, record the marker, but time out
+    # before confirmation completes.
+    first = CannedTransport([
+        (200, proj),
+        (200, {'deployments': [], 'pagination': {'next': None}}),
+        (201, b_dep),
+        (200, bound),
+        (200, building),
+        (200, bound),
+        (200, building),
+        (200, bound),
+        (200, building),
+    ])
+    a.transport = first
+    r1 = a.ensure_bootstrap(APP, proj, max_polls=3, interval=0,
+                            bootstrap_state=state)
+    assert not r1.success
+    assert r1.error_code == 'BOOTSTRAP_CONFIRMATION_TIMEOUT'
+    assert state['wbBootstrapMeta']['deployment_id'] == 'dpl_boot'
+    posts1 = [c for c in first.calls if c['method'] == 'POST']
+    assert len(posts1) == 1
+    # Invocation 2 (restart): same state, still BUILDING. No second POST:
+    # the marker forces the GET-only path and polls the recorded id.
+    second = CannedTransport([
+        (200, proj),  # initial binding read: still absent
+        (200, {'deployments': [], 'pagination': {'next': None}}),  # list lag
+        (200, bound),  # poll 1: binding now at our id
+        (200, building),  # not ready yet
+        (200, bound),
+        (200, dict(b_dep, readyState='READY')),  # ready
+    ])
+    a.transport = second
+    r2 = a.ensure_bootstrap(APP, proj, max_polls=5, interval=0,
+                            bootstrap_state=state)
+    assert r2.success, r2.error_code
+    posts2 = [c for c in second.calls if c['method'] == 'POST']
+    assert posts2 == []  # crash-safe: no duplicate bootstrap POST
+
+
+def test_bootstrap_marker_mismatch_fails_closed_no_post():
+    """P1 FINALIZATION: a marker that records a deployment id whose digest
+    no longer matches this project generation cannot be trusted to
+    identify which deployment was created -> fail closed, GET-only, no
+    POST."""
+    a = VercelAdapter('tok', TEAM, NS, None)
+    proj = _proj(targets=None, name=a.project_name_for(APP),
+                 marker=a._marker(APP))
+    state = {'wbBootstrapMeta': {'payload_digest': 'corrupt',
+                                 'deployment_id': 'dpl_boot'}}
+    transport = CannedTransport([
+        (200, proj),
+        (200, {'deployments': [], 'pagination': {'next': None}}),
+    ])
+    a.transport = transport
+    r = a.ensure_bootstrap(APP, proj, max_polls=5, interval=0,
+                           bootstrap_state=state)
+    assert not r.success
+    assert r.error_code == 'BOOTSTRAP_RECONCILIATION_REQUIRED'
+    assert [c['method'] for c in transport.calls if c['method'] == 'POST'] == []
+
+
+def test_bootstrap_confirmed_marker_still_noop_on_reentry():
+    """P1 FINALIZATION: once bootstrap is confirmed READY+bound, the
+    marker-bearing re-entry is a no-op (the production binding already
+    proves the slot is consumed; no polling, no POST)."""
+    a = VercelAdapter('tok', TEAM, NS, None)
+    proj = _proj(targets={'production': {'id': 'dpl_boot'}},
+                 name=a.project_name_for(APP), marker=a._marker(APP))
+    state = {'wbBootstrapMeta': {'payload_digest': 'anything',
+                                 'deployment_id': 'dpl_boot'}}
+    transport = CannedTransport([(200, proj)])
+    a.transport = transport
+    r = a.ensure_bootstrap(APP, proj, max_polls=5, interval=0,
+                           bootstrap_state=state)
+    assert r.success
+    assert r.data.get('already_current_production') is True
+    assert [c['method'] for c in transport.calls] == ['GET']
+
+
+def test_bootstrap_legacy_state_without_marker_still_relocates():
+    """P1 FINALIZATION backward-compat: a legacy state dict without the
+    marker (or the None default) still relocates by deterministic identity
+    and creates exactly one POST for a fresh project -- no behavior
+    regression."""
+    a = VercelAdapter('tok', TEAM, NS, None)
+    proj = _proj(targets=None, name=a.project_name_for(APP),
+                 marker=a._marker(APP))
+    b_dep = _ready_dep('dpl_boot', None, 'boot.vercel.app',
+                       proj['name'], proj['env'][0]['value'])
+    bound = {**proj, 'targets': {'production': {'id': 'dpl_boot'}}}
+    transport = CannedTransport([
+        (200, proj),
+        (200, {'deployments': [], 'pagination': {'next': None}}),
+        (201, b_dep),
+        (200, bound),
+        (200, b_dep),
+    ])
+    a.transport = transport
+    r = a.ensure_bootstrap(APP, proj, max_polls=5, interval=0)  # no state
+    assert r.success
+    posts = [c['method'] for c in transport.calls if c['method'] == 'POST']
+    assert posts == ['POST']  # exactly one create POST
+
+
+def test_bootstrap_malformed_state_fails_closed():
+    """P1 FINALIZATION: a non-dict bootstrap_state is not a signal to
+    create -- it fails closed."""
+    a = VercelAdapter('tok', TEAM, NS, None)
+    proj = _proj(targets=None, name=a.project_name_for(APP),
+                 marker=a._marker(APP))
+    transport = CannedTransport([])
+    a.transport = transport
+    r = a.ensure_bootstrap(APP, proj, bootstrap_state='not-a-dict')
+    assert not r.success
+    assert r.error_code == 'BOOTSTRAP_RECONCILIATION_REQUIRED'
+    assert transport.calls == []
+
+
+def test_bootstrap_pre_post_attempt_marker_not_found_fails_closed():
+    """P1 FINALIZATION (pre-POST crash window): the pre-POST attempt marker
+    survived a crash, but the provider list does not show the deployment and
+    the marker carries no id. The outcome is UNKNOWN -> fail closed, GET-only,
+    never a second POST."""
+    a = VercelAdapter('tok', TEAM, NS, None)
+    proj = _proj(targets=None, name=a.project_name_for(APP),
+                 marker=a._marker(APP))
+    digest = a._bootstrap_payload_digest(APP, proj) if hasattr(
+        a, '_bootstrap_payload_digest') else None  # digest is computed inline
+    # Seed a marker whose digest matches this generation. The digest is
+    # deterministic; reuse the adapter's own computation via a dry run is
+    # overkill, so derive it the same way the adapter does.
+    import hashlib
+    entries = [{'file': 'index.html',
+                'data': 'PHRpY3RsZT4uPC90aXRsZT4=',  # placeholder, replaced below
+                'encoding': 'base64'}]
+    # Build the exact payload the adapter computes.
+    from app.deploy.adapters import _BOOTSTRAP_HTML
+    import base64 as _b64
+    entries = [{'file': 'index.html',
+                'data': _b64.b64encode(_BOOTSTRAP_HTML).decode(),
+                'encoding': 'base64'}]
+    digest = hashlib.sha256(json.dumps({
+        'name': proj['name'],
+        'project': proj['id'],
+        'files': entries,
+        'meta': {'wbOwner': a._marker(APP),
+                 'wbBootstrap': a._bootstrap_operation_id(APP)},
+    }, sort_keys=True).encode()).hexdigest()
+    state = {'wbBootstrapMeta': {'payload_digest': digest,
+                                 'state': 'posted_attempted'}}
+    transport = CannedTransport([
+        (200, proj),
+        (200, {'deployments': [], 'pagination': {'next': None}}),
+    ])
+    a.transport = transport
+    r = a.ensure_bootstrap(APP, proj, max_polls=3, interval=0,
+                           bootstrap_state=state)
+    assert not r.success
+    assert r.error_code == 'BOOTSTRAP_RECONCILIATION_REQUIRED'
+    assert [c['method'] for c in transport.calls if c['method'] == 'POST'] == []
+
+
+def test_bootstrap_pre_post_attempt_marker_relocates_get_only():
+    """P1 FINALIZATION (pre-POST crash window, deployment found): the marker
+    has no id, but the provider list shows exactly one bootstrap deployment
+    for this deterministic identity. Reconcile GET-only and confirm."""
+    a = VercelAdapter('tok', TEAM, NS, None)
+    proj = _proj(targets=None, name=a.project_name_for(APP),
+                 marker=a._marker(APP))
+    b_dep = _ready_dep('dpl_boot', None, 'boot.vercel.app',
+                       proj['name'], proj['env'][0]['value'],
+                       meta={'wbBootstrap': a._bootstrap_operation_id(APP)})
+    bound = {**proj, 'targets': {'production': {'id': 'dpl_boot'}}}
+    import hashlib
+    import base64 as _b64
+    from app.deploy.adapters import _BOOTSTRAP_HTML
+    entries = [{'file': 'index.html',
+                'data': _b64.b64encode(_BOOTSTRAP_HTML).decode(),
+                'encoding': 'base64'}]
+    digest = hashlib.sha256(json.dumps({
+        'name': proj['name'],
+        'project': proj['id'],
+        'files': entries,
+        'meta': {'wbOwner': a._marker(APP),
+                 'wbBootstrap': a._bootstrap_operation_id(APP)},
+    }, sort_keys=True).encode()).hexdigest()
+    state = {'wbBootstrapMeta': {'payload_digest': digest,
+                                 'state': 'posted_attempted'}}
+    transport = CannedTransport([
+        (200, proj),
+        (200, {'deployments': [b_dep], 'pagination': {'next': None}}),
+        (200, bound),
+        (200, b_dep),
+    ])
+    a.transport = transport
+    r = a.ensure_bootstrap(APP, proj, max_polls=3, interval=0,
+                           bootstrap_state=state)
+    assert r.success, r.error_code
+    assert [c['method'] for c in transport.calls if c['method'] == 'POST'] == []
+    assert r.data['deployment_id'] == 'dpl_boot'
+    assert state['wbBootstrapMeta']['state'] == 'confirmed'
+
+
+def test_bootstrap_mapping_facade_store_accepted():
+    """P1 FINALIZATION: the production runtime wires a mapping FACADE (not a
+    dict subclass) that persists each write. The adapter must accept it and
+    persist the marker through __setitem__."""
+    a = VercelAdapter('tok', TEAM, NS, None)
+    proj = _proj(targets=None, name=a.project_name_for(APP),
+                 marker=a._marker(APP))
+    b_dep = _ready_dep('dpl_boot', None, 'boot.vercel.app',
+                       proj['name'], proj['env'][0]['value'])
+    bound = {**proj, 'targets': {'production': {'id': 'dpl_boot'}}}
+    transport = CannedTransport([
+        (200, proj),
+        (200, {'deployments': [], 'pagination': {'next': None}}),
+        (201, b_dep),
+        (200, bound),
+        (200, b_dep),
+    ])
+    a.transport = transport
+
+    class Facade:
+        def __init__(self):
+            self.entry = {}
+            self.writes = 0
+
+        def get(self, key, default=None):
+            return self.entry.get(key, default)
+
+        def __getitem__(self, key):
+            return self.entry[key]
+
+        def __setitem__(self, key, value):
+            self.entry[key] = dict(value)
+            self.writes += 1
+
+    facade = Facade()
+    r = a.ensure_bootstrap(APP, proj, max_polls=3, interval=0,
+                           bootstrap_state=facade)
+    assert r.success, r.error_code
+    assert facade.writes >= 2  # pre-POST attempt + post-response enrichment
+    assert facade.entry['wbBootstrapMeta']['deployment_id'] == 'dpl_boot'
+    assert facade.entry['wbBootstrapMeta']['state'] == 'confirmed'

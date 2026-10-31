@@ -176,6 +176,13 @@ class PreviewDeps:
     bypass_is_stored: Any = None
     reprovision_bypass: Any = None
     sleep: Any = None
+    # P1 FINALIZATION: durable bootstrap-marker store, keyed by app_id.
+    # When set, the orchestrator passes the SAME persistent dict to
+    # vercel.ensure_bootstrap on every re-entry so a crash/timeout/5xx
+    # after a bootstrap POST leaves a durable record that forces the next
+    # entry to reconcile GET-only instead of issuing a second POST.
+    # ``None`` keeps the legacy adapter-only relocation path.
+    bootstrap_state_store: Any = None
 
 
 class PreviewOrchestrator:
@@ -482,8 +489,26 @@ class PreviewOrchestrator:
         # artifact is ever deployed. Pure remote reconciliation -- no new
         # local state, safe to call on every run (no-ops once production
         # already exists, whether from a prior bootstrap or real content).
-        bootstrap_result = self.deps.vercel.ensure_bootstrap(
-            app_id, vercel_project, expected_name=expected_name)
+        #
+        # P1 FINALIZATION: when the caller wires a durable bootstrap-state
+        # store, the SAME per-app dict is threaded into every re-entry so
+        # the adapter's post-create marker survives a crash/timeout/5xx and
+        # the next entry reconciles GET-only (never a second POST). Legacy
+        # collaborators without the keyword keep the historical behavior.
+        bootstrap_state = None
+        bootstrap_state_store = getattr(self.deps, 'bootstrap_state_store', None)
+        if bootstrap_state_store is not None:
+            bootstrap_state = bootstrap_state_store(app_id)
+        try:
+            bootstrap_result = self.deps.vercel.ensure_bootstrap(
+                app_id, vercel_project, expected_name=expected_name,
+                bootstrap_state=bootstrap_state)
+        except TypeError:
+            # Legacy vercel collaborator without the P1-finalization
+            # bootstrap_state keyword: fall back to the historical call
+            # shape (adapter-only relocation, no marker store).
+            bootstrap_result = self.deps.vercel.ensure_bootstrap(
+                app_id, vercel_project, expected_name=expected_name)
         if not bootstrap_result.success:
             return bootstrap_result
 
@@ -524,6 +549,30 @@ class PreviewOrchestrator:
         # No provider call, no POST, no reconcile — return the persisted
         # terminal result directly.
         if promoted:
+            promoted_err = previous.get("promoted_error_code")
+            # P0 FINALIZATION: keep the CONFIRMED-promotion terminal distinct
+            # from the production-shaped (unconfirmed) terminal: the persisted
+            # error code is the source of truth, and a restart must not
+            # silently upgrade an unconfirmed outcome to a confirmed one.
+            if promoted_err == "DEPLOYMENT_PRODUCTION_TARGET_REJECTED":
+                return OperationResult(
+                    success=False,
+                    error="DEPLOYMENT_PRODUCTION_TARGET_REJECTED",
+                    error_code="DEPLOYMENT_PRODUCTION_TARGET_REJECTED",
+                    retryable=False,
+                    data={
+                        "production_target_rejected": True,
+                        "confirmed_promotion": False,
+                        "promoted_to_production": False,
+                        "deployment_id": previous.get("deployment_id"),
+                        "preview_url": previous.get("preview_url"),
+                        "state": "READY",
+                        "note": ("terminal: provider labelled the deployment "
+                                 "target=production without a confirmed "
+                                 "binding; preview refused, no resend on "
+                                 "restart"),
+                    },
+                )
             return OperationResult(
                 success=False,
                 error="DEPLOYMENT_PROMOTED_TO_PRODUCTION",
@@ -531,10 +580,35 @@ class PreviewOrchestrator:
                 retryable=False,
                 data={
                     "promoted_to_production": True,
+                    "confirmed_promotion": True,
                     "deployment_id": previous.get("deployment_id"),
                     "preview_url": previous.get("preview_url"),
                     "state": "READY",
                     "note": "terminal: provider promoted to production; no action taken on restart",
+                },
+            )
+        # P0 FINALIZATION: legacy persisted state from before the distinct
+        # production-shaped terminal was introduced: promoted_terminal is set
+        # but no promoted_error_code survived (e.g. the field was pruned).
+        # Fail closed as the production-shaped outcome: it must never be
+        # upgraded to a confirmed promotion, and no provider call, POST or
+        # lookup is issued.
+        if previous.get("promoted_terminal") is True and not previous.get("promoted_error_code"):
+            return OperationResult(
+                success=False,
+                error="DEPLOYMENT_PRODUCTION_TARGET_REJECTED",
+                error_code="DEPLOYMENT_PRODUCTION_TARGET_REJECTED",
+                retryable=False,
+                data={
+                    "production_target_rejected": True,
+                    "confirmed_promotion": False,
+                    "promoted_to_production": False,
+                    "deployment_id": previous.get("deployment_id"),
+                    "preview_url": previous.get("preview_url"),
+                    "state": "READY",
+                    "note": ("terminal: promoted outcome persisted before the "
+                             "distinct production-shaped terminal; fail-closed, "
+                             "no resend on restart"),
                 },
             )
         deployment = None
@@ -561,6 +635,15 @@ class PreviewOrchestrator:
             deployment = None  # fall through to the normal reconcile branch
         if deployment is None:
             if not unresolved:
+                # P1 FINALIZATION: persist the durable operation marker
+                # BEFORE the upload. A crash/restart after an unknown
+                # outcome re-enters here and takes the read-only lookup
+                # branch (``attempted``), which reconciles against the
+                # provider's own deterministic metadata instead of issuing
+                # a second POST. This is application-side crash-safe
+                # idempotency: it does NOT claim provider-enforced
+                # idempotency, and an ambiguous legacy outcome still
+                # fails closed (NOT_FOUND never authorizes a resend).
                 self._update_intent(project_id, operation_id,
                                     deployment_attempted=True,
                                     deployment_unresolved=False,
@@ -1160,7 +1243,14 @@ class PreviewOrchestrator:
         second POST. The state machine:
 
         * PROMOTED  -> ``promoted_terminal=True`` + full ``external_promotion``
-                        record (P2.6). No retry, no second POST, ever.
+                        record (P2.6). No retry, no second POST, ever. A
+                        production-SHAPED but NOT-CONFIRMED outcome
+                        (DEPLOYMENT_PRODUCTION_TARGET_REJECTED) is ALSO
+                        persisted as a promoted terminal: the deployment is
+                        provider-labelled production, so it can never be an
+                        approved preview and a resend can never fix it. The
+                        record carries confirmed_promotion=False to keep the
+                        two cases distinct.
         * BOOTSTRAP_REQUIRED_BEFORE_DEPLOY, DEPLOYMENT_RECONCILIATION_REQUIRED,
           DEPLOYMENT_IDENTITY_MISMATCH, INCOMPLETE_LOOKUP, NOT_FOUND,
           AMBIGUOUS_DEPLOYMENT -> ``deployment_unresolved=True``. The attempt
@@ -1176,14 +1266,19 @@ class PreviewOrchestrator:
         import time as _time
         err = deployment.error_code or deployment.error
         promoted = err == 'DEPLOYMENT_PROMOTED_TO_PRODUCTION'
+        # P0 FINALIZATION: a production-SHAPED deployment whose promotion is
+        # not yet confirmed by the binding is equally terminal for preview
+        # purposes: it is provider-labelled production, so it must never be
+        # shown as an approved preview and no resend can fix it.
+        production_rejected = err == 'DEPLOYMENT_PRODUCTION_TARGET_REJECTED'
         with self.store.acquire_writer(project_id) as locked:
             intent = locked.deployment.get("preview_intent") or {}
             if intent.get("operation_id") != operation_id:
                 return  # superseded operation; do not clobber its record
             intent["deployment_attempt_at"] = _time.time()
             intent["deployment_attempt_outcome"] = (
-                "promoted" if promoted else "unresolved")
-            if promoted:
+                "promoted" if (promoted or production_rejected) else "unresolved")
+            if promoted or production_rejected:
                 intent["promoted_terminal"] = True
                 intent["promoted_error_code"] = err
                 # P2.6: application-owned external promotion record.
@@ -1197,13 +1292,15 @@ class PreviewOrchestrator:
                     "artifact_sha256": snapshot.artifact_sha256,
                     "deployment_id": deployment.data.get("deployment_id"),
                     "deployment_target": (deployment.data.get("deployment") or {}).get("target"),
+                    "confirmed_promotion": promoted,
                     "ready_state": deployment.data.get("state"),
                     "ready_substate": (deployment.data.get("deployment") or {}).get("readySubstate"),
                     "deployment_url": deployment.data.get("preview_url"),
                     "canonical_alias": None,  # provider read, if available
                     "automatic_aliases": (deployment.data.get("deployment") or {}).get("aliases") or [],
-                    "evidence": "DIRECT_BINDING",  # the binding read that proved it
-                    "evidence_source": "provider_targets_production",
+                    "evidence": ("DIRECT_BINDING" if promoted else "PRODUCTION_TARGET_LABEL"),
+                    "evidence_source": ("provider_targets_production" if promoted
+                                        else "deployment_target_production_binding_unconfirmed"),
                     "observed_at": _time.time(),
                     "rollback_attempted": False,
                     # P2.6 conflict handling: if the record already exists
@@ -1253,6 +1350,13 @@ class PreviewOrchestrator:
         """
         dep_body = deployment.data.get("deployment") or {}
         dep_id = deployment.data.get("deployment_id") or dep_body.get("id")
+        # P0 FINALIZATION: read the target from the deployment payload
+        # itself -- the provider's response is the only authoritative source
+        # for the deployment's own target shape. The top-level
+        # deployment_target field is only ever populated on persisted
+        # external_promotion records and is never threaded through the
+        # orchestrator's live results.
+        target = dep_body.get("target")
         try:
             prod_id = self.deps.vercel._current_production_id(vercel_project)
         except Exception:
@@ -1261,31 +1365,63 @@ class PreviewOrchestrator:
             return OperationResult.fail(
                 "DEPLOYMENT_RECONCILIATION_REQUIRED",
                 error_code="DEPLOYMENT_RECONCILIATION_REQUIRED")
-        if prod_id and dep_id and prod_id == dep_id:
-            # This deployment IS the production binding. Build the same
-            # explicit terminal result the adapter would produce.
+        if dep_id and target == "production":
+            # P0 FINALIZATION: a production-SHAPED deployment (target=
+            # 'production') is never an approved preview candidate,
+            # regardless of whether the binding currently points at it.
+            # Distinguish the two sub-cases so downstream persistence can
+            # tell them apart:
+            #   * binding == dep_id  -> CONFIRMED promotion: the deployment
+            #     is the live production target (terminal, no resend).
+            #   * binding != dep_id   -> production-shaped, NOT confirmed
+            #     (alias may still be settling): fail-closed, no resend,
+            #     but NOT a confirmed-promotion terminal.
+            confirmed = prod_id is not None and prod_id == dep_id
+            kind = "CONFIRMED" if confirmed else "NOT-CONFIRMED"
             logger.warning(
-                "Orchestrator guard: deployment %s IS the project's "
-                "current production binding; refusing preview path "
-                "(defense-in-depth, P2.8/E)", dep_id,
+                "Orchestrator guard: deployment %s is PRODUCTION-SHAPED "
+                "(target=production, binding %s%s); refusing preview path "
+                "(P0 finalization, %s)",
+                dep_id,
+                prod_id or "absent",
+                " == deployment" if confirmed else " != deployment",
+                kind,
             )
             return OperationResult(
                 success=False,
-                error="DEPLOYMENT_PROMOTED_TO_PRODUCTION",
-                error_code="DEPLOYMENT_PROMOTED_TO_PRODUCTION",
+                error=("DEPLOYMENT_PROMOTED_TO_PRODUCTION" if confirmed
+                       else "DEPLOYMENT_PRODUCTION_TARGET_REJECTED"),
+                error_code=("DEPLOYMENT_PROMOTED_TO_PRODUCTION" if confirmed
+                            else "DEPLOYMENT_PRODUCTION_TARGET_REJECTED"),
                 retryable=False,
-                data=dict(deployment.data, promoted_to_production=True))
+                data=dict(deployment.data,
+                          promoted_to_production=confirmed,
+                          production_target_rejected=not confirmed,
+                          confirmed_promotion=confirmed))
         return None
 
     def _deploy_or_reconcile(self, app_id, project, snapshot, operation_id, source_revision,
-                             *, expected_name=None):
+                             *, expected_name=None, expected_target=None):
         """Deploy; on ambiguity/timeout, reconcile via lookup — never resend blindly."""
         try:
             result = self.deps.vercel.deploy_static_files(
                 app_id, project, dict(snapshot.dist),
                 operation_id, source_revision, snapshot.artifact_sha256,
                 expected_name=expected_name,
+                expected_target=expected_target,
             )
+        except TypeError:
+            # Legacy vercel collaborator without the P1-finalization
+            # expected_target keyword: fall back to the historical call
+            # shape (no target pinning).
+            try:
+                result = self.deps.vercel.deploy_static_files(
+                    app_id, project, dict(snapshot.dist),
+                    operation_id, source_revision, snapshot.artifact_sha256,
+                    expected_name=expected_name,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                result = OperationResult.fail(str(exc), error_code="DEPLOY_EXCEPTION")
         except Exception as exc:  # pragma: no cover - defensive
             result = OperationResult.fail(str(exc), error_code="DEPLOY_EXCEPTION")
 

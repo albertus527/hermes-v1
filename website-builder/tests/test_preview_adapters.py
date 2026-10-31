@@ -130,8 +130,8 @@ def test_deployment_identity_failclosed(field, value):
 def test_deployment_target_production_rejected_when_already_canonical():
     """If the deployment response says target="production" AND the project's
     OWN production binding points at this exact deployment id, the provider
-    accepted the deployment and it IS live. That is a PROVIDER SUCCESS, not
-    an upload failure: reported as the distinct explicit outcome
+    accepted the deployment and it IS live. That is a CONFIRMED promotion,
+    not an upload failure: reported as the distinct explicit outcome
     DEPLOYMENT_PROMOTED_TO_PRODUCTION, success=False (never shown as an
     approved preview), retryable=False (resending can never fix it), with
     the full deployment payload preserved for reconciliation.
@@ -149,8 +149,96 @@ def test_deployment_target_production_rejected_when_already_canonical():
     assert not result.success and not result.retryable
     assert result.error_code == 'DEPLOYMENT_PROMOTED_TO_PRODUCTION'
     assert result.data['promoted_to_production'] is True
+    assert result.data['confirmed_promotion'] is True
     assert result.data['deployment_id'] == d['id']
     assert result.data['deployment']['id'] == d['id']
+
+
+def test_deployment_target_production_binding_absent_rejected_fail_closed():
+    """P0 FINALIZATION: target="production" with NO production binding (the
+    alias is still settling) must NOT fall through to a preview success.
+    The deployment's own target field says production; the binding not yet
+    pointing at it is not evidence of safety. Fail closed with the distinct
+    non-confirmed outcome, non-retryable, and no POST resend implied."""
+    a, t = adapter()
+    d = deployment(a)
+    d['target'] = 'production'
+    p = project(a)
+    t.responses = [
+        (200, _bootstrapped(a, p)),   # first-deployment guard: binding exists
+        (201, d),                      # POST: provider returned target=production
+        (200, {**p, 'targets': {}}),   # guard re-read: binding still absent
+    ]
+    result = a.deploy_static_files('app', p, {'index.html': b'x'}, 'operation', 2, SHA)
+    assert not result.success and not result.retryable
+    assert result.error_code == 'DEPLOYMENT_PRODUCTION_TARGET_REJECTED'
+    assert result.data['production_target_rejected'] is True
+    assert result.data['confirmed_promotion'] is False
+    assert result.data['deployment_id'] == d['id']
+    # Exactly one POST: the deployment itself. No blind resend.
+    posts = [c for c in t.calls if c[0] == 'POST']
+    assert len(posts) == 1
+
+
+def test_deployment_target_production_stale_binding_rejected_fail_closed():
+    """P0 FINALIZATION: target="production" with the fresh binding pointing
+    at a DIFFERENT (stale) deployment -> rejected, not accepted as preview."""
+    a, t = adapter()
+    d = deployment(a)
+    d['target'] = 'production'
+    p = project(a)
+    t.responses = [
+        (200, _bootstrapped(a, p)),
+        (201, d),
+        (200, {**p, 'targets': {'production': {'id': 'dpl_stale'}}}),
+    ]
+    result = a.deploy_static_files('app', p, {'index.html': b'x'}, 'operation', 2, SHA)
+    assert not result.success and not result.retryable
+    assert result.error_code == 'DEPLOYMENT_PRODUCTION_TARGET_REJECTED'
+    assert result.data['production_target_rejected'] is True
+    assert result.data['confirmed_promotion'] is False
+
+
+def test_lookup_target_production_stale_binding_rejected_consistent_with_direct():
+    """P0 FINALIZATION (direct/lookup consistency): the read-only
+    reconciliation lookup must classify a production-shaped deployment the
+    SAME way the direct path does. A target="production" deployment whose
+    fresh binding does not equal it is DEPLOYMENT_PRODUCTION_TARGET_REJECTED
+    -- never a preview success, never a reason for a second POST."""
+    a, t = adapter()
+    d = deployment(a)
+    d['target'] = 'production'
+    p = project(a)
+    t.responses = [
+        (200, {'deployments': [d], 'pagination': {'next': None}}),
+        (200, d),
+        (200, {**p, 'targets': {'production': {'id': 'dpl_stale'}}}),
+    ]
+    result = a.find_deployment_by_operation_id('app', p, 'operation', 2, SHA)
+    assert not result.success
+    assert result.error_code == 'DEPLOYMENT_PRODUCTION_TARGET_REJECTED'
+    assert result.data['production_target_rejected'] is True
+    assert result.data['confirmed_promotion'] is False
+
+
+def test_lookup_target_production_no_binding_rejected_consistent_with_direct():
+    """P0 FINALIZATION: lookup finds a target="production" deployment but the
+    project has NO production binding -> rejected, consistent with the
+    direct path. A missing/ambiguous binding never authorizes a resend."""
+    a, t = adapter()
+    d = deployment(a)
+    d['target'] = 'production'
+    p = project(a)
+    t.responses = [
+        (200, {'deployments': [d], 'pagination': {'next': None}}),
+        (200, d),
+        (200, {**p, 'targets': {}}),
+    ]
+    result = a.find_deployment_by_operation_id('app', p, 'operation', 2, SHA)
+    assert not result.success
+    assert result.error_code == 'DEPLOYMENT_PRODUCTION_TARGET_REJECTED'
+    assert result.data['production_target_rejected'] is True
+    assert result.data['confirmed_promotion'] is False
 
 
 def test_first_deployment_refused_when_promotion_unspent():

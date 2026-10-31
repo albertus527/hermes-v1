@@ -444,6 +444,100 @@ def test_guard_refuses_when_binding_read_unreadable(tmp_path):
     assert store.load('proj').deployment.get('latest_shown_preview') is None
 
 
+def test_guard_refuses_production_shaped_binding_absent(tmp_path):
+    """P0 FINALIZATION: a deployment whose response body carries
+    target='production' while the production binding is ABSENT (alias still
+    settling) must be refused as an approved preview. No smoke, no
+    delivery, no latest_shown_preview, no second POST. The state persists a
+    promoted terminal with confirmed_promotion=False so a restart re-enters
+    the same read-only terminal without issuing any provider call."""
+    store = ProjectStateStore(tmp_path / 'state')
+    ws = _make_workspace(tmp_path)
+    _preview_ready_state(store, 'proj', ws)
+
+    class ProdShapedVercel(FakeVercel):
+        def deploy_static_files(self, app_id, project, files, operation_id,
+                                source_revision, artifact_sha256, expected_name=None):
+            self.deploy_calls += 1
+            return OperationResult.ok({
+                'deployment_id': 'dpl_new',
+                'preview_url': 'https://public.vercel.app',
+                'state': 'READY',
+                'deployment': {'id': 'dpl_new', 'target': 'production'},
+            })
+
+    vercel = ProdShapedVercel()
+    vercel._current_prod_id = None  # binding absent: promotion unconfirmed
+    deps = _deps(tmp_path, vercel=vercel)
+    result = PreviewOrchestrator(store, deps).run_owned('proj', ws)
+    assert not result.success
+    assert result.error_code == 'DEPLOYMENT_PRODUCTION_TARGET_REJECTED'
+    assert result.data.get('production_target_rejected') is True
+    assert result.data.get('confirmed_promotion') is False
+    assert vercel.deploy_calls == 1  # the deployment itself; never resent
+    state = store.load('proj')
+    # No smoke, no delivery.
+    assert state.deployment.get('latest_shown_preview') is None
+    assert deps.telegram.sent == []
+    # Terminal persisted, distinct from a confirmed promotion.
+    assert state.deployment['preview_intent'].get('promoted_terminal') is True
+    assert state.deployment['preview_intent'].get(
+        'promoted_error_code') == 'DEPLOYMENT_PRODUCTION_TARGET_REJECTED'
+    ep = state.deployment.get('external_promotion')
+    assert ep is not None
+    assert ep['deployment_id'] == 'dpl_new'
+    assert ep['confirmed_promotion'] is False
+
+
+def test_production_shaped_terminal_is_read_only_on_restart(tmp_path):
+    """P0 FINALIZATION: after a production-shaped (unconfirmed) outcome is
+    persisted as a promoted terminal, a restart returns the SAME terminal
+    result with ZERO provider calls -- no POST, no lookup, no guard read.
+    No second deployment is ever issued."""
+    store = ProjectStateStore(tmp_path / 'state')
+    ws = _make_workspace(tmp_path)
+    _preview_ready_state(store, 'proj', ws)
+
+    calls = {'run': 0, 'deploy': 0, 'lookup': 0}
+
+    class ProdShapedVercel(FakeVercel):
+        def deploy_static_files(self, app_id, project, files, operation_id,
+                                source_revision, artifact_sha256, expected_name=None):
+            calls['deploy'] += 1
+            return OperationResult.ok({
+                'deployment_id': 'dpl_new',
+                'preview_url': 'https://public.vercel.app',
+                'state': 'READY',
+                'deployment': {'id': 'dpl_new', 'target': 'production'},
+            })
+
+        def find_deployment_by_operation_id(self, app_id, project, operation_id,
+                                            source_revision, artifact_sha256, expected_name=None):
+            calls['lookup'] += 1
+            return OperationResult.ok({
+                'deployment_id': 'dpl_new',
+                'preview_url': 'https://public.vercel.app',
+                'state': 'READY',
+                'deployment': {'id': 'dpl_new', 'target': 'production'},
+            })
+
+    vercel = ProdShapedVercel()
+    vercel._current_prod_id = None
+    deps = _deps(tmp_path, vercel=vercel)
+    orch = PreviewOrchestrator(store, deps)
+
+    first = orch.run_owned('proj', ws)
+    assert first.error_code == 'DEPLOYMENT_PRODUCTION_TARGET_REJECTED'
+    assert calls['deploy'] == 1
+
+    # Simulate a process restart: same operation, persisted terminal state.
+    second = orch.run_owned('proj', ws)
+    assert second.error_code == 'DEPLOYMENT_PRODUCTION_TARGET_REJECTED'
+    # No second POST, no lookup, no guard read on the restart.
+    assert calls['deploy'] == 1
+    assert calls['lookup'] == 0
+
+
 def test_normal_preview_path_unaffected_by_guard(tmp_path):
     """When the production binding points at a DIFFERENT deployment, the
     guard is inert and the preview path proceeds normally."""

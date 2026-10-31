@@ -65,6 +65,50 @@ deployment is not the canonical production target.
   `DEPLOYMENT_PROMOTED_TO_PRODUCTION` terminal classification when the
   binding is present but points at the new deployment) remains in force.
 
+### Production-shaped rejection (finalization P0)
+
+A deployment response whose own payload says `target == "production"` is
+**never** accepted as a preview, whether or not the project binding has
+caught up with it. Two terminal outcomes are kept distinct:
+
+| Outcome | Meaning | Persisted as |
+|---|---|---|
+| `DEPLOYMENT_PROMOTED_TO_PRODUCTION` | binding GET confirms the new deployment IS the production target | confirmed promotion |
+| `DEPLOYMENT_PRODUCTION_TARGET_REJECTED` | provider labelled the deployment `production`, but the binding is absent/ambiguous/unreadable — alias may still be propagating | production-shaped, **not** confirmed |
+
+Both are terminal: no retry, no second POST, no lookup on restart. The
+unconfirmed variant is never upgraded to the confirmed one on restart; a
+legacy persisted state that has `promoted_terminal=True` but no surviving
+`promoted_error_code` fails closed as the production-shaped outcome. The
+rejection is persisted in `external_promotion` with
+`confirmed_promotion=False` and `evidence=PRODUCTION_TARGET_LABEL`, so the
+audit trail states exactly what was proven.
+
+### Bootstrap crash-safe idempotency (finalization P1)
+
+Vercel has no server-side idempotency key: a repeated bootstrap POST creates
+a second deployment. `ensure_bootstrap` therefore accepts an optional
+caller-owned durable `bootstrap_state` mapping. When wired:
+
+1. **Before the POST** the adapter records a deterministic marker in that
+   mapping (`wbBootstrapMeta` = the payload digest).
+2. On every **re-entry** — timeout, 5xx, reset, process restart — a present
+   marker means the POST may already have happened. The adapter takes the
+   **GET-only** path: relocate the deployment by deterministic metadata and
+   poll its readiness. It never re-POSTs.
+3. A missing/legacy marker cannot prove the POST never happened, so an
+   unknown prior attempt fails closed (`BOOTSTRAP_RECONCILIATION_REQUIRED`)
+   rather than authorizing a second create. Only a project with no marker
+   AND no visible deployment may POST.
+4. The marker is **not** a provider-enforced idempotency claim; it is an
+   application-side crash/timeout record that converts "unknown" into
+   "reconcile, never create".
+
+The production runtime persists this mapping in the project's own deployment
+state (`deployment["bootstrap_marker"]`), so a process restart reloads the
+same marker. Orchestrators without the store keep the historical adapter-only
+relocation path.
+
 ## Mock test surface
 
 `tests/test_bootstrap_preview_evidence.py` drives `ensure_bootstrap` +

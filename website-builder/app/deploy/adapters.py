@@ -88,6 +88,35 @@ _BOOTSTRAP_HTML = b'<!doctype html><title>.</title>'
 # normal transient state and simply keeps polling within the bounded loop.
 _BOOTSTRAP_TERMINAL_STATES = frozenset({'ERROR', 'CANCELED'})
 
+# P1 FINALIZATION — bootstrap crash-safe idempotency marker.
+#
+# Vercel's deployment API has no server-side idempotency key: a repeated
+# bootstrap POST creates a second deployment. The fix is application-side:
+# the orchestrator persists a single durable marker (``bootstrap_state``
+# dict, one entry under ``wbBootstrapMeta``) that records the deployment id
+# of a CONFIRMED bootstrap create response. On every re-entry the adapter
+# uses ONLY GET-only reconciliation: a recorded id is polled, or the
+# bootstrap is relocated by its deterministic provider metadata. A second
+# POST is issued only for a fresh project with no marker and no visible
+# bootstrap. The marker is written TWICE: first as a PRE-POST attempt
+# (``state=posted_attempted``, digest only) immediately BEFORE the upload,
+# then enriched with the deployment id as soon as the create response
+# returns. A crash between "provider accepted the POST" and "response
+# recorded" therefore still leaves the pre-POST attempt marker behind: the
+# next entry takes the GET-only reconcile path and can never re-POST on a
+# NOT_FOUND list read. This is NOT a provider-enforced idempotency claim --
+# it is a local durability record that converts an unknown/ambiguous
+# outcome into "reconcile read-only, never create". Legacy states without
+# the marker still rely on deterministic identity relocation and fail
+# closed.
+_BOOTSTRAP_MARKER_KEY = 'wbBootstrapMeta'
+_BOOTSTRAP_MARKER_UNSET = 'unset'
+# Marker lifecycle values recorded in the caller's durable state:
+#   * posted_attempted -> a create POST may have been issued; GET-only.
+#   * confirmed        -> the bootstrap is provably bound AND READY.
+_BOOTSTRAP_MARKER_POSTED_ATTEMPTED = 'posted_attempted'
+_BOOTSTRAP_MARKER_CONFIRMED = 'confirmed'
+
 # Vercel automation-bypass secrets are 32 alphanumeric characters
 # (``^[a-zA-Z0-9]{32}$``). Used to conservatively validate the LIVE map-key
 # shape (the map key IS the secret) before accepting it.
@@ -556,12 +585,31 @@ class VercelAdapter:
                 return _fail('AMBIGUOUS_PROJECT_CREATE')
             return _fail('PROJECT_RECONCILIATION_REQUIRED')
 
-    def _meta(self, app_id, operation_id, source_revision, artifact_sha256):
+    def _meta(self, app_id, operation_id, source_revision, artifact_sha256,
+              target=None):
+        """Deterministic, caller-supplied metadata recorded ON the deployment
+        so a later lookup-by-identity can prove which provider deployment
+        belongs to which operation.
+
+        P1 FINALIZATION: ``target`` pins the pre-POST request shape the
+        caller durably recorded BEFORE the upload (``wbTarget``). For
+        real-content deployments the orchestrator persists it in the
+        operation intent before any side effect; the provider echoes it
+        back in the deployment's own metadata, so a later lookup can
+        verify the response matches the request that was actually sent.
+        A production-shaped response against a preview-pinned operation is
+        an identity mismatch, not a preview success. ``None`` (legacy
+        rows, promotion-path identities) keeps the historical binding-
+        based classification.
+        """
         if (not operation_id or len(operation_id) > 128 or type(source_revision) is not int
                 or source_revision < 1 or not re.fullmatch('[a-f0-9]{64}', artifact_sha256)):
             raise ValueError('Invalid operation identity')
-        return {'wbOwner': self._marker(app_id), 'wbOperation': operation_id,
+        meta = {'wbOwner': self._marker(app_id), 'wbOperation': operation_id,
                 'wbRevision': str(source_revision), 'wbArtifact': artifact_sha256}
+        if target is not None:
+            meta['wbTarget'] = target
+        return meta
 
     def _current_production_id(self, project):
         """Read-only fetch of the project's CURRENT canonical production
@@ -592,7 +640,7 @@ class VercelAdapter:
             raise ValueError('PRODUCTION_BINDING_LOOKUP_FAILED')
         return prod['id']
 
-    def _deployment(self, body, project, meta):
+    def _deployment(self, body, project, meta, *, expect_target=None):
         # Identity and target semantics, from the provider contract:
         #   * preview deployments respond with target: null
         #   * production deployments respond with target: "production"
@@ -607,8 +655,25 @@ class VercelAdapter:
         # production aliases. The documented "omitted -> preview" rule is NOT
         # honoured for deployment #1; the promotion is confirmed provider
         # behavior, not a hypothesis.
+        #
+        # P1 FINALIZATION: ``expect_target`` is the PRE-POST request shape the
+        # caller pinned durably in the provider request metadata
+        # (``wbTarget``). When it is set, the response's own target field
+        # must match the pinned shape EXACTLY: a real-content deployment was
+        # requested with the preview shape, so a response labelled
+        # target="production" is a PRODUCTION-SHAPED result and must never be
+        # accepted as a preview (P0). When it is None -- the bootstrap
+        # payload requests NO target at all, and its provider response
+        # legitimately carries target="production" because it intentionally
+        # consumes the project's one-time first-deployment auto-promotion --
+        # a production-shaped response is the EXPECTED outcome and is
+        # accepted so the confirmation barrier can bind the bootstrap id.
+        # Every other shape mismatch fails closed with
+        # DEPLOYMENT_IDENTITY_MISMATCH.
         team = body.get('teamId') or (body.get('team') or {}).get('id')
         project_id = body.get('projectId') or (body.get('project') or {}).get('id')
+        if expect_target is not None and body.get('target') != expect_target:
+            return _fail('DEPLOYMENT_IDENTITY_MISMATCH')
         if (not body.get('id') or project_id != project['id'] or team != self.team_id
                 or body.get('name') != project['name'] or 'target' not in body
                 or body['target'] not in (None, 'production')
@@ -618,20 +683,35 @@ class VercelAdapter:
         if not _safe_origin(url):
             return _fail('INVALID_PREVIEW_URL')
         if body['target'] == 'production':
+            # P0 FINALIZATION: a production-shaped response is NEVER accepted
+            # as a preview, regardless of the binding state.
+            #
+            # The old code accepted the deployment as a normal preview when
+            # the fresh production binding did not (yet) equal this
+            # deployment id -- on the assumption that alias assignment was
+            # still settling. That assumption is unsafe: the deployment's
+            # own target field says 'production', and until the provider
+            # PROVES it is the current canonical production target (binding
+            # equality, read authoritatively from the project, never from
+            # this body), no caller may treat it as an approved preview
+            # candidate. Promotion/alias assignment is eventually
+            # consistent, so a lagging binding is exactly the window in
+            # which a production deployment could silently enter the
+            # preview smoke/delivery path.
             try:
                 current_prod_id = self._current_production_id(project)
             except Exception:
                 # Ambiguous/malformed binding lookup: never assume safe.
-                return _fail('DEPLOYMENT_IDENTITY_MISMATCH')
+                return _fail('DEPLOYMENT_RECONCILIATION_REQUIRED')
             if current_prod_id == body['id']:
-                # PROVIDER SUCCESS, not an upload failure: the provider
-                # accepted this deployment and it IS the project's live
-                # production target. Reported as a DISTINCT explicit outcome
-                # -- success=False so no caller treats it as an approved
-                # preview, but with the full deployment payload and
-                # promoted_to_production=True so it can never be mistaken
-                # for a failed upload, an identity mismatch, or a reason to
-                # resend. Resending can NEVER fix this outcome.
+                # CONFIRMED promotion: the provider accepted this deployment
+                # and it IS the project's live production target. Reported
+                # as a DISTINCT explicit outcome -- success=False so no
+                # caller treats it as an approved preview, but with the
+                # full deployment payload and promoted_to_production=True
+                # so it can never be mistaken for a failed upload, an
+                # identity mismatch, or a reason to resend. Resending can
+                # NEVER fix this outcome.
                 logger.warning(
                     "Vercel deployment PROMOTED TO PRODUCTION: "
                     "operation=deploy_static_files project=%s deployment=%s "
@@ -644,16 +724,48 @@ class VercelAdapter:
                     error_code='DEPLOYMENT_PROMOTED_TO_PRODUCTION',
                     retryable=False,
                     data={'promoted_to_production': True,
+                          'confirmed_promotion': True,
                           'deployment_id': body['id'],
                           'preview_url': url,
                           'state': body.get('readyState') or body.get('status'),
                           'deployment': body})
+            # PRODUCTION-SHAPED, NOT CONFIRMED: the provider labelled this
+            # deployment target='production', but the authoritative binding
+            # does not (yet) point at it (absent, or still settling on a
+            # different id). This is a DISTINCT outcome from the confirmed
+            # case: the deployment is NOT approved for preview, and it is
+            # NOT evidence of a confirmed live promotion. fail-closed and
+            # non-retryable -- a resend can never make a production-shaped
+            # deployment a preview, so neither the direct path nor the
+            # read-only lookup may treat this as a preview candidate or
+            # re-issue the POST.
+            logger.warning(
+                "Vercel deployment PRODUCTION-SHAPED, NOT CONFIRMED: "
+                "operation=deploy_static_files project=%s deployment=%s "
+                "(target=production with binding %s; refusing preview, "
+                "fail-closed, no resend)",
+                project.get('id'), body['id'],
+                "absent" if current_prod_id is None
+                else "stale/moved (%s)" % current_prod_id,
+            )
+            return OperationResult(
+                success=False,
+                error='DEPLOYMENT_PRODUCTION_TARGET_REJECTED',
+                error_code='DEPLOYMENT_PRODUCTION_TARGET_REJECTED',
+                retryable=False,
+                data={'production_target_rejected': True,
+                      'confirmed_promotion': False,
+                      'deployment_id': body['id'],
+                      'preview_url': url,
+                      'state': body.get('readyState') or body.get('status'),
+                      'deployment': body})
         return OperationResult.ok({'deployment_id': body['id'], 'preview_url': url,
                                   'state': body.get('readyState') or body.get('status'),
                                   'deployment': body})
 
     def deploy_static_files(self, app_id, project, files, operation_id,
-                            source_revision, artifact_sha256, *, expected_name=None):
+                            source_revision, artifact_sha256, *, expected_name=None,
+                            expected_target=None):
         """files maps canonical relative POSIX names to immutable bytes.
 
         Uses Vercel's static v2 builder with inline exact bytes. No package
@@ -663,11 +775,22 @@ class VercelAdapter:
         name (the friendly slug resolved before ensure_project_with_slug, or
         None for the legacy opaque name) -- never inferred from the project
         response itself.
+
+        P0 FINALIZATION: ``expected_target`` is an OPTIONAL pin of the
+        PRE-POST request shape (``preview`` for the preview shape,
+        ``production`` for an explicit production request). When supplied it
+        is recorded in the provider request metadata as ``wbTarget`` and
+        enforced in ``_deployment``. The orchestrator's preview path leaves it
+        ``None`` and relies on the binding-based classification instead, which
+        refuses a production-shaped response on BOTH the direct and the
+        read-only lookup path; the pin remains available to callers that want
+        an explicit request-shape contract.
         """
         try:
             if not self._project_valid(project, app_id, expected_name=expected_name):
                 return _fail('PROJECT_IDENTITY_MISMATCH')
-            meta = self._meta(app_id, operation_id, source_revision, artifact_sha256)
+            meta = self._meta(app_id, operation_id, source_revision, artifact_sha256,
+                              target=expected_target)
             if not files or 'index.html' not in files:
                 return _fail('INVALID_STATIC_FILES')
             entries = []
@@ -740,7 +863,12 @@ class VercelAdapter:
                     sum(len(e['data']) for e in entries),
                 )
                 return _fail('DEPLOYMENT_RECONCILIATION_REQUIRED')
-            return self._deployment(body, project, meta)
+            # P1 FINALIZATION: enforce the pinned pre-POST request shape.
+            # A real-content deployment was requested with the preview
+            # shape; a response labelled target="production" against that
+            # pin is an identity mismatch, never a preview success.
+            return self._deployment(body, project, meta,
+                                    expect_target=expected_target)
         except Exception as exc:
             # Classify BEFORE the fail-closed return. This preserves the
             # existing behaviour (one opaque, retryable=False result) while
@@ -758,11 +886,12 @@ class VercelAdapter:
         pagination, repeated cursors, missing meta all fail closed; NOT_FOUND
         is not proof a resend/create is safe).
 
-        Returns (failure_result_or_None, identifier). On success, the first
-        element is ``None`` and ``identifier`` is set to the unique matching
-        deployment id. On failure (including NOT_FOUND/AMBIGUOUS), the first
-        element is the ``OperationResult`` to propagate and ``identifier`` is
-        ``None``.
+        Returns (failure_result_or_None, record). On success, the first
+        element is ``None`` and ``record`` is the unique matching deployment
+        row from the provider's list response (an ``id``-/``uid``-bearing
+        dict, never a bare string). On failure (including
+        NOT_FOUND/AMBIGUOUS), the first element is the ``OperationResult``
+        to propagate and ``record`` is ``None``.
         """
         matches, seen, query = {}, set(), {'projectId': project['id'], 'limit': 100}
         for _ in range(max_pages):
@@ -790,7 +919,7 @@ class VercelAdapter:
             return _fail('INCOMPLETE_LOOKUP'), None
         if len(matches) != 1:
             return _fail('AMBIGUOUS_DEPLOYMENT' if matches else 'NOT_FOUND'), None
-        return None, next(iter(matches))
+        return None, next(iter(matches.values()))
 
     def _bootstrap_operation_id(self, app_id):
         # Distinct namespace from real content operation ids -- can never
@@ -1049,7 +1178,7 @@ class VercelAdapter:
         return secret if kind == 'secret' else None
 
     def ensure_bootstrap(self, app_id, project, max_polls=20, interval=0.25,
-                         *, expected_name=None):
+                         *, expected_name=None, bootstrap_state=None):
         """Consume Vercel's unavoidable first-deployment auto-promotion with
         deterministic, content-free bytes -- BEFORE any real user artifact is
         ever deployed. No new local state/lifecycle: this is a pure remote
@@ -1087,10 +1216,42 @@ class VercelAdapter:
           * production bound to a DIFFERENT deployment, or anything
             ambiguous/malformed -> fail closed, never guess, never a second
             bootstrap POST.
+
+        P1 FINALIZATION crash-safe idempotency (``bootstrap_state``):
+          * the caller passes the SAME durable dict on every re-entry for
+            this project. After a create POST returns a clean 2xx with an
+            id, the adapter records ``wbBootstrapMeta = {payload_digest,
+            deployment_id}`` in it. A crash/timeout/5xx after the POST (or
+            any unknown outcome) leaves that record behind, and the next
+            re-entry takes ONLY the GET-only path: poll the recorded
+            deployment id (and/or relocate by deterministic identity) and
+            never issue a second POST.
+          * On re-entry, a marker whose digest no longer matches the
+            deterministic payload for this project, or that records no
+            deployment id, cannot be trusted to identify which deployment
+            was created -> fail closed (GET-only, no POST,
+            BOOTSTRAP_RECONCILIATION_REQUIRED).
+          * Legacy states without the marker behave exactly as before:
+            deterministic identity relocation, then a single POST for a
+            genuinely fresh project.
+          * The marker is an application-side durability record, NOT a
+            provider-enforced idempotency key (Vercel has none): its role
+            is to make the orchestrator's next entry reconcile read-only
+            instead of creating a duplicate deployment.
         """
         try:
             if not self._project_valid(project, app_id, expected_name=expected_name):
                 return _fail('PROJECT_IDENTITY_MISMATCH')
+            # P1 FINALIZATION: the caller's durable bootstrap-state mapping
+            # is the marker store. The adapter only ever reads/writes through
+            # it (get / __getitem__ / __setitem__), so a mapping facade that
+            # persists each write is accepted; a malformed store is not a
+            # signal to create, it is a fail-closed condition.
+            if bootstrap_state is not None and not (
+                    hasattr(bootstrap_state, 'get')
+                    and hasattr(bootstrap_state, '__setitem__')
+                    and hasattr(bootstrap_state, '__getitem__')):
+                return _fail('BOOTSTRAP_RECONCILIATION_REQUIRED')
             try:
                 current = self._current_production_id(project)
             except Exception:
@@ -1103,23 +1264,112 @@ class VercelAdapter:
 
             operation_id = self._bootstrap_operation_id(app_id)
             marker = self._marker(app_id)
-            fail, identifier = self._find_unique_deployment_by_meta_key(
-                project, 'wbBootstrap', operation_id)
-            if fail is not None and fail.error_code != 'NOT_FOUND':
-                return fail
-            reconciled = fail is None
-            if not reconciled:
-                entries = [{'file': 'index.html',
-                           'data': base64.b64encode(_BOOTSTRAP_HTML).decode(), 'encoding': 'base64'}]
-                status, body = self._call('POST', '/v13/deployments', {
-                    'name': project['name'], 'project': project['id'], 'version': 2,
-                    'files': entries, 'builds': [{'src': '**', 'use': '@vercel/static'}],
+            entries = [{'file': 'index.html',
+                       'data': base64.b64encode(_BOOTSTRAP_HTML).decode(),
+                       'encoding': 'base64'}]
+            # The marker's digest is deterministic over the exact payload
+            # this project generation would upload. It lets a later GET-only
+            # reconcile verify that a recorded deployment id belongs to THIS
+            # payload; a mismatched digest is treated as untrustworthy.
+            payload_digest = hashlib.sha256(
+                json.dumps({
+                    'name': project['name'],
+                    'project': project['id'],
+                    'files': entries,
                     'meta': {'wbOwner': marker, 'wbBootstrap': operation_id},
-                    'projectSettings': {'framework': None},
-                })
-                if status not in (200, 201) or not body.get('id'):
+                }, sort_keys=True).encode()
+            ).hexdigest()
+            reconciled = False
+            identifier = None
+            prior_id = None
+            prior_marker = None
+            if bootstrap_state is not None:
+                prior_marker = bootstrap_state.get(_BOOTSTRAP_MARKER_KEY)
+            if prior_marker is not None:
+                # A marker exists: a create may already have been issued.
+                # GET-only from here -- a second POST must never be issued.
+                if not (isinstance(prior_marker, dict)
+                        and prior_marker.get('payload_digest') == payload_digest):
+                    # The marker does not positively identify THIS payload
+                    # generation (legacy, corrupt, or written by an unknown
+                    # generation): it cannot prove what was created. Fail
+                    # closed; reconcile read-only.
                     return _fail('BOOTSTRAP_RECONCILIATION_REQUIRED')
-                identifier = body['id']
+                prior_id = prior_marker.get('deployment_id')
+                if prior_id is not None and not (isinstance(prior_id, str) and prior_id):
+                    return _fail('BOOTSTRAP_RECONCILIATION_REQUIRED')
+                reconciled = True
+                fail, record = self._find_unique_deployment_by_meta_key(
+                    project, 'wbBootstrap', operation_id)
+                if fail is None:
+                    found_id = record.get('uid') or record.get('id')
+                    if found_id and prior_id and found_id != prior_id:
+                        # Two distinct deployments carry this deterministic
+                        # identity: the provider state is ambiguous. Never
+                        # guess which is the real one.
+                        return _fail('BOOTSTRAP_RECONCILIATION_REQUIRED')
+                    identifier = found_id or prior_id
+                elif fail.error_code == 'NOT_FOUND':
+                    # The provider list does not show the deployment. A
+                    # marker with a recorded id may still be propagating:
+                    # poll that id (GET-only). A marker WITHOUT an id proves
+                    # a POST was issued but not what it created -- unknown,
+                    # so fail closed; a resend is never authorized.
+                    if not prior_id:
+                        return _fail('BOOTSTRAP_RECONCILIATION_REQUIRED')
+                    identifier = prior_id
+                else:
+                    return fail
+            else:
+                # No marker: either a fresh project or legacy state.
+                # Relocate the bootstrap by deterministic identity BEFORE
+                # creating.
+                fail, record = self._find_unique_deployment_by_meta_key(
+                    project, 'wbBootstrap', operation_id)
+                if fail is not None and fail.error_code != 'NOT_FOUND':
+                    return fail
+                reconciled = fail is None
+                identifier = None
+                if reconciled:
+                    identifier = record.get('uid') or record.get('id')
+                if identifier is None:
+                    # P1 FINALIZATION: persist the PRE-POST attempt marker
+                    # BEFORE the upload. A crash between "POST accepted" and
+                    # "response recorded" leaves this marker behind, so the
+                    # next entry knows a create may have happened and takes
+                    # the GET-only path (never a second POST). The digest
+                    # pins the marker to THIS exact payload.
+                    if bootstrap_state is not None:
+                        bootstrap_state[_BOOTSTRAP_MARKER_KEY] = {
+                            'payload_digest': payload_digest,
+                            'state': _BOOTSTRAP_MARKER_POSTED_ATTEMPTED,
+                        }
+                    status, body = self._call('POST', '/v13/deployments', {
+                        'name': project['name'], 'project': project['id'],
+                        'version': 2,
+                        'files': entries,
+                        'builds': [{'src': '**', 'use': '@vercel/static'}],
+                        'meta': {'wbOwner': marker, 'wbBootstrap': operation_id},
+                        'projectSettings': {'framework': None},
+                    })
+                    if status not in (200, 201) or not isinstance(body, dict) \
+                            or not body.get('id'):
+                        # The provider answered but the outcome is not a
+                        # clean create: UNKNOWN. Reconcile read-only on the
+                        # next entry; no second POST here. The pre-POST
+                        # marker already survives, so the next entry is
+                        # GET-only by construction.
+                        return _fail('BOOTSTRAP_RECONCILIATION_REQUIRED')
+                    identifier = body['id']
+                    if bootstrap_state is not None:
+                        # Durable record of the create response: any later
+                        # re-entry polls this id instead of creating
+                        # another deployment.
+                        bootstrap_state[_BOOTSTRAP_MARKER_KEY] = {
+                            'payload_digest': payload_digest,
+                            'state': _BOOTSTRAP_MARKER_POSTED_ATTEMPTED,
+                            'deployment_id': identifier,
+                        }
 
             # ---- Remote confirmation barrier: a POST/reconcile alone is
             # never proof. Promotion/alias assignment is eventually
@@ -1158,6 +1408,16 @@ class VercelAdapter:
                         return _fail('BOOTSTRAP_RECONCILIATION_REQUIRED')
                     state = dep.get('readyState')
                     if state == 'READY':
+                        if bootstrap_state is not None:
+                            # Terminal confirmation: the marker now proves
+                            # binding + READY. A later re-entry that still
+                            # finds a production binding is a no-op above;
+                            # this value documents the proven outcome.
+                            bootstrap_state[_BOOTSTRAP_MARKER_KEY] = {
+                                'payload_digest': payload_digest,
+                                'state': _BOOTSTRAP_MARKER_CONFIRMED,
+                                'deployment_id': identifier,
+                            }
                         return OperationResult.ok({'bootstrapped': True,
                                                    'deployment_id': identifier,
                                                    'reconciled': reconciled,
@@ -1181,19 +1441,34 @@ class VercelAdapter:
 
         Missing metadata, malformed pagination, repeated cursors and multiple
         matching IDs fail closed. NOT_FOUND is not permission to resend.
+
+        P0 FINALIZATION: the lookup classifies through the SAME
+        ``_deployment`` contract as the direct deploy path, so the two paths
+        cannot disagree. A response labelled target="production" is a
+        PRODUCTION-SHAPED result and is rejected (never accepted as a
+        preview); if the caller pinned the pre-POST request shape in the
+        provider request metadata (``wbTarget``), the response's own target
+        must also match that pin. Legacy deployments carry no wbTarget and are
+        classified by the fresh production binding read, exactly as before.
         """
         try:
             if not self._project_valid(project, app_id, expected_name=expected_name):
                 return _fail('PROJECT_IDENTITY_MISMATCH')
             meta = self._meta(app_id, operation_id, source_revision, artifact_sha256)
-            fail, identifier = self._find_unique_deployment_by_meta_key(
+            fail, record = self._find_unique_deployment_by_meta_key(
                 project, 'wbOperation', operation_id, max_pages=max_pages)
             if fail is not None:
                 return fail
+            identifier = record.get('uid') or record.get('id')
             status, body = self._call('GET', '/v13/deployments/' + quote(identifier, safe=''))
             if status != 200 or body.get('id') != identifier:
                 return _fail('DEPLOYMENT_IDENTITY_MISMATCH')
-            return self._deployment(body, project, meta)
+            # Legacy rows (pre-pin) carry no wbTarget -> binding-based
+            # classification. Pinned rows -> strict shape match.
+            pinned = (record.get('meta') or {}).get('wbTarget')
+            if pinned is None:
+                pinned = meta.get('wbTarget')
+            return self._deployment(body, project, meta, expect_target=pinned)
         except Exception:
             return _fail('INCOMPLETE_LOOKUP')
 

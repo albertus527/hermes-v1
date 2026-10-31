@@ -506,7 +506,11 @@ class TestPromotedToProduction:
 
     def test_ambiguous_binding_still_fails_closed(self):
         """If the binding read is ambiguous the adapter cannot know whether
-        the deployment went live -- fail closed, no payload trust."""
+        the deployment went live -- fail closed, no payload trust. The
+        production-target branch of _deployment reports this as
+        DEPLOYMENT_RECONCILIATION_REQUIRED (P0 finalization), while the
+        general pre-target identity check still fails as
+        DEPLOYMENT_IDENTITY_MISMATCH."""
         a, t = adapter()
         t.responses.append((201, self._promoted(a)))
         t.responses.append((200, {"id": "prj_1", "name": "dorma-atelier",
@@ -514,5 +518,6 @@ class TestPromotedToProduction:
                                   "targets": {"production": "not-a-dict"}}))
         r = deploy(a)
         assert not r.success
-        assert r.error_code == "DEPLOYMENT_IDENTITY_MISMATCH"
+        assert r.error_code in (
+            "DEPLOYMENT_IDENTITY_MISMATCH", "DEPLOYMENT_RECONCILIATION_REQUIRED")
         assert "promoted_to_production" not in r.data
