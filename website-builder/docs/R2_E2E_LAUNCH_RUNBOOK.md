@@ -3,18 +3,35 @@
 Status: **prepared, NOT started.** Awaiting explicit owner GO.
 
 Bot: `@website527_bot` (id `8722247904`, display name `wbtest`)
-Worktree: `/home/albertus527/wt-n8-int/website-builder` @ `824b7b47a` (branch `merge/n9-into-r2`)
+Worktree: `/home/albertus527/wt-n8-int/website-builder` @ `18eb527e8` (branch `merge/n9-into-r2`)
 R2 root: `~/.website-builder-r2/`
+
+## Validation stages (do not skip or reorder)
+
+1. **Static validation** — code/tests/docs only; no listener, no provider calls.
+2. **Preflight** — read-only environment/config checks; no listener.
+3. **Listener startup** — §2; **this is the first step that opens a live
+   Telegram long-poll**.
+4. **Live E2E** — only after an explicit owner GO; sends/receives real
+   Telegram messages and bills model calls.
+
+Steps in stages 1–2 cannot contact Telegram or a model provider. Do not treat a
+passing static/preflight check as permission to run the live E2E.
 
 ---
 
-## 0. Pre-launch state (verified 2026-10-22)
+## 0. Pre-launch state — **STALE, NOT VERIFIED for `18eb527e8`**
+
+> The table below is the state last observed on **2026-10-22**, before the
+> final deployment-safety commits. It has **not** been revalidated against
+> `18eb527e8`. Re-run the preflight checks and refresh the values below before
+> starting the listener; do not quote these values as current evidence.
 
 | Check | Value |
 |---|---|
 | Bot identity | `@website527_bot` / `8722247904` / `wbtest` |
 | Polling conflict | none — no process holds the token, no webhook, `pending=0` |
-| R2 config | `r2-e2e.yaml` selected via `WEBSITE_BUILDER_CONFIG_PATH` |
+| R2 config | `~/.website-builder-r2/r2-e2e.yaml` selected via `WEBSITE_BUILDER_CONFIG_PATH` |
 | `requirement_creator.enabled` | `true` |
 | `decision_engine.design_mode` | `disabled` |
 | `decision_engine.intake_mode` | `disabled` |
@@ -25,10 +42,11 @@ R2 root: `~/.website-builder-r2/`
 | Vercel account | `albertus527` / `team_E50r6RSMGypiUpWGdMHEK1DG` |
 | Free slug | `dorma-atelier` — confirmed unused |
 | Browser | `/opt/r2-browser/chrome`, root-owned, `r2-browser` profile loaded |
-| Cost baseline | `max_id=5266`, 5,266 rows, last request `2026-10-21T13:59:27Z` |
+| Cost baseline (**STALE**) | `max_id=5266`, 5,266 rows, last request `2026-10-21T13:59:27Z` — re-derive the current `max_id` before launch |
 | Gateway credential | `NINEROUTER_API_KEY` in `profile/.env` — **required** (see §1a) |
 
-Post-repair preflight: **21/21 PASS**.
+Post-repair preflight: **21/21 PASS on 2026-10-22 — STALE, NOT VERIFIED for
+`18eb527e8`.** Re-run it before launch.
 
 ---
 
@@ -160,20 +178,25 @@ Confirm before proceeding:
 
 ```bash
 pwd                                    # expect .../wt-n8-int/website-builder
-git rev-parse --short HEAD             # expect 824b7b47a
+git rev-parse --short HEAD             # expect 18eb527e8
 echo "$WEBSITE_BUILDER_CONFIG_PATH"    # expect .../r2-e2e.yaml
 ```
 
 ---
 
-## 2. Start
+## 2. Listener startup (LIVE — owner GO required)
+
+> **WARNING: `python3 -m app` starts a live Telegram listener.** It opens a
+> long-poll against the production bot token and will consume real updates.
+> Run it only in stage 3, after stages 1–2 pass and the owner has given an
+> explicit GO. There is no dry-run flag on this command.
 
 ```bash
 python3 -m app
 ```
 
 This begins long-polling `@website527_bot`. **No model request is sent until a
-brief arrives.**
+brief arrives.** Once running, the next action is the live E2E in §3.
 
 ---
 
@@ -205,8 +228,12 @@ Cost, in a second shell:
 
 ```bash
 cd /home/albertus527/wt-n8-int/website-builder
-python3 tools/r2_cost_report.py --delta --since 5266
+python3 tools/r2_cost_report.py --delta --since <baseline_id>
 ```
+
+`<baseline_id>` is the `max_id` you re-derived during preflight. The historical
+`5266` is **STALE** (last observed `2026-10-21T13:59:27Z`) and must not be
+used as the current baseline.
 
 **Abort target $1.00 is a manual threshold, not an enforced kill switch.**
 Worst case at 8 provider calls ≈ $1.40. If the delta crosses $1.00, stop the run.
@@ -249,6 +276,39 @@ for d in /proc/[0-9]*; do sudo -n tr '\0' '\n' < "$d/environ" 2>/dev/null \
 If a stale `frontend_budget` lock exists under
 `~/.website-builder-r2/state/.frontend_budget/`, inspect before deleting — do
 not remove blindly.
+
+---
+
+## 5a. Rollback limitation after R2 state writes
+
+**A code rollback alone is not a complete rollback.** R2 reads older state
+fine: absent fields default, so a pre-R2 `ProjectState` loads unchanged. The
+reverse is not true. R2 persists `revisions.design_guidance_version`; the
+current R1 `RevisionState` has no such field and constructs with
+`RevisionState(**data["revisions"])`, so an R1 process reading an R2-written
+project state fails closed with:
+
+```
+TypeError: RevisionState.__init__() got an unexpected keyword argument 'design_guidance_version'
+```
+
+(Observed directly against the target-branch `app/core/state.py`; no schema
+change proposed here.)
+
+Operational consequence: after this run writes project state, switching the
+code back to R1 does **not** restore service for that project. Before the live
+E2E, decide and record one of:
+
+- **Snapshot first** — copy `~/.website-builder-r2/state/*.json` (and the
+  workspace) before launch, so a rollback can restore pre-R2 state; or
+- **Forward-fix only** — accept that rollback means reverting code *and*
+  restoring the matching state snapshot; or
+- **Isolated state root** — keep R2 state in its own root and never point an R1
+  process at it.
+
+Do not hand-edit `design_guidance_version` out of a state file as a rollback
+shortcut; the field participates in design-guidance revision tracking and
+removing it loses provenance.
 
 ---
 

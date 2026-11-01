@@ -1571,6 +1571,12 @@ def _unsafe_commit(live, extra_entries=None, label="unsafe", extra_files=None):
     repo.mkdir(parents=True, exist_ok=True)
     if not (repo / ".git").exists():
         _git(live.mirror.parent, "-c", "init.defaultBranch=main", "init", str(repo))
+        # ``commit-tree`` needs a committer identity. Set it in this disposable
+        # repository only -- never in global config -- so the helper does not
+        # depend on the host's git identity being configured.
+        _git(repo, "config", "user.email", "t@example.invalid")
+        _git(repo, "config", "user.name", "t")
+        _git(repo, "config", "commit.gpgsign", "false")
     tree = _tree_from_paths(repo, entries)
     commit = _git(repo, "commit-tree", tree, "-m", label).stdout.strip()
     _inject_objects(live.output.path, repo)
